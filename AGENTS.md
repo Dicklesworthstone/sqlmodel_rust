@@ -54,6 +54,28 @@ The `legacy_*` directories contain cloned Python repositories for SPECIFICATION 
 
 **Use these to extract BEHAVIORS, not to translate code.**
 
+### Why We DON'T Port Pydantic/SQLAlchemy as Separate Crates
+
+In Python, SQLModel depends on Pydantic + SQLAlchemy because Python lacks compile-time types and macros. **Rust has these natively:**
+
+| Python Needs Library For | Rust Has Built-In |
+|--------------------------|-------------------|
+| Runtime type validation (Pydantic) | Compile-time type system |
+| JSON ser/de (Pydantic) | `serde` ecosystem |
+| Field metadata (Pydantic) | Proc macro attributes |
+| Connection abstraction (SQLAlchemy) | Traits + generics |
+| Query building (SQLAlchemy) | Type-safe builders |
+| ORM mapping (SQLAlchemy) | `#[derive(Model)]` macro |
+
+**We implement the COMBINED functionality directly in sqlmodel-rust crates.**
+
+The legacy repos help us understand:
+1. What SQL to generate for each operation
+2. What edge cases exist (null handling, type coercion)
+3. What the user-facing API should feel like
+
+We do NOT create separate `pydantic-rust` or `sqlalchemy-rust` crates.
+
 ## Porting Methodology
 
 ### The Three Documents

@@ -4,6 +4,34 @@
 
 SQLModel is a Python library that combines Pydantic (data validation) and SQLAlchemy (SQL toolkit/ORM) to provide intuitive, type-safe database operations. This document outlines the strategy for porting SQLModel to Rust while preserving its developer experience and enhancing performance.
 
+## Why We Don't Port Pydantic/SQLAlchemy Separately
+
+**Critical insight:** In Python, SQLModel depends on Pydantic and SQLAlchemy because Python lacks:
+- Compile-time type checking (Pydantic provides runtime validation)
+- Zero-cost abstractions (SQLAlchemy abstracts away database differences)
+- Powerful macro system (everything done via metaclasses/decorators)
+
+**In Rust, we have all of these natively:**
+
+| Python Library | What It Provides | Rust Native Equivalent |
+|----------------|------------------|------------------------|
+| **Pydantic** | Runtime type validation | Rust's type system (compile-time) |
+| **Pydantic** | JSON serialization | `serde` + `serde_json` |
+| **Pydantic** | Field metadata | Proc macro attributes |
+| **SQLAlchemy Core** | Connection management | Our `sqlmodel-core` |
+| **SQLAlchemy Core** | Query building | Our `sqlmodel-query` |
+| **SQLAlchemy ORM** | Model→Table mapping | Our `#[derive(Model)]` macro |
+| **SQLAlchemy ORM** | Session/UoW | Explicit transactions (simpler!) |
+| **SQLAlchemy** | Migrations | Our `sqlmodel-schema` |
+| **SQLAlchemy** | Connection pooling | Our `sqlmodel-pool` |
+
+**The legacy repos are REFERENCE ONLY** - we study them to understand:
+1. What SQL each operation should generate
+2. What edge cases exist
+3. What the user-facing API should feel like
+
+We do NOT translate their code. We implement the *essence* directly in idiomatic Rust.
+
 ## Value Propositions to Preserve
 
 1. **Intuitive API** - Define models as simple structs with derive macros
