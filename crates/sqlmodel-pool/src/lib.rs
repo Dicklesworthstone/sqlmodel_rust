@@ -726,168 +726,124 @@ mod tests {
     struct MockTx;
 
     impl TransactionOps for MockTx {
-        fn query(
+        async fn query(&self, _cx: &Cx, _sql: &str, _params: &[Value]) -> Outcome<Vec<Row>, Error> {
+            Outcome::Ok(vec![])
+        }
+
+        async fn query_one(
             &self,
             _cx: &Cx,
             _sql: &str,
             _params: &[Value],
-        ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
-            async { Outcome::Ok(vec![]) }
+        ) -> Outcome<Option<Row>, Error> {
+            Outcome::Ok(None)
         }
 
-        fn query_one(
-            &self,
-            _cx: &Cx,
-            _sql: &str,
-            _params: &[Value],
-        ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
-            async { Outcome::Ok(None) }
+        async fn execute(&self, _cx: &Cx, _sql: &str, _params: &[Value]) -> Outcome<u64, Error> {
+            Outcome::Ok(0)
         }
 
-        fn execute(
-            &self,
-            _cx: &Cx,
-            _sql: &str,
-            _params: &[Value],
-        ) -> impl Future<Output = Outcome<u64, Error>> + Send {
-            async { Outcome::Ok(0) }
+        async fn savepoint(&self, _cx: &Cx, _name: &str) -> Outcome<(), Error> {
+            Outcome::Ok(())
         }
 
-        fn savepoint(
-            &self,
-            _cx: &Cx,
-            _name: &str,
-        ) -> impl Future<Output = Outcome<(), Error>> + Send {
-            async { Outcome::Ok(()) }
+        async fn rollback_to(&self, _cx: &Cx, _name: &str) -> Outcome<(), Error> {
+            Outcome::Ok(())
         }
 
-        fn rollback_to(
-            &self,
-            _cx: &Cx,
-            _name: &str,
-        ) -> impl Future<Output = Outcome<(), Error>> + Send {
-            async { Outcome::Ok(()) }
+        async fn release(&self, _cx: &Cx, _name: &str) -> Outcome<(), Error> {
+            Outcome::Ok(())
         }
 
-        fn release(
-            &self,
-            _cx: &Cx,
-            _name: &str,
-        ) -> impl Future<Output = Outcome<(), Error>> + Send {
-            async { Outcome::Ok(()) }
+        async fn commit(self, _cx: &Cx) -> Outcome<(), Error> {
+            Outcome::Ok(())
         }
 
-        fn commit(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-            async { Outcome::Ok(()) }
-        }
-
-        fn rollback(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-            async { Outcome::Ok(()) }
+        async fn rollback(self, _cx: &Cx) -> Outcome<(), Error> {
+            Outcome::Ok(())
         }
     }
 
     impl Connection for MockConnection {
         type Tx<'conn> = MockTx;
 
-        fn query(
+        async fn query(&self, _cx: &Cx, _sql: &str, _params: &[Value]) -> Outcome<Vec<Row>, Error> {
+            Outcome::Ok(vec![])
+        }
+
+        async fn query_one(
             &self,
             _cx: &Cx,
             _sql: &str,
             _params: &[Value],
-        ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
-            async { Outcome::Ok(vec![]) }
+        ) -> Outcome<Option<Row>, Error> {
+            Outcome::Ok(None)
         }
 
-        fn query_one(
-            &self,
-            _cx: &Cx,
-            _sql: &str,
-            _params: &[Value],
-        ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
-            async { Outcome::Ok(None) }
+        async fn execute(&self, _cx: &Cx, _sql: &str, _params: &[Value]) -> Outcome<u64, Error> {
+            Outcome::Ok(0)
         }
 
-        fn execute(
-            &self,
-            _cx: &Cx,
-            _sql: &str,
-            _params: &[Value],
-        ) -> impl Future<Output = Outcome<u64, Error>> + Send {
-            async { Outcome::Ok(0) }
+        async fn insert(&self, _cx: &Cx, _sql: &str, _params: &[Value]) -> Outcome<i64, Error> {
+            Outcome::Ok(0)
         }
 
-        fn insert(
-            &self,
-            _cx: &Cx,
-            _sql: &str,
-            _params: &[Value],
-        ) -> impl Future<Output = Outcome<i64, Error>> + Send {
-            async { Outcome::Ok(0) }
-        }
-
-        fn batch(
+        async fn batch(
             &self,
             _cx: &Cx,
             _statements: &[(String, Vec<Value>)],
-        ) -> impl Future<Output = Outcome<Vec<u64>, Error>> + Send {
-            async { Outcome::Ok(vec![]) }
+        ) -> Outcome<Vec<u64>, Error> {
+            Outcome::Ok(vec![])
         }
 
-        fn begin(&self, _cx: &Cx) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
-            async { Outcome::Ok(MockTx) }
+        async fn begin(&self, _cx: &Cx) -> Outcome<Self::Tx<'_>, Error> {
+            Outcome::Ok(MockTx)
         }
 
-        fn begin_with(
+        async fn begin_with(
             &self,
             _cx: &Cx,
             _isolation: IsolationLevel,
-        ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
-            async { Outcome::Ok(MockTx) }
+        ) -> Outcome<Self::Tx<'_>, Error> {
+            Outcome::Ok(MockTx)
         }
 
-        fn prepare(
-            &self,
-            _cx: &Cx,
-            _sql: &str,
-        ) -> impl Future<Output = Outcome<PreparedStatement, Error>> + Send {
-            async { Outcome::Ok(PreparedStatement::new(1, String::new(), 0)) }
+        async fn prepare(&self, _cx: &Cx, _sql: &str) -> Outcome<PreparedStatement, Error> {
+            Outcome::Ok(PreparedStatement::new(1, String::new(), 0))
         }
 
-        fn query_prepared(
+        async fn query_prepared(
             &self,
             _cx: &Cx,
             _stmt: &PreparedStatement,
             _params: &[Value],
-        ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
-            async { Outcome::Ok(vec![]) }
+        ) -> Outcome<Vec<Row>, Error> {
+            Outcome::Ok(vec![])
         }
 
-        fn execute_prepared(
+        async fn execute_prepared(
             &self,
             _cx: &Cx,
             _stmt: &PreparedStatement,
             _params: &[Value],
-        ) -> impl Future<Output = Outcome<u64, Error>> + Send {
-            async { Outcome::Ok(0) }
+        ) -> Outcome<u64, Error> {
+            Outcome::Ok(0)
         }
 
-        fn ping(&self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-            let should_fail = self.ping_should_fail.load(Ordering::Relaxed);
-            async move {
-                if should_fail {
-                    Outcome::Err(Error::Connection(ConnectionError {
-                        kind: ConnectionErrorKind::Disconnected,
-                        message: "mock ping failed".to_string(),
-                        source: None,
-                    }))
-                } else {
-                    Outcome::Ok(())
-                }
+        async fn ping(&self, _cx: &Cx) -> Outcome<(), Error> {
+            if self.ping_should_fail.load(Ordering::Relaxed) {
+                Outcome::Err(Error::Connection(ConnectionError {
+                    kind: ConnectionErrorKind::Disconnected,
+                    message: "mock ping failed".to_string(),
+                    source: None,
+                }))
+            } else {
+                Outcome::Ok(())
             }
         }
 
-        fn close(self, _cx: &Cx) -> impl Future<Output = Result<(), Error>> + Send {
-            async { Ok(()) }
+        async fn close(self, _cx: &Cx) -> Result<(), Error> {
+            Ok(())
         }
     }
 
@@ -945,9 +901,11 @@ mod tests {
 
     #[test]
     fn test_stats_clone() {
-        let mut stats = PoolStats::default();
-        stats.total_connections = 5;
-        stats.acquires = 100;
+        let stats = PoolStats {
+            total_connections: 5,
+            acquires: 100,
+            ..Default::default()
+        };
         let cloned = stats.clone();
         assert_eq!(stats.total_connections, cloned.total_connections);
         assert_eq!(stats.acquires, cloned.acquires);
@@ -1066,8 +1024,12 @@ mod tests {
         inner.total_count = 5;
         inner.active_count = 3;
         inner.waiter_count = 2;
-        inner.idle.push_back(ConnectionMeta::new(MockConnection::new(1)));
-        inner.idle.push_back(ConnectionMeta::new(MockConnection::new(2)));
+        inner
+            .idle
+            .push_back(ConnectionMeta::new(MockConnection::new(1)));
+        inner
+            .idle
+            .push_back(ConnectionMeta::new(MockConnection::new(2)));
 
         let stats = inner.stats();
         assert_eq!(stats.total_connections, 5);
@@ -1264,13 +1226,19 @@ mod tests {
 
     #[test]
     fn test_acquire_action_enum() {
-        // Just verify the enum variants exist and can be constructed
-        let _closed: AcquireAction<MockConnection> = AcquireAction::PoolClosed;
-        let _create: AcquireAction<MockConnection> = AcquireAction::CreateNew;
-        let _wait: AcquireAction<MockConnection> = AcquireAction::Wait;
+        // Verify the enum variants exist and can be pattern-matched
+        let closed: AcquireAction<MockConnection> = AcquireAction::PoolClosed;
+        assert!(matches!(closed, AcquireAction::PoolClosed));
+
+        let create: AcquireAction<MockConnection> = AcquireAction::CreateNew;
+        assert!(matches!(create, AcquireAction::CreateNew));
+
+        let wait: AcquireAction<MockConnection> = AcquireAction::Wait;
+        assert!(matches!(wait, AcquireAction::Wait));
 
         let meta = ConnectionMeta::new(MockConnection::new(1));
-        let _validate: AcquireAction<MockConnection> = AcquireAction::ValidateExisting(meta);
+        let validate: AcquireAction<MockConnection> = AcquireAction::ValidateExisting(meta);
+        assert!(matches!(validate, AcquireAction::ValidateExisting(_)));
     }
 
     #[test]
@@ -1303,9 +1271,15 @@ mod tests {
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 3;
-            inner.idle.push_back(ConnectionMeta::new(MockConnection::new(1)));
-            inner.idle.push_back(ConnectionMeta::new(MockConnection::new(2)));
-            inner.idle.push_back(ConnectionMeta::new(MockConnection::new(3)));
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::new(1)));
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::new(2)));
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::new(3)));
         }
 
         assert_eq!(pool.idle_count(), 3);

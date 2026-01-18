@@ -167,11 +167,11 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     if !target.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&target.join(", "));
-                        sql.push_str(")");
+                        sql.push(')');
                     } else if !M::PRIMARY_KEY.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&M::PRIMARY_KEY.join(", "));
-                        sql.push_str(")");
+                        sql.push(')');
                     }
 
                     sql.push_str(" DO UPDATE SET ");
@@ -312,8 +312,7 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
                 .map(|col| {
                     row.iter()
                         .find(|(name, _)| name == col)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(Value::Null)
+                        .map_or(Value::Null, |(_, v)| v.clone())
                 })
                 .collect();
 
@@ -344,11 +343,11 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
                     if !target.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&target.join(", "));
-                        sql.push_str(")");
+                        sql.push(')');
                     } else if !M::PRIMARY_KEY.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&M::PRIMARY_KEY.join(", "));
-                        sql.push_str(")");
+                        sql.push(')');
                     }
 
                     sql.push_str(" DO UPDATE SET ");
@@ -821,7 +820,7 @@ mod tests {
 
         fn to_row(&self) -> Vec<(&'static str, Value)> {
             vec![
-                ("id", self.id.map(Value::BigInt).unwrap_or(Value::Null)),
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
                 ("name", Value::Text(self.name.clone())),
                 ("age", Value::Int(self.age)),
             ]
@@ -832,7 +831,7 @@ mod tests {
         }
 
         fn primary_key_value(&self) -> Vec<Value> {
-            vec![self.id.map(Value::BigInt).unwrap_or(Value::Null)]
+            vec![self.id.map_or(Value::Null, Value::BigInt)]
         }
 
         fn is_new(&self) -> bool {
@@ -1006,7 +1005,7 @@ mod tests {
         let (sql, _) = InsertBuilder::new(&hero).build_with_dialect(Dialect::Mysql);
 
         // MySQL uses ? without numbers
-        assert!(sql.contains("?"));
+        assert!(sql.contains('?'));
         assert!(!sql.contains("$1"));
     }
 }

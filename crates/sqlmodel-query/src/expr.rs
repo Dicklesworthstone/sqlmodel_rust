@@ -3,6 +3,7 @@
 //! This module provides a type-safe expression system for building
 //! WHERE clauses, ORDER BY, computed columns, and other SQL expressions.
 
+use crate::clause::{OrderBy, OrderDirection};
 use sqlmodel_core::Value;
 
 /// SQL dialect for generating dialect-specific SQL.
@@ -632,8 +633,8 @@ impl Expr {
     // ==================== Ordering ====================
 
     /// Create an ascending ORDER BY expression.
-    pub fn asc(self) -> OrderExpr {
-        OrderExpr {
+    pub fn asc(self) -> OrderBy {
+        OrderBy {
             expr: self,
             direction: OrderDirection::Asc,
             nulls: None,
@@ -641,8 +642,8 @@ impl Expr {
     }
 
     /// Create a descending ORDER BY expression.
-    pub fn desc(self) -> OrderExpr {
-        OrderExpr {
+    pub fn desc(self) -> OrderBy {
+        OrderBy {
             expr: self,
             direction: OrderDirection::Desc,
             nulls: None,
@@ -829,71 +830,6 @@ impl CaseBuilder {
             when_clauses: self.when_clauses,
             else_clause: None,
         }
-    }
-}
-
-// ==================== Order Expression ====================
-
-/// Sort direction for ORDER BY.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OrderDirection {
-    /// Ascending order (default)
-    #[default]
-    Asc,
-    /// Descending order
-    Desc,
-}
-
-/// NULLS FIRST/LAST specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NullsOrder {
-    /// NULLS FIRST
-    First,
-    /// NULLS LAST
-    Last,
-}
-
-/// An expression with ordering information for ORDER BY.
-#[derive(Debug, Clone)]
-pub struct OrderExpr {
-    /// The expression to order by
-    pub expr: Expr,
-    /// Sort direction
-    pub direction: OrderDirection,
-    /// NULLS FIRST/LAST
-    pub nulls: Option<NullsOrder>,
-}
-
-impl OrderExpr {
-    /// Set NULLS FIRST.
-    pub fn nulls_first(mut self) -> Self {
-        self.nulls = Some(NullsOrder::First);
-        self
-    }
-
-    /// Set NULLS LAST.
-    pub fn nulls_last(mut self) -> Self {
-        self.nulls = Some(NullsOrder::Last);
-        self
-    }
-
-    /// Build SQL for this ORDER BY expression.
-    pub fn build(&self, dialect: Dialect, params: &mut Vec<Value>, offset: usize) -> String {
-        let mut sql = self.expr.build_with_dialect(dialect, params, offset);
-
-        sql.push_str(match self.direction {
-            OrderDirection::Asc => " ASC",
-            OrderDirection::Desc => " DESC",
-        });
-
-        if let Some(nulls) = self.nulls {
-            sql.push_str(match nulls {
-                NullsOrder::First => " NULLS FIRST",
-                NullsOrder::Last => " NULLS LAST",
-            });
-        }
-
-        sql
     }
 }
 

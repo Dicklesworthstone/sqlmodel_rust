@@ -269,8 +269,8 @@ impl TextDecode for [u8; 16] {
 
         let mut bytes = [0u8; 16];
         for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-                .map_err(|_| type_error("uuid", &s))?;
+            *byte =
+                u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| type_error("uuid", &s))?;
         }
         Ok(bytes)
     }
@@ -355,11 +355,7 @@ pub fn parse_time_string(s: &str) -> Result<i64, Error> {
 
     if let Some(frac) = micros_part {
         // Pad or truncate to 6 digits
-        let frac_str = if frac.len() > 6 {
-            &frac[..6]
-        } else {
-            frac
-        };
+        let frac_str = if frac.len() > 6 { &frac[..6] } else { frac };
         let frac_micros: i64 = frac_str.parse().map_err(|_| type_error("time", s))?;
         let multiplier = 10_i64.pow(6 - frac_str.len() as u32);
         micros += frac_micros * multiplier;
@@ -380,11 +376,7 @@ pub fn parse_timestamp_string(s: &str) -> Result<i64, Error> {
         &s[..pos]
     } else if let Some(pos) = s.rfind('-') {
         // Check if this is date separator or timezone
-        if pos > 10 {
-            &s[..pos]
-        } else {
-            &s
-        }
+        if pos > 10 { &s[..pos] } else { &s }
     } else {
         &s
     };
@@ -652,8 +644,8 @@ fn decode_bytea_escape(s: &str) -> Result<Vec<u8>, Error> {
                             }
                         }
                     }
-                    let byte = u8::from_str_radix(&octal, 8)
-                        .map_err(|_| type_error("bytea escape", s))?;
+                    let byte =
+                        u8::from_str_radix(&octal, 8).map_err(|_| type_error("bytea escape", s))?;
                     bytes.push(byte);
                 }
                 _ => {
@@ -709,7 +701,10 @@ mod tests {
         assert!(f64::decode_text("NaN").unwrap().is_nan());
         assert!(f64::decode_text("Infinity").unwrap().is_infinite());
         assert!(f64::decode_text("-Infinity").unwrap().is_infinite());
-        assert_eq!(f64::decode_text("3.14").unwrap(), 3.14);
+        // Use a value not close to any math constant to avoid clippy::approx_constant
+        // and use epsilon comparison to avoid clippy::float_cmp
+        let decoded = f64::decode_text("1.5").unwrap();
+        assert!((decoded - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -742,7 +737,10 @@ mod tests {
     fn test_time_parsing() {
         assert_eq!(parse_time_string("00:00:00").unwrap(), 0);
         assert_eq!(parse_time_string("01:00:00").unwrap(), 3_600_000_000);
-        assert_eq!(parse_time_string("12:30:45.123456").unwrap(), 45_045_123_456);
+        assert_eq!(
+            parse_time_string("12:30:45.123456").unwrap(),
+            45_045_123_456
+        );
     }
 
     #[test]
