@@ -9,7 +9,10 @@ pub mod expr;
 pub mod join;
 pub mod select;
 
-pub use builder::QueryBuilder;
+pub use builder::{
+    DeleteBuilder, InsertBuilder, InsertManyBuilder, OnConflict, QueryBuilder, SetClause,
+    UpdateBuilder,
+};
 pub use clause::{Limit, Offset, OrderBy, Where};
 pub use expr::{BinaryOp, Expr, UnaryOp};
 pub use join::{Join, JoinType};
@@ -49,6 +52,29 @@ macro_rules! select {
 macro_rules! insert {
     ($model:expr) => {
         $crate::builder::InsertBuilder::new($model)
+    };
+}
+
+/// Create a bulk INSERT query for multiple models.
+///
+/// # Example
+///
+/// ```ignore
+/// let heroes = vec![hero1, hero2, hero3];
+/// let count = insert_many!(heroes)
+///     .execute(cx, &conn)
+///     .await?;
+///
+/// // With UPSERT
+/// insert_many!(heroes)
+///     .on_conflict_do_update(&["name", "age"])
+///     .execute(cx, &conn)
+///     .await?;
+/// ```
+#[macro_export]
+macro_rules! insert_many {
+    ($models:expr) => {
+        $crate::builder::InsertManyBuilder::new($models)
     };
 }
 
