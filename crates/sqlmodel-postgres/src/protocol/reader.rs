@@ -3,7 +3,7 @@
 //! This module handles decoding backend messages from the wire protocol format.
 
 use super::messages::{
-    auth_type, backend_type, BackendMessage, ErrorFields, FieldDescription, TransactionStatus,
+    BackendMessage, ErrorFields, FieldDescription, TransactionStatus, auth_type, backend_type,
 };
 use std::error::Error as StdError;
 use std::fmt;
@@ -170,9 +170,7 @@ impl MessageReader {
             backend_type::COPY_DONE => Ok(BackendMessage::CopyDone),
             backend_type::NOTIFICATION_RESPONSE => parse_notification_response(&mut cur),
             backend_type::FUNCTION_CALL_RESPONSE => parse_function_call_response(&mut cur),
-            backend_type::NEGOTIATE_PROTOCOL_VERSION => {
-                parse_negotiate_protocol_version(&mut cur)
-            }
+            backend_type::NEGOTIATE_PROTOCOL_VERSION => parse_negotiate_protocol_version(&mut cur),
             _ => Err(ProtocolError::UnknownMessageType(ty)),
         }
     }
@@ -203,7 +201,9 @@ fn parse_authentication(cur: &mut Cursor<'_>) -> Result<BackendMessage, Protocol
         auth_type::SASL_CONTINUE => Ok(BackendMessage::AuthenticationSASLContinue(
             cur.take_remaining(),
         )),
-        auth_type::SASL_FINAL => Ok(BackendMessage::AuthenticationSASLFinal(cur.take_remaining())),
+        auth_type::SASL_FINAL => Ok(BackendMessage::AuthenticationSASLFinal(
+            cur.take_remaining(),
+        )),
         _ => Err(ProtocolError::InvalidField("unknown auth type")),
     }
 }
@@ -333,9 +333,7 @@ fn parse_notification_response(cur: &mut Cursor<'_>) -> Result<BackendMessage, P
     })
 }
 
-fn parse_function_call_response(
-    cur: &mut Cursor<'_>,
-) -> Result<BackendMessage, ProtocolError> {
+fn parse_function_call_response(cur: &mut Cursor<'_>) -> Result<BackendMessage, ProtocolError> {
     let len = cur.read_i32()?;
     if len == -1 {
         return Ok(BackendMessage::FunctionCallResponse(None));
@@ -347,13 +345,13 @@ fn parse_function_call_response(
     Ok(BackendMessage::FunctionCallResponse(Some(bytes)))
 }
 
-fn parse_negotiate_protocol_version(
-    cur: &mut Cursor<'_>,
-) -> Result<BackendMessage, ProtocolError> {
+fn parse_negotiate_protocol_version(cur: &mut Cursor<'_>) -> Result<BackendMessage, ProtocolError> {
     let newest_minor = cur.read_i32()?;
     let count = cur.read_i32()?;
     if count < 0 {
-        return Err(ProtocolError::InvalidField("negative protocol option count"));
+        return Err(ProtocolError::InvalidField(
+            "negative protocol option count",
+        ));
     }
     let mut unrecognized = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -509,7 +507,10 @@ mod tests {
         let payload = [TransactionStatus::Idle.as_byte()];
         let msg = build_message(backend_type::READY_FOR_QUERY, &payload);
         let decoded = MessageReader::parse_message(&msg).unwrap();
-        assert!(matches!(decoded, BackendMessage::ReadyForQuery(TransactionStatus::Idle)));
+        assert!(matches!(
+            decoded,
+            BackendMessage::ReadyForQuery(TransactionStatus::Idle)
+        ));
     }
 
     #[test]

@@ -9,4 +9,5 @@
 //! - Connection management with state machine
 //! - Type conversion between Rust and PostgreSQL types
 
+pub mod auth;
 pub mod protocol;

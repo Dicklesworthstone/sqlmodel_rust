@@ -3,8 +3,8 @@
 //! This module handles encoding frontend messages into the wire protocol format.
 
 use super::messages::{
-    frontend_type, DescribeKind, FrontendMessage, CANCEL_REQUEST_CODE, PROTOCOL_VERSION,
-    SSL_REQUEST_CODE,
+    CANCEL_REQUEST_CODE, DescribeKind, FrontendMessage, PROTOCOL_VERSION, SSL_REQUEST_CODE,
+    frontend_type,
 };
 
 /// Buffer for writing PostgreSQL protocol messages.
@@ -288,7 +288,8 @@ impl MessageWriter {
 
         // Result format codes
         let num_result_formats = result_formats.len() as i16;
-        self.buf.extend_from_slice(&num_result_formats.to_be_bytes());
+        self.buf
+            .extend_from_slice(&num_result_formats.to_be_bytes());
         for &fmt in result_formats {
             self.buf.extend_from_slice(&fmt.to_be_bytes());
         }
@@ -365,7 +366,8 @@ impl MessageWriter {
         // Length (16 bytes total)
         self.buf.extend_from_slice(&16_i32.to_be_bytes());
         // Cancel request code
-        self.buf.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+        self.buf
+            .extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
         // Process ID
         self.buf.extend_from_slice(&process_id.to_be_bytes());
         // Secret key
@@ -486,11 +488,7 @@ mod tests {
 
         // Find the statement name
         let name_start = 5;
-        let name_end = data[name_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap()
-            + name_start;
+        let name_end = data[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
         assert_eq!(&data[name_start..name_end], b"stmt1");
     }
 
@@ -602,9 +600,7 @@ mod tests {
 
         // Look for -1 (NULL indicator) in the parameter section
         let null_indicator = (-1_i32).to_be_bytes();
-        assert!(data
-            .windows(4)
-            .any(|w| w == null_indicator));
+        assert!(data.windows(4).any(|w| w == null_indicator));
     }
 
     #[test]
