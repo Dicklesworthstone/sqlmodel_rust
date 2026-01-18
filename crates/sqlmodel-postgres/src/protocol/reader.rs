@@ -2,6 +2,8 @@
 //!
 //! This module handles decoding backend messages from the wire protocol format.
 
+#![allow(clippy::cast_possible_truncation)]
+
 use super::messages::{
     BackendMessage, ErrorFields, FieldDescription, TransactionStatus, auth_type, backend_type,
 };
@@ -484,6 +486,7 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn build_message(ty: u8, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(ty);

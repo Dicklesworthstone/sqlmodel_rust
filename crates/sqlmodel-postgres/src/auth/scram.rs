@@ -54,9 +54,10 @@ impl ScramClient {
     }
 
     /// Process server-first message and generate client-final
+    #[allow(clippy::result_large_err)]
     pub fn process_server_first(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
-        let msg = std::str::from_utf8(data)
-            .map_err(|e| protocol_error(format!("Invalid UTF-8 in SASL continue: {}", e)))?;
+
+                let msg = std::str::from_utf8(data).map_err(|e| protocol_error(format!("Invalid UTF-8 in SASL continue: {}", e)))?;
 
         // Parse server-first: r=<nonce>,s=<salt>,i=<iterations>
         let mut combined_nonce = None;
@@ -137,9 +138,10 @@ impl ScramClient {
     }
 
     /// Verify server-final message
+    #[allow(clippy::result_large_err)]
     pub fn verify_server_final(&self, data: &[u8]) -> Result<(), Error> {
-        let msg = std::str::from_utf8(data)
-            .map_err(|e| protocol_error(format!("Invalid UTF-8 in SASL final: {}", e)))?;
+
+                let msg = std::str::from_utf8(data).map_err(|e| protocol_error(format!("Invalid UTF-8 in SASL final: {}", e)))?;
 
         let server_signature_b64 = msg
             .strip_prefix("v=")
@@ -188,6 +190,7 @@ fn auth_error(msg: impl Into<String>) -> Error {
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], Error> {
     let mut mac = HmacSha256::new_from_slice(key)
         .map_err(|e| protocol_error(format!("HMAC init failed: {}", e)))?;

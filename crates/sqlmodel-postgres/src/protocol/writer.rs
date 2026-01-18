@@ -2,8 +2,10 @@
 //!
 //! This module handles encoding frontend messages into the wire protocol format.
 
+#![allow(clippy::cast_possible_truncation)]
+
 use super::messages::{
-    CANCEL_REQUEST_CODE, DescribeKind, FrontendMessage, PROTOCOL_VERSION, SSL_REQUEST_CODE,
+    CANCEL_REQUEST_CODE, DescribeKind, FrontendMessage, SSL_REQUEST_CODE,
     frontend_type,
 };
 
@@ -403,6 +405,7 @@ impl MessageWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::PROTOCOL_VERSION;
 
     #[test]
     fn test_startup_message() {
@@ -524,7 +527,7 @@ mod tests {
     fn test_execute_message() {
         let mut writer = MessageWriter::new();
         let msg = FrontendMessage::Execute {
-            portal: "".to_string(),
+            portal: String::new(),
             max_rows: 0,
         };
 
@@ -588,7 +591,7 @@ mod tests {
     fn test_bind_with_null_params() {
         let mut writer = MessageWriter::new();
         let msg = FrontendMessage::Bind {
-            portal: "".to_string(),
+            portal: String::new(),
             statement: "stmt1".to_string(),
             param_formats: vec![0],
             params: vec![None], // NULL parameter

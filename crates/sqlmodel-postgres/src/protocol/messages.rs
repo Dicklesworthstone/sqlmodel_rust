@@ -1,19 +1,15 @@
-//! PostgreSQL protocol message types.
-//!
-//! This module defines all frontend (client -> server) and backend (server -> client)
-//! messages used in the PostgreSQL wire protocol.
+//! Message definitions for PostgreSQL protocol.
 
 use std::fmt;
 
-/// Protocol version 3.0 (major=3, minor=0)
-pub const PROTOCOL_VERSION: i32 = 196608; // 3 << 16
+/// Protocol version 3.0.
+pub const PROTOCOL_VERSION: i32 = 196_608; // 3 << 16
 
-/// Cancel request code
-pub const CANCEL_REQUEST_CODE: i32 = 80877102; // 1234 << 16 | 5678
+/// Cancel request code.
+pub const CANCEL_REQUEST_CODE: i32 = 80_877_102; // 1234 << 16 | 5678
 
-/// SSL request code
-pub const SSL_REQUEST_CODE: i32 = 80877103; // 1234 << 16 | 5679
-
+/// SSL request code.
+pub const SSL_REQUEST_CODE: i32 = 80_877_103; // 1234 << 16 | 5679
 // ==================== Frontend Messages (Client -> Server) ====================
 
 /// Messages sent from the client to the PostgreSQL server.
