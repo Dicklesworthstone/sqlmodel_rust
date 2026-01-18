@@ -20,126 +20,129 @@ use std::ptr;
 /// - `stmt` must be a valid, non-null prepared statement handle
 /// - `index` must be a valid 1-based parameter index
 pub unsafe fn bind_value(stmt: *mut ffi::sqlite3_stmt, index: c_int, value: &Value) -> c_int {
-    match value {
-        Value::Null => ffi::sqlite3_bind_null(stmt, index),
+    // SAFETY: All FFI calls require unsafe in Rust 2024
+    unsafe {
+        match value {
+            Value::Null => ffi::sqlite3_bind_null(stmt, index),
 
-        Value::Bool(b) => ffi::sqlite3_bind_int(stmt, index, if *b { 1 } else { 0 }),
+            Value::Bool(b) => ffi::sqlite3_bind_int(stmt, index, if *b { 1 } else { 0 }),
 
-        Value::TinyInt(v) => ffi::sqlite3_bind_int(stmt, index, i32::from(*v)),
+            Value::TinyInt(v) => ffi::sqlite3_bind_int(stmt, index, i32::from(*v)),
 
-        Value::SmallInt(v) => ffi::sqlite3_bind_int(stmt, index, i32::from(*v)),
+            Value::SmallInt(v) => ffi::sqlite3_bind_int(stmt, index, i32::from(*v)),
 
-        Value::Int(v) => ffi::sqlite3_bind_int(stmt, index, *v),
+            Value::Int(v) => ffi::sqlite3_bind_int(stmt, index, *v),
 
-        Value::BigInt(v) => ffi::sqlite3_bind_int64(stmt, index, *v),
+            Value::BigInt(v) => ffi::sqlite3_bind_int64(stmt, index, *v),
 
-        Value::Float(v) => ffi::sqlite3_bind_double(stmt, index, f64::from(*v)),
+            Value::Float(v) => ffi::sqlite3_bind_double(stmt, index, f64::from(*v)),
 
-        Value::Double(v) => ffi::sqlite3_bind_double(stmt, index, *v),
+            Value::Double(v) => ffi::sqlite3_bind_double(stmt, index, *v),
 
-        Value::Decimal(s) => {
-            let bytes = s.as_bytes();
-            ffi::sqlite3_bind_text(
+            Value::Decimal(s) => {
+                let bytes = s.as_bytes();
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    index,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as c_int,
+                    ffi::sqlite_transient(),
+                )
+            }
+
+            Value::Text(s) => {
+                let bytes = s.as_bytes();
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    index,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as c_int,
+                    ffi::sqlite_transient(),
+                )
+            }
+
+            Value::Bytes(b) => ffi::sqlite3_bind_blob(
+                stmt,
+                index,
+                b.as_ptr().cast(),
+                b.len() as c_int,
+                ffi::sqlite_transient(),
+            ),
+
+            // Date stored as ISO-8601 text (YYYY-MM-DD)
+            Value::Date(days) => {
+                let date = days_to_date(*days);
+                let bytes = date.as_bytes();
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    index,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as c_int,
+                    ffi::sqlite_transient(),
+                )
+            }
+
+            // Time stored as ISO-8601 text (HH:MM:SS.sss)
+            Value::Time(micros) => {
+                let time = micros_to_time(*micros);
+                let bytes = time.as_bytes();
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    index,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as c_int,
+                    ffi::sqlite_transient(),
+                )
+            }
+
+            // Timestamp stored as ISO-8601 text
+            Value::Timestamp(micros) | Value::TimestampTz(micros) => {
+                let ts = micros_to_timestamp(*micros);
+                let bytes = ts.as_bytes();
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    index,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as c_int,
+                    ffi::sqlite_transient(),
+                )
+            }
+
+            // UUID stored as 16-byte blob
+            Value::Uuid(bytes) => ffi::sqlite3_bind_blob(
                 stmt,
                 index,
                 bytes.as_ptr().cast(),
-                bytes.len() as c_int,
-                ffi::SQLITE_TRANSIENT,
-            )
-        }
+                16,
+                ffi::sqlite_transient(),
+            ),
 
-        Value::Text(s) => {
-            let bytes = s.as_bytes();
-            ffi::sqlite3_bind_text(
-                stmt,
-                index,
-                bytes.as_ptr().cast(),
-                bytes.len() as c_int,
-                ffi::SQLITE_TRANSIENT,
-            )
-        }
+            // JSON stored as text
+            Value::Json(json) => {
+                let s = json.to_string();
+                let bytes = s.as_bytes();
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    index,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as c_int,
+                    ffi::sqlite_transient(),
+                )
+            }
 
-        Value::Bytes(b) => ffi::sqlite3_bind_blob(
-            stmt,
-            index,
-            b.as_ptr().cast(),
-            b.len() as c_int,
-            ffi::SQLITE_TRANSIENT,
-        ),
-
-        // Date stored as ISO-8601 text (YYYY-MM-DD)
-        Value::Date(days) => {
-            let date = days_to_date(*days);
-            let bytes = date.as_bytes();
-            ffi::sqlite3_bind_text(
-                stmt,
-                index,
-                bytes.as_ptr().cast(),
-                bytes.len() as c_int,
-                ffi::SQLITE_TRANSIENT,
-            )
-        }
-
-        // Time stored as ISO-8601 text (HH:MM:SS.sss)
-        Value::Time(micros) => {
-            let time = micros_to_time(*micros);
-            let bytes = time.as_bytes();
-            ffi::sqlite3_bind_text(
-                stmt,
-                index,
-                bytes.as_ptr().cast(),
-                bytes.len() as c_int,
-                ffi::SQLITE_TRANSIENT,
-            )
-        }
-
-        // Timestamp stored as ISO-8601 text
-        Value::Timestamp(micros) | Value::TimestampTz(micros) => {
-            let ts = micros_to_timestamp(*micros);
-            let bytes = ts.as_bytes();
-            ffi::sqlite3_bind_text(
-                stmt,
-                index,
-                bytes.as_ptr().cast(),
-                bytes.len() as c_int,
-                ffi::SQLITE_TRANSIENT,
-            )
-        }
-
-        // UUID stored as 16-byte blob
-        Value::Uuid(bytes) => ffi::sqlite3_bind_blob(
-            stmt,
-            index,
-            bytes.as_ptr().cast(),
-            16,
-            ffi::SQLITE_TRANSIENT,
-        ),
-
-        // JSON stored as text
-        Value::Json(json) => {
-            let s = json.to_string();
-            let bytes = s.as_bytes();
-            ffi::sqlite3_bind_text(
-                stmt,
-                index,
-                bytes.as_ptr().cast(),
-                bytes.len() as c_int,
-                ffi::SQLITE_TRANSIENT,
-            )
-        }
-
-        // Arrays stored as JSON text
-        Value::Array(arr) => {
-            let json = serde_json::Value::Array(arr.iter().map(value_to_json).collect());
-            let s = json.to_string();
-            let bytes = s.as_bytes();
-            ffi::sqlite3_bind_text(
-                stmt,
-                index,
-                bytes.as_ptr().cast(),
-                bytes.len() as c_int,
-                ffi::SQLITE_TRANSIENT,
-            )
+            // Arrays stored as JSON text
+            Value::Array(arr) => {
+                let json = serde_json::Value::Array(arr.iter().map(value_to_json).collect());
+                let s = json.to_string();
+                let bytes = s.as_bytes();
+                ffi::sqlite3_bind_text(
+                    stmt,
+                    index,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as c_int,
+                    ffi::sqlite_transient(),
+                )
+            }
         }
     }
 }
@@ -150,50 +153,53 @@ pub unsafe fn bind_value(stmt: *mut ffi::sqlite3_stmt, index: c_int, value: &Val
 /// - `stmt` must be a valid prepared statement that has just returned SQLITE_ROW
 /// - `index` must be a valid 0-based column index
 pub unsafe fn read_column(stmt: *mut ffi::sqlite3_stmt, index: c_int) -> Value {
-    let col_type = ffi::sqlite3_column_type(stmt, index);
+    // SAFETY: All FFI calls require unsafe in Rust 2024
+    unsafe {
+        let col_type = ffi::sqlite3_column_type(stmt, index);
 
-    match col_type {
-        ffi::SQLITE_NULL => Value::Null,
+        match col_type {
+            ffi::SQLITE_NULL => Value::Null,
 
-        ffi::SQLITE_INTEGER => {
-            let v = ffi::sqlite3_column_int64(stmt, index);
-            // Choose the smallest representation
-            if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-                Value::Int(v as i32)
-            } else {
-                Value::BigInt(v)
+            ffi::SQLITE_INTEGER => {
+                let v = ffi::sqlite3_column_int64(stmt, index);
+                // Choose the smallest representation
+                if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+                    Value::Int(v as i32)
+                } else {
+                    Value::BigInt(v)
+                }
             }
-        }
 
-        ffi::SQLITE_FLOAT => {
-            let v = ffi::sqlite3_column_double(stmt, index);
-            Value::Double(v)
-        }
-
-        ffi::SQLITE_TEXT => {
-            let ptr = ffi::sqlite3_column_text(stmt, index);
-            let len = ffi::sqlite3_column_bytes(stmt, index);
-            if ptr.is_null() {
-                Value::Null
-            } else {
-                let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize);
-                let s = String::from_utf8_lossy(slice).into_owned();
-                Value::Text(s)
+            ffi::SQLITE_FLOAT => {
+                let v = ffi::sqlite3_column_double(stmt, index);
+                Value::Double(v)
             }
-        }
 
-        ffi::SQLITE_BLOB => {
-            let ptr = ffi::sqlite3_column_blob(stmt, index);
-            let len = ffi::sqlite3_column_bytes(stmt, index);
-            if ptr.is_null() || len == 0 {
-                Value::Bytes(Vec::new())
-            } else {
-                let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize);
-                Value::Bytes(slice.to_vec())
+            ffi::SQLITE_TEXT => {
+                let ptr = ffi::sqlite3_column_text(stmt, index);
+                let len = ffi::sqlite3_column_bytes(stmt, index);
+                if ptr.is_null() {
+                    Value::Null
+                } else {
+                    let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize);
+                    let s = String::from_utf8_lossy(slice).into_owned();
+                    Value::Text(s)
+                }
             }
-        }
 
-        _ => Value::Null,
+            ffi::SQLITE_BLOB => {
+                let ptr = ffi::sqlite3_column_blob(stmt, index);
+                let len = ffi::sqlite3_column_bytes(stmt, index);
+                if ptr.is_null() || len == 0 {
+                    Value::Bytes(Vec::new())
+                } else {
+                    let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize);
+                    Value::Bytes(slice.to_vec())
+                }
+            }
+
+            _ => Value::Null,
+        }
     }
 }
 
@@ -203,11 +209,14 @@ pub unsafe fn read_column(stmt: *mut ffi::sqlite3_stmt, index: c_int) -> Value {
 /// - `stmt` must be a valid prepared statement
 /// - `index` must be a valid 0-based column index
 pub unsafe fn column_name(stmt: *mut ffi::sqlite3_stmt, index: c_int) -> Option<String> {
-    let ptr = ffi::sqlite3_column_name(stmt, index);
-    if ptr.is_null() {
-        None
-    } else {
-        CStr::from_ptr(ptr).to_str().ok().map(String::from)
+    // SAFETY: All FFI calls require unsafe in Rust 2024
+    unsafe {
+        let ptr = ffi::sqlite3_column_name(stmt, index);
+        if ptr.is_null() {
+            None
+        } else {
+            CStr::from_ptr(ptr).to_str().ok().map(String::from)
+        }
     }
 }
 

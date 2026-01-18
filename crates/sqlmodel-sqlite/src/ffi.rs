@@ -71,12 +71,23 @@ pub const SQLITE_TEXT: c_int = 3;
 pub const SQLITE_BLOB: c_int = 4;
 pub const SQLITE_NULL: c_int = 5;
 
-// Special destructor values
-pub const SQLITE_STATIC: *mut c_void = 0 as *mut c_void;
-pub const SQLITE_TRANSIENT: *mut c_void = !0 as *mut c_void;
-
 // Type alias for destructor callback
 pub type sqlite3_destructor_type = Option<unsafe extern "C" fn(*mut c_void)>;
+
+// Special destructor value that tells SQLite to copy the data immediately.
+// SQLITE_TRANSIENT is defined in SQLite as ((void(*)(void*))(-1))
+// We use transmute at runtime since const transmute is unstable.
+/// Returns the SQLITE_TRANSIENT destructor value.
+///
+/// This value tells SQLite to immediately copy any bound string or blob data.
+/// It is the safest option when the source data's lifetime is uncertain.
+#[inline]
+pub fn sqlite_transient() -> sqlite3_destructor_type {
+    // SAFETY: This is how SQLite defines SQLITE_TRANSIENT in its C API.
+    // The address 0xFFFF...FFFF is never a valid function pointer, and
+    // SQLite specifically checks for this sentinel value.
+    unsafe { std::mem::transmute(!0usize) }
+}
 
 #[link(name = "sqlite3")]
 unsafe extern "C" {

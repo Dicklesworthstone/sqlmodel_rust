@@ -399,7 +399,7 @@ impl SqliteConnection {
 
     /// Begin a transaction.
     fn begin_sync(&self, isolation: IsolationLevel) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         if inner.in_transaction {
             return Err(Error::Query(QueryError {
                 kind: QueryErrorKind::Database,
@@ -431,7 +431,7 @@ impl SqliteConnection {
 
     /// Commit the current transaction.
     fn commit_sync(&self) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         if !inner.in_transaction {
             return Err(Error::Query(QueryError {
                 kind: QueryErrorKind::Database,
@@ -455,7 +455,7 @@ impl SqliteConnection {
 
     /// Rollback the current transaction.
     fn rollback_sync(&self) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         if !inner.in_transaction {
             return Err(Error::Query(QueryError {
                 kind: QueryErrorKind::Database,
