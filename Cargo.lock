@@ -950,6 +950,7 @@ dependencies = [
  "asupersync",
  "serde",
  "serde_json",
+ "sqlmodel-console",
  "sqlmodel-core",
  "sqlmodel-macros",
  "sqlmodel-pool",

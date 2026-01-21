@@ -9,6 +9,10 @@ description = "SQL databases in Rust, designed to be intuitive and type-safe"
 [lints]
 workspace = true
 
+[features]
+default = []
+console = ["dep:sqlmodel-console"]
+
 [dependencies]
 sqlmodel-core.workspace = true
 sqlmodel-macros.workspace = true
@@ -18,3 +22,6 @@ sqlmodel-pool.workspace = true
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# Optional console support for rich output
+sqlmodel-console = { path = "../sqlmodel-console", optional = true }

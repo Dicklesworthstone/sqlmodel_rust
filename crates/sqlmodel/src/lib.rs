@@ -101,6 +101,18 @@ pub use sqlmodel_schema::{
 
 pub use sqlmodel_pool::{Pool, PoolConfig, PoolStats, PooledConnection};
 
+// Console integration (feature-gated)
+#[cfg(feature = "console")]
+pub use sqlmodel_console::{
+    // Core console types
+    ConsoleAware,
+    OutputMode,
+    SqlModelConsole,
+    Theme,
+    // Renderables
+    renderables::{ErrorPanel, ErrorSeverity, PoolHealth, PoolStatsProvider, PoolStatusDisplay},
+};
+
 /// Prelude module for convenient imports.
 ///
 /// ```ignore
@@ -142,4 +154,11 @@ pub mod prelude {
     };
     // Derive macros (re-export only Validate since Model trait conflicts)
     pub use sqlmodel_macros::Validate;
+
+    // Console types when feature enabled
+    #[cfg(feature = "console")]
+    pub use crate::{
+        ConsoleAware, ErrorPanel, ErrorSeverity, OutputMode, PoolHealth, PoolStatsProvider,
+        PoolStatusDisplay, SqlModelConsole, Theme,
+    };
 }
