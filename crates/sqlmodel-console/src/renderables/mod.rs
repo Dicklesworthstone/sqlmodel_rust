@@ -10,10 +10,12 @@
 //! # Implementation Status
 //!
 //! - Phase 2: Connection pool status display ✓
-//! - Phase 3: Error panels
+//! - Phase 3: Error panels ✓
 //! - Phase 4: Query result tables
 //! - Phase 5: Schema trees
 
+pub mod error;
 pub mod pool_status;
 
+pub use error::{ErrorPanel, ErrorSeverity};
 pub use pool_status::{PoolHealth, PoolStatsProvider, PoolStatusDisplay};

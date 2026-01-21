@@ -99,6 +99,15 @@ impl ThemeColor {
     pub const fn plain_marker(&self) -> Option<&'static str> {
         self.plain_marker
     }
+
+    /// Get a truecolor ANSI escape sequence for this color.
+    ///
+    /// Returns a string like `\x1b[38;2;R;G;Bm` for foreground color.
+    #[must_use]
+    pub fn color_code(&self) -> String {
+        let (r, g, b) = self.rgb;
+        format!("\x1b[38;2;{r};{g};{b}m")
+    }
 }
 
 /// SQLModel console theme with semantic colors.
