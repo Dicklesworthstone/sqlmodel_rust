@@ -327,6 +327,9 @@ impl SqliteConnection {
 
     /// Prepare and execute a query, returning all rows.
     fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, Error> {
+        #[cfg(feature = "console")]
+        let start = std::time::Instant::now();
+
         let inner = self.inner.lock().unwrap();
         let stmt = prepare_stmt(inner.db, sql)?;
 
@@ -350,7 +353,7 @@ impl SqliteConnection {
                 unsafe { types::column_name(stmt, i) }.unwrap_or_else(|| format!("col{}", i));
             col_names.push(name);
         }
-        let columns = Arc::new(ColumnInfo::new(col_names));
+        let columns = Arc::new(ColumnInfo::new(col_names.clone()));
 
         // Fetch rows
         let mut rows = Vec::new();
@@ -378,11 +381,22 @@ impl SqliteConnection {
 
         // SAFETY: stmt is valid
         unsafe { ffi::sqlite3_finalize(stmt) };
+
+        // Emit console output for PRAGMA queries and timing
+        #[cfg(feature = "console")]
+        {
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.emit_query_result(sql, &col_names, &rows, elapsed_ms);
+        }
+
         Ok(rows)
     }
 
     /// Prepare and execute a statement, returning rows affected.
     fn execute_sync(&self, sql: &str, params: &[Value]) -> Result<u64, Error> {
+        #[cfg(feature = "console")]
+        let start = std::time::Instant::now();
+
         let inner = self.inner.lock().unwrap();
         let stmt = prepare_stmt(inner.db, sql)?;
 
@@ -408,6 +422,13 @@ impl SqliteConnection {
             ffi::SQLITE_DONE | ffi::SQLITE_ROW => {
                 // SAFETY: db is valid
                 let changes = unsafe { ffi::sqlite3_changes(inner.db) };
+
+                #[cfg(feature = "console")]
+                {
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    self.emit_execute_timing(sql, changes as u64, elapsed_ms);
+                }
+
                 Ok(changes as u64)
             }
             _ => Err(step_error(inner.db, sql)),
@@ -862,6 +883,30 @@ fn error_code_to_kind(code: c_int) -> QueryErrorKind {
     }
 }
 
+/// Format a Value for display in console output.
+fn format_value(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(n) => format!("{:.6}", n),
+        Value::Double(n) => format!("{:.6}", n),
+        Value::Text(s) => s.clone(),
+        Value::Bytes(b) => format!("[BLOB: {} bytes]", b.len()),
+        Value::Date(d) => d.to_string(),
+        Value::Time(t) => t.to_string(),
+        Value::Timestamp(ts) => ts.to_string(),
+        Value::TimestampTz(ts) => ts.to_string(),
+        Value::Json(j) => j.to_string(),
+        Value::Uuid(u) => u.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Array(arr) => format!("[{} items]", arr.len()),
+    }
+}
+
 // ==================== Console Support ====================
 
 #[cfg(feature = "console")]
@@ -951,6 +996,176 @@ impl SqliteConnection {
         }
     }
 
+    /// Emit query results with PRAGMA-aware formatting.
+    #[cfg(feature = "console")]
+    fn emit_query_result(&self, sql: &str, col_names: &[String], rows: &[Row], elapsed_ms: f64) {
+        if let Some(console) = &self.console {
+            // Check if this is a PRAGMA query for special formatting
+            let sql_upper = sql.trim().to_uppercase();
+            let is_pragma = sql_upper.starts_with("PRAGMA");
+
+            if is_pragma && !rows.is_empty() {
+                // Format PRAGMA results as a table
+                if console.mode().is_plain() {
+                    // Plain text format for agents
+                    console.status(&format!("{}:", sql.trim()));
+                    // Header
+                    console.status(&format!("  {}", col_names.join("|")));
+                    // Rows
+                    for row in rows.iter().take(20) {
+                        let values: Vec<String> = (0..col_names.len())
+                            .map(|i| {
+                                row.get(i)
+                                    .map(|v| format_value(v))
+                                    .unwrap_or_else(|| "NULL".to_string())
+                            })
+                            .collect();
+                        console.status(&format!("  {}", values.join("|")));
+                    }
+                    if rows.len() > 20 {
+                        console.status(&format!("  ... and {} more rows", rows.len() - 20));
+                    }
+                    console.status(&format!("  ({:.1}ms)", elapsed_ms));
+                } else {
+                    // Rich format with table rendering
+                    let mut table_output = String::new();
+                    table_output.push_str(&format!("PRAGMA Query Results ({:.1}ms)\n", elapsed_ms));
+
+                    // Calculate column widths
+                    let mut widths: Vec<usize> = col_names.iter().map(|c| c.len()).collect();
+                    for row in rows.iter().take(20) {
+                        for (i, w) in widths.iter_mut().enumerate() {
+                            let val_len = row.get(i)
+                                .map(|v| format_value(v).len())
+                                .unwrap_or(4); // "NULL".len()
+                            if val_len > *w {
+                                *w = val_len;
+                            }
+                        }
+                    }
+
+                    // Build header separator
+                    let sep: String = widths.iter().map(|w| "-".repeat(*w + 2)).collect::<Vec<_>>().join("+");
+                    table_output.push_str(&format!("+{}+\n", sep));
+
+                    // Header row
+                    let header: String = col_names.iter().enumerate()
+                        .map(|(i, name)| format!(" {:width$} ", name, width = widths[i]))
+                        .collect::<Vec<_>>().join("|");
+                    table_output.push_str(&format!("|{}|\n", header));
+                    table_output.push_str(&format!("+{}+\n", sep));
+
+                    // Data rows
+                    for row in rows.iter().take(20) {
+                        let data: String = (0..col_names.len())
+                            .map(|i| {
+                                let val = row.get(i)
+                                    .map(|v| format_value(v))
+                                    .unwrap_or_else(|| "NULL".to_string());
+                                format!(" {:width$} ", val, width = widths[i])
+                            })
+                            .collect::<Vec<_>>().join("|");
+                        table_output.push_str(&format!("|{}|\n", data));
+                    }
+                    table_output.push_str(&format!("+{}+", sep));
+
+                    if rows.len() > 20 {
+                        table_output.push_str(&format!("\n... and {} more rows", rows.len() - 20));
+                    }
+
+                    console.status(&table_output);
+                }
+            } else {
+                // Regular query timing
+                self.emit_query_timing(elapsed_ms, rows.len());
+            }
+        }
+    }
+
+    /// Emit execute operation timing to console.
+    #[cfg(feature = "console")]
+    fn emit_execute_timing(&self, sql: &str, rows_affected: u64, elapsed_ms: f64) {
+        if let Some(console) = &self.console {
+            let sql_upper = sql.trim().to_uppercase();
+
+            // Provide contextual message based on operation type
+            let op_type = if sql_upper.starts_with("INSERT") {
+                "Insert"
+            } else if sql_upper.starts_with("UPDATE") {
+                "Update"
+            } else if sql_upper.starts_with("DELETE") {
+                "Delete"
+            } else if sql_upper.starts_with("CREATE") {
+                "Create"
+            } else if sql_upper.starts_with("DROP") {
+                "Drop"
+            } else if sql_upper.starts_with("ALTER") {
+                "Alter"
+            } else {
+                "Execute"
+            };
+
+            if console.mode().is_plain() {
+                console.status(&format!(
+                    "{}: {} rows affected ({:.1}ms)",
+                    op_type, rows_affected, elapsed_ms
+                ));
+            } else {
+                console.status(&format!(
+                    "[{}] {} rows affected ({:.1}ms)",
+                    op_type.to_uppercase(), rows_affected, elapsed_ms
+                ));
+            }
+        }
+    }
+
+    /// Emit busy waiting status to console.
+    #[cfg(feature = "console")]
+    pub fn emit_busy_waiting(&self, elapsed_secs: f64) {
+        if let Some(console) = &self.console {
+            if console.mode().is_plain() {
+                console.status(&format!(
+                    "Waiting for database lock... ({:.1}s)",
+                    elapsed_secs
+                ));
+            } else {
+                console.status(&format!(
+                    "[..] Waiting for database lock... ({:.1}s)",
+                    elapsed_secs
+                ));
+            }
+        }
+    }
+
+    /// Emit WAL checkpoint progress to console.
+    #[cfg(feature = "console")]
+    pub fn emit_checkpoint_progress(&self, pages_done: u32, pages_total: u32) {
+        if let Some(console) = &self.console {
+            let pct = if pages_total > 0 {
+                (pages_done as f64 / pages_total as f64) * 100.0
+            } else {
+                100.0
+            };
+
+            if console.mode().is_plain() {
+                console.status(&format!(
+                    "WAL checkpoint: {:.0}% ({}/{} pages)",
+                    pct, pages_done, pages_total
+                ));
+            } else {
+                // ASCII progress bar for rich mode
+                let bar_width = 20;
+                let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                let empty = bar_width.saturating_sub(filled);
+                let bar = format!("[{}{}]", "=".repeat(filled), " ".repeat(empty));
+                console.status(&format!(
+                    "WAL checkpoint: {} {:.0}% ({}/{} pages)",
+                    bar, pct, pages_done, pages_total
+                ));
+            }
+        }
+    }
+
     /// No-op when console feature is disabled.
     #[cfg(not(feature = "console"))]
     fn emit_open_status(&self) {}
@@ -962,6 +1177,22 @@ impl SqliteConnection {
     /// No-op when console feature is disabled.
     #[cfg(not(feature = "console"))]
     fn emit_query_timing(&self, _elapsed_ms: f64, _rows: usize) {}
+
+    /// No-op when console feature is disabled.
+    #[cfg(not(feature = "console"))]
+    fn emit_query_result(&self, _sql: &str, _col_names: &[String], _rows: &[Row], _elapsed_ms: f64) {}
+
+    /// No-op when console feature is disabled.
+    #[cfg(not(feature = "console"))]
+    fn emit_execute_timing(&self, _sql: &str, _rows_affected: u64, _elapsed_ms: f64) {}
+
+    /// No-op when console feature is disabled.
+    #[cfg(not(feature = "console"))]
+    pub fn emit_busy_waiting(&self, _elapsed_secs: f64) {}
+
+    /// No-op when console feature is disabled.
+    #[cfg(not(feature = "console"))]
+    pub fn emit_checkpoint_progress(&self, _pages_done: u32, _pages_total: u32) {}
 }
 
 #[cfg(test)]
