@@ -965,6 +965,7 @@ dependencies = [
  "rich_rust",
  "serde",
  "serde_json",
+ "sqlmodel-schema",
 ]
 
 [[package]]

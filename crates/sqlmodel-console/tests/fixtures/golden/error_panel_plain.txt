@@ -1,0 +1,11 @@
+=== SQL Syntax Error [ERROR] ===
+
+Unexpected token near 'FORM'
+
+Query:
+  SELECT * FORM users WHERE id = 1
+           ^
+
+Hint: Did you mean 'FROM'?
+
+SQLSTATE: 42601
