@@ -11,6 +11,10 @@ description = "PostgreSQL driver for SQLModel Rust"
 [lints]
 workspace = true
 
+[features]
+default = []
+console = ["dep:sqlmodel-console"]
+
 [dependencies]
 sqlmodel-core.workspace = true
 asupersync.workspace = true
@@ -22,5 +26,8 @@ pbkdf2 = "0.12"
 base64 = "0.22"
 rand = "0.8"
 md5 = "0.7"
+
+# Optional console support
+sqlmodel-console = { path = "../sqlmodel-console", optional = true }
 
 [dev-dependencies]

@@ -41,3 +41,9 @@ pub mod types;
 pub use config::{PgConfig, SslMode};
 pub use connection::{ConnectionState, PgConnection, TransactionStatusState};
 pub use types::{Format, TypeCategory, TypeInfo, TypeRegistry};
+
+// Console integration (feature-gated)
+#[cfg(feature = "console")]
+pub use connection::ConnectionStage;
+#[cfg(feature = "console")]
+pub use sqlmodel_console::ConsoleAware;

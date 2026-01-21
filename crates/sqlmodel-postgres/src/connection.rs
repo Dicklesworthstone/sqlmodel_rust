@@ -2,15 +2,36 @@
 //!
 //! This module implements the PostgreSQL wire protocol connection,
 //! including connection establishment, authentication, and state management.
+//!
+//! # Console Integration
+//!
+//! When the `console` feature is enabled, the connection can report progress
+//! during connection establishment. Use the `ConsoleAware` trait to attach
+//! a console for rich output.
+//!
+//! ```rust,ignore
+//! use sqlmodel_postgres::{PgConfig, PgConnection};
+//! use sqlmodel_console::{SqlModelConsole, ConsoleAware};
+//! use std::sync::Arc;
+//!
+//! let console = Arc::new(SqlModelConsole::new());
+//! let mut conn = PgConnection::connect(config)?;
+//! conn.set_console(Some(console));
+//! ```
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+#[cfg(feature = "console")]
+use std::sync::Arc;
 
 use sqlmodel_core::Error;
 use sqlmodel_core::error::{
     ConnectionError, ConnectionErrorKind, ProtocolError, QueryError, QueryErrorKind,
 };
+
+#[cfg(feature = "console")]
+use sqlmodel_console::{ConsoleAware, SqlModelConsole};
 
 use crate::auth::ScramClient;
 use crate::config::PgConfig;
@@ -66,6 +87,12 @@ impl From<TransactionStatus> for TransactionStatusState {
 ///
 /// Manages a TCP connection to a PostgreSQL server, handling the wire protocol,
 /// authentication, and state tracking.
+///
+/// # Console Support
+///
+/// When the `console` feature is enabled, the connection can report progress
+/// via an attached `SqlModelConsole`. This provides rich feedback during
+/// connection establishment and query execution.
 pub struct PgConnection {
     /// TCP stream to the server
     stream: TcpStream,
@@ -85,6 +112,9 @@ pub struct PgConnection {
     writer: MessageWriter,
     /// Read buffer
     read_buf: Vec<u8>,
+    /// Optional console for rich output
+    #[cfg(feature = "console")]
+    console: Option<Arc<SqlModelConsole>>,
 }
 
 impl std::fmt::Debug for PgConnection {
@@ -149,6 +179,8 @@ impl PgConnection {
             reader: MessageReader::new(),
             writer: MessageWriter::new(),
             read_buf: vec![0u8; 8192],
+            #[cfg(feature = "console")]
+            console: None,
         };
 
         // 2. SSL negotiation (if configured)
@@ -525,6 +557,104 @@ impl Drop for PgConnection {
     fn drop(&mut self) {
         // Try to close gracefully, ignore errors
         let _ = self.close();
+    }
+}
+
+// ==================== Console Support ====================
+
+#[cfg(feature = "console")]
+impl ConsoleAware for PgConnection {
+    fn set_console(&mut self, console: Option<Arc<SqlModelConsole>>) {
+        self.console = console;
+    }
+
+    fn console(&self) -> Option<&Arc<SqlModelConsole>> {
+        self.console.as_ref()
+    }
+
+    fn has_console(&self) -> bool {
+        self.console.is_some()
+    }
+}
+
+/// Connection progress stage for console output.
+#[cfg(feature = "console")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStage {
+    /// Resolving DNS
+    DnsResolve,
+    /// Establishing TCP connection
+    TcpConnect,
+    /// Negotiating SSL/TLS
+    SslNegotiate,
+    /// SSL/TLS established
+    SslEstablished,
+    /// Sending startup message
+    Startup,
+    /// Authenticating
+    Authenticating,
+    /// Authentication complete
+    Authenticated,
+    /// Ready for queries
+    Ready,
+}
+
+#[cfg(feature = "console")]
+impl ConnectionStage {
+    /// Get a human-readable description of the stage.
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::DnsResolve => "Resolving DNS",
+            Self::TcpConnect => "Connecting (TCP)",
+            Self::SslNegotiate => "Negotiating SSL",
+            Self::SslEstablished => "SSL established",
+            Self::Startup => "Sending startup",
+            Self::Authenticating => "Authenticating",
+            Self::Authenticated => "Authenticated",
+            Self::Ready => "Ready",
+        }
+    }
+}
+
+#[cfg(feature = "console")]
+impl PgConnection {
+    /// Emit a connection progress message to the console.
+    ///
+    /// This is a no-op if no console is attached.
+    pub fn emit_progress(&self, stage: ConnectionStage, success: bool) {
+        if let Some(console) = &self.console {
+            let status = if success { "[OK]" } else { "[..] " };
+            let message = format!("{} {}", status, stage.description());
+            console.info(&message);
+        }
+    }
+
+    /// Emit a connection success message with server info.
+    pub fn emit_connected(&self) {
+        if let Some(console) = &self.console {
+            let server_version = self
+                .parameters
+                .get("server_version")
+                .map_or("unknown", |s| s.as_str());
+            let message = format!(
+                "Connected to PostgreSQL {} at {}:{}",
+                server_version, self.config.host, self.config.port
+            );
+            console.success(&message);
+        }
+    }
+
+    /// Emit a plain-text connection summary (for agent mode).
+    pub fn emit_connected_plain(&self) -> String {
+        let server_version = self
+            .parameters
+            .get("server_version")
+            .map_or("unknown", |s| s.as_str());
+        format!(
+            "Connected to PostgreSQL {} at {}:{}",
+            server_version, self.config.host, self.config.port
+        )
     }
 }
 
