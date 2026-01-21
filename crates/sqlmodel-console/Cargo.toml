@@ -25,3 +25,6 @@ serde_json = { workspace = true }
 
 # Optional: rich terminal output library
 rich_rust = { path = "../../../rich_rust", optional = true }
+
+[dev-dependencies]
+sqlmodel-schema = { workspace = true }
