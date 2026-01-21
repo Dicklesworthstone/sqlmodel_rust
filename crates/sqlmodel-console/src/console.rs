@@ -468,9 +468,8 @@ pub fn strip_markup(s: &str) -> String {
                 // 2. Compound styles: contains a space (e.g., "red on white")
                 // 3. Style names: has 2+ alphabetic chars (e.g., "bold", "red")
                 let letter_count = tag_content.chars().filter(|c| c.is_alphabetic()).count();
-                let is_markup = tag_content.starts_with('/')
-                    || tag_content.contains(' ')
-                    || letter_count >= 2;
+                let is_markup =
+                    tag_content.starts_with('/') || tag_content.contains(' ') || letter_count >= 2;
 
                 if is_markup {
                     // Skip the entire tag

@@ -111,10 +111,7 @@ impl OutputMode {
         }
 
         // Dumb terminal
-        if env::var("TERM")
-            .map(|t| t == "dumb")
-            .unwrap_or(false)
-        {
+        if env::var("TERM").map(|t| t == "dumb").unwrap_or(false) {
             return Self::Plain;
         }
 

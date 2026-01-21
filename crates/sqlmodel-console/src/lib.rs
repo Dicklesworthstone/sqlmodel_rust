@@ -41,24 +41,24 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![cfg_attr(test, allow(unsafe_code))]
 
-pub mod mode;
 pub mod console;
-pub mod theme;
 pub mod logging;
-pub mod traits;
+pub mod mode;
 pub mod renderables;
+pub mod theme;
+pub mod traits;
 pub mod widgets;
 
 // Re-export primary types
-pub use mode::OutputMode;
 pub use console::SqlModelConsole;
+pub use mode::OutputMode;
 pub use theme::Theme;
 pub use traits::ConsoleAware;
 
 /// Prelude for convenient imports.
 pub mod prelude {
-    pub use crate::mode::OutputMode;
     pub use crate::console::SqlModelConsole;
+    pub use crate::mode::OutputMode;
     pub use crate::theme::Theme;
     pub use crate::traits::ConsoleAware;
 }

@@ -5,11 +5,15 @@
 //! - Query results as tables
 //! - Schema diagrams as trees
 //! - Error messages as panels
-//! - Connection info displays
+//! - Connection pool status dashboards
 //!
 //! # Implementation Status
 //!
-//! Renderables will be added in later phases:
+//! - Phase 2: Connection pool status display ✓
 //! - Phase 3: Error panels
 //! - Phase 4: Query result tables
 //! - Phase 5: Schema trees
+
+pub mod pool_status;
+
+pub use pool_status::{PoolHealth, PoolStatsProvider, PoolStatusDisplay};
