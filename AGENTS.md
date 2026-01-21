@@ -12,6 +12,12 @@
 4. **Zero-cost abstractions** - Compile-time code generation, no runtime reflection
 5. **Structured concurrency** - All async operations go through asupersync's `Cx` context
 
+## RULE 0 - THE FUNDAMENTAL OVERRIDE PEROGATIVE
+
+If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
+
+---
+
 ## Rule #1: NO FILE DELETION
 
 **ABSOLUTELY FORBIDDEN** without explicit user permission:
@@ -616,3 +622,9 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
+
+---
+
+## Note on Built-in TODO Functionality
+
+Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.

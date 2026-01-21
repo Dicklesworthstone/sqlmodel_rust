@@ -230,6 +230,21 @@ let deleted = delete!(User)
 
 ---
 
+## Console Examples
+
+SQLModel Rust ships a `sqlmodel-console` crate with visual renderables. You can run
+example programs to preview both rich and plain output:
+
+```bash
+cargo run -p sqlmodel-console --example console_demo
+cargo run -p sqlmodel-console --example error_showcase
+cargo run -p sqlmodel-console --example query_results
+cargo run -p sqlmodel-console --example progress_demo
+cargo run -p sqlmodel-console --example schema_visualization
+```
+
+---
+
 ## Architecture
 
 ```

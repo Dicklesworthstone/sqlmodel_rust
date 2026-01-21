@@ -306,10 +306,11 @@ impl SqlHighlighter {
                 // Handle multi-char operators
                 if i < chars.len() {
                     let next = chars[i];
-                    if (c == '<' && next == '>') || (c == '<' && next == '=') ||
-                       (c == '>' && next == '=') || (c == '!' && next == '=') ||
-                       (c == '|' && next == '|')
-                    {
+                    let is_two_char_op = matches!(
+                        (c, next),
+                        ('<', '>' | '=') | ('>' | '!', '=') | ('|', '|')
+                    );
+                    if is_two_char_op {
                         i += 1;
                     }
                 }
@@ -417,11 +418,13 @@ impl SqlHighlighter {
             }
 
             // Add keyword that needs newline before
-            if matches!(upper.as_str(), "AND" | "OR") && !newline_before {
-                if !result.ends_with('\n') && !result.ends_with(' ') {
-                    result.push('\n');
-                    result.push_str(&indent_str.repeat(indent + 1));
-                }
+            if matches!(upper.as_str(), "AND" | "OR")
+                && !newline_before
+                && !result.ends_with('\n')
+                && !result.ends_with(' ')
+            {
+                result.push('\n');
+                result.push_str(&indent_str.repeat(indent + 1));
             }
 
             // Handle JOIN keywords

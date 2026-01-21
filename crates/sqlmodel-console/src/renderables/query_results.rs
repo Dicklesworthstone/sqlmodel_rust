@@ -510,8 +510,7 @@ impl QueryResultTable {
                             ValueType::Float => {
                                 if let Ok(n) = cell.value.parse::<f64>() {
                                     serde_json::Number::from_f64(n)
-                                        .map(serde_json::Value::Number)
-                                        .unwrap_or_else(|| serde_json::Value::String(cell.value.clone()))
+                                        .map_or_else(|| serde_json::Value::String(cell.value.clone()), serde_json::Value::Number)
                                 } else {
                                     serde_json::Value::String(cell.value.clone())
                                 }
@@ -555,8 +554,7 @@ impl QueryResultTable {
                             ValueType::Float => {
                                 if let Ok(n) = cell.value.parse::<f64>() {
                                     serde_json::Number::from_f64(n)
-                                        .map(serde_json::Value::Number)
-                                        .unwrap_or_else(|| serde_json::Value::String(cell.value.clone()))
+                                        .map_or_else(|| serde_json::Value::String(cell.value.clone()), serde_json::Value::Number)
                                 } else {
                                     serde_json::Value::String(cell.value.clone())
                                 }
@@ -733,8 +731,7 @@ impl QueryResultTable {
                             ValueType::Float => {
                                 if let Ok(n) = cell.value.parse::<f64>() {
                                     serde_json::Number::from_f64(n)
-                                        .map(serde_json::Value::Number)
-                                        .unwrap_or_else(|| serde_json::Value::String(cell.value.clone()))
+                                        .map_or_else(|| serde_json::Value::String(cell.value.clone()), serde_json::Value::Number)
                                 } else {
                                     serde_json::Value::String(cell.value.clone())
                                 }

@@ -159,6 +159,7 @@ impl QueryTiming {
 
     /// Render as plain text.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn render_plain(&self) -> String {
         let mut lines = Vec::new();
         let total = self.effective_total();
@@ -193,6 +194,7 @@ impl QueryTiming {
 
     /// Render as styled text with ANSI colors and bar charts.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn render_styled(&self) -> String {
         let theme = self.theme.clone().unwrap_or_default();
         let total = self.effective_total();

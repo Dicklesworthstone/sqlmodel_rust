@@ -253,11 +253,11 @@ impl QueryTreeView {
     /// Render as JSON-serializable structure.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
-        self.node_to_json(&self.root)
+        Self::node_to_json(&self.root)
     }
 
     /// Convert a node to JSON.
-    fn node_to_json(&self, node: &TreeNode) -> serde_json::Value {
+    fn node_to_json(node: &TreeNode) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         obj.insert("label".to_string(), serde_json::Value::String(node.label.clone()));
 
@@ -266,7 +266,7 @@ impl QueryTreeView {
         }
 
         if !node.children.is_empty() {
-            let children: Vec<serde_json::Value> = node.children.iter().map(|c| self.node_to_json(c)).collect();
+            let children: Vec<serde_json::Value> = node.children.iter().map(Self::node_to_json).collect();
             obj.insert("children".to_string(), serde_json::Value::Array(children));
         }
 
