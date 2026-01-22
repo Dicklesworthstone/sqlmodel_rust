@@ -28,3 +28,6 @@ rich_rust = { path = "../../../rich_rust", optional = true }
 
 [dev-dependencies]
 sqlmodel-schema = { workspace = true }
+
+[[bench]]
+name = "console_bench"
