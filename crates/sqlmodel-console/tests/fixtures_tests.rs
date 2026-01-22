@@ -2,6 +2,7 @@ mod fixtures;
 
 use fixtures::*;
 use sqlmodel_console::renderables::PoolStatsProvider;
+use sqlmodel_console::ConsoleAware;
 
 #[test]
 fn test_user_table_info() {

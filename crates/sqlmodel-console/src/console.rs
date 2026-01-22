@@ -45,7 +45,7 @@ use crate::theme::Theme;
 /// console.status("Processing...");
 /// console.success("Done!");
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SqlModelConsole {
     /// Current output mode.
     mode: OutputMode,
@@ -53,21 +53,13 @@ pub struct SqlModelConsole {
     theme: Theme,
     /// Default width for plain mode rules and formatting.
     plain_width: usize,
-    /// Rich console instance (only available when the `rich` feature is enabled).
-    #[cfg(feature = "rich")]
-    rich_console: Option<rich_rust::Console>,
+    // Note: We intentionally don't store rich_rust::Console here because it contains
+    // Cell/RefCell types that are not Sync. Instead, rich output is created on-demand
+    // in methods that need it. This allows SqlModelConsole to be Send+Sync for use
+    // in global statics and cross-thread sharing.
 }
 
 impl SqlModelConsole {
-    #[cfg(feature = "rich")]
-    fn make_rich_console(mode: OutputMode) -> Option<rich_rust::Console> {
-        if mode == OutputMode::Rich {
-            Some(rich_rust::Console::new())
-        } else {
-            None
-        }
-    }
-
     /// Create a new console with auto-detected mode and default theme.
     ///
     /// This is the recommended way to create a console. It will:
@@ -77,13 +69,10 @@ impl SqlModelConsole {
     /// 4. Choose appropriate mode
     #[must_use]
     pub fn new() -> Self {
-        let mode = OutputMode::detect();
         Self {
-            mode,
+            mode: OutputMode::detect(),
             theme: Theme::default(),
             plain_width: 80,
-            #[cfg(feature = "rich")]
-            rich_console: Self::make_rich_console(mode),
         }
     }
 
@@ -96,21 +85,16 @@ impl SqlModelConsole {
             mode,
             theme: Theme::default(),
             plain_width: 80,
-            #[cfg(feature = "rich")]
-            rich_console: Self::make_rich_console(mode),
         }
     }
 
     /// Create a console with a specific theme.
     #[must_use]
     pub fn with_theme(theme: Theme) -> Self {
-        let mode = OutputMode::detect();
         Self {
-            mode,
+            mode: OutputMode::detect(),
             theme,
             plain_width: 80,
-            #[cfg(feature = "rich")]
-            rich_console: Self::make_rich_console(mode),
         }
     }
 
@@ -149,10 +133,6 @@ impl SqlModelConsole {
     /// Set the output mode.
     pub fn set_mode(&mut self, mode: OutputMode) {
         self.mode = mode;
-        #[cfg(feature = "rich")]
-        {
-            self.rich_console = Self::make_rich_console(mode);
-        }
     }
 
     /// Set the theme.
@@ -357,19 +337,6 @@ impl SqlModelConsole {
     /// Print an empty line to stderr.
     pub fn newline_stderr(&self) {
         eprintln!();
-    }
-}
-
-impl Clone for SqlModelConsole {
-    fn clone(&self) -> Self {
-        let mode = self.mode;
-        Self {
-            mode,
-            theme: self.theme.clone(),
-            plain_width: self.plain_width,
-            #[cfg(feature = "rich")]
-            rich_console: Self::make_rich_console(mode),
-        }
     }
 }
 

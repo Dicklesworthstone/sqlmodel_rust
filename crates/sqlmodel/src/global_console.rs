@@ -23,12 +23,16 @@
 //! 2. Global console (if set via `set_global_console()` or `init_auto_console()`)
 //! 3. No console (silent operation)
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sqlmodel_console::SqlModelConsole;
 
-/// Global console storage using `OnceLock` for thread-safe single initialization.
-static GLOBAL_CONSOLE: OnceLock<Arc<SqlModelConsole>> = OnceLock::new();
+/// Global console storage using `OnceLock` with `Mutex` for thread-safety.
+///
+/// We need the `Mutex` wrapper because `SqlModelConsole` contains `rich_rust::Console`
+/// which has interior mutability types (`Cell`, `RefCell`) that are not `Sync`.
+/// The `Mutex` provides the necessary synchronization for safe concurrent access.
+static GLOBAL_CONSOLE: OnceLock<Mutex<Arc<SqlModelConsole>>> = OnceLock::new();
 
 /// Set the global console. Can only be called once per process.
 ///
@@ -48,7 +52,7 @@ static GLOBAL_CONSOLE: OnceLock<Arc<SqlModelConsole>> = OnceLock::new();
 /// ```
 pub fn set_global_console(console: SqlModelConsole) {
     // OnceLock::set returns Err if already set, which we silently ignore
-    let _ = GLOBAL_CONSOLE.set(Arc::new(console));
+    let _ = GLOBAL_CONSOLE.set(Mutex::new(Arc::new(console)));
 }
 
 /// Set a shared global console. Can only be called once per process.
@@ -69,7 +73,7 @@ pub fn set_global_console(console: SqlModelConsole) {
 /// console.print("Hello");
 /// ```
 pub fn set_global_shared_console(console: Arc<SqlModelConsole>) {
-    let _ = GLOBAL_CONSOLE.set(console);
+    let _ = GLOBAL_CONSOLE.set(Mutex::new(console));
 }
 
 /// Get the global console if set.
@@ -87,7 +91,10 @@ pub fn set_global_shared_console(console: Arc<SqlModelConsole>) {
 /// ```
 #[must_use]
 pub fn global_console() -> Option<Arc<SqlModelConsole>> {
-    GLOBAL_CONSOLE.get().cloned()
+    GLOBAL_CONSOLE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|guard| Arc::clone(&guard))
 }
 
 /// Check if a global console has been initialized.
@@ -126,7 +133,7 @@ pub fn has_global_console() -> bool {
 /// }
 /// ```
 pub fn init_auto_console() {
-    let _ = GLOBAL_CONSOLE.set(Arc::new(SqlModelConsole::new()));
+    let _ = GLOBAL_CONSOLE.set(Mutex::new(Arc::new(SqlModelConsole::new())));
 }
 
 #[cfg(test)]
