@@ -20,7 +20,7 @@ fn e2e_progress_bar_basic() {
     let progress = OperationProgress::new("Processing records", 100)
         .completed(50);
 
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Processing records");
@@ -32,7 +32,7 @@ fn e2e_progress_bar_basic() {
 #[test]
 fn e2e_progress_zero_percent() {
     let progress = OperationProgress::new("Starting", 100);
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Starting");
@@ -45,7 +45,7 @@ fn e2e_progress_complete() {
     let progress = OperationProgress::new("Completed task", 100)
         .completed(100);
 
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain.clone(), String::new());
 
     output.assert_stdout_contains("Completed task");
@@ -61,7 +61,7 @@ fn e2e_progress_custom_total() {
     let progress = OperationProgress::new("Migrating users", 1500)
         .completed(750);
 
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Migrating users");
@@ -86,7 +86,7 @@ fn e2e_progress_percentage() {
 #[test]
 fn e2e_spinner_basic() {
     let spinner = IndeterminateSpinner::new("Loading data");
-    let plain = spinner.to_plain();
+    let plain = spinner.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Loading data");
@@ -99,7 +99,7 @@ fn e2e_spinner_with_status() {
     let spinner = IndeterminateSpinner::new("Connecting")
         .with_status("Establishing connection...");
 
-    let plain = spinner.to_plain();
+    let plain = spinner.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Connecting");
@@ -110,7 +110,7 @@ fn e2e_spinner_with_status() {
 #[test]
 fn e2e_spinner_plain_no_animation() {
     let spinner = IndeterminateSpinner::new("Working");
-    let plain = spinner.to_plain();
+    let plain = spinner.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     // Plain mode should not have cursor movement or animation codes
@@ -128,11 +128,15 @@ fn e2e_spinner_plain_no_animation() {
 /// E2E test: Batch tracker basic display.
 #[test]
 fn e2e_batch_tracker_basic() {
-    let tracker = BatchOperationTracker::new("Processing files", 50)
-        .succeeded(30)
-        .failed(5);
+    let mut tracker = BatchOperationTracker::new("Processing files", 5, 50);
+    // Complete 3 batches of 10 rows each = 30 rows
+    for _ in 0..3 {
+        tracker.complete_batch(10);
+    }
+    // Record 5 errors
+    tracker.record_errors(5);
 
-    let plain = tracker.to_plain();
+    let plain = tracker.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Processing files");
@@ -144,10 +148,13 @@ fn e2e_batch_tracker_basic() {
 /// E2E test: Batch tracker all success.
 #[test]
 fn e2e_batch_tracker_all_success() {
-    let tracker = BatchOperationTracker::new("Batch complete", 100)
-        .succeeded(100);
+    let mut tracker = BatchOperationTracker::new("Batch complete", 10, 100);
+    // Complete all 10 batches of 10 rows each = 100 rows
+    for _ in 0..10 {
+        tracker.complete_batch(10);
+    }
 
-    let plain = tracker.to_plain();
+    let plain = tracker.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("100");
@@ -157,10 +164,11 @@ fn e2e_batch_tracker_all_success() {
 /// E2E test: Batch tracker all failed.
 #[test]
 fn e2e_batch_tracker_all_failed() {
-    let tracker = BatchOperationTracker::new("Batch failed", 20)
-        .failed(20);
+    let mut tracker = BatchOperationTracker::new("Batch failed", 2, 20);
+    // All 20 rows encountered errors
+    tracker.record_errors(20);
 
-    let plain = tracker.to_plain();
+    let plain = tracker.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("20");
@@ -170,12 +178,16 @@ fn e2e_batch_tracker_all_failed() {
 /// E2E test: Batch tracker mixed results.
 #[test]
 fn e2e_batch_tracker_mixed() {
-    let tracker = BatchOperationTracker::new("Import records", 1000)
-        .succeeded(850)
-        .failed(100)
-        .skipped(50);
+    let mut tracker = BatchOperationTracker::new("Import records", 10, 1000);
+    // Complete batches totaling 850 rows
+    for _ in 0..8 {
+        tracker.complete_batch(100);  // 8 batches of 100 = 800 rows
+    }
+    tracker.complete_batch(50);  // 1 more batch of 50 = 850 total
+    // Record 100 errors
+    tracker.record_errors(100);
 
-    let plain = tracker.to_plain();
+    let plain = tracker.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Import records");
@@ -195,7 +207,7 @@ fn e2e_progress_plain_console() {
     assert!(console.is_plain());
 
     let progress = OperationProgress::new("Test", 100).completed(50);
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_plain_mode_clean();
@@ -212,9 +224,12 @@ fn e2e_progress_json_serializable() {
     let json = serde_json::to_string(&spinner);
     assert!(json.is_ok(), "IndeterminateSpinner should serialize to JSON");
 
-    let tracker = BatchOperationTracker::new("Tracker", 10).succeeded(5);
-    let json = serde_json::to_string(&tracker);
-    assert!(json.is_ok(), "BatchOperationTracker should serialize to JSON");
+    let mut tracker = BatchOperationTracker::new("Tracker", 2, 10);
+    tracker.complete_batch(5);  // Complete 1 batch of 5 rows
+    // BatchOperationTracker uses to_json() method instead of serde_json::to_string
+    let json = tracker.to_json();
+    assert!(!json.is_empty(), "BatchOperationTracker should serialize to JSON");
+    assert!(json.contains("Tracker"));
 }
 
 // ============================================================================
@@ -226,7 +241,7 @@ fn e2e_progress_json_serializable() {
 fn e2e_progress_zero_total() {
     // Zero total should not panic
     let progress = OperationProgress::new("Empty", 0);
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
 
     // Should render something valid
     assert!(!plain.is_empty() || plain.is_empty()); // Just don't panic
@@ -238,7 +253,7 @@ fn e2e_progress_exceeds_total() {
     let progress = OperationProgress::new("Overflow", 100)
         .completed(150);
 
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     // Should handle gracefully, might clamp to 100%
@@ -252,7 +267,7 @@ fn e2e_progress_long_description() {
     let progress = OperationProgress::new(&long_desc, 100)
         .completed(50);
 
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     // Should handle long descriptions
@@ -265,7 +280,7 @@ fn e2e_progress_unicode_description() {
     let progress = OperationProgress::new("处理文件 (Processing files)", 100)
         .completed(50);
 
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("处理文件");
@@ -278,7 +293,7 @@ fn e2e_progress_special_chars() {
     let progress = OperationProgress::new("Processing <items> & [things]", 100)
         .completed(50);
 
-    let plain = progress.to_plain();
+    let plain = progress.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_plain_mode_clean();

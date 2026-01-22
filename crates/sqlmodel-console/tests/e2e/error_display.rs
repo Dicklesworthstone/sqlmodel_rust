@@ -23,7 +23,7 @@ fn e2e_error_panel_plain_mode() {
         .with_sqlstate("42601")
         .with_hint("Did you mean 'FROM'?");
 
-    let plain_output = panel.to_plain();
+    let plain_output = panel.render_plain();
 
     // Create captured output for assertions
     let output = CapturedOutput::from_strings(plain_output.clone(), String::new());
@@ -43,7 +43,7 @@ fn e2e_error_panel_plain_mode() {
 #[test]
 fn e2e_error_panel_severity_levels() {
     let severities = [
-        (ErrorSeverity::Info, "Info"),
+        (ErrorSeverity::Notice, "Notice"),
         (ErrorSeverity::Warning, "Warning"),
         (ErrorSeverity::Error, "Error"),
         (ErrorSeverity::Critical, "Critical"),
@@ -53,7 +53,7 @@ fn e2e_error_panel_severity_levels() {
         let panel = ErrorPanel::new(&format!("{name} Message"), "Test detail")
             .severity(severity);
 
-        let plain = panel.to_plain();
+        let plain = panel.render_plain();
         let output = CapturedOutput::from_strings(plain, String::new());
 
         output.assert_stdout_contains(&format!("{name} Message"));
@@ -72,7 +72,7 @@ fn e2e_connection_error_panel() {
         .add_context("User: postgres")
         .with_hint("Check that the database server is running");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Connection Failed");
@@ -92,7 +92,7 @@ fn e2e_timeout_error_panel() {
         .with_detail("Timeout after 30 seconds")
         .with_hint("Consider adding an index or simplifying the query");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Query Timeout");
@@ -110,7 +110,7 @@ fn e2e_timeout_error_panel() {
 #[test]
 fn e2e_error_panel_minimal() {
     let panel = ErrorPanel::new("Simple Error", "Something went wrong");
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Simple Error");
@@ -133,7 +133,7 @@ fn e2e_error_panel_long_sql() {
     let panel = ErrorPanel::new("Complex Query Failed", "Error in subquery")
         .with_sql(long_sql);
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     // Key parts should be present
@@ -153,7 +153,7 @@ fn e2e_error_panel_special_chars() {
     .with_sql("SELECT * FROM users WHERE name = 'Müller'")
     .with_hint("Check encoding settings");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Unicode Error");
@@ -172,7 +172,7 @@ fn e2e_error_panel_multiple_context() {
         .add_context("Got: string")
         .with_hint("Check the configuration file syntax");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Configuration Error");
@@ -194,7 +194,7 @@ fn e2e_error_via_console_plain() {
     let panel = ErrorPanel::new("Test Error", "Test message");
 
     // In plain mode, the panel output should have no ANSI codes
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_plain_mode_clean();
@@ -208,7 +208,7 @@ fn e2e_error_output_parseable() {
         .with_position(10)
         .with_sqlstate("42601");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
 
     // Output should be parseable text
     assert!(!plain.is_empty());
@@ -250,7 +250,7 @@ fn e2e_sample_syntax_error() {
         .with_sqlstate("42601")
         .with_hint("Did you mean 'FROM'?");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("SQL Syntax Error");
@@ -269,7 +269,7 @@ fn e2e_sample_connection_error() {
         .add_context("User: postgres")
         .with_hint("Check that the database server is running");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Connection Failed");
@@ -286,7 +286,7 @@ fn e2e_sample_timeout_error() {
         .with_detail("Timeout after 30 seconds")
         .with_hint("Consider adding an index or simplifying the query");
 
-    let plain = panel.to_plain();
+    let plain = panel.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("Query Timeout");

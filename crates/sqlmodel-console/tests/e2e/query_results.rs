@@ -24,8 +24,8 @@ fn e2e_simple_query_results() {
         vec!["3".to_string(), "Carol".to_string(), "carol@example.com".to_string()],
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     // Verify column headers
@@ -53,8 +53,8 @@ fn e2e_query_results_row_count() {
         vec!["3".to_string()],
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     // Should show row count
@@ -72,8 +72,8 @@ fn e2e_empty_query_results() {
     let columns = vec!["id".to_string(), "name".to_string()];
     let rows: Vec<Vec<String>> = vec![];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain.clone(), String::new());
 
     // Should still show headers
@@ -83,9 +83,9 @@ fn e2e_empty_query_results() {
     // No ANSI codes
     output.assert_plain_mode_clean();
 
-    // Should indicate empty or 0 rows
-    let has_empty_indicator = plain.contains("0 rows") || plain.contains("Empty") || rows.is_empty();
-    assert!(has_empty_indicator || plain.lines().count() <= 3);
+    // Should indicate empty or 0 rows (rows was empty, so check output)
+    let has_empty_indicator = plain.contains("0 rows") || plain.contains("Empty") || plain.lines().count() <= 3;
+    assert!(has_empty_indicator);
 }
 
 /// E2E test: Single column results.
@@ -94,8 +94,8 @@ fn e2e_single_column_results() {
     let columns = vec!["count".to_string()];
     let rows = vec![vec!["42".to_string()]];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("count");
@@ -111,8 +111,8 @@ fn e2e_many_columns() {
         (0..10).map(|i| format!("val_{i}")).collect(),
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("col_0");
@@ -130,8 +130,8 @@ fn e2e_large_dataset() {
         .map(|i| vec![i.to_string(), format!("value_{i}")])
         .collect();
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain.clone(), String::new());
 
     // Should handle large datasets
@@ -175,8 +175,8 @@ fn e2e_mixed_data_types() {
         ],
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("42");
@@ -198,8 +198,8 @@ fn e2e_unicode_content() {
         vec!["🎉".to_string(), "Emoji support".to_string()],
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("日本語");
@@ -215,8 +215,8 @@ fn e2e_long_values() {
     let long_content = "A".repeat(200);
     let rows = vec![vec!["1".to_string(), long_content.clone()]];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain.clone(), String::new());
 
     // Should handle long content (might be truncated)
@@ -237,8 +237,8 @@ fn e2e_empty_string_values() {
         vec!["2".to_string(), "has value".to_string()],
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("id");
@@ -258,8 +258,8 @@ fn e2e_query_results_plain_console() {
     let columns = vec!["status".to_string()];
     let rows = vec![vec!["ok".to_string()]];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     assert!(console.is_plain());
@@ -272,8 +272,8 @@ fn e2e_query_results_parseable() {
     let columns = vec!["a".to_string(), "b".to_string()];
     let rows = vec![vec!["1".to_string(), "2".to_string()]];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
 
     // Output should be valid UTF-8 text
     assert!(!plain.is_empty());
@@ -290,13 +290,12 @@ fn e2e_query_results_json() {
     let columns = vec!["id".to_string(), "name".to_string()];
     let rows = vec![vec!["1".to_string(), "Test".to_string()]];
 
-    let results = QueryResults::new(columns, rows);
+    let results = QueryResults::from_data(columns, rows);
 
-    // Should be JSON-serializable
-    let json = serde_json::to_string(&results);
-    assert!(json.is_ok(), "QueryResults should serialize to JSON");
+    // Get JSON via to_json() method
+    let json_value = results.to_json();
+    let json_str = serde_json::to_string(&json_value).unwrap();
 
-    let json_str = json.unwrap();
     assert!(json_str.contains("id"));
     assert!(json_str.contains("name"));
     assert!(json_str.contains("Test"));
@@ -315,8 +314,8 @@ fn e2e_pipe_delimited_format() {
         vec!["2".to_string(), "Bob".to_string()],
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
 
     // Should contain separators
     assert!(plain.contains('|') || plain.contains('\t') || plain.contains(' '));
@@ -331,8 +330,8 @@ fn e2e_table_alignment() {
         vec!["longer".to_string(), "x".to_string()],
     ];
 
-    let results = QueryResults::new(columns, rows);
-    let plain = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let plain = results.render_plain();
     let output = CapturedOutput::from_strings(plain, String::new());
 
     output.assert_stdout_contains("short");

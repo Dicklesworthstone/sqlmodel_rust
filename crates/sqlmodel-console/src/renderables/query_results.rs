@@ -230,6 +230,11 @@ pub struct QueryResultTable {
     plain_format: PlainFormat,
 }
 
+/// Alias for `QueryResultTable` for simpler API.
+///
+/// This provides a more concise name for query results.
+pub type QueryResults = QueryResultTable;
+
 impl QueryResultTable {
     /// Create a new empty query result table.
     #[must_use]
@@ -245,6 +250,32 @@ impl QueryResultTable {
             theme: None,
             plain_format: PlainFormat::Pipe,
         }
+    }
+
+    /// Create a query result table from column names and row data.
+    ///
+    /// This is a convenience constructor that directly sets columns and rows.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sqlmodel_console::renderables::QueryResultTable;
+    ///
+    /// let columns = vec!["id".to_string(), "name".to_string()];
+    /// let rows = vec![
+    ///     vec!["1".to_string(), "Alice".to_string()],
+    ///     vec!["2".to_string(), "Bob".to_string()],
+    /// ];
+    /// let table = QueryResultTable::from_data(columns, rows);
+    /// ```
+    #[must_use]
+    pub fn from_data(columns: Vec<String>, rows: Vec<Vec<String>>) -> Self {
+        let mut table = Self::new();
+        table.columns = columns;
+        table.rows = rows.into_iter()
+            .map(|row| row.into_iter().map(Cell::new).collect())
+            .collect();
+        table
     }
 
     /// Set the table title.

@@ -35,7 +35,7 @@ pub use batch_tracker::{BatchOperationTracker, BatchState};
 pub use error::{ErrorPanel, ErrorSeverity};
 pub use operation_progress::{OperationProgress, ProgressState};
 pub use pool_status::{PoolHealth, PoolStatsProvider, PoolStatusDisplay};
-pub use query_results::{Cell, PlainFormat, QueryResultTable, ValueType};
+pub use query_results::{Cell, PlainFormat, QueryResultTable, QueryResults, ValueType};
 pub use query_timing::QueryTiming;
 pub use query_tree::QueryTreeView;
 pub use spinner::{IndeterminateSpinner, SpinnerStyle};

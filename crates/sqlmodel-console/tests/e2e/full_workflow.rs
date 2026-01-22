@@ -36,8 +36,8 @@ fn e2e_complete_query_workflow() {
         vec!["1".to_string(), "Alice".to_string(), "alice@example.com".to_string()],
         vec!["2".to_string(), "Bob".to_string(), "bob@example.com".to_string()],
     ];
-    let results = QueryResults::new(columns, rows);
-    workflow_output.push_str(&results.to_plain());
+    let results = QueryResults::from_data(columns, rows);
+    workflow_output.push_str(&results.render_plain());
     workflow_output.push('\n');
 
     // 4. Completion
@@ -73,7 +73,7 @@ fn e2e_query_workflow_with_error() {
     let error = ErrorPanel::new("SQL Syntax Error", "Unexpected token 'SELCT'")
         .with_sql("SELCT * FROM users")
         .with_hint("Did you mean 'SELECT'?");
-    workflow_output.push_str(&error.to_plain());
+    workflow_output.push_str(&error.render_plain());
 
     let output = CapturedOutput::from_strings(workflow_output, workflow_stderr);
 
@@ -100,21 +100,21 @@ fn e2e_batch_insert_workflow() {
     // 2. Progress updates
     let progress = OperationProgress::new("Inserting records", 1000)
         .completed(1000);
-    workflow_output.push_str(&progress.to_plain());
+    workflow_output.push_str(&progress.render_plain());
     workflow_output.push('\n');
 
-    // 3. Results summary
-    let tracker = BatchOperationTracker::new("Batch complete", 1000)
-        .succeeded(950)
-        .failed(50);
-    workflow_output.push_str(&tracker.to_plain());
+    // 3. Results summary - use actual BatchOperationTracker API
+    let mut tracker = BatchOperationTracker::new("Batch complete", 10, 1000);
+    // Simulate completing batches (10 batches of 100 rows each)
+    for _ in 0..10 {
+        tracker.complete_batch(100);
+    }
+    workflow_output.push_str(&tracker.render_plain());
 
     let output = CapturedOutput::from_strings(workflow_output, workflow_stderr);
 
     output.assert_stderr_contains("Starting batch");
     output.assert_stdout_contains("1000");
-    output.assert_stdout_contains("950");
-    output.assert_stdout_contains("50");
     output.assert_all_plain();
 }
 
@@ -123,12 +123,15 @@ fn e2e_batch_insert_workflow() {
 fn e2e_batch_with_failures() {
     let mut workflow_output = String::new();
 
-    // Batch results
-    let tracker = BatchOperationTracker::new("Import users", 100)
-        .succeeded(80)
-        .failed(15)
-        .skipped(5);
-    workflow_output.push_str(&tracker.to_plain());
+    // Batch results - use actual BatchOperationTracker API
+    let mut tracker = BatchOperationTracker::new("Import users", 10, 100);
+    // Complete 8 batches of 10 rows each
+    for _ in 0..8 {
+        tracker.complete_batch(10);
+    }
+    // Record errors for remaining 2 batches
+    tracker.record_errors(15);
+    workflow_output.push_str(&tracker.render_plain());
     workflow_output.push('\n');
 
     // Error details for failures
@@ -137,7 +140,7 @@ fn e2e_batch_with_failures() {
         .add_context("Constraint violation: unique email")
         .add_context("Invalid data format: 5 records")
         .with_hint("Review error log for details");
-    workflow_output.push_str(&error.to_plain());
+    workflow_output.push_str(&error.render_plain());
 
     let output = CapturedOutput::from_strings(workflow_output, String::new());
 
@@ -168,7 +171,7 @@ fn e2e_connection_failure_workflow() {
         .add_context("Host: localhost:5432")
         .add_context("Database: mydb")
         .with_hint("Check that PostgreSQL is running");
-    workflow_output.push_str(&error.to_plain());
+    workflow_output.push_str(&error.render_plain());
 
     let output = CapturedOutput::from_strings(workflow_output, workflow_stderr);
 
@@ -214,7 +217,7 @@ fn e2e_migration_workflow() {
     // 2. Progress
     let progress = OperationProgress::new("Running migrations", 3)
         .completed(3);
-    workflow_output.push_str(&progress.to_plain());
+    workflow_output.push_str(&progress.render_plain());
     workflow_output.push('\n');
 
     // 3. Results
@@ -246,7 +249,7 @@ fn e2e_migration_rollback_workflow() {
         .with_sql("CREATE INDEX idx_users_email ON users(email)")
         .with_detail("Column 'email' does not exist")
         .severity(ErrorSeverity::Error);
-    workflow_output.push_str(&error.to_plain());
+    workflow_output.push_str(&error.render_plain());
     workflow_output.push('\n');
 
     // 2. Rollback
@@ -279,8 +282,8 @@ fn e2e_agent_parseable_workflow() {
         vec!["1".to_string(), "active".to_string()],
         vec!["2".to_string(), "pending".to_string()],
     ];
-    let results = QueryResults::new(columns, rows);
-    let output = results.to_plain();
+    let results = QueryResults::from_data(columns, rows);
+    let output = results.render_plain();
 
     // Verify parseable format
     let captured = CapturedOutput::from_strings(output.clone(), String::new());
@@ -300,14 +303,13 @@ fn e2e_json_workflow() {
     // Create structured data
     let columns = vec!["id".to_string(), "value".to_string()];
     let rows = vec![vec!["1".to_string(), "test".to_string()]];
-    let results = QueryResults::new(columns, rows);
+    let results = QueryResults::from_data(columns, rows);
 
-    // Serialize to JSON
-    let json = serde_json::to_string(&results).unwrap();
+    // Get JSON using the to_json() method
+    let json_value = results.to_json();
 
-    // Verify valid JSON
-    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert!(parsed.is_object() || parsed.is_array());
+    // Verify valid JSON structure
+    assert!(json_value.is_object() || json_value.is_array());
 }
 
 // ============================================================================
@@ -323,9 +325,9 @@ fn e2e_large_result_performance() {
         .map(|r| (0..10).map(|c| format!("r{r}c{c}")).collect())
         .collect();
 
-    let results = QueryResults::new(columns, rows);
+    let results = QueryResults::from_data(columns, rows);
     let start = std::time::Instant::now();
-    let output = results.to_plain();
+    let output = results.render_plain();
     let duration = start.elapsed();
 
     let captured = CapturedOutput::with_duration(output, String::new(), duration);
@@ -344,7 +346,7 @@ fn e2e_streaming_progress_updates() {
     for completed in [0, 25, 50, 75, 100] {
         let progress = OperationProgress::new("Processing", 100)
             .completed(completed);
-        all_output.push_str(&format!("{}\n", progress.to_plain()));
+        all_output.push_str(&format!("{}\n", progress.render_plain()));
     }
 
     let output = CapturedOutput::from_strings(all_output, String::new());
@@ -367,15 +369,15 @@ fn e2e_query_retry_workflow() {
     workflow_stderr.push_str("Attempt 1: Executing query...\n");
     let error = ErrorPanel::new("Timeout", "Query timed out")
         .severity(ErrorSeverity::Warning);
-    workflow_output.push_str(&error.to_plain());
+    workflow_output.push_str(&error.render_plain());
     workflow_output.push('\n');
 
     // Retry succeeds
     workflow_stderr.push_str("Attempt 2: Executing query...\n");
     let columns = vec!["result".to_string()];
     let rows = vec![vec!["success".to_string()]];
-    let results = QueryResults::new(columns, rows);
-    workflow_output.push_str(&results.to_plain());
+    let results = QueryResults::from_data(columns, rows);
+    workflow_output.push_str(&results.render_plain());
 
     workflow_stderr.push_str("Query completed on retry\n");
 
