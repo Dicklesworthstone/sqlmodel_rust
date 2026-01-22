@@ -8,7 +8,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust: Nightly](https://img.shields.io/badge/Rust-nightly-orange.svg)](https://www.rust-lang.org/)
 
-A first-principles Rust port of Python's [SQLModel](https://sqlmodel.tiangolo.com/) library.
+*A Rust port of [tiangolo/sqlmodel](https://github.com/tiangolo/sqlmodel) (Python), extended with [asupersync](https://github.com/Dicklesworthstone/asupersync) for structured concurrency and cancel-correct async database operations.*
 
 </div>
 
