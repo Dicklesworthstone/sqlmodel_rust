@@ -67,38 +67,145 @@ impl SqlHighlighter {
     /// SQL keywords to highlight.
     const KEYWORDS: &'static [&'static str] = &[
         // DML
-        "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE", "SET",
-        "VALUES", "INTO", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
-        "FULL", "CROSS", "ON", "USING", "AS", "DISTINCT", "ALL",
-        "ORDER", "BY", "ASC", "DESC", "NULLS", "FIRST", "LAST",
-        "LIMIT", "OFFSET", "FETCH", "NEXT", "ROWS", "ONLY",
-        "GROUP", "HAVING", "UNION", "INTERSECT", "EXCEPT",
-        "CASE", "WHEN", "THEN", "ELSE", "END",
-        "BETWEEN", "IN", "LIKE", "ILIKE", "SIMILAR", "TO",
-        "EXISTS", "ANY", "SOME",
-        "RETURNING", "WITH", "RECURSIVE",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "FROM",
+        "WHERE",
+        "SET",
+        "VALUES",
+        "INTO",
+        "JOIN",
+        "LEFT",
+        "RIGHT",
+        "INNER",
+        "OUTER",
+        "FULL",
+        "CROSS",
+        "ON",
+        "USING",
+        "AS",
+        "DISTINCT",
+        "ALL",
+        "ORDER",
+        "BY",
+        "ASC",
+        "DESC",
+        "NULLS",
+        "FIRST",
+        "LAST",
+        "LIMIT",
+        "OFFSET",
+        "FETCH",
+        "NEXT",
+        "ROWS",
+        "ONLY",
+        "GROUP",
+        "HAVING",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
+        "BETWEEN",
+        "IN",
+        "LIKE",
+        "ILIKE",
+        "SIMILAR",
+        "TO",
+        "EXISTS",
+        "ANY",
+        "SOME",
+        "RETURNING",
+        "WITH",
+        "RECURSIVE",
         // DDL
-        "CREATE", "ALTER", "DROP", "TRUNCATE", "TABLE", "INDEX",
-        "VIEW", "SCHEMA", "DATABASE", "CONSTRAINT", "PRIMARY", "KEY",
-        "FOREIGN", "REFERENCES", "UNIQUE", "CHECK", "DEFAULT",
-        "NOT", "NULL", "AUTO_INCREMENT", "AUTOINCREMENT", "SERIAL",
-        "IF", "CASCADE", "RESTRICT",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "TRUNCATE",
+        "TABLE",
+        "INDEX",
+        "VIEW",
+        "SCHEMA",
+        "DATABASE",
+        "CONSTRAINT",
+        "PRIMARY",
+        "KEY",
+        "FOREIGN",
+        "REFERENCES",
+        "UNIQUE",
+        "CHECK",
+        "DEFAULT",
+        "NOT",
+        "NULL",
+        "AUTO_INCREMENT",
+        "AUTOINCREMENT",
+        "SERIAL",
+        "IF",
+        "CASCADE",
+        "RESTRICT",
         // TCL
-        "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "TRANSACTION",
-        "START", "RELEASE",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "TRANSACTION",
+        "START",
+        "RELEASE",
         // Types
-        "INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT",
-        "REAL", "FLOAT", "DOUBLE", "PRECISION", "DECIMAL", "NUMERIC",
-        "VARCHAR", "CHAR", "TEXT", "BLOB", "BYTEA",
-        "BOOLEAN", "BOOL", "DATE", "TIME", "TIMESTAMP", "INTERVAL",
-        "UUID", "JSON", "JSONB", "ARRAY",
+        "INTEGER",
+        "INT",
+        "BIGINT",
+        "SMALLINT",
+        "TINYINT",
+        "REAL",
+        "FLOAT",
+        "DOUBLE",
+        "PRECISION",
+        "DECIMAL",
+        "NUMERIC",
+        "VARCHAR",
+        "CHAR",
+        "TEXT",
+        "BLOB",
+        "BYTEA",
+        "BOOLEAN",
+        "BOOL",
+        "DATE",
+        "TIME",
+        "TIMESTAMP",
+        "INTERVAL",
+        "UUID",
+        "JSON",
+        "JSONB",
+        "ARRAY",
         // Functions
-        "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF",
-        "CAST", "EXTRACT", "NOW", "CURRENT_DATE", "CURRENT_TIME",
-        "CURRENT_TIMESTAMP", "LOWER", "UPPER", "TRIM", "SUBSTRING",
-        "LENGTH", "CONCAT", "REPLACE",
+        "COUNT",
+        "SUM",
+        "AVG",
+        "MIN",
+        "MAX",
+        "COALESCE",
+        "NULLIF",
+        "CAST",
+        "EXTRACT",
+        "NOW",
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "CURRENT_TIMESTAMP",
+        "LOWER",
+        "UPPER",
+        "TRIM",
+        "SUBSTRING",
+        "LENGTH",
+        "CONCAT",
+        "REPLACE",
     ];
-
 
     /// Create a new SQL highlighter with the default theme.
     #[must_use]
@@ -130,7 +237,10 @@ impl SqlHighlighter {
     /// Check if a word is a SQL operator keyword.
     fn is_operator_keyword(word: &str) -> bool {
         let upper = word.to_uppercase();
-        matches!(upper.as_str(), "AND" | "OR" | "NOT" | "IS" | "BETWEEN" | "LIKE" | "ILIKE" | "IN")
+        matches!(
+            upper.as_str(),
+            "AND" | "OR" | "NOT" | "IS" | "BETWEEN" | "LIKE" | "ILIKE" | "IN"
+        )
     }
 
     /// Tokenize SQL into segments.
@@ -241,7 +351,10 @@ impl SqlHighlighter {
             }
 
             // Named parameter (:name)
-            if c == ':' && i + 1 < chars.len() && (chars[i + 1].is_alphabetic() || chars[i + 1] == '_') {
+            if c == ':'
+                && i + 1 < chars.len()
+                && (chars[i + 1].is_alphabetic() || chars[i + 1] == '_')
+            {
                 let start = i;
                 i += 1;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -255,7 +368,9 @@ impl SqlHighlighter {
             }
 
             // Number
-            if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+            if c.is_ascii_digit()
+                || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
+            {
                 let start = i;
                 let mut has_dot = c == '.';
                 i += 1;
@@ -306,10 +421,8 @@ impl SqlHighlighter {
                 // Handle multi-char operators
                 if i < chars.len() {
                     let next = chars[i];
-                    let is_two_char_op = matches!(
-                        (c, next),
-                        ('<', '>' | '=') | ('>' | '!', '=') | ('|', '|')
-                    );
+                    let is_two_char_op =
+                        matches!((c, next), ('<', '>' | '=') | ('>' | '!', '=') | ('|', '|'));
                     if is_two_char_op {
                         i += 1;
                     }
@@ -396,9 +509,20 @@ impl SqlHighlighter {
             // Keywords that start a new line with same indentation
             if matches!(
                 upper.as_str(),
-                "SELECT" | "FROM" | "WHERE" | "ORDER" | "GROUP" | "HAVING" |
-                "LIMIT" | "OFFSET" | "SET" | "VALUES" | "RETURNING" | "UNION" |
-                "INTERSECT" | "EXCEPT"
+                "SELECT"
+                    | "FROM"
+                    | "WHERE"
+                    | "ORDER"
+                    | "GROUP"
+                    | "HAVING"
+                    | "LIMIT"
+                    | "OFFSET"
+                    | "SET"
+                    | "VALUES"
+                    | "RETURNING"
+                    | "UNION"
+                    | "INTERSECT"
+                    | "EXCEPT"
             ) {
                 if !result.is_empty() && !result.ends_with('\n') {
                     result.push('\n');
@@ -487,7 +611,9 @@ mod tests {
         let h = SqlHighlighter::new();
         let segments = h.tokenize("SELECT 'hello'");
 
-        let has_string = segments.iter().any(|s| s.token == SqlToken::String && s.text == "'hello'");
+        let has_string = segments
+            .iter()
+            .any(|s| s.token == SqlToken::String && s.text == "'hello'");
         assert!(has_string);
     }
 
@@ -528,7 +654,9 @@ mod tests {
         let h = SqlHighlighter::new();
         let segments = h.tokenize("SELECT * FROM users WHERE id = $1");
 
-        let has_param = segments.iter().any(|s| s.token == SqlToken::Parameter && s.text == "$1");
+        let has_param = segments
+            .iter()
+            .any(|s| s.token == SqlToken::Parameter && s.text == "$1");
         assert!(has_param);
     }
 
@@ -537,7 +665,9 @@ mod tests {
         let h = SqlHighlighter::new();
         let segments = h.tokenize("SELECT * FROM users WHERE id = ?");
 
-        let has_param = segments.iter().any(|s| s.token == SqlToken::Parameter && s.text == "?");
+        let has_param = segments
+            .iter()
+            .any(|s| s.token == SqlToken::Parameter && s.text == "?");
         assert!(has_param);
     }
 
@@ -546,7 +676,9 @@ mod tests {
         let h = SqlHighlighter::new();
         let segments = h.tokenize("SELECT * FROM users WHERE id = :user_id");
 
-        let has_param = segments.iter().any(|s| s.token == SqlToken::Parameter && s.text == ":user_id");
+        let has_param = segments
+            .iter()
+            .any(|s| s.token == SqlToken::Parameter && s.text == ":user_id");
         assert!(has_param);
     }
 
@@ -555,8 +687,12 @@ mod tests {
         let h = SqlHighlighter::new();
         let segments = h.tokenize("SELECT * FROM users WHERE age >= 18 AND active = true");
 
-        let has_ge = segments.iter().any(|s| s.token == SqlToken::Operator && s.text == ">=");
-        let has_and = segments.iter().any(|s| s.token == SqlToken::Operator && s.text.to_uppercase() == "AND");
+        let has_ge = segments
+            .iter()
+            .any(|s| s.token == SqlToken::Operator && s.text == ">=");
+        let has_and = segments
+            .iter()
+            .any(|s| s.token == SqlToken::Operator && s.text.to_uppercase() == "AND");
         assert!(has_ge);
         assert!(has_and);
     }
@@ -566,7 +702,9 @@ mod tests {
         let h = SqlHighlighter::new();
         let segments = h.tokenize("SELECT \"user-name\" FROM users");
 
-        let has_quoted = segments.iter().any(|s| s.token == SqlToken::Identifier && s.text == "\"user-name\"");
+        let has_quoted = segments
+            .iter()
+            .any(|s| s.token == SqlToken::Identifier && s.text == "\"user-name\"");
         assert!(has_quoted);
     }
 
@@ -631,7 +769,9 @@ mod tests {
         let h = SqlHighlighter::new();
         let segments = h.tokenize("SELECT 1.5e10");
 
-        let has_num = segments.iter().any(|s| s.token == SqlToken::Number && s.text.contains('e'));
+        let has_num = segments
+            .iter()
+            .any(|s| s.token == SqlToken::Number && s.text.contains('e'));
         assert!(has_num);
     }
 

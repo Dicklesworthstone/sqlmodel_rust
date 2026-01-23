@@ -377,7 +377,11 @@ impl BatchOperationTracker {
         // Line 2: Row stats
         let rate = self.throughput();
         let error_str = if self.error_count == 0 {
-            format!("{}{} errors{reset}", theme.success.color_code(), self.error_count)
+            format!(
+                "{}{} errors{reset}",
+                theme.success.color_code(),
+                self.error_count
+            )
         } else if self.error_count > self.error_threshold {
             format!(
                 "{}{} errors (threshold exceeded!){reset}",
@@ -625,7 +629,7 @@ mod tests {
         tracker.complete_batch(100);
 
         assert!(tracker.is_complete());
-        assert_eq!(tracker.batch_percentage(), 100.0);
+        assert!((tracker.batch_percentage() - 100.0).abs() < f64::EPSILON);
         assert_eq!(tracker.current_state(), BatchState::Complete);
     }
 

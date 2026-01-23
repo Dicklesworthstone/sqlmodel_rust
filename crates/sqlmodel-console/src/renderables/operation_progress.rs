@@ -264,11 +264,7 @@ impl OperationProgress {
 
         if self.show_throughput && self.completed > 0 {
             let rate = self.throughput();
-            let unit_label = if self.unit.is_empty() {
-                ""
-            } else {
-                &self.unit
-            };
+            let unit_label = if self.unit.is_empty() { "" } else { &self.unit };
             parts.push(format!("{rate:.1}{unit_label}/s"));
         }
 
@@ -305,8 +301,7 @@ impl OperationProgress {
         // Build the progress bar
         let bar = format!(
             "{bar_color}[{filled}{empty}]{reset}",
-            filled = "=".repeat(filled.saturating_sub(1))
-                + if filled > 0 { ">" } else { "" },
+            filled = "=".repeat(filled.saturating_sub(1)) + if filled > 0 { ">" } else { "" },
             empty = " ".repeat(empty),
         );
 
@@ -320,11 +315,7 @@ impl OperationProgress {
 
         if self.show_throughput && self.completed > 0 {
             let rate = self.throughput();
-            let unit_label = if self.unit.is_empty() {
-                ""
-            } else {
-                &self.unit
-            };
+            let unit_label = if self.unit.is_empty() { "" } else { &self.unit };
             parts.push(format!("{rate:.1}{unit_label}/s"));
         }
 

@@ -152,9 +152,8 @@ impl QueryTiming {
 
     /// Calculate the total from phases if not set.
     fn effective_total(&self) -> Duration {
-        self.total_time.unwrap_or_else(|| {
-            self.phases.iter().map(|p| p.duration).sum()
-        })
+        self.total_time
+            .unwrap_or_else(|| self.phases.iter().map(|p| p.duration).sum())
     }
 
     /// Render as plain text.
@@ -165,7 +164,9 @@ impl QueryTiming {
         let total = self.effective_total();
 
         // Header line
-        let row_info = self.row_count.map_or(String::new(), |r| format!(" ({} rows)", r));
+        let row_info = self
+            .row_count
+            .map_or(String::new(), |r| format!(" ({} rows)", r));
         lines.push(format!(
             "Query completed in {}{}",
             Self::format_duration(total),
@@ -206,7 +207,9 @@ impl QueryTiming {
         let mut lines = Vec::new();
 
         // Header line
-        let row_info = self.row_count.map_or(String::new(), |r| format!(" ({} rows)", r));
+        let row_info = self
+            .row_count
+            .map_or(String::new(), |r| format!(" ({} rows)", r));
         lines.push(format!(
             "{success_color}Query completed in {}{row_info}{reset}",
             Self::format_duration(total),
@@ -391,9 +394,7 @@ mod tests {
 
     #[test]
     fn test_render_plain_basic() {
-        let timing = QueryTiming::new()
-            .total(Duration::from_millis(12))
-            .rows(3);
+        let timing = QueryTiming::new().total(Duration::from_millis(12)).rows(3);
 
         let output = timing.render_plain();
         assert!(output.contains("Query completed"));
@@ -505,8 +506,7 @@ mod tests {
 
     #[test]
     fn test_fetch_phase() {
-        let timing = QueryTiming::new()
-            .fetch(Duration::from_micros(1000));
+        let timing = QueryTiming::new().fetch(Duration::from_micros(1000));
 
         assert_eq!(timing.phases.len(), 1);
         assert_eq!(timing.phases[0].name, "Fetch");
@@ -514,8 +514,7 @@ mod tests {
 
     #[test]
     fn test_custom_phase() {
-        let timing = QueryTiming::new()
-            .phase("Custom", Duration::from_micros(1000));
+        let timing = QueryTiming::new().phase("Custom", Duration::from_micros(1000));
 
         assert_eq!(timing.phases.len(), 1);
         assert_eq!(timing.phases[0].name, "Custom");

@@ -101,7 +101,11 @@ impl QueryTreeView {
 
     /// Add a node with children (for lists like columns).
     #[must_use]
-    pub fn add_child(mut self, label: impl Into<String>, items: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn add_child(
+        mut self,
+        label: impl Into<String>,
+        items: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         let mut node = TreeNode::new(label);
         for item in items {
             node.children.push(TreeNode::new(item));
@@ -156,7 +160,14 @@ impl QueryTreeView {
     }
 
     /// Recursively render a node in plain text.
-    fn render_node_plain(&self, node: &TreeNode, prefix: &str, is_last: bool, depth: usize, lines: &mut Vec<String>) {
+    fn render_node_plain(
+        &self,
+        node: &TreeNode,
+        prefix: &str,
+        is_last: bool,
+        depth: usize,
+        lines: &mut Vec<String>,
+    ) {
         let (branch, last_branch, vertical, space) = self.chars();
 
         // Root node handling (depth 0)
@@ -203,7 +214,15 @@ impl QueryTreeView {
     }
 
     /// Recursively render a node with styling.
-    fn render_node_styled(&self, node: &TreeNode, prefix: &str, is_last: bool, depth: usize, lines: &mut Vec<String>, theme: &Theme) {
+    fn render_node_styled(
+        &self,
+        node: &TreeNode,
+        prefix: &str,
+        is_last: bool,
+        depth: usize,
+        lines: &mut Vec<String>,
+        theme: &Theme,
+    ) {
         let (branch, last_branch, vertical, space) = self.chars();
         let reset = "\x1b[0m";
         let dim = theme.dim.color_code();
@@ -213,7 +232,10 @@ impl QueryTreeView {
         // Root node handling (depth 0)
         if depth == 0 {
             let root_line = if let Some(ref value) = node.value {
-                format!("{keyword_color}{}{reset}: {value_color}{}{reset}", node.label, value)
+                format!(
+                    "{keyword_color}{}{reset}: {value_color}{}{reset}",
+                    node.label, value
+                )
             } else {
                 format!("{keyword_color}{}{reset}", node.label)
             };
@@ -226,10 +248,7 @@ impl QueryTreeView {
                     node.label, value
                 )
             } else {
-                format!(
-                    "{dim}{prefix}{connector}{reset}{}",
-                    node.label
-                )
+                format!("{dim}{prefix}{connector}{reset}{}", node.label)
             };
             lines.push(line);
         }
@@ -259,14 +278,21 @@ impl QueryTreeView {
     /// Convert a node to JSON.
     fn node_to_json(node: &TreeNode) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
-        obj.insert("label".to_string(), serde_json::Value::String(node.label.clone()));
+        obj.insert(
+            "label".to_string(),
+            serde_json::Value::String(node.label.clone()),
+        );
 
         if let Some(ref value) = node.value {
-            obj.insert("value".to_string(), serde_json::Value::String(value.clone()));
+            obj.insert(
+                "value".to_string(),
+                serde_json::Value::String(value.clone()),
+            );
         }
 
         if !node.children.is_empty() {
-            let children: Vec<serde_json::Value> = node.children.iter().map(Self::node_to_json).collect();
+            let children: Vec<serde_json::Value> =
+                node.children.iter().map(Self::node_to_json).collect();
             obj.insert("children".to_string(), serde_json::Value::Array(children));
         }
 
@@ -367,10 +393,7 @@ impl SelectTreeBuilder {
     /// Build the query tree view.
     #[must_use]
     pub fn build(self) -> QueryTreeView {
-        let root_label = format!(
-            "SELECT from {}",
-            self.table.as_deref().unwrap_or("?")
-        );
+        let root_label = format!("SELECT from {}", self.table.as_deref().unwrap_or("?"));
         let mut tree = QueryTreeView::new(root_label);
 
         // Columns
@@ -430,8 +453,7 @@ mod tests {
 
     #[test]
     fn test_query_tree_with_node() {
-        let tree = QueryTreeView::new("SELECT from users")
-            .add_node("WHERE", "id = 1");
+        let tree = QueryTreeView::new("SELECT from users").add_node("WHERE", "id = 1");
 
         let output = tree.render_plain();
         assert!(output.contains("WHERE: id = 1"));
@@ -471,8 +493,7 @@ mod tests {
 
     #[test]
     fn test_query_tree_styled_contains_ansi() {
-        let tree = QueryTreeView::new("SELECT from users")
-            .add_node("WHERE", "id = 1");
+        let tree = QueryTreeView::new("SELECT from users").add_node("WHERE", "id = 1");
 
         let styled = tree.render_styled();
         assert!(styled.contains('\x1b'));
@@ -480,8 +501,7 @@ mod tests {
 
     #[test]
     fn test_query_tree_to_json() {
-        let tree = QueryTreeView::new("SELECT from users")
-            .add_node("WHERE", "id = 1");
+        let tree = QueryTreeView::new("SELECT from users").add_node("WHERE", "id = 1");
 
         let json = tree.to_json();
         assert_eq!(json["label"], "SELECT from users");
@@ -546,14 +566,10 @@ mod tests {
 
     #[test]
     fn test_nested_tree() {
-        let tree = QueryTreeView::new("Root")
-            .add_tree_node(
-                TreeNode::new("Level 1")
-                    .add_child(
-                        TreeNode::new("Level 2")
-                            .add_child(TreeNode::new("Level 3"))
-                    )
-            );
+        let tree = QueryTreeView::new("Root").add_tree_node(
+            TreeNode::new("Level 1")
+                .add_child(TreeNode::new("Level 2").add_child(TreeNode::new("Level 3"))),
+        );
 
         let output = tree.render_plain();
         assert!(output.contains("Root"));

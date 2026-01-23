@@ -106,7 +106,9 @@ impl ValueType {
                 && parts[2].len() == 4
                 && parts[3].len() == 4
                 && parts[4].len() == 12
-                && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+                && parts
+                    .iter()
+                    .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
             {
                 return Self::Uuid;
             }
@@ -132,7 +134,11 @@ impl ValueType {
         // Check for time pattern (HH:MM:SS)
         if trimmed.len() >= 8 && trimmed.contains(':') && !trimmed.contains('-') {
             let parts: Vec<&str> = trimmed.split(':').collect();
-            if parts.len() >= 2 && parts.iter().all(|p| p.parse::<u32>().is_ok() || p.contains('.')) {
+            if parts.len() >= 2
+                && parts
+                    .iter()
+                    .all(|p| p.parse::<u32>().is_ok() || p.contains('.'))
+            {
                 return Self::Time;
             }
         }
@@ -272,7 +278,8 @@ impl QueryResultTable {
     pub fn from_data(columns: Vec<String>, rows: Vec<Vec<String>>) -> Self {
         let mut table = Self::new();
         table.columns = columns;
-        table.rows = rows.into_iter()
+        table.rows = rows
+            .into_iter()
             .map(|row| row.into_iter().map(Cell::new).collect())
             .collect();
         table
@@ -309,7 +316,10 @@ impl QueryResultTable {
 
     /// Add multiple rows at once.
     #[must_use]
-    pub fn rows(mut self, rows: impl IntoIterator<Item = impl IntoIterator<Item = impl Into<String>>>) -> Self {
+    pub fn rows(
+        mut self,
+        rows: impl IntoIterator<Item = impl IntoIterator<Item = impl Into<String>>>,
+    ) -> Self {
         for row in rows {
             let cells: Vec<Cell> = row.into_iter().map(|v| Cell::new(v)).collect();
             self.rows.push(cells);
@@ -380,11 +390,7 @@ impl QueryResultTable {
 
     /// Calculate column widths based on content.
     fn calculate_column_widths(&self) -> Vec<usize> {
-        let mut widths: Vec<usize> = self
-            .columns
-            .iter()
-            .map(|c| c.chars().count())
-            .collect();
+        let mut widths: Vec<usize> = self.columns.iter().map(|c| c.chars().count()).collect();
 
         // Consider row number column if enabled
         if self.show_row_numbers {
@@ -477,7 +483,10 @@ impl QueryResultTable {
 
         // Truncation indicator
         if truncated {
-            lines.push(format!("... and {} more rows", self.rows.len() - display_rows));
+            lines.push(format!(
+                "... and {} more rows",
+                self.rows.len() - display_rows
+            ));
         }
 
         lines.join("\n")
@@ -540,8 +549,10 @@ impl QueryResultTable {
                             }
                             ValueType::Float => {
                                 if let Ok(n) = cell.value.parse::<f64>() {
-                                    serde_json::Number::from_f64(n)
-                                        .map_or_else(|| serde_json::Value::String(cell.value.clone()), serde_json::Value::Number)
+                                    serde_json::Number::from_f64(n).map_or_else(
+                                        || serde_json::Value::String(cell.value.clone()),
+                                        serde_json::Value::Number,
+                                    )
                                 } else {
                                     serde_json::Value::String(cell.value.clone())
                                 }
@@ -584,8 +595,10 @@ impl QueryResultTable {
                             }
                             ValueType::Float => {
                                 if let Ok(n) = cell.value.parse::<f64>() {
-                                    serde_json::Number::from_f64(n)
-                                        .map_or_else(|| serde_json::Value::String(cell.value.clone()), serde_json::Value::Number)
+                                    serde_json::Number::from_f64(n).map_or_else(
+                                        || serde_json::Value::String(cell.value.clone()),
+                                        serde_json::Value::Number,
+                                    )
                                 } else {
                                     serde_json::Value::String(cell.value.clone())
                                 }
@@ -625,7 +638,10 @@ impl QueryResultTable {
             let full_title = format!(" {title}{timing_str} ");
             let title_len = full_title.chars().count();
             let left_pad = (total_width.saturating_sub(2).saturating_sub(title_len)) / 2;
-            let right_pad = total_width.saturating_sub(2).saturating_sub(title_len).saturating_sub(left_pad);
+            let right_pad = total_width
+                .saturating_sub(2)
+                .saturating_sub(title_len)
+                .saturating_sub(left_pad);
 
             lines.push(format!(
                 "{border_color}╭{}{}{}╮{reset}",
@@ -637,7 +653,10 @@ impl QueryResultTable {
             let timing_str = format!(" {} rows in {:.2}ms ", self.rows.len(), ms);
             let timing_len = timing_str.chars().count();
             let left_pad = (total_width.saturating_sub(2).saturating_sub(timing_len)) / 2;
-            let right_pad = total_width.saturating_sub(2).saturating_sub(timing_len).saturating_sub(left_pad);
+            let right_pad = total_width
+                .saturating_sub(2)
+                .saturating_sub(timing_len)
+                .saturating_sub(left_pad);
 
             lines.push(format!(
                 "{border_color}╭{}{}{}╮{reset}",
@@ -661,7 +680,11 @@ impl QueryResultTable {
             let col_idx = if self.show_row_numbers { i + 1 } else { i };
             let width = widths.get(col_idx).copied().unwrap_or(10);
             let truncated = Self::truncate_value(col, width);
-            header_cells.push(format!("{header_color}{:width$}{reset}", truncated, width = width));
+            header_cells.push(format!(
+                "{header_color}{:width$}{reset}",
+                truncated,
+                width = width
+            ));
         }
         lines.push(format!(
             "{border_color}│{reset} {} {border_color}│{reset}",
@@ -685,7 +708,11 @@ impl QueryResultTable {
 
             if self.show_row_numbers {
                 let row_num_width = widths[0];
-                cells.push(format!("{dim}{:>width$}{reset}", idx + 1, width = row_num_width));
+                cells.push(format!(
+                    "{dim}{:>width$}{reset}",
+                    idx + 1,
+                    width = row_num_width
+                ));
             }
 
             for (i, cell) in row.iter().enumerate() {
@@ -700,7 +727,11 @@ impl QueryResultTable {
                         format!("{color}{:>width$}{reset}", truncated_val, width = width)
                     }
                     ValueType::Null => {
-                        format!("{color}\x1b[3m{:^width$}\x1b[23m{reset}", truncated_val, width = width)
+                        format!(
+                            "{color}\x1b[3m{:^width$}\x1b[23m{reset}",
+                            truncated_val,
+                            width = width
+                        )
                     }
                     _ => {
                         format!("{color}{:width$}{reset}", truncated_val, width = width)
@@ -718,7 +749,9 @@ impl QueryResultTable {
         // Truncation indicator
         if truncated {
             let more_text = format!("... and {} more rows", self.rows.len() - display_rows);
-            let padding = total_width.saturating_sub(4).saturating_sub(more_text.len());
+            let padding = total_width
+                .saturating_sub(4)
+                .saturating_sub(more_text.len());
             lines.push(format!(
                 "{border_color}│{reset} {dim}{more_text}{:padding$}{reset} {border_color}│{reset}",
                 "",
@@ -761,8 +794,10 @@ impl QueryResultTable {
                             }
                             ValueType::Float => {
                                 if let Ok(n) = cell.value.parse::<f64>() {
-                                    serde_json::Number::from_f64(n)
-                                        .map_or_else(|| serde_json::Value::String(cell.value.clone()), serde_json::Value::Number)
+                                    serde_json::Number::from_f64(n).map_or_else(
+                                        || serde_json::Value::String(cell.value.clone()),
+                                        serde_json::Value::Number,
+                                    )
                                 } else {
                                     serde_json::Value::String(cell.value.clone())
                                 }
@@ -848,8 +883,14 @@ mod tests {
 
     #[test]
     fn test_value_type_inference_timestamp() {
-        assert_eq!(ValueType::infer("2024-01-15T10:30:00"), ValueType::Timestamp);
-        assert_eq!(ValueType::infer("2024-01-15 10:30:00"), ValueType::Timestamp);
+        assert_eq!(
+            ValueType::infer("2024-01-15T10:30:00"),
+            ValueType::Timestamp
+        );
+        assert_eq!(
+            ValueType::infer("2024-01-15 10:30:00"),
+            ValueType::Timestamp
+        );
     }
 
     #[test]
@@ -1008,7 +1049,10 @@ mod tests {
 
     #[test]
     fn test_truncate_value_long() {
-        assert_eq!(QueryResultTable::truncate_value("hello world", 8), "hello...");
+        assert_eq!(
+            QueryResultTable::truncate_value("hello world", 8),
+            "hello..."
+        );
     }
 
     #[test]
@@ -1032,9 +1076,7 @@ mod tests {
 
     #[test]
     fn test_render_styled_contains_box() {
-        let table = QueryResultTable::new()
-            .columns(vec!["id"])
-            .row(vec!["1"]);
+        let table = QueryResultTable::new().columns(vec!["id"]).row(vec!["1"]);
 
         let styled = table.render_styled();
         assert!(styled.contains("╭"));
