@@ -72,8 +72,7 @@ fn main() {
     plain.print(&progress.render_plain());
 
     rich.rule(Some("Spinner"));
-    let spinner = IndeterminateSpinner::new("Connecting to database")
-        .style(SpinnerStyle::Dots);
+    let spinner = IndeterminateSpinner::new("Connecting to database").style(SpinnerStyle::Dots);
     rich.print(&spinner.render_styled());
     plain.print(&spinner.render_plain());
 

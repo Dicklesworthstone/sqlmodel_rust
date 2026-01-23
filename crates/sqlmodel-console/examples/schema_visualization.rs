@@ -7,18 +7,16 @@ fn main() {
 
     rich.rule(Some("Schema Tree (Preview)"));
     let tree = QueryTreeView::new("Schema: app")
-        .add_child("users", [
-            "id (PK)",
-            "name",
-            "email (UNIQUE)",
-            "created_at",
-        ])
-        .add_child("posts", [
-            "id (PK)",
-            "user_id (FK -> users.id)",
-            "title",
-            "content (NULL)",
-        ]);
+        .add_child("users", ["id (PK)", "name", "email (UNIQUE)", "created_at"])
+        .add_child(
+            "posts",
+            [
+                "id (PK)",
+                "user_id (FK -> users.id)",
+                "title",
+                "content (NULL)",
+            ],
+        );
     rich.print(&tree.render_styled());
     plain.print(&tree.render_plain());
 

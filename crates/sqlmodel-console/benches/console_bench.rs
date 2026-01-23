@@ -22,7 +22,7 @@
 
 extern crate test;
 
-use test::{black_box, Bencher};
+use test::{Bencher, black_box};
 
 use sqlmodel_console::renderables::{
     BatchOperationTracker, Cell, ErrorPanel, IndeterminateSpinner, OperationProgress, PlainFormat,
@@ -220,12 +220,15 @@ fn bench_cell_new(b: &mut Bencher) {
 // ============================================================================
 
 fn create_sample_error() -> ErrorPanel {
-    ErrorPanel::new("Connection timeout", "Failed to connect within timeout period")
-        .with_sql("SELECT * FROM users WHERE id = $1")
-        .with_position(1)
-        .with_detail("Host: localhost:5432")
-        .with_hint("Check if the database server is running")
-        .with_sqlstate("08001")
+    ErrorPanel::new(
+        "Connection timeout",
+        "Failed to connect within timeout period",
+    )
+    .with_sql("SELECT * FROM users WHERE id = $1")
+    .with_position(1)
+    .with_detail("Host: localhost:5432")
+    .with_hint("Check if the database server is running")
+    .with_sqlstate("08001")
 }
 
 #[bench]

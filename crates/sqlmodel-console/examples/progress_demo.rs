@@ -1,8 +1,7 @@
 use std::time::Duration;
 
 use sqlmodel_console::renderables::{
-    BatchOperationTracker, IndeterminateSpinner, OperationProgress, PoolStatusDisplay,
-    SpinnerStyle,
+    BatchOperationTracker, IndeterminateSpinner, OperationProgress, PoolStatusDisplay, SpinnerStyle,
 };
 use sqlmodel_console::{OutputMode, SqlModelConsole};
 
@@ -32,8 +31,7 @@ fn main() {
         SpinnerStyle::Arrow,
         SpinnerStyle::Simple,
     ] {
-        let spinner = IndeterminateSpinner::new("Connecting")
-            .style(style);
+        let spinner = IndeterminateSpinner::new("Connecting").style(style);
         rich.print(&spinner.render_styled());
         plain.print(&spinner.render_plain());
     }
