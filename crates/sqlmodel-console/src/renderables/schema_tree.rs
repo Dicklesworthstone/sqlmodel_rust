@@ -291,10 +291,10 @@ impl SchemaTree {
         let connector = if is_last { last_branch } else { branch };
 
         // Table name with icon
-        let pk_info = if !table.primary_key.is_empty() {
-            format!(" [PK: {}]", table.primary_key.join(", "))
-        } else {
+        let pk_info = if table.primary_key.is_empty() {
             String::new()
+        } else {
+            format!(" [PK: {}]", table.primary_key.join(", "))
         };
         lines.push(format!("{prefix}{connector}Table: {}{pk_info}", table.name));
 
@@ -305,6 +305,7 @@ impl SchemaTree {
         };
 
         // Calculate total children for proper connectors
+        #[allow(clippy::type_complexity)]
         let mut children: Vec<(&str, Box<dyn Fn(&str, bool, &mut Vec<String>) + '_>)> = Vec::new();
 
         // Columns section
@@ -379,18 +380,18 @@ impl SchemaTree {
             }
 
             if self.config.show_constraints {
-                let mut constraints = Vec::new();
+                let mut constraints: Vec<String> = Vec::new();
                 if col.primary_key {
-                    constraints.push("PK");
+                    constraints.push("PK".into());
                 }
                 if col.auto_increment {
-                    constraints.push("AUTO");
+                    constraints.push("AUTO".into());
                 }
                 if !col.nullable {
-                    constraints.push("NOT NULL");
+                    constraints.push("NOT NULL".into());
                 }
                 if let Some(ref default) = col.default {
-                    constraints.push(&format!("DEFAULT {default}"));
+                    constraints.push(format!("DEFAULT {default}"));
                 }
                 if !constraints.is_empty() {
                     parts.push(format!("[{}]", constraints.join(", ")));
@@ -497,14 +498,14 @@ impl SchemaTree {
         let reset = "\x1b[0m";
         let dim = theme.dim.color_code();
         let table_color = theme.sql_keyword.color_code();
-        let name_color = theme.identifier.color_code();
+        let name_color = theme.sql_identifier.color_code();
         let pk_color = theme.dim.color_code();
 
         // Table name
-        let pk_info = if !table.primary_key.is_empty() {
-            format!(" {pk_color}[PK: {}]{reset}", table.primary_key.join(", "))
-        } else {
+        let pk_info = if table.primary_key.is_empty() {
             String::new()
+        } else {
+            format!(" {pk_color}[PK: {}]{reset}", table.primary_key.join(", "))
         };
         lines.push(format!(
             "{dim}{prefix}{connector}{reset}{table_color}Table:{reset} {name_color}{}{reset}{pk_info}",
@@ -518,6 +519,7 @@ impl SchemaTree {
         };
 
         // Sections
+        #[allow(clippy::type_complexity)]
         let mut sections: Vec<(&str, Box<dyn Fn(&str, bool, &mut Vec<String>, &Theme) + '_>)> =
             Vec::new();
 
@@ -582,8 +584,8 @@ impl SchemaTree {
         let (branch, last_branch, _, _) = self.chars();
         let reset = "\x1b[0m";
         let dim = theme.dim.color_code();
-        let name_color = theme.identifier.color_code();
-        let type_color = theme.sql_type.color_code();
+        let name_color = theme.sql_identifier.color_code();
+        let type_color = theme.sql_keyword.color_code();
         let constraint_color = theme.dim.color_code();
 
         let col_count = columns.len();
@@ -601,18 +603,18 @@ impl SchemaTree {
             }
 
             if self.config.show_constraints {
-                let mut constraints = Vec::new();
+                let mut constraints: Vec<String> = Vec::new();
                 if col.primary_key {
-                    constraints.push("PK");
+                    constraints.push("PK".into());
                 }
                 if col.auto_increment {
-                    constraints.push("AUTO");
+                    constraints.push("AUTO".into());
                 }
                 if !col.nullable {
-                    constraints.push("NOT NULL");
+                    constraints.push("NOT NULL".into());
                 }
                 if let Some(ref default) = col.default {
-                    constraints.push(&format!("DEFAULT {default}"));
+                    constraints.push(format!("DEFAULT {default}"));
                 }
                 if !constraints.is_empty() {
                     line.push_str(&format!(
@@ -638,7 +640,7 @@ impl SchemaTree {
         let (branch, last_branch, _, _) = self.chars();
         let reset = "\x1b[0m";
         let dim = theme.dim.color_code();
-        let name_color = theme.identifier.color_code();
+        let name_color = theme.sql_identifier.color_code();
         let keyword_color = theme.sql_keyword.color_code();
 
         let idx_count = indexes.len();
@@ -672,7 +674,7 @@ impl SchemaTree {
         let (branch, last_branch, _, _) = self.chars();
         let reset = "\x1b[0m";
         let dim = theme.dim.color_code();
-        let name_color = theme.identifier.color_code();
+        let name_color = theme.sql_identifier.color_code();
         let ref_color = theme.string_value.color_code();
 
         let fk_count = fks.len();
