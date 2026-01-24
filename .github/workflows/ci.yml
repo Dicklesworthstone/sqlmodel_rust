@@ -25,10 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone asupersync dependency
+      - name: Clone dependencies
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -55,19 +56,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone asupersync dependency (Unix)
+      - name: Clone dependencies (Unix)
         if: runner.os != 'Windows'
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
-      - name: Clone asupersync dependency (Windows)
+      - name: Clone dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync 2>$null
-          if (-not $?) { Write-Host "asupersync already exists or clone failed" }
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust 2>$null
+          if (-not $?) { Write-Host "Dependencies already exist or clone failed" }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -93,10 +96,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone asupersync dependency
+      - name: Clone dependencies
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -114,10 +118,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone asupersync dependency
+      - name: Clone dependencies
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -137,10 +142,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone asupersync dependency
+      - name: Clone dependencies
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
       - name: Install Rust toolchain (MSRV)
         uses: dtolnay/rust-toolchain@master
@@ -173,19 +179,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone asupersync dependency (Unix)
+      - name: Clone dependencies (Unix)
         if: runner.os != 'Windows'
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
-      - name: Clone asupersync dependency (Windows)
+      - name: Clone dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cd ..
           git clone https://github.com/Dicklesworthstone/asupersync.git asupersync 2>$null
-          if (-not $?) { Write-Host "asupersync already exists or clone failed" }
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust 2>$null
+          if (-not $?) { Write-Host "Dependencies already exist or clone failed" }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
