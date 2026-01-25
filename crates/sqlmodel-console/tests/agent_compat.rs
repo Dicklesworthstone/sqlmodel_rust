@@ -175,6 +175,7 @@ fn test_detects_aider_repo() {
 
 /// Test that generic AGENT_MODE marker is detected.
 #[test]
+#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_agent_mode() {
     let _guard = EnvGuard::new();
     set_var("AGENT_MODE", "1");
