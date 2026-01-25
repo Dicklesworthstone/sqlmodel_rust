@@ -917,8 +917,8 @@ mod tests {
         assert_eq!(format_number(999), "999");
         assert_eq!(format_number(1000), "1,000");
         assert_eq!(format_number(12345), "12,345");
-        assert_eq!(format_number(1234567), "1,234,567");
-        assert_eq!(format_number(1234567890), "1,234,567,890");
+        assert_eq!(format_number(1_234_567), "1,234,567");
+        assert_eq!(format_number(1_234_567_890), "1,234,567,890");
     }
 
     #[test]

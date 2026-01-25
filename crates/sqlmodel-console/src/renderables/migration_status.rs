@@ -813,8 +813,8 @@ mod tests {
         assert_eq!(record_ms.format_duration(), Some("45ms".to_string()));
 
         // Test seconds
-        let record_s = MigrationRecord::new("002", "test").duration_ms(Some(2500));
-        assert_eq!(record_s.format_duration(), Some("2.5s".to_string()));
+        let record_sec = MigrationRecord::new("002", "test").duration_ms(Some(2500));
+        assert_eq!(record_sec.format_duration(), Some("2.5s".to_string()));
 
         // Test minutes
         let record_m = MigrationRecord::new("003", "test").duration_ms(Some(125_000));
