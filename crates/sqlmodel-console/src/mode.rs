@@ -395,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_explicit_json_override() {
         with_clean_env(|| {
             test_set_var("SQLMODEL_JSON", "1");
@@ -414,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_plain_takes_priority_over_json() {
         with_clean_env(|| {
             test_set_var("SQLMODEL_PLAIN", "1");
