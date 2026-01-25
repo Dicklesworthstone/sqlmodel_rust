@@ -786,8 +786,8 @@ mod tests {
         let ts = formatted.unwrap();
         assert!(ts.contains("2024-01-15"));
         assert!(ts.contains("10:30:00"));
-        assert!(!ts.contains("T")); // Should be replaced with space
-        assert!(!ts.contains("Z")); // Should be stripped
+        assert!(!ts.contains('T')); // Should be replaced with space
+        assert!(!ts.contains('Z')); // Should be stripped
     }
 
     // === Test 8: test_migration_checksums ===
