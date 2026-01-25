@@ -18,6 +18,17 @@
 //! conn.set_console(Some(console));
 //! ```
 
+// Allow casts in FFI code where we need to match C types exactly
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::result_large_err)] // Error type is defined in sqlmodel-core
+#![allow(clippy::borrow_as_ptr)] // FFI requires raw pointers
+#![allow(clippy::if_not_else)] // Clearer for error handling
+#![allow(clippy::implicit_clone)] // Minor optimization
+#![allow(clippy::map_unwrap_or)] // Clearer for optional formatting
+#![allow(clippy::redundant_closure)] // format_value requires context
+
 use crate::ffi;
 use crate::types;
 use sqlmodel_core::{
@@ -705,9 +716,9 @@ impl Connection for SqliteConnection {
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
 
-    fn close(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
+    async fn close(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
         // Connection is closed on drop
-        async { Ok(()) }
+        Ok(())
     }
 }
 

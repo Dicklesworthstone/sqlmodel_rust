@@ -9,10 +9,15 @@
 //!
 //! We map these to/from sqlmodel-core's Value type.
 
+// Allow casts in FFI code where we need to match C types exactly
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::checked_conversions)]
+
 use crate::ffi;
 use sqlmodel_core::Value;
-use std::ffi::{CStr, c_int, c_void};
-use std::ptr;
+use std::ffi::{CStr, c_int};
 
 /// Bind a Value to a prepared statement parameter.
 ///
@@ -319,11 +324,9 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Int(v) => serde_json::Value::Number((*v).into()),
         Value::BigInt(v) => serde_json::Value::Number((*v).into()),
         Value::Float(v) => serde_json::Number::from_f64(f64::from(*v))
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::Double(v) => serde_json::Number::from_f64(*v)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::Decimal(s) | Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Bytes(b) => serde_json::Value::String(base64_encode(b)),
         Value::Date(d) => serde_json::Value::String(days_to_date(*d)),
