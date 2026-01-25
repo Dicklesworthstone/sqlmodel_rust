@@ -895,6 +895,7 @@ fn error_code_to_kind(code: c_int) -> QueryErrorKind {
 }
 
 /// Format a Value for display in console output.
+#[allow(dead_code)]
 fn format_value(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
@@ -1203,6 +1204,7 @@ impl SqliteConnection {
 
     /// No-op when console feature is disabled.
     #[cfg(not(feature = "console"))]
+    #[allow(dead_code)]
     fn emit_open_status(&self) {}
 
     /// No-op when console feature is disabled.
@@ -1211,10 +1213,12 @@ impl SqliteConnection {
 
     /// No-op when console feature is disabled.
     #[cfg(not(feature = "console"))]
+    #[allow(dead_code)]
     fn emit_query_timing(&self, _elapsed_ms: f64, _rows: usize) {}
 
     /// No-op when console feature is disabled.
     #[cfg(not(feature = "console"))]
+    #[allow(dead_code)]
     fn emit_query_result(
         &self,
         _sql: &str,
@@ -1226,6 +1230,7 @@ impl SqliteConnection {
 
     /// No-op when console feature is disabled.
     #[cfg(not(feature = "console"))]
+    #[allow(dead_code)]
     fn emit_execute_timing(&self, _sql: &str, _rows_affected: u64, _elapsed_ms: f64) {}
 
     /// No-op when console feature is disabled.

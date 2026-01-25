@@ -79,8 +79,11 @@ jobs:
           vcpkg integrate install
           vcpkg install sqlite3:x64-windows
           $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          echo "SQLITE3_LIB_DIR=$vcpkgRoot\installed\x64-windows\lib" >> $env:GITHUB_ENV
+          $libDir = "$vcpkgRoot\installed\x64-windows\lib"
+          echo "SQLITE3_LIB_DIR=$libDir" >> $env:GITHUB_ENV
           echo "SQLITE3_INCLUDE_DIR=$vcpkgRoot\installed\x64-windows\include" >> $env:GITHUB_ENV
+          # Add to LIB for MSVC linker to find sqlite3.lib
+          echo "LIB=$libDir;$env:LIB" >> $env:GITHUB_ENV
           # Add to PATH for runtime DLL
           echo "$vcpkgRoot\installed\x64-windows\bin" >> $env:GITHUB_PATH
 
@@ -214,8 +217,11 @@ jobs:
           vcpkg integrate install
           vcpkg install sqlite3:x64-windows
           $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          echo "SQLITE3_LIB_DIR=$vcpkgRoot\installed\x64-windows\lib" >> $env:GITHUB_ENV
+          $libDir = "$vcpkgRoot\installed\x64-windows\lib"
+          echo "SQLITE3_LIB_DIR=$libDir" >> $env:GITHUB_ENV
           echo "SQLITE3_INCLUDE_DIR=$vcpkgRoot\installed\x64-windows\include" >> $env:GITHUB_ENV
+          # Add to LIB for MSVC linker to find sqlite3.lib
+          echo "LIB=$libDir;$env:LIB" >> $env:GITHUB_ENV
           # Add to PATH for runtime DLL
           echo "$vcpkgRoot\installed\x64-windows\bin" >> $env:GITHUB_PATH
 

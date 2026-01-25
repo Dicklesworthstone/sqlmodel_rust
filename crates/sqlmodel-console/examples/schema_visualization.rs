@@ -21,7 +21,7 @@ fn main() {
     plain.print(&tree.render_plain());
 
     rich.rule(Some("DDL Highlight"));
-    let ddl = r#"
+    let ddl = r"
 CREATE TABLE users (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -35,7 +35,7 @@ CREATE TABLE posts (
   title TEXT NOT NULL,
   content TEXT
 );
-"#;
+";
 
     let highlighter = SqlHighlighter::new();
     rich.print(&highlighter.highlight(ddl));
