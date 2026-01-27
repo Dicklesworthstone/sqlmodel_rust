@@ -60,6 +60,9 @@ pub struct FieldInfo {
     pub column_name: &'static str,
     /// SQL type for this field
     pub sql_type: SqlType,
+    /// Explicit SQL type override string (e.g., "VARCHAR(255)", "DECIMAL(10,2)")
+    /// When set, this takes precedence over `sql_type` in DDL generation.
+    pub sql_type_override: Option<&'static str>,
     /// Whether this field is nullable
     pub nullable: bool,
     /// Whether this is a primary key
@@ -87,6 +90,7 @@ impl FieldInfo {
             name,
             column_name,
             sql_type,
+            sql_type_override: None,
             nullable: false,
             primary_key: false,
             auto_increment: false,
@@ -103,6 +107,31 @@ impl FieldInfo {
     pub const fn column(mut self, name: &'static str) -> Self {
         self.column_name = name;
         self
+    }
+
+    /// Set explicit SQL type override.
+    ///
+    /// When set, this string will be used directly in DDL generation instead
+    /// of the `sql_type.sql_name()`. Use this for database-specific types like
+    /// `VARCHAR(255)`, `DECIMAL(10,2)`, `TINYINT UNSIGNED`, etc.
+    pub const fn sql_type_override(mut self, type_str: &'static str) -> Self {
+        self.sql_type_override = Some(type_str);
+        self
+    }
+
+    /// Set SQL type override from optional.
+    pub const fn sql_type_override_opt(mut self, type_str: Option<&'static str>) -> Self {
+        self.sql_type_override = type_str;
+        self
+    }
+
+    /// Get the effective SQL type name for DDL generation.
+    ///
+    /// Returns `sql_type_override` if set, otherwise falls back to `sql_type.sql_name()`.
+    #[must_use]
+    pub fn effective_sql_type(&self) -> String {
+        self.sql_type_override
+            .map_or_else(|| self.sql_type.sql_name(), str::to_string)
     }
 
     /// Set nullable flag.

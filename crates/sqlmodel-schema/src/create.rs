@@ -97,7 +97,7 @@ impl<M: Model> CreateTable<M> {
     }
 
     fn column_definition(&self, field: &FieldInfo) -> String {
-        let mut def = format!("  \"{}\" {}", field.column_name, field.sql_type.sql_name());
+        let mut def = format!("  \"{}\" {}", field.column_name, field.effective_sql_type());
 
         if !field.nullable && !field.auto_increment {
             def.push_str(" NOT NULL");
@@ -142,6 +142,7 @@ mod tests {
                     name: "id",
                     column_name: "id",
                     sql_type: SqlType::BigInt,
+                    sql_type_override: None,
                     nullable: true,
                     primary_key: true,
                     auto_increment: true,
@@ -156,6 +157,7 @@ mod tests {
                     name: "name",
                     column_name: "name",
                     sql_type: SqlType::Text,
+                    sql_type_override: None,
                     nullable: false,
                     primary_key: false,
                     auto_increment: false,
@@ -170,6 +172,7 @@ mod tests {
                     name: "age",
                     column_name: "age",
                     sql_type: SqlType::Integer,
+                    sql_type_override: None,
                     nullable: true,
                     primary_key: false,
                     auto_increment: false,
@@ -184,6 +187,7 @@ mod tests {
                     name: "team_id",
                     column_name: "team_id",
                     sql_type: SqlType::BigInt,
+                    sql_type_override: None,
                     nullable: true,
                     primary_key: false,
                     auto_increment: false,
@@ -313,6 +317,7 @@ mod tests {
                     name: "id",
                     column_name: "id",
                     sql_type: SqlType::Integer,
+                    sql_type_override: None,
                     nullable: false,
                     primary_key: true,
                     auto_increment: false,
@@ -327,6 +332,7 @@ mod tests {
                     name: "is_active",
                     column_name: "is_active",
                     sql_type: SqlType::Boolean,
+                    sql_type_override: None,
                     nullable: false,
                     primary_key: false,
                     auto_increment: false,
@@ -378,6 +384,7 @@ mod tests {
                     name: "id",
                     column_name: "id",
                     sql_type: SqlType::BigInt,
+                    sql_type_override: None,
                     nullable: true,
                     primary_key: true,
                     auto_increment: true,
@@ -392,6 +399,7 @@ mod tests {
                     name: "post_id",
                     column_name: "post_id",
                     sql_type: SqlType::BigInt,
+                    sql_type_override: None,
                     nullable: false,
                     primary_key: false,
                     auto_increment: false,
@@ -459,6 +467,101 @@ mod tests {
             Some(ReferentialAction::SetNull)
         );
         assert_eq!(ReferentialAction::from_str("invalid"), None);
+    }
+
+    // Test model with sql_type_override
+    struct TestWithSqlTypeOverride;
+
+    impl Model for TestWithSqlTypeOverride {
+        const TABLE_NAME: &'static str = "products";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo {
+                    name: "id",
+                    column_name: "id",
+                    sql_type: SqlType::BigInt,
+                    sql_type_override: None,
+                    nullable: true,
+                    primary_key: true,
+                    auto_increment: true,
+                    unique: false,
+                    default: None,
+                    foreign_key: None,
+                    on_delete: None,
+                    on_update: None,
+                    index: None,
+                },
+                FieldInfo {
+                    name: "price",
+                    column_name: "price",
+                    sql_type: SqlType::Real,                  // Base type
+                    sql_type_override: Some("DECIMAL(10,2)"), // Override for precision
+                    nullable: false,
+                    primary_key: false,
+                    auto_increment: false,
+                    unique: false,
+                    default: None,
+                    foreign_key: None,
+                    on_delete: None,
+                    on_update: None,
+                    index: None,
+                },
+                FieldInfo {
+                    name: "sku",
+                    column_name: "sku",
+                    sql_type: SqlType::Text,                // Base type
+                    sql_type_override: Some("VARCHAR(50)"), // Override for length constraint
+                    nullable: false,
+                    primary_key: false,
+                    auto_increment: false,
+                    unique: true,
+                    default: None,
+                    foreign_key: None,
+                    on_delete: None,
+                    on_update: None,
+                    index: None,
+                },
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestWithSqlTypeOverride)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_create_table_sql_type_override() {
+        let sql = CreateTable::<TestWithSqlTypeOverride>::new().build();
+        // Override types should be used instead of base types
+        assert!(sql.contains("\"price\" DECIMAL(10,2) NOT NULL"));
+        assert!(sql.contains("\"sku\" VARCHAR(50) NOT NULL"));
+        // Non-overridden types use sql_type.sql_name()
+        assert!(sql.contains("\"id\" BIGINT"));
+    }
+
+    #[test]
+    fn test_field_info_effective_sql_type() {
+        let field_no_override = FieldInfo::new("col", "col", SqlType::Integer);
+        assert_eq!(field_no_override.effective_sql_type(), "INTEGER");
+
+        let field_with_override =
+            FieldInfo::new("col", "col", SqlType::Text).sql_type_override("VARCHAR(255)");
+        assert_eq!(field_with_override.effective_sql_type(), "VARCHAR(255)");
     }
 }
 
