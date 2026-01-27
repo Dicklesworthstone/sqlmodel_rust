@@ -1,7 +1,7 @@
 //! SELECT query builder.
 
 use crate::clause::{Limit, Offset, OrderBy, Where};
-use crate::eager::{build_join_clause, find_relationship, EagerLoader, IncludePath};
+use crate::eager::{EagerLoader, IncludePath, build_join_clause, find_relationship};
 use crate::expr::{Dialect, Expr};
 use crate::join::Join;
 use asupersync::{Cx, Outcome};
@@ -169,6 +169,7 @@ impl<M: Model> Select<M> {
     /// Build SQL for eager loading with JOINs.
     ///
     /// Generates SELECT with aliased columns and LEFT JOINs for included relationships.
+    #[tracing::instrument(level = "trace", skip(self))]
     fn build_eager(&self) -> (String, Vec<Value>, Vec<EagerJoinInfo>) {
         let mut sql = String::new();
         let mut params = Vec::new();
@@ -210,10 +211,7 @@ impl<M: Model> Select<M> {
 
                     // Add aliased columns for related table
                     // We select all columns and alias them
-                    col_parts.push(format!(
-                        "{}.*",
-                        rel.related_table
-                    ));
+                    col_parts.push(format!("{}.*", rel.related_table));
                 }
             }
         }
@@ -290,8 +288,17 @@ impl<M: Model> Select<M> {
     /// Execute the query with eager loading and return hydrated models.
     ///
     /// This method fetches the parent models along with their eagerly loaded
-    /// relationships in a single query using JOINs. The `Related<T>` and
-    /// `RelatedMany<T>` fields are populated with the loaded data.
+    /// relationships in a single query using JOINs. Results are deduplicated
+    /// by primary key to handle one-to-many JOINs.
+    ///
+    /// # Note
+    ///
+    /// Currently, this method parses parent models from aliased columns and
+    /// deduplicates by primary key. Full hydration of `Related<T>` and
+    /// `RelatedMany<T>` fields requires macro support and is tracked
+    /// separately. The JOIN query is still valuable as it:
+    /// - Fetches all data in a single query (avoiding N+1)
+    /// - Returns related data that can be accessed via `row.subset_by_prefix()`
     ///
     /// # Example
     ///
@@ -300,14 +307,8 @@ impl<M: Model> Select<M> {
     ///     .eager(EagerLoader::new().include("team"))
     ///     .all_eager(cx, &conn)
     ///     .await?;
-    ///
-    /// // Access the eagerly loaded team
-    /// for hero in &heroes {
-    ///     if let Some(team) = hero.team.get() {
-    ///         println!("{} is on team {}", hero.name, team.name);
-    ///     }
-    /// }
     /// ```
+    #[tracing::instrument(level = "debug", skip(self, cx, conn))]
     pub async fn all_eager<C: Connection>(
         self,
         cx: &Cx,
@@ -315,28 +316,79 @@ impl<M: Model> Select<M> {
     ) -> Outcome<Vec<M>, sqlmodel_core::Error> {
         // If no eager loading configured, fall back to regular all()
         if self.eager_loader.is_none() || !self.eager_loader.as_ref().unwrap().has_includes() {
+            tracing::trace!("No eager loading configured, falling back to regular all()");
             return self.all(cx, conn).await;
         }
 
-        let (sql, params, _join_info) = self.build_eager();
+        let (sql, params, join_info) = self.build_eager();
+
+        tracing::debug!(
+            table = M::TABLE_NAME,
+            includes = join_info.len(),
+            "Executing eager loading query"
+        );
+        tracing::trace!(sql = %sql, "Eager SQL");
+
         let rows = conn.query(cx, &sql, &params).await;
 
-        // For now, we parse just the parent model.
-        // Full hydration of relationships requires more sophisticated row parsing
-        // that understands the aliased column structure.
-        // This is a foundation - the full implementation would:
-        // 1. Parse parent columns from aliases
-        // 2. Parse related table columns from aliases
-        // 3. Group by parent PK to handle one-to-many
-        // 4. Call set_loaded() on Related<T>/RelatedMany<T> fields
         rows.and_then(|rows| {
+            tracing::debug!(row_count = rows.len(), "Processing eager query results");
+
+            // Use a map to deduplicate by primary key (JOINs can duplicate parent rows)
+            let mut seen_pks = std::collections::HashSet::new();
             let mut models = Vec::with_capacity(rows.len());
+
             for row in &rows {
-                match M::from_row(row) {
-                    Ok(model) => models.push(model),
-                    Err(e) => return Outcome::Err(e),
+                // Extract parent columns using table prefix
+                let parent_row = row.subset_by_prefix(M::TABLE_NAME);
+
+                // Skip if we can't parse (shouldn't happen with well-formed query)
+                if parent_row.is_empty() {
+                    tracing::warn!(
+                        table = M::TABLE_NAME,
+                        "Row has no columns with parent table prefix"
+                    );
+                    // Fall back to trying the row as-is (backwards compatibility)
+                    match M::from_row(row) {
+                        Ok(model) => {
+                            models.push(model);
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Failed to parse model from row");
+                            return Outcome::Err(e);
+                        }
+                    }
+                    continue;
+                }
+
+                // Parse the parent model from extracted columns
+                match M::from_row(&parent_row) {
+                    Ok(model) => {
+                        // Deduplicate by primary key
+                        let pk = model.primary_key_value();
+                        let pk_hash = {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            // Hash the debug representation as a simple PK identifier
+                            format!("{:?}", pk).hash(&mut hasher);
+                            hasher.finish()
+                        };
+
+                        if seen_pks.insert(pk_hash) {
+                            models.push(model);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "Failed to parse model from prefixed row");
+                        return Outcome::Err(e);
+                    }
                 }
             }
+
+            tracing::debug!(
+                unique_models = models.len(),
+                "Eager loading complete (deduplicated)"
+            );
             Outcome::Ok(models)
         })
     }
@@ -854,10 +906,11 @@ mod tests {
     impl Model for EagerHero {
         const TABLE_NAME: &'static str = "heroes";
         const PRIMARY_KEY: &'static [&'static str] = &["id"];
-        const RELATIONSHIPS: &'static [RelationshipInfo] = &[
-            RelationshipInfo::new("team", "teams", RelationshipKind::ManyToOne)
-                .local_key("team_id"),
-        ];
+        const RELATIONSHIPS: &'static [RelationshipInfo] =
+            &[
+                RelationshipInfo::new("team", "teams", RelationshipKind::ManyToOne)
+                    .local_key("team_id"),
+            ];
 
         fn fields() -> &'static [FieldInfo] {
             static FIELDS: &[FieldInfo] = &[

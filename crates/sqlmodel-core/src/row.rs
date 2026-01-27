@@ -85,6 +85,69 @@ impl Row {
         Self { values, columns }
     }
 
+    /// Extract a subset of columns with a given prefix.
+    ///
+    /// This is useful for eager loading where columns are aliased like
+    /// `table__column`. This method extracts columns matching `prefix__*`
+    /// and returns a new Row with the prefix stripped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let row = Row::new(
+    ///     vec!["heroes__id", "heroes__name", "teams__id", "teams__name"],
+    ///     vec![Value::Int(1), Value::Text("Hero".into()), Value::Int(10), Value::Text("Team".into())],
+    /// );
+    /// let hero_row = row.subset_by_prefix("heroes");
+    /// // hero_row has columns: ["id", "name"] with values [1, "Hero"]
+    /// ```
+    #[must_use]
+    pub fn subset_by_prefix(&self, prefix: &str) -> Self {
+        let prefix_with_sep = format!("{}__", prefix);
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+
+        for (name, value) in self.iter() {
+            if let Some(stripped) = name.strip_prefix(&prefix_with_sep) {
+                names.push(stripped.to_string());
+                values.push(value.clone());
+            }
+        }
+
+        Self::new(names, values)
+    }
+
+    /// Check if this row has any columns with the given prefix.
+    ///
+    /// Useful for checking if a LEFT JOIN returned NULL (no matching rows).
+    #[must_use]
+    pub fn has_prefix(&self, prefix: &str) -> bool {
+        let prefix_with_sep = format!("{}__", prefix);
+        self.column_names()
+            .any(|name| name.starts_with(&prefix_with_sep))
+    }
+
+    /// Check if all values with a given prefix are NULL.
+    ///
+    /// Used to detect LEFT JOIN rows where no related record exists.
+    #[must_use]
+    pub fn prefix_is_all_null(&self, prefix: &str) -> bool {
+        let prefix_with_sep = format!("{}__", prefix);
+        let mut found_any = false;
+
+        for (name, value) in self.iter() {
+            if name.starts_with(&prefix_with_sep) {
+                found_any = true;
+                if !value.is_null() {
+                    return false;
+                }
+            }
+        }
+
+        // If we found no columns with prefix, consider it "all null"
+        !found_any || found_any
+    }
+
     /// Create a new row with shared column metadata.
     ///
     /// This is more efficient for creating multiple rows from the same query.
@@ -680,5 +743,81 @@ mod tests {
         assert_eq!(row.get_named::<i32>("col_0").unwrap(), 0);
         assert_eq!(row.get_named::<i32>("col_50").unwrap(), 50);
         assert_eq!(row.get_named::<i32>("col_99").unwrap(), 99);
+    }
+
+    #[test]
+    fn test_subset_by_prefix() {
+        let row = Row::new(
+            vec![
+                "heroes__id".to_string(),
+                "heroes__name".to_string(),
+                "teams__id".to_string(),
+                "teams__name".to_string(),
+            ],
+            vec![
+                Value::Int(1),
+                Value::Text("Batman".to_string()),
+                Value::Int(10),
+                Value::Text("Justice League".to_string()),
+            ],
+        );
+
+        // Extract heroes columns
+        let heroes_row = row.subset_by_prefix("heroes");
+        assert_eq!(heroes_row.len(), 2);
+        assert_eq!(heroes_row.get_named::<i32>("id").unwrap(), 1);
+        assert_eq!(heroes_row.get_named::<String>("name").unwrap(), "Batman");
+
+        // Extract teams columns
+        let teams_row = row.subset_by_prefix("teams");
+        assert_eq!(teams_row.len(), 2);
+        assert_eq!(teams_row.get_named::<i32>("id").unwrap(), 10);
+        assert_eq!(
+            teams_row.get_named::<String>("name").unwrap(),
+            "Justice League"
+        );
+
+        // Non-existent prefix returns empty row
+        let empty_row = row.subset_by_prefix("powers");
+        assert!(empty_row.is_empty());
+    }
+
+    #[test]
+    fn test_has_prefix() {
+        let row = Row::new(
+            vec!["heroes__id".to_string(), "teams__id".to_string()],
+            vec![Value::Int(1), Value::Int(10)],
+        );
+
+        assert!(row.has_prefix("heroes"));
+        assert!(row.has_prefix("teams"));
+        assert!(!row.has_prefix("powers"));
+    }
+
+    #[test]
+    fn test_prefix_is_all_null() {
+        let row = Row::new(
+            vec![
+                "heroes__id".to_string(),
+                "heroes__name".to_string(),
+                "teams__id".to_string(),
+                "teams__name".to_string(),
+            ],
+            vec![
+                Value::Int(1),
+                Value::Text("Batman".to_string()),
+                Value::Null,
+                Value::Null,
+            ],
+        );
+
+        // Heroes have values
+        assert!(!row.prefix_is_all_null("heroes"));
+
+        // Teams are all NULL (LEFT JOIN with no match)
+        assert!(row.prefix_is_all_null("teams"));
+
+        // Non-existent prefix is considered "all null"
+        assert!(row.prefix_is_all_null("powers"));
     }
 }

@@ -13,3 +13,4 @@ workspace = true
 sqlmodel-core.workspace = true
 asupersync.workspace = true
 serde.workspace = true
+tracing.workspace = true
