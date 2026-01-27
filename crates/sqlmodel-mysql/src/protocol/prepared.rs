@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(value_to_field_type(&Value::Float(1.0)), FieldType::Float);
         assert_eq!(value_to_field_type(&Value::Double(1.0)), FieldType::Double);
         assert_eq!(
-            value_to_field_type(&Value::Text("".into())),
+            value_to_field_type(&Value::Text(String::new())),
             FieldType::VarString
         );
         assert_eq!(value_to_field_type(&Value::Bytes(vec![])), FieldType::Blob);

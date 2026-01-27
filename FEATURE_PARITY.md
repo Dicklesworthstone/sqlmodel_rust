@@ -201,10 +201,42 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 |--------|--------|------|--------|
 | SQLite | Via SQLAlchemy | `sqlmodel-sqlite` | ✅ Complete |
 | MySQL | Via SQLAlchemy | `sqlmodel-mysql` | ✅ Complete |
-| PostgreSQL | Via SQLAlchemy | `sqlmodel-postgres` | ⚠️ Skeleton |
+| PostgreSQL | Via SQLAlchemy | `sqlmodel-postgres` | ✅ Complete |
 | Prepared statements | Automatic | Binary protocol | ✅ Complete |
-| TLS/SSL | Engine config | Feature-gated | ✅ Complete |
+| TLS/SSL | Engine config | Feature-gated (rustls) | ✅ Complete |
 | Connection string | URL parsing | `Config` struct | ✅ Complete |
+
+### MySQL Driver Details (sqlmodel-mysql)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Wire protocol | ✅ Complete | Full MySQL protocol implementation |
+| Authentication | ✅ Complete | mysql_native_password, caching_sha2_password |
+| TLS/SSL | ✅ Complete | Via rustls (SslMode::Disable/Preferred/Required/VerifyCa/VerifyIdentity) |
+| Prepared statements | ✅ Complete | Binary protocol with COM_STMT_PREPARE/EXECUTE |
+| Async connection | ✅ Complete | Via asupersync TCP primitives |
+| Packet fragmentation | ✅ Complete | Handles TCP packet splitting |
+| Connection pooling | ✅ Complete | Via sqlmodel-pool |
+
+### PostgreSQL Driver Details (sqlmodel-postgres)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Wire protocol | ✅ Complete | Full Postgres protocol |
+| Authentication | ✅ Complete | MD5, SCRAM-SHA-256 |
+| TLS/SSL | ✅ Complete | Via rustls |
+| Prepared statements | ✅ Complete | Named statements |
+| Transactions | ✅ Complete | All isolation levels |
+| Type conversion | ✅ Complete | All major types |
+
+### SQLite Driver Details (sqlmodel-sqlite)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| In-memory DB | ✅ Complete | `:memory:` support |
+| File DB | ✅ Complete | File path support |
+| Transactions | ✅ Complete | Via sqlite3 |
+| Concurrent access | ✅ Complete | Via mutex |
 
 ---
 
