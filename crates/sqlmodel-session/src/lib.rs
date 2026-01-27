@@ -33,8 +33,10 @@
 //! ```
 
 pub mod change_tracker;
+pub mod flush;
 
 pub use change_tracker::{ChangeTracker, ObjectSnapshot};
+pub use flush::{FlushOrderer, FlushPlan, FlushResult, PendingOp};
 
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
