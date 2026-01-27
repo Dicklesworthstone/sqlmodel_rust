@@ -3,6 +3,7 @@
 //! This module implements the async MySQL connection using asupersync's TCP primitives.
 //! It provides the `Connection` trait implementation for integration with sqlmodel-core.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, Read as StdRead, Write as StdWrite};
 use std::net::TcpStream as StdTcpStream;
@@ -27,7 +28,7 @@ use crate::config::MySqlConfig;
 use crate::connection::{ConnectionState, ServerCapabilities};
 use crate::protocol::{
     Command, ErrPacket, PacketHeader, PacketReader, PacketType, PacketWriter, capabilities,
-    charset, MAX_PACKET_SIZE,
+    charset, prepared, MAX_PACKET_SIZE,
 };
 use crate::types::{ColumnDef, FieldType, decode_text_value, interpolate_params};
 
@@ -56,9 +57,25 @@ pub struct MySqlAsyncConnection {
     config: MySqlConfig,
     /// Current sequence ID for packet framing
     sequence_id: u8,
+    /// Prepared statement metadata (keyed by statement ID)
+    prepared_stmts: HashMap<u32, PreparedStmtMeta>,
     /// Optional console for rich output
     #[cfg(feature = "console")]
     console: Option<Arc<SqlModelConsole>>,
+}
+
+/// Metadata for a prepared statement.
+///
+/// Stores the MySQL-specific information needed to execute
+/// and decode results from a prepared statement.
+#[derive(Debug, Clone)]
+struct PreparedStmtMeta {
+    /// Server-assigned statement ID
+    statement_id: u32,
+    /// Parameter column definitions (for type encoding)
+    params: Vec<ColumnDef>,
+    /// Result column definitions (for binary decoding)
+    columns: Vec<ColumnDef>,
 }
 
 /// Connection stream wrapper for sync/async compatibility.
@@ -133,6 +150,7 @@ impl MySqlAsyncConnection {
             warnings: 0,
             config,
             sequence_id: 0,
+            prepared_stmts: HashMap::new(),
             #[cfg(feature = "console")]
             console: None,
         };
