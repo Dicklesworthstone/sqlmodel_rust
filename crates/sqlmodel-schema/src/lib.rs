@@ -2,15 +2,25 @@
 //!
 //! This crate provides:
 //! - Schema definition from Model types
+//! - Expected schema extraction from Model definitions
 //! - Table creation/alteration SQL generation
 //! - Migration tracking and execution
 //! - Database introspection
 
 pub mod create;
+pub mod expected;
 pub mod introspect;
 pub mod migrate;
 
 pub use create::{CreateTable, SchemaBuilder};
+pub use expected::{
+    ModelSchema, ModelTuple, expected_schema, normalize_sql_type, table_schema_from_fields,
+    table_schema_from_model,
+};
+pub use introspect::{
+    CheckConstraintInfo, ColumnInfo, DatabaseSchema, Dialect, ForeignKeyInfo, IndexInfo,
+    Introspector, ParsedSqlType, TableInfo, UniqueConstraintInfo,
+};
 pub use migrate::{Migration, MigrationRunner, MigrationStatus};
 
 use asupersync::{Cx, Outcome};
