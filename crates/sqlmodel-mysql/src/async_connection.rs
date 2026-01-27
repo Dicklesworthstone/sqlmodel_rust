@@ -10,7 +10,7 @@ use std::net::TcpStream as StdTcpStream;
 use std::sync::Arc;
 
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
-use asupersync::net::tcp::TcpStream;
+use asupersync::net::TcpStream;
 use asupersync::{Cx, Outcome};
 
 use sqlmodel_core::connection::{Connection, IsolationLevel, PreparedStatement, TransactionOps};
@@ -1180,51 +1180,43 @@ pub struct MySqlTransaction<'conn> {
 impl<'conn> TransactionOps for MySqlTransaction<'conn> {
     fn query(
         &self,
-        cx: &Cx,
-        sql: &str,
-        params: &[Value],
+        _cx: &Cx,
+        _sql: &str,
+        _params: &[Value],
     ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
         async move { Outcome::Err(connection_error("Transaction query not yet implemented")) }
     }
 
     fn query_one(
         &self,
-        cx: &Cx,
-        sql: &str,
-        params: &[Value],
+        _cx: &Cx,
+        _sql: &str,
+        _params: &[Value],
     ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
         async move { Outcome::Err(connection_error("Transaction query_one not yet implemented")) }
     }
 
     fn execute(
         &self,
-        cx: &Cx,
-        sql: &str,
-        params: &[Value],
+        _cx: &Cx,
+        _sql: &str,
+        _params: &[Value],
     ) -> impl Future<Output = Outcome<u64, Error>> + Send {
         async move { Outcome::Err(connection_error("Transaction execute not yet implemented")) }
     }
 
-    fn commit(&mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-        async move { Outcome::Err(connection_error("Transaction commit not yet implemented")) }
-    }
-
-    fn rollback(&mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-        async move { Outcome::Err(connection_error("Transaction rollback not yet implemented")) }
-    }
-
     fn savepoint(
-        &mut self,
-        cx: &Cx,
-        name: &str,
+        &self,
+        _cx: &Cx,
+        _name: &str,
     ) -> impl Future<Output = Outcome<(), Error>> + Send {
         async move { Outcome::Err(connection_error("Transaction savepoint not yet implemented")) }
     }
 
     fn rollback_to(
-        &mut self,
-        cx: &Cx,
-        name: &str,
+        &self,
+        _cx: &Cx,
+        _name: &str,
     ) -> impl Future<Output = Outcome<(), Error>> + Send {
         async move {
             Outcome::Err(connection_error(
@@ -1233,16 +1225,24 @@ impl<'conn> TransactionOps for MySqlTransaction<'conn> {
         }
     }
 
-    fn release_savepoint(
-        &mut self,
-        cx: &Cx,
-        name: &str,
+    fn release(
+        &self,
+        _cx: &Cx,
+        _name: &str,
     ) -> impl Future<Output = Outcome<(), Error>> + Send {
         async move {
             Outcome::Err(connection_error(
-                "Transaction release_savepoint not yet implemented",
+                "Transaction release not yet implemented",
             ))
         }
+    }
+
+    fn commit(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        async move { Outcome::Err(connection_error("Transaction commit not yet implemented")) }
+    }
+
+    fn rollback(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        async move { Outcome::Err(connection_error("Transaction rollback not yet implemented")) }
     }
 }
 
