@@ -107,8 +107,7 @@ pub fn parse_model(input: &DeriveInput) -> Result<ModelDef> {
     let generics = input.generics.clone();
 
     // Parse struct-level attributes
-    let table_name = parse_table_name(&input.attrs, &name)?;
-    let table_alias = parse_table_alias(&input.attrs)?;
+    let (table_name, table_alias) = parse_struct_sqlmodel_attrs(&input.attrs, &name)?;
 
     // Get struct fields
     let fields = match &input.data {
@@ -144,70 +143,71 @@ pub fn parse_model(input: &DeriveInput) -> Result<ModelDef> {
     })
 }
 
-/// Parse the table name from struct-level `#[sqlmodel(table = "...")]` attribute.
-/// If not present, derive from struct name using snake_case and pluralization.
-fn parse_table_name(attrs: &[Attribute], struct_name: &Ident) -> Result<String> {
+/// Parse struct-level `#[sqlmodel(...)]` attributes.
+///
+/// Supported keys:
+/// - `table = "name"` (overrides derived table name)
+/// - `table_alias = "alias"` (optional table alias)
+fn parse_struct_sqlmodel_attrs(
+    attrs: &[Attribute],
+    struct_name: &Ident,
+) -> Result<(String, Option<String>)> {
+    let mut table_name: Option<String> = None;
+    let mut table_alias: Option<String> = None;
+
     for attr in attrs {
         if !attr.path().is_ident("sqlmodel") {
             continue;
         }
-
-        let mut table_name = None;
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("table") {
+                if table_name.is_some() {
+                    return Err(Error::new_spanned(
+                        meta.path,
+                        "duplicate sqlmodel attribute: table",
+                    ));
+                }
+
                 let value: Lit = meta.value()?.parse()?;
                 if let Lit::Str(lit_str) = value {
                     table_name = Some(lit_str.value());
+                    Ok(())
                 } else {
-                    return Err(Error::new_spanned(
+                    Err(Error::new_spanned(
                         value,
                         "expected string literal for table name",
+                    ))
+                }
+            } else if meta.path.is_ident("table_alias") {
+                if table_alias.is_some() {
+                    return Err(Error::new_spanned(
+                        meta.path,
+                        "duplicate sqlmodel attribute: table_alias",
                     ));
                 }
-            }
-            Ok(())
-        })?;
 
-        if let Some(name) = table_name {
-            return Ok(name);
-        }
-    }
-
-    // No explicit table name, derive from struct name
-    Ok(derive_table_name(&struct_name.to_string()))
-}
-
-/// Parse the optional table alias from `#[sqlmodel(table_alias = "...")]`.
-fn parse_table_alias(attrs: &[Attribute]) -> Result<Option<String>> {
-    for attr in attrs {
-        if !attr.path().is_ident("sqlmodel") {
-            continue;
-        }
-
-        let mut table_alias = None;
-
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("table_alias") {
                 let value: Lit = meta.value()?.parse()?;
                 if let Lit::Str(lit_str) = value {
                     table_alias = Some(lit_str.value());
+                    Ok(())
                 } else {
-                    return Err(Error::new_spanned(
+                    Err(Error::new_spanned(
                         value,
                         "expected string literal for table_alias",
-                    ));
+                    ))
                 }
+            } else {
+                Err(Error::new_spanned(
+                    meta.path,
+                    "unknown sqlmodel struct attribute (supported: table, table_alias)",
+                ))
             }
-            Ok(())
         })?;
-
-        if table_alias.is_some() {
-            return Ok(table_alias);
-        }
     }
 
-    Ok(None)
+    let table_name = table_name.unwrap_or_else(|| derive_table_name(&struct_name.to_string()));
+    Ok((table_name, table_alias))
 }
 
 /// Derive table name from struct name: convert to snake_case and pluralize.
@@ -612,6 +612,7 @@ pub fn is_option_type(ty: &Type) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syn::parse_quote;
 
     #[test]
     fn test_to_snake_case() {
@@ -668,5 +669,56 @@ mod tests {
         assert_eq!(derive_table_name("Person"), "people");
         assert_eq!(derive_table_name("Category"), "categories");
         assert_eq!(derive_table_name("User"), "users");
+    }
+
+    #[test]
+    fn test_parse_model_table_override() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table = "events")]
+            struct Event {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.table_name, "events");
+        assert_eq!(def.table_alias, None);
+    }
+
+    #[test]
+    fn test_parse_model_table_and_alias_same_attr() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table = "events", table_alias = "e")]
+            struct Event {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.table_name, "events");
+        assert_eq!(def.table_alias.as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn test_parse_model_unknown_struct_attr_errors() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(not_a_real_key = "x")]
+            struct Event {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let err = parse_model(&input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown sqlmodel struct attribute"),
+            "{err}"
+        );
     }
 }
