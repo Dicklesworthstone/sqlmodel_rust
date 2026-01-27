@@ -36,10 +36,11 @@ pub mod auth;
 pub mod config;
 pub mod connection;
 pub mod protocol;
+pub mod tls;
 pub mod types;
 
 pub use async_connection::{MySqlAsyncConnection, SharedMySqlConnection};
-pub use config::{MySqlConfig, SslMode};
+pub use config::{MySqlConfig, SslMode, TlsConfig};
 pub use connection::{ConnectionState, MySqlConnection};
 
 // Console integration (feature-gated)

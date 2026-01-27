@@ -4,7 +4,81 @@
 //! including authentication, SSL, and connection options.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
+
+/// TLS/SSL configuration for MySQL connections.
+///
+/// This struct holds the certificate and key paths for TLS connections.
+/// The actual TLS implementation requires the `tls` feature to be enabled.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Path to CA certificate file (PEM format) for server verification.
+    /// Required for `SslMode::VerifyCa` and `SslMode::VerifyIdentity`.
+    pub ca_cert_path: Option<PathBuf>,
+
+    /// Path to client certificate file (PEM format) for mutual TLS.
+    /// Optional - only needed if server requires client certificate.
+    pub client_cert_path: Option<PathBuf>,
+
+    /// Path to client private key file (PEM format) for mutual TLS.
+    /// Required if `client_cert_path` is set.
+    pub client_key_path: Option<PathBuf>,
+
+    /// Skip server certificate verification.
+    ///
+    /// # Security Warning
+    /// Setting this to `true` disables certificate verification, making the
+    /// connection vulnerable to man-in-the-middle attacks. Only use for
+    /// development/testing with self-signed certificates.
+    pub danger_skip_verify: bool,
+
+    /// Server name for SNI (Server Name Indication).
+    /// If not set, defaults to the connection hostname.
+    pub server_name: Option<String>,
+}
+
+impl TlsConfig {
+    /// Create a new TLS configuration with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the CA certificate path.
+    pub fn ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Set the client certificate path.
+    pub fn client_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_cert_path = Some(path.into());
+        self
+    }
+
+    /// Set the client key path.
+    pub fn client_key(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_key_path = Some(path.into());
+        self
+    }
+
+    /// Skip server certificate verification (dangerous!).
+    pub fn skip_verify(mut self, skip: bool) -> Self {
+        self.danger_skip_verify = skip;
+        self
+    }
+
+    /// Set the server name for SNI.
+    pub fn server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
+    /// Check if mutual TLS (client certificate) is configured.
+    pub fn has_client_cert(&self) -> bool {
+        self.client_cert_path.is_some() && self.client_key_path.is_some()
+    }
+}
 
 /// SSL mode for MySQL connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,6 +130,8 @@ pub struct MySqlConfig {
     pub connect_timeout: Duration,
     /// SSL mode
     pub ssl_mode: SslMode,
+    /// TLS configuration (certificates, keys, etc.)
+    pub tls_config: TlsConfig,
     /// Enable compression (CLIENT_COMPRESS capability)
     pub compression: bool,
     /// Additional connection attributes
@@ -77,6 +153,7 @@ impl Default for MySqlConfig {
             charset: crate::protocol::charset::UTF8MB4_0900_AI_CI,
             connect_timeout: Duration::from_secs(30),
             ssl_mode: SslMode::default(),
+            tls_config: TlsConfig::default(),
             compression: false,
             attributes: HashMap::new(),
             local_infile: false,
@@ -136,6 +213,32 @@ impl MySqlConfig {
     /// Set the SSL mode.
     pub fn ssl_mode(mut self, mode: SslMode) -> Self {
         self.ssl_mode = mode;
+        self
+    }
+
+    /// Set the TLS configuration.
+    pub fn tls_config(mut self, config: TlsConfig) -> Self {
+        self.tls_config = config;
+        self
+    }
+
+    /// Set the CA certificate path for TLS.
+    ///
+    /// This is a convenience method equivalent to:
+    /// ```ignore
+    /// config.tls_config(TlsConfig::new().ca_cert(path))
+    /// ```
+    pub fn ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.tls_config.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Set client certificate and key paths for mutual TLS.
+    ///
+    /// Both cert and key must be provided for client authentication.
+    pub fn client_cert(mut self, cert_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
+        self.tls_config.client_cert_path = Some(cert_path.into());
+        self.tls_config.client_key_path = Some(key_path.into());
         self
     }
 
@@ -282,5 +385,55 @@ mod tests {
         assert_eq!(config.ssl_mode, SslMode::Disable);
         assert!(!config.compression);
         assert!(!config.local_infile);
+    }
+
+    #[test]
+    fn test_tls_config_builder() {
+        let tls = TlsConfig::new()
+            .ca_cert("/path/to/ca.pem")
+            .client_cert("/path/to/client.pem")
+            .client_key("/path/to/client-key.pem")
+            .server_name("db.example.com");
+
+        assert_eq!(tls.ca_cert_path, Some(PathBuf::from("/path/to/ca.pem")));
+        assert_eq!(tls.client_cert_path, Some(PathBuf::from("/path/to/client.pem")));
+        assert_eq!(tls.client_key_path, Some(PathBuf::from("/path/to/client-key.pem")));
+        assert_eq!(tls.server_name, Some("db.example.com".to_string()));
+        assert!(!tls.danger_skip_verify);
+        assert!(tls.has_client_cert());
+    }
+
+    #[test]
+    fn test_tls_config_skip_verify() {
+        let tls = TlsConfig::new().skip_verify(true);
+        assert!(tls.danger_skip_verify);
+    }
+
+    #[test]
+    fn test_mysql_config_with_tls() {
+        let config = MySqlConfig::new()
+            .host("db.example.com")
+            .ssl_mode(SslMode::VerifyCa)
+            .ca_cert("/etc/ssl/certs/ca.pem")
+            .client_cert("/home/user/.mysql/client-cert.pem", "/home/user/.mysql/client-key.pem");
+
+        assert_eq!(config.ssl_mode, SslMode::VerifyCa);
+        assert_eq!(
+            config.tls_config.ca_cert_path,
+            Some(PathBuf::from("/etc/ssl/certs/ca.pem"))
+        );
+        assert!(config.tls_config.has_client_cert());
+    }
+
+    #[test]
+    fn test_tls_config_no_client_cert() {
+        let tls = TlsConfig::new().ca_cert("/path/to/ca.pem");
+        assert!(!tls.has_client_cert());
+
+        // Only cert, no key
+        let tls = TlsConfig::new()
+            .ca_cert("/path/to/ca.pem")
+            .client_cert("/path/to/client.pem");
+        assert!(!tls.has_client_cert());
     }
 }
