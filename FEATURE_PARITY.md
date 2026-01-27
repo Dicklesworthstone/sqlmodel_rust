@@ -17,12 +17,12 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Session/Connection | 8 | 8 | 100% |
 | Transactions | 6 | 6 | 100% |
 | Schema/DDL | 7 | 8 | 88% |
-| Validation | 0 | 6 | 0% |
+| Validation | 4 | 6 | 67% |
 | Relationships | 0 | 6 | 0% (Excluded) |
 | Serialization | 4 | 4 | 100% |
 | Database Drivers | 3 | 3 | 100% |
 | Connection Pooling | 8 | 8 | 100% |
-| **TOTAL** | **101** | **117** | **86%** |
+| **TOTAL** | **105** | **117** | **90%** |
 
 ---
 
@@ -159,12 +159,12 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
 | Feature | Python | Rust | Status |
 |---------|--------|------|--------|
-| Field validator | `@field_validator` | `#[derive(Validate)]` | ❌ TODO |
-| Model validator | `@model_validator` | `#[derive(Validate)]` | ❌ TODO |
-| Numeric range | `Field(gt=, ge=, lt=, le=)` | N/A | ❌ TODO |
-| String length | `Field(min_length=, max_length=)` | N/A | ❌ TODO |
-| Regex pattern | `Field(regex=)` | N/A | ❌ TODO |
-| Custom validators | Python functions | Rust methods | ❌ TODO |
+| Field validator | `@field_validator` | `#[derive(Validate)]` | ✅ Complete |
+| Model validator | `@model_validator` | N/A (use field validators) | ❌ Not planned |
+| Numeric range | `Field(gt=, ge=, lt=, le=)` | `#[validate(min=, max=)]` | ✅ Complete |
+| String length | `Field(min_length=, max_length=)` | `#[validate(min_length=, max_length=)]` | ✅ Complete |
+| Regex pattern | `Field(regex=)` | `#[validate(pattern=)]` (simplified) | ⚠️ Partial |
+| Custom validators | Python functions | `#[validate(custom="fn_name")]` | ✅ Complete |
 
 ---
 
@@ -322,7 +322,7 @@ The Rust SQLModel implementation is **~86% feature complete** compared to Python
 
 ### Remaining Gaps
 
-1. **Validation derive macro** (TODO) - Attributes defined but not implemented
+1. **Full regex support** - Validation pattern matching is simplified (email, url)
 2. **Some field options** - on_delete action, decimal precision/scale
 3. **Advanced type inference** - DateTime/UUID need explicit sql_type
 
