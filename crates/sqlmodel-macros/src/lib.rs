@@ -13,7 +13,7 @@ mod parse;
 mod validate;
 mod validate_derive;
 
-use parse::{ModelDef, parse_model};
+use parse::{ModelDef, RelationshipKindAttr, parse_model};
 
 /// Derive macro for the `Model` trait.
 ///
@@ -102,6 +102,9 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     // Generate static FieldInfo array for fields()
     let field_infos = generate_field_infos(model);
 
+    // Generate RELATIONSHIPS constant
+    let relationships = generate_relationships(model);
+
     // Generate to_row implementation
     let to_row_body = generate_to_row(model);
 
@@ -118,6 +121,7 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
         impl #impl_generics sqlmodel_core::Model for #name #ty_generics #where_clause {
             const TABLE_NAME: &'static str = #table_name;
             const PRIMARY_KEY: &'static [&'static str] = #pk_slice;
+            const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] = #relationships;
 
             fn fields() -> &'static [sqlmodel_core::FieldInfo] {
                 static FIELDS: &[sqlmodel_core::FieldInfo] = &[
@@ -307,10 +311,22 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
         })
         .collect();
 
+    // Handle relationship fields with Default (they're not in the DB row)
+    let relationship_fields: Vec<_> = model
+        .fields
+        .iter()
+        .filter(|f| f.relationship.is_some())
+        .map(|f| {
+            let field_name = &f.name;
+            quote::quote! { #field_name: Default::default() }
+        })
+        .collect();
+
     quote::quote! {
         Ok(#name {
             #(#field_extractions,)*
             #(#skipped_fields,)*
+            #(#relationship_fields,)*
         })
     }
 }
@@ -387,6 +403,90 @@ fn generate_is_new(model: &ModelDef) -> proc_macro2::TokenStream {
 
     // Default: cannot determine, always return true
     quote::quote! { true }
+}
+
+/// Generate the RELATIONSHIPS constant from relationship fields.
+fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
+    let relationship_fields = model.relationship_fields();
+
+    if relationship_fields.is_empty() {
+        return quote::quote! { &[] };
+    }
+
+    let mut relationship_tokens = Vec::new();
+
+    for field in relationship_fields {
+        let rel = field.relationship.as_ref().unwrap();
+        let field_name = &field.name;
+        let related_table = &rel.model;
+
+        // Determine RelationshipKind token
+        let kind_token = match rel.kind {
+            RelationshipKindAttr::OneToOne => {
+                quote::quote! { sqlmodel_core::RelationshipKind::OneToOne }
+            }
+            RelationshipKindAttr::ManyToOne => {
+                quote::quote! { sqlmodel_core::RelationshipKind::ManyToOne }
+            }
+            RelationshipKindAttr::OneToMany => {
+                quote::quote! { sqlmodel_core::RelationshipKind::OneToMany }
+            }
+            RelationshipKindAttr::ManyToMany => {
+                quote::quote! { sqlmodel_core::RelationshipKind::ManyToMany }
+            }
+        };
+
+        // Build optional method calls
+        let local_key_call = if let Some(ref fk) = rel.foreign_key {
+            quote::quote! { .local_key(#fk) }
+        } else {
+            quote::quote! {}
+        };
+
+        let remote_key_call = if let Some(ref rk) = rel.remote_key {
+            quote::quote! { .remote_key(#rk) }
+        } else {
+            quote::quote! {}
+        };
+
+        let back_populates_call = if let Some(ref bp) = rel.back_populates {
+            quote::quote! { .back_populates(#bp) }
+        } else {
+            quote::quote! {}
+        };
+
+        let link_table_call = if let Some(ref lt) = rel.link_table {
+            let table = &lt.table;
+            let local_col = &lt.local_column;
+            let remote_col = &lt.remote_column;
+            quote::quote! {
+                .link_table(sqlmodel_core::LinkTableInfo::new(#table, #local_col, #remote_col))
+            }
+        } else {
+            quote::quote! {}
+        };
+
+        let lazy_val = rel.lazy;
+        let cascade_val = rel.cascade_delete;
+
+        relationship_tokens.push(quote::quote! {
+            sqlmodel_core::RelationshipInfo::new(
+                stringify!(#field_name),
+                #related_table,
+                #kind_token
+            )
+            #local_key_call
+            #remote_key_call
+            #back_populates_call
+            #link_table_call
+            .lazy(#lazy_val)
+            .cascade_delete(#cascade_val)
+        });
+    }
+
+    quote::quote! {
+        &[#(#relationship_tokens),*]
+    }
 }
 
 /// Derive macro for field validation.
