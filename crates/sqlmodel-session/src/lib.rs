@@ -34,11 +34,13 @@
 
 pub mod change_tracker;
 pub mod flush;
+pub mod n1_detection;
 
 pub use change_tracker::{ChangeTracker, ObjectSnapshot};
 pub use flush::{
     FlushOrderer, FlushPlan, FlushResult, LinkTableOp, PendingOp, execute_link_table_ops,
 };
+pub use n1_detection::{CallSite, N1QueryTracker, N1Stats};
 
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
@@ -331,6 +333,8 @@ pub struct Session<C: Connection> {
     pending_dirty: Vec<ObjectKey>,
     /// Configuration.
     config: SessionConfig,
+    /// N+1 query detection tracker (optional).
+    n1_tracker: Option<N1QueryTracker>,
 }
 
 impl<C: Connection> Session<C> {
@@ -349,6 +353,7 @@ impl<C: Connection> Session<C> {
             pending_delete: Vec::new(),
             pending_dirty: Vec::new(),
             config,
+            n1_tracker: None,
         }
     }
 
@@ -1113,6 +1118,251 @@ impl<C: Connection> Session<C> {
     }
 
     // ========================================================================
+    // Bidirectional Relationship Sync (back_populates)
+    // ========================================================================
+
+    /// Relate a child to a parent with bidirectional sync.
+    ///
+    /// Sets the parent on the child (ManyToOne side) and adds the child to the
+    /// parent's collection (OneToMany side) if `back_populates` is defined.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Hero has a ManyToOne relationship to Team (hero.team)
+    /// // Team has a OneToMany relationship to Hero (team.heroes) with back_populates
+    ///
+    /// session.relate_to_one(
+    ///     &mut hero,
+    ///     |h| &mut h.team,
+    ///     |h| h.team_id = team.id,  // Set FK
+    ///     &mut team,
+    ///     |t| &mut t.heroes,
+    /// );
+    /// // Now hero.team is set AND team.heroes includes hero
+    /// ```
+    pub fn relate_to_one<Child, Parent, FC, FP, FK>(
+        &self,
+        child: &mut Child,
+        child_accessor: FC,
+        set_fk: FK,
+        parent: &mut Parent,
+        parent_accessor: FP,
+    ) where
+        Child: Model + Clone + 'static,
+        Parent: Model + Clone + 'static,
+        FC: FnOnce(&mut Child) -> &mut sqlmodel_core::Related<Parent>,
+        FP: FnOnce(&mut Parent) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FK: FnOnce(&mut Child),
+    {
+        // Set the forward direction: child.parent = Related::loaded(parent)
+        let related = child_accessor(child);
+        let _ = related.set_loaded(Some(parent.clone()));
+
+        // Set the FK value
+        set_fk(child);
+
+        // Set the reverse direction: parent.children.link(child)
+        let related_many = parent_accessor(parent);
+        related_many.link(child);
+
+        tracing::debug!(
+            child_model = std::any::type_name::<Child>(),
+            parent_model = std::any::type_name::<Parent>(),
+            "Established bidirectional ManyToOne <-> OneToMany relationship"
+        );
+    }
+
+    /// Unrelate a child from a parent with bidirectional sync.
+    ///
+    /// Clears the parent on the child and removes the child from the parent's collection.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// session.unrelate_from_one(
+    ///     &mut hero,
+    ///     |h| &mut h.team,
+    ///     |h| h.team_id = None,  // Clear FK
+    ///     &mut team,
+    ///     |t| &mut t.heroes,
+    /// );
+    /// ```
+    pub fn unrelate_from_one<Child, Parent, FC, FP, FK>(
+        &self,
+        child: &mut Child,
+        child_accessor: FC,
+        clear_fk: FK,
+        parent: &mut Parent,
+        parent_accessor: FP,
+    ) where
+        Child: Model + Clone + 'static,
+        Parent: Model + Clone + 'static,
+        FC: FnOnce(&mut Child) -> &mut sqlmodel_core::Related<Parent>,
+        FP: FnOnce(&mut Parent) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FK: FnOnce(&mut Child),
+    {
+        // Clear the forward direction by assigning an empty Related
+        let related = child_accessor(child);
+        *related = sqlmodel_core::Related::empty();
+
+        // Clear the FK value
+        clear_fk(child);
+
+        // Remove from the reverse direction
+        let related_many = parent_accessor(parent);
+        related_many.unlink(child);
+
+        tracing::debug!(
+            child_model = std::any::type_name::<Child>(),
+            parent_model = std::any::type_name::<Parent>(),
+            "Removed bidirectional ManyToOne <-> OneToMany relationship"
+        );
+    }
+
+    /// Relate two objects in a many-to-many relationship with bidirectional sync.
+    ///
+    /// Adds each object to the other's collection.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Hero has ManyToMany to Power via hero_powers link table
+    /// // Power has ManyToMany to Hero via hero_powers link table (back_populates)
+    ///
+    /// session.relate_many_to_many(
+    ///     &mut hero,
+    ///     |h| &mut h.powers,
+    ///     &mut power,
+    ///     |p| &mut p.heroes,
+    /// );
+    /// // Now hero.powers includes power AND power.heroes includes hero
+    /// ```
+    pub fn relate_many_to_many<Left, Right, FL, FR>(
+        &self,
+        left: &mut Left,
+        left_accessor: FL,
+        right: &mut Right,
+        right_accessor: FR,
+    ) where
+        Left: Model + Clone + 'static,
+        Right: Model + Clone + 'static,
+        FL: FnOnce(&mut Left) -> &mut sqlmodel_core::RelatedMany<Right>,
+        FR: FnOnce(&mut Right) -> &mut sqlmodel_core::RelatedMany<Left>,
+    {
+        // Add right to left's collection
+        let left_coll = left_accessor(left);
+        left_coll.link(right);
+
+        // Add left to right's collection (back_populates)
+        let right_coll = right_accessor(right);
+        right_coll.link(left);
+
+        tracing::debug!(
+            left_model = std::any::type_name::<Left>(),
+            right_model = std::any::type_name::<Right>(),
+            "Established bidirectional ManyToMany relationship"
+        );
+    }
+
+    /// Unrelate two objects in a many-to-many relationship with bidirectional sync.
+    ///
+    /// Removes each object from the other's collection.
+    pub fn unrelate_many_to_many<Left, Right, FL, FR>(
+        &self,
+        left: &mut Left,
+        left_accessor: FL,
+        right: &mut Right,
+        right_accessor: FR,
+    ) where
+        Left: Model + Clone + 'static,
+        Right: Model + Clone + 'static,
+        FL: FnOnce(&mut Left) -> &mut sqlmodel_core::RelatedMany<Right>,
+        FR: FnOnce(&mut Right) -> &mut sqlmodel_core::RelatedMany<Left>,
+    {
+        // Remove right from left's collection
+        let left_coll = left_accessor(left);
+        left_coll.unlink(right);
+
+        // Remove left from right's collection (back_populates)
+        let right_coll = right_accessor(right);
+        right_coll.unlink(left);
+
+        tracing::debug!(
+            left_model = std::any::type_name::<Left>(),
+            right_model = std::any::type_name::<Right>(),
+            "Removed bidirectional ManyToMany relationship"
+        );
+    }
+
+    // ========================================================================
+    // N+1 Query Detection
+    // ========================================================================
+
+    /// Enable N+1 query detection with the specified threshold.
+    ///
+    /// When the number of lazy loads for a single relationship reaches the
+    /// threshold, a warning is emitted suggesting batch loading.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// session.enable_n1_detection(3);  // Warn after 3 lazy loads
+    ///
+    /// // This will trigger a warning:
+    /// for hero in &mut heroes {
+    ///     hero.team.load(&mut session).await?;
+    /// }
+    ///
+    /// // Check stats
+    /// if let Some(stats) = session.n1_stats() {
+    ///     println!("Potential N+1 issues: {}", stats.potential_n1);
+    /// }
+    /// ```
+    pub fn enable_n1_detection(&mut self, threshold: usize) {
+        self.n1_tracker = Some(N1QueryTracker::new().with_threshold(threshold));
+    }
+
+    /// Disable N+1 query detection and clear the tracker.
+    pub fn disable_n1_detection(&mut self) {
+        self.n1_tracker = None;
+    }
+
+    /// Check if N+1 detection is enabled.
+    #[must_use]
+    pub fn n1_detection_enabled(&self) -> bool {
+        self.n1_tracker.is_some()
+    }
+
+    /// Get mutable access to the N+1 tracker (for recording loads).
+    pub fn n1_tracker_mut(&mut self) -> Option<&mut N1QueryTracker> {
+        self.n1_tracker.as_mut()
+    }
+
+    /// Get N+1 detection statistics.
+    #[must_use]
+    pub fn n1_stats(&self) -> Option<N1Stats> {
+        self.n1_tracker.as_ref().map(|t| t.stats())
+    }
+
+    /// Reset N+1 detection counts (call at start of new request/transaction).
+    pub fn reset_n1_tracking(&mut self) {
+        if let Some(tracker) = &mut self.n1_tracker {
+            tracker.reset();
+        }
+    }
+
+    /// Record a lazy load for N+1 detection.
+    ///
+    /// This is called automatically by lazy loading methods.
+    #[track_caller]
+    pub fn record_lazy_load(&mut self, parent_type: &'static str, relationship: &'static str) {
+        if let Some(tracker) = &mut self.n1_tracker {
+            tracker.record_load(parent_type, relationship);
+        }
+    }
+
+    // ========================================================================
     // Debug Diagnostics
     // ========================================================================
 
@@ -1246,10 +1496,7 @@ mod tests {
     fn unwrap_outcome<T: std::fmt::Debug>(outcome: Outcome<T, Error>) -> T {
         match outcome {
             Outcome::Ok(v) => v,
-            other => {
-                assert!(false, "unexpected outcome: {other:?}");
-                loop {}
-            }
+            other => std::panic::panic_any(format!("unexpected outcome: {other:?}")),
         }
     }
 

@@ -188,9 +188,7 @@ pub fn find_back_relationship(
     target_relationships: &'static [RelationshipInfo],
 ) -> Option<&'static RelationshipInfo> {
     let back_field = source_rel.back_populates?;
-    target_relationships
-        .iter()
-        .find(|r| r.name == back_field)
+    target_relationships.iter().find(|r| r.name == back_field)
 }
 
 /// Validate that back_populates is symmetric between two models.
@@ -202,8 +200,13 @@ pub fn find_back_relationship(
 pub fn validate_back_populates<Source: crate::Model, Target: crate::Model>(
     source_field: &str,
 ) -> Result<(), String> {
-    let source_rel = find_relationship::<Source>(source_field)
-        .ok_or_else(|| format!("No relationship '{}' on {}", source_field, Source::TABLE_NAME))?;
+    let source_rel = find_relationship::<Source>(source_field).ok_or_else(|| {
+        format!(
+            "No relationship '{}' on {}",
+            source_field,
+            Source::TABLE_NAME
+        )
+    })?;
 
     let Some(back_field) = source_rel.back_populates else {
         // No back_populates, nothing to validate
@@ -1679,5 +1682,167 @@ mod tests {
 
         // Second attempt should fail (already set)
         assert!(lazy.set_loaded(None).is_err());
+    }
+
+    // ========================================================================
+    // Relationship Lookup Helper Tests
+    // ========================================================================
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Hero {
+        id: Option<i64>,
+        name: String,
+    }
+
+    impl Model for Hero {
+        const TABLE_NAME: &'static str = "heroes";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+        const RELATIONSHIPS: &'static [RelationshipInfo] = &[RelationshipInfo {
+            name: "team",
+            related_table: "teams",
+            kind: RelationshipKind::ManyToOne,
+            local_key: Some("team_id"),
+            remote_key: None,
+            link_table: None,
+            back_populates: Some("heroes"),
+            lazy: false,
+            cascade_delete: false,
+        }];
+
+        fn fields() -> &'static [FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> Result<Self> {
+            Ok(Self {
+                id: None,
+                name: String::new(),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            match self.id {
+                Some(id) => vec![Value::from(id)],
+                None => vec![],
+            }
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    // TeamWithRelationships has back_populates pointing to Hero
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct TeamWithRelationships {
+        id: Option<i64>,
+        name: String,
+    }
+
+    impl Model for TeamWithRelationships {
+        const TABLE_NAME: &'static str = "teams";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+        const RELATIONSHIPS: &'static [RelationshipInfo] = &[RelationshipInfo {
+            name: "heroes",
+            related_table: "heroes",
+            kind: RelationshipKind::OneToMany,
+            local_key: None,
+            remote_key: Some("team_id"),
+            link_table: None,
+            back_populates: Some("team"),
+            lazy: false,
+            cascade_delete: false,
+        }];
+
+        fn fields() -> &'static [FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> Result<Self> {
+            Ok(Self {
+                id: None,
+                name: String::new(),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            match self.id {
+                Some(id) => vec![Value::from(id)],
+                None => vec![],
+            }
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[test]
+    fn test_find_relationship_found() {
+        let rel = find_relationship::<Hero>("team");
+        assert!(rel.is_some());
+        let rel = rel.unwrap();
+        assert_eq!(rel.name, "team");
+        assert_eq!(rel.related_table, "teams");
+        assert_eq!(rel.back_populates, Some("heroes"));
+    }
+
+    #[test]
+    fn test_find_relationship_not_found() {
+        let rel = find_relationship::<Hero>("powers");
+        assert!(rel.is_none());
+    }
+
+    #[test]
+    fn test_find_relationship_empty_relationships() {
+        // Team has no relationships defined
+        let rel = find_relationship::<Team>("heroes");
+        assert!(rel.is_none());
+    }
+
+    #[test]
+    fn test_find_back_relationship_found() {
+        let hero_team_rel = find_relationship::<Hero>("team").unwrap();
+        let back = find_back_relationship(hero_team_rel, TeamWithRelationships::RELATIONSHIPS);
+        assert!(back.is_some());
+        let back = back.unwrap();
+        assert_eq!(back.name, "heroes");
+        assert_eq!(back.back_populates, Some("team"));
+    }
+
+    #[test]
+    fn test_find_back_relationship_no_back_populates() {
+        let rel = RelationshipInfo::new("team", "teams", RelationshipKind::ManyToOne);
+        let back = find_back_relationship(&rel, TeamWithRelationships::RELATIONSHIPS);
+        assert!(back.is_none());
+    }
+
+    #[test]
+    fn test_validate_back_populates_valid() {
+        let result = validate_back_populates::<Hero, TeamWithRelationships>("team");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_back_populates_no_source_relationship() {
+        let result = validate_back_populates::<Hero, TeamWithRelationships>("nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No relationship"));
+    }
+
+    #[test]
+    fn test_validate_back_populates_no_target_relationship() {
+        // Team has no RELATIONSHIPS, so validation will fail
+        let result = validate_back_populates::<Hero, Team>("team");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
     }
 }

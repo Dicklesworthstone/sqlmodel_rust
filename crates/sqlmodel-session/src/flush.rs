@@ -984,7 +984,7 @@ mod tests {
                 assert_eq!(remote_column, "power_id");
                 assert_eq!(remote_value, Value::BigInt(5));
             }
-            _ => panic!("Expected Link variant"),
+            LinkTableOp::Unlink { .. } => std::panic::panic_any("Expected Link variant"),
         }
     }
 
@@ -1012,7 +1012,7 @@ mod tests {
                 assert_eq!(remote_column, "power_id");
                 assert_eq!(remote_value, Value::BigInt(5));
             }
-            _ => panic!("Expected Unlink variant"),
+            LinkTableOp::Link { .. } => std::panic::panic_any("Expected Unlink variant"),
         }
     }
 
@@ -1081,7 +1081,7 @@ mod tests {
                 assert_eq!(lv1, lv2);
                 assert_eq!(rv1, rv2);
             }
-            _ => panic!("Clone should preserve variant"),
+            _ => std::panic::panic_any("Clone should preserve variant"),
         }
     }
 
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn test_link_table_ops_multiple_operations() {
-        let ops = vec![
+        let ops = [
             LinkTableOp::link(
                 "hero_powers".to_string(),
                 "hero_id".to_string(),
@@ -1151,7 +1151,7 @@ mod tests {
                 assert!(matches!(local_value, Value::Text(_)));
                 assert!(matches!(remote_value, Value::Text(_)));
             }
-            _ => panic!("Expected Link"),
+            LinkTableOp::Unlink { .. } => std::panic::panic_any("Expected Link"),
         }
 
         // Test with integer values
@@ -1172,7 +1172,7 @@ mod tests {
                 assert!(matches!(local_value, Value::Int(_)));
                 assert!(matches!(remote_value, Value::Int(_)));
             }
-            _ => panic!("Expected Link"),
+            LinkTableOp::Unlink { .. } => std::panic::panic_any("Expected Link"),
         }
     }
 }
