@@ -3,6 +3,11 @@
 //! This module implements the async MySQL connection using asupersync's TCP primitives.
 //! It provides the `Connection` trait implementation for integration with sqlmodel-core.
 
+// Allow `impl Future` return types in trait methods - intentional design for async trait compat
+#![allow(clippy::manual_async_fn)]
+// The Error type is intentionally large to carry full context
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, Read as StdRead, Write as StdWrite};
@@ -1281,6 +1286,7 @@ impl MySqlAsyncConnection {
 
     /// Close a prepared statement.
     pub async fn close_prepared_async(&mut self, stmt: &PreparedStatement) {
+        #[allow(clippy::cast_possible_truncation)] // Statement IDs are u32 in MySQL
         let stmt_id = stmt.id() as u32;
         self.prepared_stmts.remove(&stmt_id);
 
@@ -1298,9 +1304,9 @@ impl MySqlAsyncConnection {
     ) -> Outcome<Vec<Row>, Error> {
         // First packet contains column count
         let mut reader = PacketReader::new(first_packet);
-        let column_count = match reader.read_lenenc_int() {
-            Some(c) => c as usize,
-            None => return Outcome::Err(protocol_error("Invalid column count")),
+        #[allow(clippy::cast_possible_truncation)] // Column count fits in usize
+        let Some(column_count) = reader.read_lenenc_int().map(|c| c as usize) else {
+            return Outcome::Err(protocol_error("Invalid column count"));
         };
 
         // The column definitions were already provided from prepare
@@ -1956,9 +1962,8 @@ impl SharedMySqlConnection {
         let inner = Arc::clone(&self.inner);
 
         // Acquire lock
-        let mut guard = match inner.lock(cx).await {
-            Ok(g) => g,
-            Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+        let Ok(mut guard) = inner.lock(cx).await else {
+            return Outcome::Err(connection_error("Failed to acquire connection lock"));
         };
 
         // Set isolation level if specified
@@ -2006,11 +2011,8 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.query_async(cx, &sql, &params).await
         }
@@ -2026,11 +2028,8 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let rows = match guard.query_async(cx, &sql, &params).await {
                 Outcome::Ok(r) => r,
@@ -2052,11 +2051,8 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_async(cx, &sql, &params).await
         }
@@ -2072,11 +2068,8 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             match guard.execute_async(cx, &sql, &params).await {
                 Outcome::Ok(_) => Outcome::Ok(guard.last_insert_id() as i64),
@@ -2095,11 +2088,8 @@ impl Connection for SharedMySqlConnection {
         let inner = Arc::clone(&self.inner);
         let statements = statements.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let mut results = Vec::with_capacity(statements.len());
             for (sql, params) in &statements {
@@ -2134,11 +2124,8 @@ impl Connection for SharedMySqlConnection {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.prepare_async(cx, &sql).await
         }
@@ -2154,11 +2141,8 @@ impl Connection for SharedMySqlConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.query_prepared_async(cx, &stmt, &params).await
         }
@@ -2174,11 +2158,8 @@ impl Connection for SharedMySqlConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_prepared_async(cx, &stmt, &params).await
         }
@@ -2187,11 +2168,8 @@ impl Connection for SharedMySqlConnection {
     fn ping(&self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.ping_async(cx).await
         }
@@ -2227,11 +2205,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.query_async(cx, &sql, &params).await
         }
@@ -2247,11 +2222,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let rows = match guard.query_async(cx, &sql, &params).await {
                 Outcome::Ok(r) => r,
@@ -2273,11 +2245,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_async(cx, &sql, &params).await
         }
@@ -2293,11 +2262,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             if let Err(e) = validation_result {
                 return Outcome::Err(e);
             }
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             match guard.execute_async(cx, &sql, &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),
@@ -2318,11 +2284,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             if let Err(e) = validation_result {
                 return Outcome::Err(e);
             }
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             match guard.execute_async(cx, &sql, &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),
@@ -2343,11 +2306,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             if let Err(e) = validation_result {
                 return Outcome::Err(e);
             }
-            let mut guard = match inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             match guard.execute_async(cx, &sql, &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),
@@ -2363,11 +2323,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
     #[allow(unused_assignments)]
     fn commit(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         async move {
-            let mut guard = match self.inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = self.inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             match guard.execute_async(cx, "COMMIT", &[]).await {
                 Outcome::Ok(_) => {
@@ -2383,11 +2340,8 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
 
     fn rollback(self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         async move {
-            let mut guard = match self.inner.lock(cx).await {
-                Ok(g) => g,
-                Err(_) => {
-                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
-                }
+            let Ok(mut guard) = self.inner.lock(cx).await else {
+                return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             match guard.execute_async(cx, "ROLLBACK", &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),

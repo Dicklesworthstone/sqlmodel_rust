@@ -751,7 +751,10 @@ pub fn decode_binary_value_with_len(
             )
         }
 
-        FieldType::DateTime | FieldType::Timestamp | FieldType::DateTime2 | FieldType::Timestamp2 => {
+        FieldType::DateTime
+        | FieldType::Timestamp
+        | FieldType::DateTime2
+        | FieldType::Timestamp2 => {
             if data.is_empty() {
                 return (Value::Null, 0);
             }

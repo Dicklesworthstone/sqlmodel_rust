@@ -236,7 +236,11 @@ impl MySqlConfig {
     /// Set client certificate and key paths for mutual TLS.
     ///
     /// Both cert and key must be provided for client authentication.
-    pub fn client_cert(mut self, cert_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
+    pub fn client_cert(
+        mut self,
+        cert_path: impl Into<PathBuf>,
+        key_path: impl Into<PathBuf>,
+    ) -> Self {
         self.tls_config.client_cert_path = Some(cert_path.into());
         self.tls_config.client_key_path = Some(key_path.into());
         self
@@ -396,8 +400,14 @@ mod tests {
             .server_name("db.example.com");
 
         assert_eq!(tls.ca_cert_path, Some(PathBuf::from("/path/to/ca.pem")));
-        assert_eq!(tls.client_cert_path, Some(PathBuf::from("/path/to/client.pem")));
-        assert_eq!(tls.client_key_path, Some(PathBuf::from("/path/to/client-key.pem")));
+        assert_eq!(
+            tls.client_cert_path,
+            Some(PathBuf::from("/path/to/client.pem"))
+        );
+        assert_eq!(
+            tls.client_key_path,
+            Some(PathBuf::from("/path/to/client-key.pem"))
+        );
         assert_eq!(tls.server_name, Some("db.example.com".to_string()));
         assert!(!tls.danger_skip_verify);
         assert!(tls.has_client_cert());
@@ -415,7 +425,10 @@ mod tests {
             .host("db.example.com")
             .ssl_mode(SslMode::VerifyCa)
             .ca_cert("/etc/ssl/certs/ca.pem")
-            .client_cert("/home/user/.mysql/client-cert.pem", "/home/user/.mysql/client-key.pem");
+            .client_cert(
+                "/home/user/.mysql/client-cert.pem",
+                "/home/user/.mysql/client-key.pem",
+            );
 
         assert_eq!(config.ssl_mode, SslMode::VerifyCa);
         assert_eq!(

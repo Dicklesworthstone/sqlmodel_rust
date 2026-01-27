@@ -455,7 +455,14 @@ fn encode_binary_datetime(writer: &mut PacketWriter, micros: i64) {
     let minute = ((time_of_day % 3600) / 60) as u8;
     let second = (time_of_day % 60) as u8;
 
-    if year == 0 && month == 0 && day == 0 && hour == 0 && minute == 0 && second == 0 && microseconds == 0 {
+    if year == 0
+        && month == 0
+        && day == 0
+        && hour == 0
+        && minute == 0
+        && second == 0
+        && microseconds == 0
+    {
         writer.write_u8(0); // Zero datetime
     } else if hour == 0 && minute == 0 && second == 0 && microseconds == 0 {
         writer.write_u8(4); // Date only
@@ -492,7 +499,11 @@ fn days_to_ymd(days: i32) -> (i32, i32, i32) {
     let z = days + 719_468;
 
     // Compute era (400-year period)
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u32; // day of era [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era [0, 399]
     let y = yoe as i32 + era * 400;
@@ -565,11 +576,7 @@ mod tests {
         // Wrong status byte
         let data = [
             0xFF, // error status
-            0x01, 0x00, 0x00, 0x00,
-            0x03, 0x00,
-            0x02, 0x00,
-            0x00,
-            0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
         ];
         assert!(parse_stmt_prepare_ok(&data).is_none());
     }
@@ -644,7 +651,10 @@ mod tests {
         assert_eq!(value_to_field_type(&Value::BigInt(1)), FieldType::LongLong);
         assert_eq!(value_to_field_type(&Value::Float(1.0)), FieldType::Float);
         assert_eq!(value_to_field_type(&Value::Double(1.0)), FieldType::Double);
-        assert_eq!(value_to_field_type(&Value::Text("".into())), FieldType::VarString);
+        assert_eq!(
+            value_to_field_type(&Value::Text("".into())),
+            FieldType::VarString
+        );
         assert_eq!(value_to_field_type(&Value::Bytes(vec![])), FieldType::Blob);
     }
 
