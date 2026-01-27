@@ -6,6 +6,7 @@ members = [
     "crates/sqlmodel-macros",
     "crates/sqlmodel-query",
     "crates/sqlmodel-schema",
+    "crates/sqlmodel-session",
     "crates/sqlmodel-pool",
     "crates/sqlmodel-postgres",
     "crates/sqlmodel-sqlite",
@@ -58,12 +59,16 @@ asupersync = { path = "../asupersync" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Logging
+tracing = "0.1"
+
 # Internal crates
 sqlmodel = { path = "crates/sqlmodel" }
 sqlmodel-core = { path = "crates/sqlmodel-core" }
 sqlmodel-macros = { path = "crates/sqlmodel-macros" }
 sqlmodel-query = { path = "crates/sqlmodel-query" }
 sqlmodel-schema = { path = "crates/sqlmodel-schema" }
+sqlmodel-session = { path = "crates/sqlmodel-session" }
 sqlmodel-pool = { path = "crates/sqlmodel-pool" }
 
 [profile.release]

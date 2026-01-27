@@ -1,17 +1,18 @@
 [package]
 name = "sqlmodel-session"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 description = "Session and Unit of Work for SQLModel Rust"
-license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
 
 [dependencies]
-sqlmodel-core = { path = "../sqlmodel-core" }
-sqlmodel-query = { path = "../sqlmodel-query" }
-asupersync = { path = "/data/projects/asupersync" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tracing = "0.1"
-
-[dev-dependencies]
+sqlmodel-core.workspace = true
+sqlmodel-query.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

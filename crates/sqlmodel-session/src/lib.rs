@@ -32,6 +32,10 @@
 //! session.commit().await?;
 //! ```
 
+pub mod change_tracker;
+
+pub use change_tracker::{ChangeTracker, ObjectSnapshot};
+
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Connection, Error, Model, Value};
@@ -93,6 +97,16 @@ impl ObjectKey {
             type_id: TypeId::of::<M>(),
             pk_hash: hash_values(pk),
         }
+    }
+
+    /// Get the primary key hash.
+    pub fn pk_hash(&self) -> u64 {
+        self.pk_hash
+    }
+
+    /// Get the type identifier.
+    pub fn type_id(&self) -> TypeId {
+        self.type_id
     }
 }
 
@@ -350,15 +364,8 @@ impl<C: Connection> Session<C> {
     /// Add a new object to the session.
     ///
     /// The object will be INSERTed on the next `flush()` call.
-    #[tracing::instrument(level = "debug", skip(self, obj))]
     pub fn add<M: Model + Clone + Send + Sync + Serialize + 'static>(&mut self, obj: &M) {
         let key = ObjectKey::from_model(obj);
-
-        tracing::info!(
-            model = std::any::type_name::<M>(),
-            table = M::TABLE_NAME,
-            "Adding object to session"
-        );
 
         // If already tracked, update the object
         if let Some(tracked) = self.identity_map.get_mut(&key) {
@@ -394,15 +401,8 @@ impl<C: Connection> Session<C> {
     /// Delete an object from the session.
     ///
     /// The object will be DELETEd on the next `flush()` call.
-    #[tracing::instrument(level = "debug", skip(self, obj))]
     pub fn delete<M: Model + 'static>(&mut self, obj: &M) {
         let key = ObjectKey::from_model(obj);
-
-        tracing::info!(
-            model = std::any::type_name::<M>(),
-            table = M::TABLE_NAME,
-            "Marking object for deletion"
-        );
 
         if let Some(tracked) = self.identity_map.get_mut(&key) {
             match tracked.state {
@@ -426,8 +426,9 @@ impl<C: Connection> Session<C> {
     /// Get an object by primary key.
     ///
     /// First checks the identity map, then queries the database if not found.
-    #[tracing::instrument(level = "debug", skip(self, cx, pk))]
-    pub async fn get<M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static>(
+    pub async fn get<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
         &mut self,
         cx: &Cx,
         pk: impl Into<Value>,
@@ -435,12 +436,6 @@ impl<C: Connection> Session<C> {
         let pk_value = pk.into();
         let pk_values = vec![pk_value.clone()];
         let key = ObjectKey::from_pk::<M>(&pk_values);
-
-        tracing::debug!(
-            model = std::any::type_name::<M>(),
-            table = M::TABLE_NAME,
-            "Getting object by primary key"
-        );
 
         // Check identity map first
         if let Some(tracked) = self.identity_map.get(&key) {
@@ -525,13 +520,10 @@ impl<C: Connection> Session<C> {
     // ========================================================================
 
     /// Begin a transaction.
-    #[tracing::instrument(level = "debug", skip(self, cx))]
     pub async fn begin(&mut self, cx: &Cx) -> Outcome<(), Error> {
         if self.in_transaction {
             return Outcome::Ok(());
         }
-
-        tracing::info!("Beginning transaction");
 
         match self.connection.execute(cx, "BEGIN", &[]).await {
             Outcome::Ok(_) => {
@@ -547,16 +539,7 @@ impl<C: Connection> Session<C> {
     /// Flush pending changes to the database.
     ///
     /// This executes INSERT, UPDATE, and DELETE statements but does NOT commit.
-    #[tracing::instrument(level = "debug", skip(self, cx))]
     pub async fn flush(&mut self, cx: &Cx) -> Outcome<(), Error> {
-        let start = std::time::Instant::now();
-
-        tracing::info!(
-            inserts = self.pending_new.len(),
-            deletes = self.pending_delete.len(),
-            "Starting flush"
-        );
-
         // Auto-begin transaction if configured
         if self.config.auto_begin && !self.in_transaction {
             match self.begin(cx).await {
@@ -627,19 +610,11 @@ impl<C: Connection> Session<C> {
         // 3. Execute UPDATEs for dirty objects
         // TODO: Implement dirty checking
 
-        tracing::info!(
-            elapsed_ms = start.elapsed().as_millis(),
-            "Flush completed"
-        );
-
         Outcome::Ok(())
     }
 
     /// Commit the current transaction.
-    #[tracing::instrument(level = "debug", skip(self, cx))]
     pub async fn commit(&mut self, cx: &Cx) -> Outcome<(), Error> {
-        tracing::info!("Committing transaction");
-
         // Flush any pending changes first
         match self.flush(cx).await {
             Outcome::Ok(()) => {}
@@ -672,10 +647,7 @@ impl<C: Connection> Session<C> {
     }
 
     /// Rollback the current transaction.
-    #[tracing::instrument(level = "debug", skip(self, cx))]
     pub async fn rollback(&mut self, cx: &Cx) -> Outcome<(), Error> {
-        tracing::info!("Rolling back transaction");
-
         if self.in_transaction {
             match self.connection.execute(cx, "ROLLBACK", &[]).await {
                 Outcome::Ok(_) => {
