@@ -6,6 +6,7 @@
 
 use crate::Result;
 use crate::field::FieldInfo;
+use crate::relationship::RelationshipInfo;
 use crate::row::Row;
 use crate::value::Value;
 
@@ -35,6 +36,12 @@ pub trait Model: Sized + Send + Sync {
 
     /// The primary key column name(s).
     const PRIMARY_KEY: &'static [&'static str];
+
+    /// Relationship metadata for this model.
+    ///
+    /// The derive macro will populate this for relationship fields; models with
+    /// no relationships can rely on the default empty slice.
+    const RELATIONSHIPS: &'static [RelationshipInfo] = &[];
 
     /// Get field metadata for all columns.
     fn fields() -> &'static [FieldInfo];
@@ -75,4 +82,45 @@ pub trait SoftDelete: Model {
 
     /// Check if the model is deleted.
     fn is_deleted(&self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FieldInfo, Row, SqlType, Value};
+
+    #[derive(Debug)]
+    struct TestModel;
+
+    impl Model for TestModel {
+        const TABLE_NAME: &'static str = "test_models";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] =
+                &[FieldInfo::new("id", "id", SqlType::Integer).primary_key(true)];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![Value::from(1_i64)]
+        }
+
+        fn is_new(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_default_relationships_is_empty() {
+        assert!(TestModel::RELATIONSHIPS.is_empty());
+    }
 }
