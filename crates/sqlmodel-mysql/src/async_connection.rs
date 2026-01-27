@@ -27,10 +27,12 @@ use crate::auth;
 use crate::config::MySqlConfig;
 use crate::connection::{ConnectionState, ServerCapabilities};
 use crate::protocol::{
-    Command, ErrPacket, PacketHeader, PacketReader, PacketType, PacketWriter, capabilities,
-    charset, prepared, MAX_PACKET_SIZE,
+    Command, ErrPacket, MAX_PACKET_SIZE, PacketHeader, PacketReader, PacketType, PacketWriter,
+    capabilities, charset, prepared,
 };
-use crate::types::{ColumnDef, FieldType, decode_binary_value_with_len, decode_text_value, interpolate_params};
+use crate::types::{
+    ColumnDef, FieldType, decode_binary_value_with_len, decode_text_value, interpolate_params,
+};
 
 /// Async MySQL connection.
 ///
@@ -343,7 +345,10 @@ impl MySqlAsyncConnection {
                                 Err(e) => {
                                     return Outcome::Err(Error::Connection(ConnectionError {
                                         kind: ConnectionErrorKind::Disconnected,
-                                        message: format!("Failed to read continuation header: {}", e),
+                                        message: format!(
+                                            "Failed to read continuation header: {}",
+                                            e
+                                        ),
                                         source: Some(Box::new(e)),
                                     }));
                                 }
@@ -507,9 +512,8 @@ impl MySqlAsyncConnection {
         let mut reader = PacketReader::new(&payload);
 
         // Protocol version
-        let protocol_version = match reader.read_u8() {
-            Some(v) => v,
-            None => return Outcome::Err(protocol_error("Missing protocol version")),
+        let Some(protocol_version) = reader.read_u8() else {
+            return Outcome::Err(protocol_error("Missing protocol version"));
         };
 
         if protocol_version != 10 {
@@ -520,30 +524,26 @@ impl MySqlAsyncConnection {
         }
 
         // Server version (null-terminated string)
-        let server_version = match reader.read_null_string() {
-            Some(v) => v,
-            None => return Outcome::Err(protocol_error("Missing server version")),
+        let Some(server_version) = reader.read_null_string() else {
+            return Outcome::Err(protocol_error("Missing server version"));
         };
 
         // Connection ID
-        let connection_id = match reader.read_u32_le() {
-            Some(v) => v,
-            None => return Outcome::Err(protocol_error("Missing connection ID")),
+        let Some(connection_id) = reader.read_u32_le() else {
+            return Outcome::Err(protocol_error("Missing connection ID"));
         };
 
         // Auth plugin data part 1 (8 bytes)
-        let auth_data_1 = match reader.read_bytes(8) {
-            Some(v) => v,
-            None => return Outcome::Err(protocol_error("Missing auth data")),
+        let Some(auth_data_1) = reader.read_bytes(8) else {
+            return Outcome::Err(protocol_error("Missing auth data"));
         };
 
         // Filler (1 byte)
         reader.skip(1);
 
         // Capability flags (lower 2 bytes)
-        let caps_lower = match reader.read_u16_le() {
-            Some(v) => v,
-            None => return Outcome::Err(protocol_error("Missing capability flags")),
+        let Some(caps_lower) = reader.read_u16_le() else {
+            return Outcome::Err(protocol_error("Missing capability flags"));
         };
 
         // Character set
@@ -606,9 +606,8 @@ impl MySqlAsyncConnection {
 
     /// Send the handshake response packet asynchronously.
     async fn send_handshake_response_async(&mut self) -> Outcome<(), Error> {
-        let server_caps = match self.server_caps.as_ref() {
-            Some(c) => c,
-            None => return Outcome::Err(protocol_error("No server handshake received")),
+        let Some(server_caps) = self.server_caps.as_ref() else {
+            return Outcome::Err(protocol_error("No server handshake received"));
         };
 
         // Determine client capabilities
@@ -713,6 +712,7 @@ impl MySqlAsyncConnection {
                 return Outcome::Err(protocol_error("Empty authentication response"));
             }
 
+            #[allow(clippy::cast_possible_truncation)] // MySQL packets are max 16MB
             match PacketType::from_first_byte(payload[0], payload.len() as u32) {
                 PacketType::Ok => {
                     let mut reader = PacketReader::new(&payload);
@@ -724,9 +724,8 @@ impl MySqlAsyncConnection {
                 }
                 PacketType::Error => {
                     let mut reader = PacketReader::new(&payload);
-                    let err = match reader.parse_err_packet() {
-                        Some(e) => e,
-                        None => return Outcome::Err(protocol_error("Invalid error packet")),
+                    let Some(err) = reader.parse_err_packet() else {
+                        return Outcome::Err(protocol_error("Invalid error packet"));
                     };
                     return Outcome::Err(auth_error(format!(
                         "Authentication failed: {} ({})",
@@ -738,13 +737,8 @@ impl MySqlAsyncConnection {
                     let data = &payload[1..];
                     let mut reader = PacketReader::new(data);
 
-                    let plugin = match reader.read_null_string() {
-                        Some(p) => p,
-                        None => {
-                            return Outcome::Err(protocol_error(
-                                "Missing plugin name in auth switch",
-                            ))
-                        }
+                    let Some(plugin) = reader.read_null_string() else {
+                        return Outcome::Err(protocol_error("Missing plugin name in auth switch"));
                     };
 
                     let auth_data = reader.read_rest();
@@ -838,6 +832,7 @@ impl MySqlAsyncConnection {
             return Outcome::Err(protocol_error("Empty query response"));
         }
 
+        #[allow(clippy::cast_possible_truncation)] // MySQL packets are max 16MB
         match PacketType::from_first_byte(payload[0], payload.len() as u32) {
             PacketType::Ok => {
                 let mut reader = PacketReader::new(&payload);
@@ -860,9 +855,8 @@ impl MySqlAsyncConnection {
             PacketType::Error => {
                 self.state = ConnectionState::Ready;
                 let mut reader = PacketReader::new(&payload);
-                let err = match reader.parse_err_packet() {
-                    Some(e) => e,
-                    None => return Outcome::Err(protocol_error("Invalid error packet")),
+                let Some(err) = reader.parse_err_packet() else {
+                    return Outcome::Err(protocol_error("Invalid error packet"));
                 };
                 Outcome::Err(query_error(&err))
             }
@@ -877,9 +871,9 @@ impl MySqlAsyncConnection {
     /// Read a result set asynchronously.
     async fn read_result_set_async(&mut self, first_packet: &[u8]) -> Outcome<Vec<Row>, Error> {
         let mut reader = PacketReader::new(first_packet);
-        let column_count = match reader.read_lenenc_int() {
-            Some(c) => c as usize,
-            None => return Outcome::Err(protocol_error("Invalid column count")),
+        #[allow(clippy::cast_possible_truncation)] // Column count fits in usize
+        let Some(column_count) = reader.read_lenenc_int().map(|c| c as usize) else {
+            return Outcome::Err(protocol_error("Invalid column count"));
         };
 
         // Read column definitions
@@ -925,6 +919,7 @@ impl MySqlAsyncConnection {
                 break;
             }
 
+            #[allow(clippy::cast_possible_truncation)] // MySQL packets are max 16MB
             match PacketType::from_first_byte(payload[0], payload.len() as u32) {
                 PacketType::Eof | PacketType::Ok => {
                     let mut reader = PacketReader::new(&payload);
@@ -943,9 +938,8 @@ impl MySqlAsyncConnection {
                 }
                 PacketType::Error => {
                     let mut reader = PacketReader::new(&payload);
-                    let err = match reader.parse_err_packet() {
-                        Some(e) => e,
-                        None => return Outcome::Err(protocol_error("Invalid error packet")),
+                    let Some(err) = reader.parse_err_packet() else {
+                        return Outcome::Err(protocol_error("Invalid error packet"));
                     };
                     self.state = ConnectionState::Ready;
                     return Outcome::Err(query_error(&err));
@@ -1098,17 +1092,15 @@ impl MySqlAsyncConnection {
         // Check for error
         if payload.first() == Some(&0xFF) {
             let mut reader = PacketReader::new(&payload);
-            let err = match reader.parse_err_packet() {
-                Some(e) => e,
-                None => return Outcome::Err(protocol_error("Invalid error packet")),
+            let Some(err) = reader.parse_err_packet() else {
+                return Outcome::Err(protocol_error("Invalid error packet"));
             };
             return Outcome::Err(query_error(&err));
         }
 
         // Parse COM_STMT_PREPARE_OK
-        let prep_ok = match prepared::parse_stmt_prepare_ok(&payload) {
-            Some(ok) => ok,
-            None => return Outcome::Err(protocol_error("Invalid prepare OK response")),
+        let Some(prep_ok) = prepared::parse_stmt_prepare_ok(&payload) else {
+            return Outcome::Err(protocol_error("Invalid prepare OK response"));
         };
 
         // Read parameter column definitions
@@ -1193,12 +1185,12 @@ impl MySqlAsyncConnection {
         stmt: &PreparedStatement,
         params: &[Value],
     ) -> Outcome<Vec<Row>, Error> {
+        #[allow(clippy::cast_possible_truncation)] // Statement IDs are u32 in MySQL
         let stmt_id = stmt.id() as u32;
 
         // Look up metadata
-        let meta = match self.prepared_stmts.get(&stmt_id) {
-            Some(m) => m.clone(),
-            None => return Outcome::Err(connection_error("Unknown prepared statement")),
+        let Some(meta) = self.prepared_stmts.get(&stmt_id).cloned() else {
+            return Outcome::Err(connection_error("Unknown prepared statement"));
         };
 
         // Verify param count
@@ -1242,6 +1234,7 @@ impl MySqlAsyncConnection {
             return Outcome::Err(protocol_error("Empty execute response"));
         }
 
+        #[allow(clippy::cast_possible_truncation)] // MySQL packets are max 16MB
         match PacketType::from_first_byte(payload[0], payload.len() as u32) {
             PacketType::Ok => {
                 // Non-SELECT statement - parse OK packet
@@ -1258,15 +1251,15 @@ impl MySqlAsyncConnection {
             PacketType::Error => {
                 self.state = ConnectionState::Ready;
                 let mut reader = PacketReader::new(&payload);
-                let err = match reader.parse_err_packet() {
-                    Some(e) => e,
-                    None => return Outcome::Err(protocol_error("Invalid error packet")),
+                let Some(err) = reader.parse_err_packet() else {
+                    return Outcome::Err(protocol_error("Invalid error packet"));
                 };
                 Outcome::Err(query_error(&err))
             }
             _ => {
                 // Result set - read binary protocol rows
-                self.read_binary_result_set_async(&payload, &meta.columns).await
+                self.read_binary_result_set_async(&payload, &meta.columns)
+                    .await
             }
         }
     }
@@ -1361,6 +1354,7 @@ impl MySqlAsyncConnection {
                 break;
             }
 
+            #[allow(clippy::cast_possible_truncation)] // MySQL packets are max 16MB
             match PacketType::from_first_byte(payload[0], payload.len() as u32) {
                 PacketType::Eof | PacketType::Ok => {
                     let mut reader = PacketReader::new(&payload);
@@ -1379,9 +1373,8 @@ impl MySqlAsyncConnection {
                 }
                 PacketType::Error => {
                     let mut reader = PacketReader::new(&payload);
-                    let err = match reader.parse_err_packet() {
-                        Some(e) => e,
-                        None => return Outcome::Err(protocol_error("Invalid error packet")),
+                    let Some(err) = reader.parse_err_packet() else {
+                        return Outcome::Err(protocol_error("Invalid error packet"));
                     };
                     self.state = ConnectionState::Ready;
                     return Outcome::Err(query_error(&err));
@@ -1393,14 +1386,12 @@ impl MySqlAsyncConnection {
             }
         }
 
-        self.state = if self.status_flags
-            & crate::protocol::server_status::SERVER_STATUS_IN_TRANS
-            != 0
-        {
-            ConnectionState::InTransaction
-        } else {
-            ConnectionState::Ready
-        };
+        self.state =
+            if self.status_flags & crate::protocol::server_status::SERVER_STATUS_IN_TRANS != 0 {
+                ConnectionState::InTransaction
+            } else {
+                ConnectionState::Ready
+            };
 
         Outcome::Ok(rows)
     }
@@ -1475,10 +1466,8 @@ impl MySqlAsyncConnection {
                     }
                 }
                 // Flush
-                if let Err(e) = std::future::poll_fn(|cx| {
-                    std::pin::Pin::new(&mut *stream).poll_flush(cx)
-                })
-                .await
+                if let Err(e) =
+                    std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_flush(cx)).await
                 {
                     return Outcome::Err(Error::Connection(ConnectionError {
                         kind: ConnectionErrorKind::Disconnected,
@@ -1719,7 +1708,11 @@ impl<'conn> TransactionOps for MySqlTransaction<'conn> {
         _sql: &str,
         _params: &[Value],
     ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
-        async move { Outcome::Err(connection_error("Transaction query_one not yet implemented")) }
+        async move {
+            Outcome::Err(connection_error(
+                "Transaction query_one not yet implemented",
+            ))
+        }
     }
 
     fn execute(
@@ -1731,12 +1724,12 @@ impl<'conn> TransactionOps for MySqlTransaction<'conn> {
         async move { Outcome::Err(connection_error("Transaction execute not yet implemented")) }
     }
 
-    fn savepoint(
-        &self,
-        _cx: &Cx,
-        _name: &str,
-    ) -> impl Future<Output = Outcome<(), Error>> + Send {
-        async move { Outcome::Err(connection_error("Transaction savepoint not yet implemented")) }
+    fn savepoint(&self, _cx: &Cx, _name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
+        async move {
+            Outcome::Err(connection_error(
+                "Transaction savepoint not yet implemented",
+            ))
+        }
     }
 
     fn rollback_to(
@@ -1751,16 +1744,8 @@ impl<'conn> TransactionOps for MySqlTransaction<'conn> {
         }
     }
 
-    fn release(
-        &self,
-        _cx: &Cx,
-        _name: &str,
-    ) -> impl Future<Output = Outcome<(), Error>> + Send {
-        async move {
-            Outcome::Err(connection_error(
-                "Transaction release not yet implemented",
-            ))
-        }
+    fn release(&self, _cx: &Cx, _name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
+        async move { Outcome::Err(connection_error("Transaction release not yet implemented")) }
     }
 
     fn commit(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
@@ -1855,7 +1840,9 @@ fn validate_savepoint_name(name: &str) -> Result<(), Error> {
         return Err(query_error_msg("Savepoint name cannot be empty"));
     }
     if name.len() > 64 {
-        return Err(query_error_msg("Savepoint name exceeds maximum length of 64 characters"));
+        return Err(query_error_msg(
+            "Savepoint name exceeds maximum length of 64 characters",
+        ));
     }
     let mut chars = name.chars();
     let first = chars.next().unwrap();
@@ -2004,7 +1991,10 @@ impl SharedMySqlConnection {
 }
 
 impl Connection for SharedMySqlConnection {
-    type Tx<'conn> = SharedMySqlTransaction<'conn> where Self: 'conn;
+    type Tx<'conn>
+        = SharedMySqlTransaction<'conn>
+    where
+        Self: 'conn;
 
     fn query(
         &self,
@@ -2018,7 +2008,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.query_async(cx, &sql, &params).await
         }
@@ -2036,7 +2028,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             let rows = match guard.query_async(cx, &sql, &params).await {
                 Outcome::Ok(r) => r,
@@ -2060,7 +2054,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.execute_async(cx, &sql, &params).await
         }
@@ -2078,7 +2074,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             match guard.execute_async(cx, &sql, &params).await {
                 Outcome::Ok(_) => Outcome::Ok(guard.last_insert_id() as i64),
@@ -2099,7 +2097,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             let mut results = Vec::with_capacity(statements.len());
             for (sql, params) in &statements {
@@ -2136,7 +2136,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.prepare_async(cx, &sql).await
         }
@@ -2154,7 +2156,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.query_prepared_async(cx, &stmt, &params).await
         }
@@ -2172,7 +2176,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.execute_prepared_async(cx, &stmt, &params).await
         }
@@ -2183,7 +2189,9 @@ impl Connection for SharedMySqlConnection {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.ping_async(cx).await
         }
@@ -2221,7 +2229,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.query_async(cx, &sql, &params).await
         }
@@ -2239,7 +2249,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             let rows = match guard.query_async(cx, &sql, &params).await {
                 Outcome::Ok(r) => r,
@@ -2263,17 +2275,15 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         async move {
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             guard.execute_async(cx, &sql, &params).await
         }
     }
 
-    fn savepoint(
-        &self,
-        cx: &Cx,
-        name: &str,
-    ) -> impl Future<Output = Outcome<(), Error>> + Send {
+    fn savepoint(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         // Validate name before building SQL to prevent injection
         let validation_result = validate_savepoint_name(name);
@@ -2285,7 +2295,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             }
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             match guard.execute_async(cx, &sql, &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),
@@ -2296,11 +2308,7 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         }
     }
 
-    fn rollback_to(
-        &self,
-        cx: &Cx,
-        name: &str,
-    ) -> impl Future<Output = Outcome<(), Error>> + Send {
+    fn rollback_to(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         // Validate name before building SQL to prevent injection
         let validation_result = validate_savepoint_name(name);
@@ -2312,7 +2320,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             }
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             match guard.execute_async(cx, &sql, &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),
@@ -2323,11 +2333,7 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         }
     }
 
-    fn release(
-        &self,
-        cx: &Cx,
-        name: &str,
-    ) -> impl Future<Output = Outcome<(), Error>> + Send {
+    fn release(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         // Validate name before building SQL to prevent injection
         let validation_result = validate_savepoint_name(name);
@@ -2339,7 +2345,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             }
             let mut guard = match inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             match guard.execute_async(cx, &sql, &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),
@@ -2357,7 +2365,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         async move {
             let mut guard = match self.inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             match guard.execute_async(cx, "COMMIT", &[]).await {
                 Outcome::Ok(_) => {
@@ -2375,7 +2385,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         async move {
             let mut guard = match self.inner.lock(cx).await {
                 Ok(g) => g,
-                Err(_) => return Outcome::Err(connection_error("Failed to acquire connection lock")),
+                Err(_) => {
+                    return Outcome::Err(connection_error("Failed to acquire connection lock"));
+                }
             };
             match guard.execute_async(cx, "ROLLBACK", &[]).await {
                 Outcome::Ok(_) => Outcome::Ok(()),
