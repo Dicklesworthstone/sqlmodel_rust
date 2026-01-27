@@ -2,7 +2,7 @@
 
 This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
-**Last Updated:** 2026-01-27 (Post-MySQL TLS/Prepared Statement Integration)
+**Last Updated:** 2026-01-27 (Full verification pass - sql_type, on_delete/on_update, Validate macro confirmed)
 
 ---
 
@@ -11,18 +11,18 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Category | Implemented | Total | Coverage |
 |----------|-------------|-------|----------|
 | Core Model | 12 | 12 | 100% |
-| Field Options | 13 | 14 | 93% |
+| Field Options | 14 | 16 | 88% |
 | Query Building | 22 | 22 | 100% |
 | Expression Operators | 20 | 20 | 100% |
 | Session/Connection | 8 | 8 | 100% |
 | Transactions | 6 | 6 | 100% |
 | Schema/DDL | 7 | 8 | 88% |
-| Validation | 4 | 6 | 67% |
+| Validation | 5 | 6 | 83% |
 | Relationships | 0 | 6 | 0% (Excluded) |
 | Serialization | 4 | 4 | 100% |
 | Database Drivers | 3 | 3 | 100% |
 | Connection Pooling | 8 | 8 | 100% |
-| **TOTAL** | **107** | **117** | **91%** |
+| **TOTAL** | **109** | **119** | **92%** |
 
 ---
 
@@ -60,7 +60,7 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Default value | `Field(default=...)` | `#[sqlmodel(default = "...")]` | ✅ Complete |
 | Default factory | `Field(default_factory=...)` | `Default` trait | ✅ Complete |
 | Column name override | `sa_column(name=...)` | `#[sqlmodel(column = "...")]` | ✅ Complete |
-| SQL type override | `Field(sa_type=...)` | `#[sqlmodel(sql_type = "...")]` | ❌ TODO |
+| SQL type override | `Field(sa_type=...)` | `#[sqlmodel(sql_type = "...")]` | ✅ Complete |
 | Max length | `Field(max_length=N)` | `#[sqlmodel(max_length = N)]` | ⚠️ Partial |
 | Decimal precision | `Field(max_digits=N)` | N/A | ❌ TODO |
 | Decimal scale | `Field(decimal_places=N)` | N/A | ❌ TODO |
@@ -260,24 +260,29 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
 ### Priority 1 (Should Implement)
 
-1. **`#[derive(Validate)]` macro** - Generates validation logic at compile time
-   - Numeric constraints (gt, ge, lt, le)
-   - String constraints (min_length, max_length, regex)
-   - Custom validator methods
+~~1. **`#[derive(Validate)]` macro** - Generates validation logic at compile time~~ ✅ **IMPLEMENTED**
+   - ✅ Numeric constraints (min, max)
+   - ✅ String constraints (min_length, max_length)
+   - ✅ Custom validator methods
+   - ⚠️ Full regex patterns (simplified - email, url only)
 
-2. **`on_delete` foreign key action** - CASCADE, SET NULL, RESTRICT
-   - Add to `#[sqlmodel(foreign_key = "...", on_delete = "CASCADE")]`
+~~2. **`on_delete` foreign key action** - CASCADE, SET NULL, RESTRICT~~ ✅ **IMPLEMENTED**
+   - ✅ `#[sqlmodel(foreign_key = "...", on_delete = "CASCADE")]`
+   - ✅ `#[sqlmodel(on_update = "...")]` also supported
 
-3. **SQL type override** - `#[sqlmodel(sql_type = "VARCHAR(500)")]`
-   - For cases where inference isn't sufficient
+~~3. **SQL type override** - `#[sqlmodel(sql_type = "VARCHAR(500)")]`~~ ✅ **IMPLEMENTED**
+   - ✅ DDL generation uses override when specified
+   - ✅ `effective_sql_type()` method handles fallback
 
 ### Priority 2 (Nice to Have)
 
-4. **Decimal precision/scale** - For financial applications
+1. **Decimal precision/scale** - For financial applications
    - `#[sqlmodel(precision = 10, scale = 2)]`
+   - Workaround: Use `#[sqlmodel(sql_type = "DECIMAL(10,2)")]`
 
-5. **PostgreSQL async driver** - Complete implementation
-   - Currently only skeleton exists
+2. **Full regex validation** - Beyond email/url patterns
+   - Would require `regex` crate dependency
+   - Current workaround: Use custom validators
 
 ### Priority 3 (Explicitly Excluded)
 
@@ -309,7 +314,7 @@ These features are intentionally NOT being ported:
 
 ## Conclusion
 
-The Rust SQLModel implementation is **~86% feature complete** compared to Python SQLModel. The core ORM functionality (Model derive, query building, CRUD operations, transactions, connection pooling) is fully implemented and production-ready.
+The Rust SQLModel implementation is **~92% feature complete** compared to Python SQLModel. The core ORM functionality (Model derive, query building, CRUD operations, transactions, connection pooling, validation) is fully implemented and production-ready.
 
 ### Fully Production-Ready
 
@@ -319,12 +324,15 @@ The Rust SQLModel implementation is **~86% feature complete** compared to Python
 4. **Connection pooling** - All configuration options, health checks, statistics
 5. **TLS/SSL** - Implemented for MySQL and PostgreSQL via rustls
 6. **Prepared statements** - MySQL binary protocol, PostgreSQL named statements
+7. **Validate derive macro** - Numeric/string constraints, custom validators
+8. **SQL type override** - `#[sqlmodel(sql_type = "...")]` for DDL customization
+9. **Referential actions** - `on_delete` and `on_update` foreign key actions
 
 ### Remaining Gaps
 
-1. **Full regex support** - Validation pattern matching is simplified (email, url)
-2. **Some field options** - decimal precision/scale
-3. **Advanced type inference** - DateTime/UUID need explicit sql_type
+1. **Full regex support** - Validation pattern matching is simplified (email, url only)
+2. **Decimal precision/scale** - Use `sql_type` override as workaround
+3. **Model-level validators** - Not planned (use field validators)
 
 ### Explicitly Excluded Features
 
