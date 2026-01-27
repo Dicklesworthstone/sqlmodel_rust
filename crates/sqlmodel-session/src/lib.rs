@@ -1243,7 +1243,7 @@ mod tests {
         assert!(info.in_transaction);
     }
 
-    fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
+    fn unwrap_outcome<T: std::fmt::Debug>(outcome: Outcome<T, Error>) -> T {
         match outcome {
             Outcome::Ok(v) => v,
             other => {
