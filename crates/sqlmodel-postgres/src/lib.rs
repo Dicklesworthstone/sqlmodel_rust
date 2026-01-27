@@ -32,12 +32,14 @@
 //! let conn = PgConnection::connect(config)?;
 //! ```
 
+pub mod async_connection;
 pub mod auth;
 pub mod config;
 pub mod connection;
 pub mod protocol;
 pub mod types;
 
+pub use async_connection::{PgAsyncConnection, SharedPgConnection, SharedPgTransaction};
 pub use config::{PgConfig, SslMode};
 pub use connection::{ConnectionState, PgConnection, TransactionStatusState};
 pub use types::{Format, TypeCategory, TypeInfo, TypeRegistry};
