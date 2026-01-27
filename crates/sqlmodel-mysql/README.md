@@ -4,7 +4,9 @@ MySQL wire protocol driver for SQLModel Rust.
 
 ## Status
 
-**Current State**: Synchronous implementation complete, async conversion pending.
+**Current State**: Async text-protocol connection works via `MySqlAsyncConnection`. Use
+`SharedMySqlConnection` (async mutex wrapper) for a correct `sqlmodel_core::Connection`
+implementation.
 
 ### What Works
 
@@ -15,15 +17,30 @@ MySQL wire protocol driver for SQLModel Rust.
 - Error handling with MySQL error codes
 - Connection state machine
 - Type encoding/decoding for common types
+- Async connection (`MySqlAsyncConnection`) + `Connection` via `SharedMySqlConnection`
 - 58 unit tests passing
 
 ### What's Missing
 
-- [ ] **Async conversion** - Convert from `std::net::TcpStream` to `asupersync::net::TcpStream`
-- [ ] **Connection trait** - Implement `sqlmodel_core::Connection` trait
 - [ ] **Prepared statements** - Binary protocol (COM_STMT_PREPARE, COM_STMT_EXECUTE)
 - [ ] **SSL/TLS** - Encrypted connections
-- [ ] **Integration tests** - Tests against real MySQL database
+- [ ] **Connection trait for MySqlAsyncConnection** - Remove the current stub (requires interior mutability or trait changes)
+
+## Integration Tests
+
+The integration suite in `crates/sqlmodel-mysql/tests/mysql_integration.rs` is **env-gated**:
+it will skip unless `SQLMODEL_TEST_MYSQL_URL` is set.
+
+Example:
+
+```bash
+export SQLMODEL_TEST_MYSQL_URL='mysql://root:secret@127.0.0.1:3306/sqlmodel_test'
+cargo test -p sqlmodel-mysql --test mysql_integration -- --nocapture
+```
+
+Note: Some MySQL 8 configurations using `caching_sha2_password` may require TLS for full auth;
+until `bd-38q` is implemented, use a test user configured for `mysql_native_password` (or
+otherwise compatible auth settings).
 
 ## Current API (Synchronous)
 
