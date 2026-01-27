@@ -45,6 +45,10 @@ pub struct FieldDef {
     pub unique: bool,
     /// Foreign key reference (e.g., `"teams.id"`).
     pub foreign_key: Option<String>,
+    /// ON DELETE referential action (e.g., "CASCADE", "SET NULL").
+    pub on_delete: Option<String>,
+    /// ON UPDATE referential action (e.g., "CASCADE", "NO ACTION").
+    pub on_update: Option<String>,
     /// SQL DEFAULT expression.
     pub default: Option<String>,
     /// Index name if this field is part of an index.
@@ -389,6 +393,8 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         auto_increment: attrs.auto_increment,
         unique: attrs.unique,
         foreign_key: attrs.foreign_key,
+        on_delete: attrs.on_delete,
+        on_update: attrs.on_update,
         default: attrs.default,
         index: attrs.index,
         skip: attrs.skip,
@@ -407,6 +413,8 @@ struct FieldAttrs {
     auto_increment: bool,
     unique: bool,
     foreign_key: Option<String>,
+    on_delete: Option<String>,
+    on_update: Option<String>,
     default: Option<String>,
     index: Option<String>,
     skip: bool,
@@ -495,6 +503,54 @@ fn parse_field_attrs(attrs: &[Attribute], field_name: &Ident) -> Result<FieldAtt
                 } else {
                     return Err(Error::new_spanned(value, "expected string literal for index"));
                 }
+            } else if path.is_ident("on_delete") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    let action = lit_str.value().to_uppercase();
+                    // Validate the referential action
+                    let valid = matches!(
+                        action.as_str(),
+                        "NO ACTION" | "NOACTION" | "NO_ACTION" | "RESTRICT" | "CASCADE"
+                            | "SET NULL" | "SETNULL" | "SET_NULL" | "SET DEFAULT"
+                            | "SETDEFAULT" | "SET_DEFAULT"
+                    );
+                    if !valid {
+                        return Err(Error::new_spanned(
+                            lit_str,
+                            "on_delete must be one of: NO ACTION, RESTRICT, CASCADE, SET NULL, SET DEFAULT",
+                        ));
+                    }
+                    result.on_delete = Some(action);
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for on_delete",
+                    ));
+                }
+            } else if path.is_ident("on_update") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    let action = lit_str.value().to_uppercase();
+                    // Validate the referential action
+                    let valid = matches!(
+                        action.as_str(),
+                        "NO ACTION" | "NOACTION" | "NO_ACTION" | "RESTRICT" | "CASCADE"
+                            | "SET NULL" | "SETNULL" | "SET_NULL" | "SET DEFAULT"
+                            | "SETDEFAULT" | "SET_DEFAULT"
+                    );
+                    if !valid {
+                        return Err(Error::new_spanned(
+                            lit_str,
+                            "on_update must be one of: NO ACTION, RESTRICT, CASCADE, SET NULL, SET DEFAULT",
+                        ));
+                    }
+                    result.on_update = Some(action);
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for on_update",
+                    ));
+                }
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -503,7 +559,7 @@ fn parse_field_attrs(attrs: &[Attribute], field_name: &Ident) -> Result<FieldAtt
                     format!(
                         "unknown sqlmodel attribute `{attr_name}`. \
                          Valid attributes are: primary_key, auto_increment, column, nullable, \
-                         unique, foreign_key, default, sql_type, index, skip, skip_insert, skip_update"
+                         unique, foreign_key, on_delete, on_update, default, sql_type, index, skip, skip_insert, skip_update"
                     ),
                 ));
             }

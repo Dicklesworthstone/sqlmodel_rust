@@ -144,6 +144,24 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     }
 }
 
+/// Convert a referential action string to the corresponding token.
+fn referential_action_token(action: &str) -> proc_macro2::TokenStream {
+    match action.to_uppercase().as_str() {
+        "NO ACTION" | "NOACTION" | "NO_ACTION" => {
+            quote::quote! { sqlmodel_core::ReferentialAction::NoAction }
+        }
+        "RESTRICT" => quote::quote! { sqlmodel_core::ReferentialAction::Restrict },
+        "CASCADE" => quote::quote! { sqlmodel_core::ReferentialAction::Cascade },
+        "SET NULL" | "SETNULL" | "SET_NULL" => {
+            quote::quote! { sqlmodel_core::ReferentialAction::SetNull }
+        }
+        "SET DEFAULT" | "SETDEFAULT" | "SET_DEFAULT" => {
+            quote::quote! { sqlmodel_core::ReferentialAction::SetDefault }
+        }
+        _ => quote::quote! { sqlmodel_core::ReferentialAction::NoAction },
+    }
+}
+
 /// Generate the static FieldInfo array contents.
 fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
     let mut field_tokens = Vec::new();
@@ -186,6 +204,22 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
             quote::quote! { None }
         };
 
+        // ON DELETE action
+        let on_delete_token = if let Some(ref action) = field.on_delete {
+            let action_token = referential_action_token(action);
+            quote::quote! { Some(#action_token) }
+        } else {
+            quote::quote! { None }
+        };
+
+        // ON UPDATE action
+        let on_update_token = if let Some(ref action) = field.on_update {
+            let action_token = referential_action_token(action);
+            quote::quote! { Some(#action_token) }
+        } else {
+            quote::quote! { None }
+        };
+
         field_tokens.push(quote::quote! {
             sqlmodel_core::FieldInfo::new(#field_name, #column_name, #sql_type_token)
                 .nullable(#nullable)
@@ -194,6 +228,8 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
                 .unique(#unique)
                 .default_opt(#default_token)
                 .foreign_key_opt(#fk_token)
+                .on_delete_opt(#on_delete_token)
+                .on_update_opt(#on_update_token)
                 .index_opt(#index_token)
         });
     }
