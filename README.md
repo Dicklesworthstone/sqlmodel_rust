@@ -230,10 +230,70 @@ let deleted = delete!(User)
 
 ---
 
-## Console Examples
+## Console Output
 
-SQLModel Rust ships a `sqlmodel-console` crate with visual renderables. You can run
-example programs to preview both rich and plain output:
+SQLModel Rust includes an optional rich console output system for beautiful terminal feedback.
+
+### Features
+
+- **Styled error messages** with context, SQL highlighting, and suggestions
+- **Formatted query result tables** with type-based coloring
+- **Schema visualization** as interactive trees
+- **Progress bars** for bulk operations
+- **Agent-safe**: auto-detects AI coding tools (Claude Code, Codex, Cursor, Aider, etc.)
+
+### Quick Setup
+
+Add the console feature to your dependency:
+
+```toml
+[dependencies]
+sqlmodel-console = { path = "crates/sqlmodel-console" }
+```
+
+Create and use a console:
+
+```rust
+use sqlmodel_console::{SqlModelConsole, OutputMode};
+use sqlmodel_console::renderables::QueryResultTable;
+
+// Auto-detect mode (rich for humans, plain for agents)
+let console = SqlModelConsole::new();
+
+// Display query results
+let table = QueryResultTable::new()
+    .columns(vec!["id", "name", "email"])
+    .row(vec!["1", "Alice", "alice@example.com"])
+    .timing_ms(12.34);
+
+console.print_table(&table);
+```
+
+### Output Modes
+
+| Mode | When Used | Output |
+|------|-----------|--------|
+| **Rich** | Human on TTY | Colors, tables, panels |
+| **Plain** | Agent detected / piped | Parseable text |
+| **JSON** | `SQLMODEL_JSON=1` | Structured JSON |
+
+### Agent Compatibility
+
+Console output is **agent-safe by default**. When running under Claude Code, Codex CLI, Cursor, or other AI coding tools, output automatically switches to plain text that agents can parse.
+
+Environment variables for control:
+- `SQLMODEL_PLAIN=1` - Force plain text mode
+- `SQLMODEL_RICH=1` - Force rich mode (even for agents)
+- `SQLMODEL_JSON=1` - Force JSON output
+
+### Documentation
+
+- [Console User Guide](docs/console/user-guide.md) - Complete feature guide
+- [Agent Compatibility Guide](docs/console/agent-compatibility.md) - For agent authors
+
+### Visual Examples
+
+Run the example programs to preview both rich and plain output:
 
 ```bash
 cargo run -p sqlmodel-console --example console_demo
