@@ -40,7 +40,7 @@ pub use flush::{FlushOrderer, FlushPlan, FlushResult, PendingOp};
 
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
-use sqlmodel_core::{Connection, Error, Model, Value};
+use sqlmodel_core::{Connection, Error, Lazy, Model, Value};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -685,6 +685,210 @@ impl<C: Connection> Session<C> {
         }
 
         Outcome::Ok(())
+    }
+
+    // ========================================================================
+    // Lazy Loading
+    // ========================================================================
+
+    /// Load a single lazy relationship.
+    ///
+    /// Fetches the related object from the database and caches it in the Lazy wrapper.
+    /// If the relationship has already been loaded, returns the cached value.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// session.load_lazy(&hero.team, &cx).await?;
+    /// let team = hero.team.get(); // Now available
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self, lazy, cx))]
+    pub async fn load_lazy<
+        T: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        lazy: &Lazy<T>,
+        cx: &Cx,
+    ) -> Outcome<bool, Error> {
+        tracing::debug!(
+            model = std::any::type_name::<T>(),
+            fk = ?lazy.fk(),
+            already_loaded = lazy.is_loaded(),
+            "Loading lazy relationship"
+        );
+
+        // If already loaded, return success
+        if lazy.is_loaded() {
+            tracing::trace!("Already loaded");
+            return Outcome::Ok(lazy.get().is_some());
+        }
+
+        // If no FK, set as empty and return
+        let Some(fk) = lazy.fk() else {
+            let _ = lazy.set_loaded(None);
+            return Outcome::Ok(false);
+        };
+
+        // Fetch from database using get()
+        let obj = match self.get::<T>(cx, fk.clone()).await {
+            Outcome::Ok(obj) => obj,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let found = obj.is_some();
+
+        // Cache the result
+        let _ = lazy.set_loaded(obj);
+
+        tracing::debug!(found = found, "Lazy load complete");
+
+        Outcome::Ok(found)
+    }
+
+    /// Batch load lazy relationships for multiple objects.
+    ///
+    /// This method collects all FK values, executes a single query, and populates
+    /// each Lazy field. This prevents the N+1 query problem when iterating over
+    /// a collection and accessing lazy relationships.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Load 100 heroes
+    /// let mut heroes = session.query::<Hero>().all().await?;
+    ///
+    /// // Without batch loading: 100 queries (N+1 problem)
+    /// // With batch loading: 1 query
+    /// session.load_many(&cx, &mut heroes, |h| &h.team).await?;
+    ///
+    /// // All teams now loaded
+    /// for hero in &heroes {
+    ///     if let Some(team) = hero.team.get() {
+    ///         println!("{} is on {}", hero.name, team.name);
+    ///     }
+    /// }
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor))]
+    pub async fn load_many<P, T, F>(
+        &mut self,
+        cx: &Cx,
+        objects: &[P],
+        accessor: F,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        T: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+        F: Fn(&P) -> &Lazy<T>,
+    {
+        // Collect all FK values that need loading
+        let mut fk_values: Vec<Value> = Vec::new();
+        let mut fk_indices: Vec<usize> = Vec::new();
+
+        for (idx, obj) in objects.iter().enumerate() {
+            let lazy = accessor(obj);
+            if !lazy.is_loaded() && !lazy.is_empty() {
+                if let Some(fk) = lazy.fk() {
+                    fk_values.push(fk.clone());
+                    fk_indices.push(idx);
+                }
+            }
+        }
+
+        let fk_count = fk_values.len();
+        tracing::info!(
+            parent_model = std::any::type_name::<P>(),
+            related_model = std::any::type_name::<T>(),
+            parent_count = objects.len(),
+            fk_count = fk_count,
+            "Batch loading lazy relationships"
+        );
+
+        if fk_values.is_empty() {
+            // Nothing to load - mark all empty/loaded Lazy fields
+            for obj in objects {
+                let lazy = accessor(obj);
+                if !lazy.is_loaded() && lazy.is_empty() {
+                    let _ = lazy.set_loaded(None);
+                }
+            }
+            return Outcome::Ok(0);
+        }
+
+        // Build query with IN clause
+        let pk_col = T::PRIMARY_KEY.first().unwrap_or(&"id");
+        let placeholders: Vec<String> = (1..=fk_values.len()).map(|i| format!("${}", i)).collect();
+        let sql = format!(
+            "SELECT * FROM \"{}\" WHERE \"{}\" IN ({})",
+            T::TABLE_NAME,
+            pk_col,
+            placeholders.join(", ")
+        );
+
+        let rows = match self.connection.query(cx, &sql, &fk_values).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Convert rows to objects and build PK hash -> object lookup
+        let mut lookup: HashMap<u64, T> = HashMap::new();
+        for row in &rows {
+            match T::from_row(row) {
+                Ok(obj) => {
+                    let pk_values = obj.primary_key_value();
+                    let pk_hash = hash_values(&pk_values);
+
+                    // Add to session identity map
+                    let serialized = serde_json::to_vec(&obj).ok();
+                    let column_names: Vec<&'static str> =
+                        T::fields().iter().map(|f| f.column_name).collect();
+                    let key = ObjectKey::from_pk::<T>(&pk_values);
+
+                    let tracked = TrackedObject {
+                        object: Box::new(obj.clone()),
+                        original_state: serialized,
+                        state: ObjectState::Persistent,
+                        table_name: T::TABLE_NAME,
+                        column_names,
+                    };
+                    self.identity_map.insert(key, tracked);
+
+                    // Add to lookup
+                    lookup.insert(pk_hash, obj);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Populate each Lazy field
+        let mut loaded_count = 0;
+        for obj in objects {
+            let lazy = accessor(obj);
+            if !lazy.is_loaded() {
+                if let Some(fk) = lazy.fk() {
+                    let fk_hash = hash_values(&[fk.clone()]);
+                    let related = lookup.get(&fk_hash).cloned();
+                    let found = related.is_some();
+                    let _ = lazy.set_loaded(related);
+                    if found {
+                        loaded_count += 1;
+                    }
+                } else {
+                    let _ = lazy.set_loaded(None);
+                }
+            }
+        }
+
+        tracing::debug!(
+            query_count = 1,
+            loaded_count = loaded_count,
+            "Batch load complete"
+        );
+
+        Outcome::Ok(loaded_count)
     }
 
     // ========================================================================
