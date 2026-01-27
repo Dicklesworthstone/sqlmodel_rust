@@ -3,6 +3,14 @@
 use sqlmodel_core::{FieldInfo, Model};
 use std::marker::PhantomData;
 
+fn quote_ident(ident: &str) -> String {
+    let mut out = String::with_capacity(ident.len() + 2);
+    out.push('"');
+    out.push_str(ident);
+    out.push('"');
+    out
+}
+
 /// Builder for CREATE TABLE statements.
 #[derive(Debug)]
 pub struct CreateTable<M: Model> {
@@ -33,7 +41,9 @@ impl<M: Model> CreateTable<M> {
             sql.push_str("IF NOT EXISTS ");
         }
 
-        sql.push_str(&format!("\"{}\"", M::TABLE_NAME));
+        sql.push('"');
+        sql.push_str(M::TABLE_NAME);
+        sql.push('"');
         sql.push_str(" (\n");
 
         let fields = M::fields();
@@ -45,23 +55,30 @@ impl<M: Model> CreateTable<M> {
 
             // Collect constraints
             if field.unique && !field.primary_key {
-                constraints.push(format!(
-                    "CONSTRAINT \"uk_{}\" UNIQUE (\"{}\")",
-                    field.column_name, field.column_name
-                ));
+                let mut constraint = String::new();
+                constraint.push_str("CONSTRAINT \"uk_");
+                constraint.push_str(field.column_name);
+                constraint.push_str("\" UNIQUE (\"");
+                constraint.push_str(field.column_name);
+                constraint.push_str("\")");
+                constraints.push(constraint);
             }
 
             if let Some(fk) = field.foreign_key {
                 let parts: Vec<&str> = fk.split('.').collect();
                 if parts.len() == 2 {
-                    let mut fk_sql = format!(
-                        "CONSTRAINT \"fk_{}_{}\" FOREIGN KEY (\"{}\") REFERENCES \"{}\"(\"{}\")",
-                        M::TABLE_NAME,
-                        field.column_name,
-                        field.column_name,
-                        parts[0],
-                        parts[1]
-                    );
+                    let mut fk_sql = String::new();
+                    fk_sql.push_str("CONSTRAINT \"fk_");
+                    fk_sql.push_str(M::TABLE_NAME);
+                    fk_sql.push('_');
+                    fk_sql.push_str(field.column_name);
+                    fk_sql.push_str("\" FOREIGN KEY (\"");
+                    fk_sql.push_str(field.column_name);
+                    fk_sql.push_str("\") REFERENCES \"");
+                    fk_sql.push_str(parts[0]);
+                    fk_sql.push_str("\"(\"");
+                    fk_sql.push_str(parts[1]);
+                    fk_sql.push_str("\")");
 
                     // Add ON DELETE action if specified
                     if let Some(on_delete) = field.on_delete {
@@ -83,8 +100,12 @@ impl<M: Model> CreateTable<M> {
         // Add primary key constraint
         let pk_cols = M::PRIMARY_KEY;
         if !pk_cols.is_empty() {
-            let quoted_pk: Vec<String> = pk_cols.iter().map(|c| format!("\"{}\"", c)).collect();
-            constraints.insert(0, format!("PRIMARY KEY ({})", quoted_pk.join(", ")));
+            let quoted_pk: Vec<String> = pk_cols.iter().map(|c| quote_ident(c)).collect();
+            let mut constraint = String::new();
+            constraint.push_str("PRIMARY KEY (");
+            constraint.push_str(&quoted_pk.join(", "));
+            constraint.push(')');
+            constraints.insert(0, constraint);
         }
 
         // Combine column definitions and constraints
@@ -97,7 +118,12 @@ impl<M: Model> CreateTable<M> {
     }
 
     fn column_definition(&self, field: &FieldInfo) -> String {
-        let mut def = format!("  \"{}\" {}", field.column_name, field.effective_sql_type());
+        let sql_type = field.effective_sql_type();
+        let mut def = String::new();
+        def.push_str("  \"");
+        def.push_str(field.column_name);
+        def.push_str("\" ");
+        def.push_str(&sql_type);
 
         if !field.nullable && !field.auto_increment {
             def.push_str(" NOT NULL");
@@ -469,6 +495,21 @@ mod tests {
         assert_eq!(ReferentialAction::from_str("invalid"), None);
     }
 
+    #[derive(sqlmodel_macros::Model)]
+    struct TestDerivedSqlTypeOverride {
+        #[sqlmodel(primary_key)]
+        id: i64,
+
+        #[sqlmodel(sql_type = "TIMESTAMP WITH TIME ZONE")]
+        created_at: String,
+    }
+
+    #[test]
+    fn test_create_table_sql_type_attribute_preserves_raw_string() {
+        let sql = CreateTable::<TestDerivedSqlTypeOverride>::new().build();
+        assert!(sql.contains("\"created_at\" TIMESTAMP WITH TIME ZONE NOT NULL"));
+    }
+
     // Test model with sql_type_override
     struct TestWithSqlTypeOverride;
 
@@ -593,14 +634,18 @@ impl SchemaBuilder {
     /// Add an index creation statement.
     pub fn create_index(mut self, name: &str, table: &str, columns: &[&str], unique: bool) -> Self {
         let unique_str = if unique { "UNIQUE " } else { "" };
-        let quoted_cols: Vec<String> = columns.iter().map(|c| format!("\"{}\"", c)).collect();
-        self.statements.push(format!(
-            "CREATE {}INDEX IF NOT EXISTS \"{}\" ON \"{}\" ({})",
-            unique_str,
-            name,
-            table,
-            quoted_cols.join(", ")
-        ));
+        let quoted_cols: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+        let mut stmt = String::new();
+        stmt.push_str("CREATE ");
+        stmt.push_str(unique_str);
+        stmt.push_str("INDEX IF NOT EXISTS \"");
+        stmt.push_str(name);
+        stmt.push_str("\" ON \"");
+        stmt.push_str(table);
+        stmt.push_str("\" (");
+        stmt.push_str(&quoted_cols.join(", "));
+        stmt.push(')');
+        self.statements.push(stmt);
         self
     }
 

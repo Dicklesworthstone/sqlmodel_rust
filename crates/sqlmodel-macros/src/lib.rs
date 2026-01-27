@@ -6,6 +6,7 @@
 //! - `JsonSchema` - JSON Schema generation (for OpenAPI)
 
 use proc_macro::TokenStream;
+use syn::ext::IdentExt;
 
 mod infer;
 mod parse;
@@ -167,7 +168,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
     let mut field_tokens = Vec::new();
 
     for field in model.select_fields() {
-        let field_name = field.name.to_string();
+        let field_ident = field.name.unraw();
         let column_name = &field.column_name;
         let nullable = field.nullable;
         let primary_key = field.primary_key;
@@ -181,6 +182,13 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         } else {
             // Infer from Rust type (handles primitives, Option<T>, common library types)
             infer::infer_sql_type(&field.ty)
+        };
+
+        // If sql_type attribute was provided, also store the raw string as an override for DDL.
+        let sql_type_override_token = if let Some(ref sql_type_str) = field.sql_type {
+            quote::quote! { Some(#sql_type_str) }
+        } else {
+            quote::quote! { None }
         };
 
         // Default value
@@ -221,7 +229,8 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         };
 
         field_tokens.push(quote::quote! {
-            sqlmodel_core::FieldInfo::new(#field_name, #column_name, #sql_type_token)
+            sqlmodel_core::FieldInfo::new(stringify!(#field_ident), #column_name, #sql_type_token)
+                .sql_type_override_opt(#sql_type_override_token)
                 .nullable(#nullable)
                 .primary_key(#primary_key)
                 .auto_increment(#auto_increment)
