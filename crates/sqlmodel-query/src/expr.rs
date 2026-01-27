@@ -114,10 +114,7 @@ pub enum Expr {
     },
 
     /// CAST(expr AS type)
-    Cast {
-        expr: Box<Expr>,
-        type_name: String,
-    },
+    Cast { expr: Box<Expr>, type_name: String },
 
     /// LIKE / NOT LIKE pattern
     Like {
