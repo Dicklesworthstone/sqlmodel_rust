@@ -39,6 +39,10 @@
 //! ```
 
 #![allow(clippy::cast_possible_truncation)]
+// The Error type is intentionally large to carry full context
+#![allow(clippy::result_large_err)]
+// Placeholder function takes stream by value since it just returns error
+#![allow(clippy::needless_pass_by_value)]
 
 use crate::config::{SslMode, TlsConfig};
 use crate::protocol::{PacketWriter, capabilities};
