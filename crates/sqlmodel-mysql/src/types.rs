@@ -640,6 +640,244 @@ pub fn encode_binary_value(value: &Value, field_type: FieldType) -> Vec<u8> {
     }
 }
 
+/// Decode a binary protocol value and return bytes consumed.
+///
+/// This is used when parsing binary result set rows where we need to know
+/// how many bytes each value occupies.
+///
+/// # Returns
+///
+/// Tuple of (decoded value, bytes consumed)
+pub fn decode_binary_value_with_len(
+    data: &[u8],
+    field_type: FieldType,
+    _is_unsigned: bool,
+) -> (Value, usize) {
+    match field_type {
+        // Fixed-size integer types
+        FieldType::Tiny => {
+            if data.is_empty() {
+                return (Value::Null, 0);
+            }
+            (Value::TinyInt(data[0] as i8), 1)
+        }
+
+        FieldType::Short | FieldType::Year => {
+            if data.len() < 2 {
+                return (Value::Null, 0);
+            }
+            let val = u16::from_le_bytes([data[0], data[1]]);
+            (Value::SmallInt(val as i16), 2)
+        }
+
+        FieldType::Long | FieldType::Int24 => {
+            if data.len() < 4 {
+                return (Value::Null, 0);
+            }
+            let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            (Value::Int(val as i32), 4)
+        }
+
+        FieldType::LongLong => {
+            if data.len() < 8 {
+                return (Value::Null, 0);
+            }
+            let val = u64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            (Value::BigInt(val as i64), 8)
+        }
+
+        FieldType::Float => {
+            if data.len() < 4 {
+                return (Value::Null, 0);
+            }
+            let val = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            (Value::Float(val), 4)
+        }
+
+        FieldType::Double => {
+            if data.len() < 8 {
+                return (Value::Null, 0);
+            }
+            let val = f64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]);
+            (Value::Double(val), 8)
+        }
+
+        // Date types - variable length with length prefix byte
+        FieldType::Date | FieldType::NewDate => {
+            if data.is_empty() {
+                return (Value::Null, 0);
+            }
+            let len = data[0] as usize;
+            if len == 0 {
+                return (Value::Text("0000-00-00".to_string()), 1);
+            }
+            if data.len() < 1 + len || len < 4 {
+                return (Value::Null, 1);
+            }
+            let year = u16::from_le_bytes([data[1], data[2]]);
+            let month = data[3];
+            let day = data[4];
+            (
+                Value::Text(format!("{year:04}-{month:02}-{day:02}")),
+                1 + len,
+            )
+        }
+
+        FieldType::Time | FieldType::Time2 => {
+            if data.is_empty() {
+                return (Value::Null, 0);
+            }
+            let len = data[0] as usize;
+            if len == 0 {
+                return (Value::Text("00:00:00".to_string()), 1);
+            }
+            if data.len() < 1 + len || len < 8 {
+                return (Value::Text("00:00:00".to_string()), 1);
+            }
+            let is_negative = data[1] != 0;
+            let days = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+            let hours = data[6];
+            let minutes = data[7];
+            let seconds = data[8];
+            let total_hours = days * 24 + u32::from(hours);
+            let sign = if is_negative { "-" } else { "" };
+            (
+                Value::Text(format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}")),
+                1 + len,
+            )
+        }
+
+        FieldType::DateTime | FieldType::Timestamp | FieldType::DateTime2 | FieldType::Timestamp2 => {
+            if data.is_empty() {
+                return (Value::Null, 0);
+            }
+            let len = data[0] as usize;
+            if len == 0 {
+                return (Value::Text("0000-00-00 00:00:00".to_string()), 1);
+            }
+            if data.len() < 1 + len {
+                return (Value::Null, 1);
+            }
+            if len >= 4 {
+                let year = u16::from_le_bytes([data[1], data[2]]);
+                let month = data[3];
+                let day = data[4];
+                if len >= 7 {
+                    let hour = data[5];
+                    let minute = data[6];
+                    let second = data[7];
+                    if len >= 11 {
+                        let microseconds =
+                            u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                        return (
+                            Value::Text(format!(
+                                "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microseconds:06}"
+                            )),
+                            1 + len,
+                        );
+                    }
+                    return (
+                        Value::Text(format!(
+                            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+                        )),
+                        1 + len,
+                    );
+                }
+                return (
+                    Value::Text(format!("{year:04}-{month:02}-{day:02} 00:00:00")),
+                    1 + len,
+                );
+            }
+            (Value::Text("0000-00-00 00:00:00".to_string()), 1 + len)
+        }
+
+        // Variable-length types with length-encoded prefix
+        FieldType::Decimal
+        | FieldType::NewDecimal
+        | FieldType::VarChar
+        | FieldType::VarString
+        | FieldType::String
+        | FieldType::Enum
+        | FieldType::Set
+        | FieldType::TinyBlob
+        | FieldType::MediumBlob
+        | FieldType::LongBlob
+        | FieldType::Blob
+        | FieldType::Json
+        | FieldType::Geometry
+        | FieldType::Bit => {
+            let (str_len, prefix_len) = read_lenenc_int(data);
+            if str_len == 0 && prefix_len == 0 {
+                return (Value::Null, 0);
+            }
+            let total_len = prefix_len + str_len;
+            if data.len() < total_len {
+                return (Value::Null, prefix_len);
+            }
+            let str_data = &data[prefix_len..total_len];
+            let value = match field_type {
+                FieldType::TinyBlob
+                | FieldType::MediumBlob
+                | FieldType::LongBlob
+                | FieldType::Blob
+                | FieldType::Geometry
+                | FieldType::Bit => Value::Bytes(str_data.to_vec()),
+                FieldType::Json => {
+                    let text = String::from_utf8_lossy(str_data);
+                    serde_json::from_str(&text)
+                        .map_or_else(|_| Value::Bytes(str_data.to_vec()), Value::Json)
+                }
+                _ => Value::Text(String::from_utf8_lossy(str_data).into_owned()),
+            };
+            (value, total_len)
+        }
+
+        // Null type
+        FieldType::Null => (Value::Null, 0),
+    }
+}
+
+/// Read a length-encoded integer from data.
+///
+/// Returns (value, bytes consumed).
+fn read_lenenc_int(data: &[u8]) -> (usize, usize) {
+    if data.is_empty() {
+        return (0, 0);
+    }
+    match data[0] {
+        0..=250 => (data[0] as usize, 1),
+        0xFC => {
+            if data.len() < 3 {
+                return (0, 1);
+            }
+            let val = u16::from_le_bytes([data[1], data[2]]) as usize;
+            (val, 3)
+        }
+        0xFD => {
+            if data.len() < 4 {
+                return (0, 1);
+            }
+            let val = u32::from_le_bytes([data[1], data[2], data[3], 0]) as usize;
+            (val, 4)
+        }
+        0xFE => {
+            if data.len() < 9 {
+                return (0, 1);
+            }
+            let val = u64::from_le_bytes([
+                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+            ]) as usize;
+            (val, 9)
+        }
+        // 0xFB is NULL indicator, 0xFF is error - both handled by the exhaustive match above
+        251..=255 => (0, 1),
+    }
+}
+
 /// Encode bytes with a length prefix.
 fn encode_length_prefixed_bytes(data: &[u8]) -> Vec<u8> {
     let len = data.len();
