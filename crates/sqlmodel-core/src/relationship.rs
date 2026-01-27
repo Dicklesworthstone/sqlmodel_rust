@@ -291,6 +291,344 @@ where
     }
 }
 
+/// A collection of related objects (one-to-many).
+///
+/// This wrapper can be in one of two states:
+/// - **Unloaded**: the collection has not been fetched yet
+/// - **Loaded**: the objects have been fetched and cached
+pub struct RelatedMany<T: Model> {
+    /// The loaded objects (if fetched).
+    loaded: OnceLock<Vec<T>>,
+    /// Foreign key column on the related model.
+    fk_column: &'static str,
+    /// Parent's primary key value.
+    parent_pk: Option<Value>,
+}
+
+impl<T: Model> RelatedMany<T> {
+    /// Create a new unloaded RelatedMany with the FK column name.
+    #[must_use]
+    pub const fn new(fk_column: &'static str) -> Self {
+        Self {
+            loaded: OnceLock::new(),
+            fk_column,
+            parent_pk: None,
+        }
+    }
+
+    /// Create with a parent primary key for loading.
+    #[must_use]
+    pub fn with_parent_pk(fk_column: &'static str, pk: impl Into<Value>) -> Self {
+        Self {
+            loaded: OnceLock::new(),
+            fk_column,
+            parent_pk: Some(pk.into()),
+        }
+    }
+
+    /// Check if the collection has been loaded.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.get().is_some()
+    }
+
+    /// Get the loaded objects as a slice (None if not loaded).
+    #[must_use]
+    pub fn get(&self) -> Option<&[T]> {
+        self.loaded.get().map(Vec::as_slice)
+    }
+
+    /// Get the number of loaded items (0 if not loaded).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.loaded.get().map_or(0, Vec::len)
+    }
+
+    /// Check if the collection is empty (true if not loaded or loaded empty).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.loaded.get().is_none_or(Vec::is_empty)
+    }
+
+    /// Set the loaded objects (internal use by query system).
+    pub fn set_loaded(&self, objects: Vec<T>) -> Result<(), Vec<T>> {
+        self.loaded.set(objects)
+    }
+
+    /// Iterate over the loaded items.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.loaded.get().map_or([].iter(), |v| v.iter())
+    }
+
+    /// Get the FK column name.
+    #[must_use]
+    pub const fn fk_column(&self) -> &'static str {
+        self.fk_column
+    }
+
+    /// Get the parent PK value (if set).
+    #[must_use]
+    pub fn parent_pk(&self) -> Option<&Value> {
+        self.parent_pk.as_ref()
+    }
+}
+
+impl<T: Model> Default for RelatedMany<T> {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+impl<T: Model + Clone> Clone for RelatedMany<T> {
+    fn clone(&self) -> Self {
+        let cloned = Self {
+            loaded: OnceLock::new(),
+            fk_column: self.fk_column,
+            parent_pk: self.parent_pk.clone(),
+        };
+
+        if let Some(vec) = self.loaded.get() {
+            let _ = cloned.loaded.set(vec.clone());
+        }
+
+        cloned
+    }
+}
+
+impl<T: Model + fmt::Debug> fmt::Debug for RelatedMany<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelatedMany")
+            .field("loaded", &self.loaded.get())
+            .field("fk_column", &self.fk_column)
+            .field("parent_pk", &self.parent_pk)
+            .finish()
+    }
+}
+
+impl<T> Serialize for RelatedMany<T>
+where
+    T: Model + Serialize,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.loaded.get() {
+            Some(vec) => vec.serialize(serializer),
+            None => Vec::<T>::new().serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for RelatedMany<T>
+where
+    T: Model + Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let vec = Vec::<T>::deserialize(deserializer)?;
+        let rel = Self::new("");
+        let _ = rel.loaded.set(vec);
+        Ok(rel)
+    }
+}
+
+impl<'a, T: Model> IntoIterator for &'a RelatedMany<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.loaded.get().map_or([].iter(), |v| v.iter())
+    }
+}
+
+// ============================================================================
+// Lazy<T> - Deferred Loading
+// ============================================================================
+
+/// A lazily-loaded related object that requires explicit load() call.
+///
+/// Unlike `Related<T>` which is loaded during the query via JOIN, `Lazy<T>`
+/// defers loading until explicitly requested with a Session reference.
+///
+/// # States
+///
+/// - **Empty**: No FK value (null relationship)
+/// - **Unloaded**: Has FK but not fetched yet
+/// - **Loaded**: Object fetched and cached
+///
+/// # Example
+///
+/// ```ignore
+/// // Field definition
+/// struct Hero {
+///     team: Lazy<Team>,
+/// }
+///
+/// // Loading (requires Session)
+/// let team = hero.team.load(&mut session, &cx).await?;
+///
+/// // After loading, access is fast
+/// if let Some(team) = hero.team.get() {
+///     println!("Team: {}", team.name);
+/// }
+/// ```
+///
+/// # N+1 Prevention
+///
+/// Use `Session::load_many()` to batch-load lazy relationships:
+///
+/// ```ignore
+/// // Load all teams in one query
+/// session.load_many(&mut heroes, |h| &mut h.team).await?;
+/// ```
+pub struct Lazy<T: Model> {
+    /// Foreign key value (if any).
+    fk_value: Option<Value>,
+    /// Loaded object (cached after first load).
+    loaded: OnceLock<Option<T>>,
+    /// Whether load() has been called.
+    load_attempted: std::sync::atomic::AtomicBool,
+}
+
+impl<T: Model> Lazy<T> {
+    /// Create an empty lazy relationship (null FK).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            fk_value: None,
+            loaded: OnceLock::new(),
+            load_attempted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Create from a foreign key value (not yet loaded).
+    #[must_use]
+    pub fn from_fk(fk: impl Into<Value>) -> Self {
+        Self {
+            fk_value: Some(fk.into()),
+            loaded: OnceLock::new(),
+            load_attempted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Create with an already-loaded object.
+    #[must_use]
+    pub fn loaded(obj: T) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(obj));
+        Self {
+            fk_value: None,
+            loaded: cell,
+            load_attempted: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Get the loaded object (None if not loaded or FK is null).
+    #[must_use]
+    pub fn get(&self) -> Option<&T> {
+        self.loaded.get().and_then(|o| o.as_ref())
+    }
+
+    /// Check if load() has been called.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        self.load_attempted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Check if the relationship is empty (null FK).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fk_value.is_none()
+    }
+
+    /// Get the foreign key value.
+    #[must_use]
+    pub fn fk(&self) -> Option<&Value> {
+        self.fk_value.as_ref()
+    }
+
+    /// Set the loaded object (internal use by Session::load_many).
+    ///
+    /// Returns `Ok(())` if successfully set, `Err` if already loaded.
+    pub fn set_loaded(&self, obj: Option<T>) -> Result<(), Option<T>> {
+        self.load_attempted
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.loaded.set(obj)
+    }
+
+    /// Reset the lazy relationship to unloaded state.
+    ///
+    /// This is useful when refreshing an object after commit.
+    pub fn reset(&mut self) {
+        self.loaded = OnceLock::new();
+        self.load_attempted = std::sync::atomic::AtomicBool::new(false);
+    }
+}
+
+impl<T: Model> Default for Lazy<T> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<T: Model + Clone> Clone for Lazy<T> {
+    fn clone(&self) -> Self {
+        let cloned = Self {
+            fk_value: self.fk_value.clone(),
+            loaded: OnceLock::new(),
+            load_attempted: std::sync::atomic::AtomicBool::new(
+                self.load_attempted.load(std::sync::atomic::Ordering::Acquire),
+            ),
+        };
+
+        if let Some(value) = self.loaded.get() {
+            let _ = cloned.loaded.set(value.clone());
+        }
+
+        cloned
+    }
+}
+
+impl<T: Model + fmt::Debug> fmt::Debug for Lazy<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = if self.is_loaded() {
+            "loaded"
+        } else if self.is_empty() {
+            "empty"
+        } else {
+            "unloaded"
+        };
+
+        f.debug_struct("Lazy")
+            .field("state", &state)
+            .field("fk_value", &self.fk_value)
+            .field("loaded", &self.get())
+            .finish()
+    }
+}
+
+impl<T> Serialize for Lazy<T>
+where
+    T: Model + Serialize,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.loaded.get() {
+            Some(Some(obj)) => obj.serialize(serializer),
+            Some(None) | None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Lazy<T>
+where
+    T: Model + Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let opt = Option::<T>::deserialize(deserializer)?;
+        Ok(match opt {
+            Some(obj) => Self::loaded(obj),
+            None => Self::empty(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +842,328 @@ mod tests {
         let decoded: Related<Team> = serde_json::from_str(&json).unwrap();
         assert!(decoded.is_loaded());
         assert_eq!(decoded.get(), rel.get());
+    }
+
+    // ========================================================================
+    // RelatedMany<T> Tests
+    // ========================================================================
+
+    #[test]
+    fn test_related_many_new_is_unloaded() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        assert!(!rel.is_loaded());
+        assert!(rel.get().is_none());
+        assert_eq!(rel.len(), 0);
+        assert!(rel.is_empty());
+    }
+
+    #[test]
+    fn test_related_many_set_loaded() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        let teams = vec![
+            Team {
+                id: Some(1),
+                name: "Avengers".to_string(),
+            },
+            Team {
+                id: Some(2),
+                name: "X-Men".to_string(),
+            },
+        ];
+        assert!(rel.set_loaded(teams.clone()).is_ok());
+        assert!(rel.is_loaded());
+        assert_eq!(rel.len(), 2);
+        assert!(!rel.is_empty());
+    }
+
+    #[test]
+    fn test_related_many_get_returns_slice() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        let teams = vec![Team {
+            id: Some(1),
+            name: "Avengers".to_string(),
+        }];
+        rel.set_loaded(teams.clone()).unwrap();
+        let slice = rel.get().unwrap();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].name, "Avengers");
+    }
+
+    #[test]
+    fn test_related_many_iter() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        let teams = vec![
+            Team {
+                id: Some(1),
+                name: "A".to_string(),
+            },
+            Team {
+                id: Some(2),
+                name: "B".to_string(),
+            },
+        ];
+        rel.set_loaded(teams).unwrap();
+        let names: Vec<_> = rel.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_related_many_default() {
+        let rel: RelatedMany<Team> = RelatedMany::default();
+        assert!(!rel.is_loaded());
+        assert!(rel.is_empty());
+    }
+
+    #[test]
+    fn test_related_many_clone() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        rel.set_loaded(vec![Team {
+            id: Some(1),
+            name: "Test".to_string(),
+        }])
+        .unwrap();
+        let cloned = rel.clone();
+        assert!(cloned.is_loaded());
+        assert_eq!(cloned.len(), 1);
+    }
+
+    #[test]
+    fn test_related_many_debug() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        let debug_str = format!("{:?}", rel);
+        assert!(debug_str.contains("RelatedMany"));
+        assert!(debug_str.contains("fk_column"));
+    }
+
+    #[test]
+    fn test_related_many_serde_serialize_loaded() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        rel.set_loaded(vec![Team {
+            id: Some(1),
+            name: "A".to_string(),
+        }])
+        .unwrap();
+        let json = serde_json::to_value(&rel).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_related_many_serde_serialize_unloaded() {
+        let rel: RelatedMany<Team> = RelatedMany::new("team_id");
+        let json = serde_json::to_value(&rel).unwrap();
+        assert!(json.is_array());
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_related_many_serde_deserialize() {
+        let rel: RelatedMany<Team> = serde_json::from_value(serde_json::json!([
+            {"id": 1, "name": "A"},
+            {"id": 2, "name": "B"}
+        ]))
+        .unwrap();
+        assert!(rel.is_loaded());
+        assert_eq!(rel.len(), 2);
+    }
+
+    // ========================================================================
+    // Lazy<T> Tests
+    // ========================================================================
+
+    #[test]
+    fn test_lazy_empty_has_no_fk() {
+        let lazy = Lazy::<Team>::empty();
+        assert!(lazy.fk().is_none());
+        assert!(lazy.is_empty());
+        assert!(!lazy.is_loaded());
+        assert!(lazy.get().is_none());
+    }
+
+    #[test]
+    fn test_lazy_from_fk_stores_value() {
+        let lazy = Lazy::<Team>::from_fk(42_i64);
+        assert!(!lazy.is_empty());
+        assert_eq!(lazy.fk(), Some(&Value::from(42_i64)));
+        assert!(!lazy.is_loaded());
+        assert!(lazy.get().is_none());
+    }
+
+    #[test]
+    fn test_lazy_not_loaded_initially() {
+        let lazy = Lazy::<Team>::from_fk(1_i64);
+        assert!(!lazy.is_loaded());
+    }
+
+    #[test]
+    fn test_lazy_loaded_creates_loaded_state() {
+        let team = Team {
+            id: Some(1),
+            name: "Avengers".to_string(),
+        };
+        let lazy = Lazy::loaded(team.clone());
+        assert!(lazy.is_loaded());
+        assert!(lazy.fk().is_none()); // No FK needed when pre-loaded
+        assert_eq!(lazy.get(), Some(&team));
+    }
+
+    #[test]
+    fn test_lazy_set_loaded_succeeds_first_time() {
+        let lazy = Lazy::<Team>::from_fk(1_i64);
+        let team = Team {
+            id: Some(1),
+            name: "Avengers".to_string(),
+        };
+        assert!(lazy.set_loaded(Some(team.clone())).is_ok());
+        assert!(lazy.is_loaded());
+        assert_eq!(lazy.get(), Some(&team));
+    }
+
+    #[test]
+    fn test_lazy_set_loaded_fails_second_time() {
+        let lazy = Lazy::<Team>::empty();
+        assert!(lazy.set_loaded(None).is_ok());
+        assert!(lazy.is_loaded());
+        assert!(lazy.set_loaded(None).is_err());
+    }
+
+    #[test]
+    fn test_lazy_get_before_load_returns_none() {
+        let lazy = Lazy::<Team>::from_fk(1_i64);
+        assert!(lazy.get().is_none());
+    }
+
+    #[test]
+    fn test_lazy_default_is_empty() {
+        let lazy: Lazy<Team> = Lazy::default();
+        assert!(lazy.is_empty());
+        assert!(!lazy.is_loaded());
+    }
+
+    #[test]
+    fn test_lazy_clone_unloaded_is_unloaded() {
+        let lazy = Lazy::<Team>::from_fk(7_i64);
+        let cloned = lazy.clone();
+        assert!(!cloned.is_loaded());
+        assert_eq!(cloned.fk(), lazy.fk());
+    }
+
+    #[test]
+    fn test_lazy_clone_loaded_preserves_object() {
+        let team = Team {
+            id: Some(1),
+            name: "Avengers".to_string(),
+        };
+        let lazy = Lazy::loaded(team.clone());
+        let cloned = lazy.clone();
+        assert!(cloned.is_loaded());
+        assert_eq!(cloned.get(), Some(&team));
+    }
+
+    #[test]
+    fn test_lazy_debug_output_shows_state() {
+        let lazy = Lazy::<Team>::from_fk(1_i64);
+        let s = format!("{lazy:?}");
+        assert!(s.contains("state"));
+        assert!(s.contains("unloaded"));
+    }
+
+    #[test]
+    fn test_lazy_serde_serialize_loaded_outputs_object() {
+        let lazy = Lazy::loaded(Team {
+            id: Some(1),
+            name: "Avengers".to_string(),
+        });
+        let json = serde_json::to_value(&lazy).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": 1,
+                "name": "Avengers"
+            })
+        );
+    }
+
+    #[test]
+    fn test_lazy_serde_serialize_unloaded_outputs_null() {
+        let lazy = Lazy::<Team>::from_fk(1_i64);
+        let json = serde_json::to_value(&lazy).unwrap();
+        assert_eq!(json, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_lazy_serde_deserialize_object_creates_loaded() {
+        let lazy: Lazy<Team> = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "name": "Avengers"
+        }))
+        .unwrap();
+
+        let expected = Team {
+            id: Some(1),
+            name: "Avengers".to_string(),
+        };
+        assert!(lazy.is_loaded());
+        assert_eq!(lazy.get(), Some(&expected));
+    }
+
+    #[test]
+    fn test_lazy_serde_deserialize_null_creates_empty() {
+        let lazy: Lazy<Team> = serde_json::from_value(serde_json::Value::Null).unwrap();
+        assert!(lazy.is_empty());
+        assert!(!lazy.is_loaded());
+        assert!(lazy.get().is_none());
+    }
+
+    #[test]
+    fn test_lazy_serde_roundtrip_preserves_data() {
+        let lazy = Lazy::loaded(Team {
+            id: Some(1),
+            name: "Avengers".to_string(),
+        });
+        let json = serde_json::to_string(&lazy).unwrap();
+        let decoded: Lazy<Team> = serde_json::from_str(&json).unwrap();
+        assert!(decoded.is_loaded());
+        assert_eq!(decoded.get(), lazy.get());
+    }
+
+    #[test]
+    fn test_lazy_reset_clears_loaded_state() {
+        let mut lazy = Lazy::loaded(Team {
+            id: Some(1),
+            name: "Test".to_string(),
+        });
+        assert!(lazy.is_loaded());
+
+        lazy.reset();
+        assert!(!lazy.is_loaded());
+        assert!(lazy.get().is_none());
+    }
+
+    #[test]
+    fn test_lazy_is_empty_accurate() {
+        let empty = Lazy::<Team>::empty();
+        assert!(empty.is_empty());
+
+        let with_fk = Lazy::<Team>::from_fk(1_i64);
+        assert!(!with_fk.is_empty());
+
+        let loaded = Lazy::loaded(Team {
+            id: Some(1),
+            name: "Test".to_string(),
+        });
+        assert!(loaded.is_empty()); // loaded() doesn't set FK value
+    }
+
+    #[test]
+    fn test_lazy_load_missing_object_caches_none() {
+        let lazy = Lazy::<Team>::from_fk(999_i64);
+        // Simulate what Session::load_many does when object not found
+        assert!(lazy.set_loaded(None).is_ok());
+        assert!(lazy.is_loaded());
+        assert!(lazy.get().is_none());
+
+        // Second attempt should fail (already set)
+        assert!(lazy.set_loaded(None).is_err());
     }
 }
