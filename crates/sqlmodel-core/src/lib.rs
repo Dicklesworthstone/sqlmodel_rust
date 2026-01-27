@@ -28,6 +28,7 @@ pub use field::{Column, Field, FieldInfo, ReferentialAction};
 pub use model::Model;
 pub use relationship::{
     Lazy, LazyLoader, LinkTableInfo, Related, RelatedMany, RelationshipInfo, RelationshipKind,
+    find_back_relationship, find_relationship, validate_back_populates,
 };
 pub use row::Row;
 pub use types::{SqlType, TypeInfo};

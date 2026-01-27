@@ -158,6 +158,88 @@ impl Default for RelationshipInfo {
     }
 }
 
+// ============================================================================
+// Relationship Lookup Helpers
+// ============================================================================
+
+/// Find a relationship by field name in a model's RELATIONSHIPS.
+///
+/// # Example
+///
+/// ```ignore
+/// let rel = find_relationship::<Hero>("team");
+/// assert_eq!(rel.unwrap().related_table, "teams");
+/// ```
+pub fn find_relationship<M: crate::Model>(field_name: &str) -> Option<&'static RelationshipInfo> {
+    M::RELATIONSHIPS.iter().find(|r| r.name == field_name)
+}
+
+/// Find the back-relationship from a target model back to the source.
+///
+/// Given `Hero::team` with `back_populates = "heroes"`, this finds
+/// `Team::heroes` which should have `back_populates = "team"`.
+///
+/// # Arguments
+///
+/// * `source_rel` - The relationship on the source model
+/// * `target_relationships` - The RELATIONSHIPS slice from the target model
+pub fn find_back_relationship(
+    source_rel: &RelationshipInfo,
+    target_relationships: &'static [RelationshipInfo],
+) -> Option<&'static RelationshipInfo> {
+    let back_field = source_rel.back_populates?;
+    target_relationships
+        .iter()
+        .find(|r| r.name == back_field)
+}
+
+/// Validate that back_populates is symmetric between two models.
+///
+/// If `Hero::team` has `back_populates = "heroes"`, then `Team::heroes`
+/// must exist and have `back_populates = "team"`.
+///
+/// Returns Ok(()) if valid, Err with message if invalid.
+pub fn validate_back_populates<Source: crate::Model, Target: crate::Model>(
+    source_field: &str,
+) -> Result<(), String> {
+    let source_rel = find_relationship::<Source>(source_field)
+        .ok_or_else(|| format!("No relationship '{}' on {}", source_field, Source::TABLE_NAME))?;
+
+    let Some(back_field) = source_rel.back_populates else {
+        // No back_populates, nothing to validate
+        return Ok(());
+    };
+
+    let target_rel = find_relationship::<Target>(back_field).ok_or_else(|| {
+        format!(
+            "{}.{} has back_populates='{}' but {}.{} does not exist",
+            Source::TABLE_NAME,
+            source_field,
+            back_field,
+            Target::TABLE_NAME,
+            back_field
+        )
+    })?;
+
+    // Validate that target points back to source
+    if let Some(target_back) = target_rel.back_populates {
+        if target_back != source_field {
+            return Err(format!(
+                "{}.{} has back_populates='{}' but {}.{} has back_populates='{}' (expected '{}')",
+                Source::TABLE_NAME,
+                source_field,
+                back_field,
+                Target::TABLE_NAME,
+                back_field,
+                target_back,
+                source_field
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Minimal session interface needed to load lazy relationships.
 ///
 /// This trait lives in `sqlmodel-core` to avoid circular dependencies: the
