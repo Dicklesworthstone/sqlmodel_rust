@@ -3,11 +3,13 @@
 //! This crate provides:
 //! - Schema definition from Model types
 //! - Expected schema extraction from Model definitions
+//! - Schema diff engine for comparing schemas
 //! - Table creation/alteration SQL generation
 //! - Migration tracking and execution
 //! - Database introspection
 
 pub mod create;
+pub mod diff;
 pub mod expected;
 pub mod introspect;
 pub mod migrate;
