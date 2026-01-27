@@ -106,6 +106,19 @@ pub enum Expr {
     /// IS NULL / IS NOT NULL
     IsNull { expr: Box<Expr>, negated: bool },
 
+    /// IS DISTINCT FROM / IS NOT DISTINCT FROM (NULL-safe comparison)
+    IsDistinctFrom {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        negated: bool,
+    },
+
+    /// CAST(expr AS type)
+    Cast {
+        expr: Box<Expr>,
+        type_name: String,
+    },
+
     /// LIKE / NOT LIKE pattern
     Like {
         expr: Box<Expr>,
@@ -379,6 +392,46 @@ impl Expr {
         }
     }
 
+    /// IS DISTINCT FROM (NULL-safe comparison: returns TRUE/FALSE, never NULL)
+    ///
+    /// Unlike `!=`, this returns TRUE when comparing NULL to a non-NULL value,
+    /// and FALSE when comparing NULL to NULL.
+    pub fn is_distinct_from(self, other: impl Into<Expr>) -> Self {
+        Expr::IsDistinctFrom {
+            left: Box::new(self),
+            right: Box::new(other.into()),
+            negated: false,
+        }
+    }
+
+    /// IS NOT DISTINCT FROM (NULL-safe equality: returns TRUE/FALSE, never NULL)
+    ///
+    /// Unlike `=`, this returns TRUE when comparing NULL to NULL,
+    /// and FALSE when comparing NULL to a non-NULL value.
+    pub fn is_not_distinct_from(self, other: impl Into<Expr>) -> Self {
+        Expr::IsDistinctFrom {
+            left: Box::new(self),
+            right: Box::new(other.into()),
+            negated: true,
+        }
+    }
+
+    // ==================== Type Casting ====================
+
+    /// CAST expression to a specific SQL type.
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("price").cast("DECIMAL(10, 2)")
+    /// // Generates: CAST("price" AS DECIMAL(10, 2))
+    /// ```
+    pub fn cast(self, type_name: impl Into<String>) -> Self {
+        Expr::Cast {
+            expr: Box::new(self),
+            type_name: type_name.into(),
+        }
+    }
+
     // ==================== Pattern Matching ====================
 
     /// LIKE pattern match
@@ -417,6 +470,90 @@ impl Expr {
             expr: Box::new(self),
             pattern: pattern.into(),
             negated: true,
+            case_insensitive: true,
+        }
+    }
+
+    /// Check if column contains the given substring (LIKE '%pattern%').
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("name").contains("man")
+    /// // Generates: "name" LIKE '%man%'
+    /// ```
+    pub fn contains(self, pattern: impl AsRef<str>) -> Self {
+        let pattern = format!("%{}%", pattern.as_ref());
+        Expr::Like {
+            expr: Box::new(self),
+            pattern,
+            negated: false,
+            case_insensitive: false,
+        }
+    }
+
+    /// Check if column starts with the given prefix (LIKE 'pattern%').
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("name").starts_with("Spider")
+    /// // Generates: "name" LIKE 'Spider%'
+    /// ```
+    pub fn starts_with(self, pattern: impl AsRef<str>) -> Self {
+        let pattern = format!("{}%", pattern.as_ref());
+        Expr::Like {
+            expr: Box::new(self),
+            pattern,
+            negated: false,
+            case_insensitive: false,
+        }
+    }
+
+    /// Check if column ends with the given suffix (LIKE '%pattern').
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("name").ends_with("man")
+    /// // Generates: "name" LIKE '%man'
+    /// ```
+    pub fn ends_with(self, pattern: impl AsRef<str>) -> Self {
+        let pattern = format!("%{}", pattern.as_ref());
+        Expr::Like {
+            expr: Box::new(self),
+            pattern,
+            negated: false,
+            case_insensitive: false,
+        }
+    }
+
+    /// Case-insensitive contains (ILIKE '%pattern%' or LOWER fallback).
+    pub fn icontains(self, pattern: impl AsRef<str>) -> Self {
+        let pattern = format!("%{}%", pattern.as_ref());
+        Expr::Like {
+            expr: Box::new(self),
+            pattern,
+            negated: false,
+            case_insensitive: true,
+        }
+    }
+
+    /// Case-insensitive starts_with (ILIKE 'pattern%' or LOWER fallback).
+    pub fn istarts_with(self, pattern: impl AsRef<str>) -> Self {
+        let pattern = format!("{}%", pattern.as_ref());
+        Expr::Like {
+            expr: Box::new(self),
+            pattern,
+            negated: false,
+            case_insensitive: true,
+        }
+    }
+
+    /// Case-insensitive ends_with (ILIKE '%pattern' or LOWER fallback).
+    pub fn iends_with(self, pattern: impl AsRef<str>) -> Self {
+        let pattern = format!("%{}", pattern.as_ref());
+        Expr::Like {
+            expr: Box::new(self),
+            pattern,
+            negated: false,
             case_insensitive: true,
         }
     }
@@ -638,6 +775,155 @@ impl Expr {
         }
     }
 
+    // ==================== NULL Handling Functions ====================
+
+    /// COALESCE function: returns the first non-NULL argument.
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::coalesce(vec![Expr::col("nickname"), Expr::col("name"), Expr::lit("Anonymous")])
+    /// // Generates: COALESCE("nickname", "name", 'Anonymous')
+    /// ```
+    pub fn coalesce(args: Vec<impl Into<Expr>>) -> Self {
+        Expr::Function {
+            name: "COALESCE".to_string(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// NULLIF function: returns NULL if both arguments are equal, otherwise returns the first.
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::nullif(Expr::col("value"), Expr::lit(0))
+    /// // Generates: NULLIF("value", 0)
+    /// ```
+    pub fn nullif(expr1: impl Into<Expr>, expr2: impl Into<Expr>) -> Self {
+        Expr::Function {
+            name: "NULLIF".to_string(),
+            args: vec![expr1.into(), expr2.into()],
+        }
+    }
+
+    /// IFNULL/NVL function (dialect-specific): returns expr2 if expr1 is NULL.
+    ///
+    /// This generates IFNULL for SQLite/MySQL or COALESCE for PostgreSQL.
+    pub fn ifnull(expr1: impl Into<Expr>, expr2: impl Into<Expr>) -> Self {
+        // Use COALESCE as it's more portable
+        Expr::Function {
+            name: "COALESCE".to_string(),
+            args: vec![expr1.into(), expr2.into()],
+        }
+    }
+
+    // ==================== String Functions ====================
+
+    /// UPPER function: converts string to uppercase.
+    pub fn upper(self) -> Self {
+        Expr::Function {
+            name: "UPPER".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// LOWER function: converts string to lowercase.
+    pub fn lower(self) -> Self {
+        Expr::Function {
+            name: "LOWER".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// LENGTH function: returns the length of a string.
+    pub fn length(self) -> Self {
+        Expr::Function {
+            name: "LENGTH".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// TRIM function: removes leading and trailing whitespace.
+    pub fn trim(self) -> Self {
+        Expr::Function {
+            name: "TRIM".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// LTRIM function: removes leading whitespace.
+    pub fn ltrim(self) -> Self {
+        Expr::Function {
+            name: "LTRIM".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// RTRIM function: removes trailing whitespace.
+    pub fn rtrim(self) -> Self {
+        Expr::Function {
+            name: "RTRIM".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// SUBSTR/SUBSTRING function: extracts a substring.
+    ///
+    /// # Arguments
+    /// * `start` - 1-based start position
+    /// * `length` - Optional length of substring
+    pub fn substr(self, start: impl Into<Expr>, length: Option<impl Into<Expr>>) -> Self {
+        let mut args = vec![self, start.into()];
+        if let Some(len) = length {
+            args.push(len.into());
+        }
+        Expr::Function {
+            name: "SUBSTR".to_string(),
+            args,
+        }
+    }
+
+    /// REPLACE function: replaces occurrences of a substring.
+    pub fn replace(self, from: impl Into<Expr>, to: impl Into<Expr>) -> Self {
+        Expr::Function {
+            name: "REPLACE".to_string(),
+            args: vec![self, from.into(), to.into()],
+        }
+    }
+
+    // ==================== Numeric Functions ====================
+
+    /// ABS function: returns absolute value.
+    pub fn abs(self) -> Self {
+        Expr::Function {
+            name: "ABS".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// ROUND function: rounds to specified decimal places.
+    pub fn round(self, decimals: impl Into<Expr>) -> Self {
+        Expr::Function {
+            name: "ROUND".to_string(),
+            args: vec![self, decimals.into()],
+        }
+    }
+
+    /// FLOOR function: rounds down to nearest integer.
+    pub fn floor(self) -> Self {
+        Expr::Function {
+            name: "FLOOR".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// CEIL/CEILING function: rounds up to nearest integer.
+    pub fn ceil(self) -> Self {
+        Expr::Function {
+            name: "CEIL".to_string(),
+            args: vec![self],
+        }
+    }
+
     // ==================== Ordering ====================
 
     /// Create an ascending ORDER BY expression.
@@ -780,6 +1066,23 @@ impl Expr {
                 let expr_sql = expr.build_with_dialect(dialect, params, offset);
                 let not_str = if *negated { " NOT" } else { "" };
                 format!("{expr_sql} IS{not_str} NULL")
+            }
+
+            Expr::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => {
+                let left_sql = left.build_with_dialect(dialect, params, offset);
+                let right_sql = right.build_with_dialect(dialect, params, offset);
+                let not_str = if *negated { " NOT" } else { "" };
+                // Standard SQL syntax supported by PostgreSQL, SQLite 3.39+, MySQL 8.0.16+
+                format!("{left_sql} IS{not_str} DISTINCT FROM {right_sql}")
+            }
+
+            Expr::Cast { expr, type_name } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                format!("CAST({expr_sql} AS {type_name})")
             }
 
             Expr::Like {

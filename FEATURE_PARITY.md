@@ -61,9 +61,9 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Default factory | `Field(default_factory=...)` | `Default` trait | ✅ Complete |
 | Column name override | `sa_column(name=...)` | `#[sqlmodel(column = "...")]` | ✅ Complete |
 | SQL type override | `Field(sa_type=...)` | `#[sqlmodel(sql_type = "...")]` | ✅ Complete |
-| Max length | `Field(max_length=N)` | `#[sqlmodel(max_length = N)]` | ⚠️ Partial |
-| Decimal precision | `Field(max_digits=N)` | N/A | ❌ TODO |
-| Decimal scale | `Field(decimal_places=N)` | N/A | ❌ TODO |
+| Max length | `Field(max_length=N)` | `#[sqlmodel(max_length = N)]` | ✅ Complete |
+| Decimal precision | `Field(max_digits=N)` | Use `sql_type = "DECIMAL(p,s)"` | ⚠️ Workaround |
+| Decimal scale | `Field(decimal_places=N)` | Use `sql_type = "DECIMAL(p,s)"` | ⚠️ Workaround |
 
 ---
 
@@ -75,7 +75,7 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | SELECT specific columns | `select(Model.col)` | `.columns(&["..."])` | ✅ Complete |
 | WHERE equals | `.where(col == val)` | `.filter(Expr::col("").eq())` | ✅ Complete |
 | WHERE comparison | `<, <=, >, >=` | `.lt(), .le(), .gt(), .ge()` | ✅ Complete |
-| WHERE LIKE | `.contains(), .startswith()` | `.like()` | ✅ Complete |
+| WHERE LIKE | `.contains(), .startswith()` | `.like()`, `.contains()`, `.starts_with()`, `.ends_with()` | ✅ Complete |
 | WHERE IN | `.in_([...])` | `.in_list()` | ✅ Complete |
 | WHERE BETWEEN | `between(a, b)` | `.between()` | ✅ Complete |
 | WHERE IS NULL | `== None` | `.is_null()` | ✅ Complete |
@@ -354,9 +354,41 @@ The Rust implementation includes a complete type-safe expression system:
 - `Expr::In` - IN / NOT IN lists
 - `Expr::Between` - BETWEEN / NOT BETWEEN
 - `Expr::IsNull` - IS NULL / IS NOT NULL
+- `Expr::IsDistinctFrom` - IS DISTINCT FROM / IS NOT DISTINCT FROM (NULL-safe comparison)
+- `Expr::Cast` - CAST(expr AS type)
 - `Expr::Like` - LIKE / ILIKE with dialect fallbacks
 - `Expr::Subquery` - Subquery expressions
 - `Expr::Raw` - Raw SQL escape hatch
+
+### String Helper Methods
+- `.contains(pattern)` - LIKE '%pattern%'
+- `.starts_with(pattern)` - LIKE 'pattern%'
+- `.ends_with(pattern)` - LIKE '%pattern'
+- `.icontains(pattern)` - Case-insensitive contains (ILIKE fallback)
+- `.istarts_with(pattern)` - Case-insensitive starts_with
+- `.iends_with(pattern)` - Case-insensitive ends_with
+
+### String Functions
+- `.upper()` - UPPER(expr)
+- `.lower()` - LOWER(expr)
+- `.length()` - LENGTH(expr)
+- `.trim()` / `.ltrim()` / `.rtrim()` - Whitespace trimming
+- `.substr(start, len)` - SUBSTR extraction
+- `.replace(from, to)` - REPLACE function
+
+### NULL Handling Functions
+- `Expr::coalesce(args)` - COALESCE(a, b, c, ...)
+- `Expr::nullif(a, b)` - NULLIF(a, b)
+- `Expr::ifnull(a, b)` - IFNULL/COALESCE for two args
+
+### Numeric Functions
+- `.abs()` - ABS(expr)
+- `.round(decimals)` - ROUND(expr, n)
+- `.floor()` - FLOOR(expr)
+- `.ceil()` - CEIL(expr)
+
+### Type Casting
+- `.cast(type_name)` - CAST(expr AS type)
 
 ### Multi-Dialect Support
 - **PostgreSQL** - `$1, $2, ...` placeholders, double-quote identifiers, ILIKE support
