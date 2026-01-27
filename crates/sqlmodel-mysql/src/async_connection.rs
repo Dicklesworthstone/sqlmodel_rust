@@ -1441,6 +1441,15 @@ impl std::fmt::Debug for SharedMySqlConnection {
 /// transaction operations by acquiring the mutex lock for each operation.
 /// The transaction must be committed or rolled back explicitly.
 ///
+/// # Warning: Uncommitted Transactions
+///
+/// If a transaction is dropped without calling `commit()` or `rollback()`,
+/// the underlying MySQL transaction will remain open until the connection
+/// is closed or a new transaction is started. This is because Rust's `Drop`
+/// trait cannot perform async operations.
+///
+/// **Always explicitly call `commit()` or `rollback()` before dropping.**
+///
 /// Note: The lifetime parameter is required by the Connection trait but the
 /// actual implementation holds an owned Arc, so the transaction can outlive
 /// the reference to SharedMySqlConnection if needed.
@@ -1867,9 +1876,18 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
 impl<'conn> Drop for SharedMySqlTransaction<'conn> {
     fn drop(&mut self) {
         if !self.committed {
-            // Transaction was not committed - ideally we'd rollback here
-            // but we can't do async in drop. The connection will clean up
-            // when it sees the transaction state.
+            // WARNING: Transaction was dropped without commit() or rollback()!
+            // We cannot do async work in Drop, so the MySQL transaction will
+            // remain open until the connection is closed or a new transaction
+            // is started. This may cause unexpected behavior.
+            //
+            // To fix: Always call tx.commit(cx).await or tx.rollback(cx).await
+            // before the transaction goes out of scope.
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "WARNING: SharedMySqlTransaction dropped without commit/rollback. \
+                 The MySQL transaction may still be open."
+            );
         }
     }
 }
