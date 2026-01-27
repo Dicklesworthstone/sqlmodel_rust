@@ -21,6 +21,8 @@ pub enum Error {
     Schema(SchemaError),
     /// Configuration errors
     Config(ConfigError),
+    /// Validation errors
+    Validation(ValidationError),
     /// I/O errors
     Io(std::io::Error),
     /// Operation timed out
@@ -175,6 +177,149 @@ pub struct ConfigError {
     pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
+/// Validation error for field-level and model-level validation.
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    /// The errors grouped by field name (or "_model" for model-level)
+    pub errors: Vec<FieldValidationError>,
+}
+
+/// A single validation error for a field.
+#[derive(Debug, Clone)]
+pub struct FieldValidationError {
+    /// The field name that failed validation
+    pub field: String,
+    /// The kind of validation that failed
+    pub kind: ValidationErrorKind,
+    /// Human-readable error message
+    pub message: String,
+}
+
+/// The type of validation constraint that was violated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationErrorKind {
+    /// Value is below minimum
+    Min,
+    /// Value is above maximum
+    Max,
+    /// String is shorter than minimum length
+    MinLength,
+    /// String is longer than maximum length
+    MaxLength,
+    /// Value doesn't match regex pattern
+    Pattern,
+    /// Required field is missing/null
+    Required,
+    /// Custom validation failed
+    Custom,
+}
+
+impl ValidationError {
+    /// Create a new empty validation error container.
+    pub fn new() -> Self {
+        Self { errors: Vec::new() }
+    }
+
+    /// Check if there are any validation errors.
+    pub fn is_empty(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// Add a field validation error.
+    pub fn add(
+        &mut self,
+        field: impl Into<String>,
+        kind: ValidationErrorKind,
+        message: impl Into<String>,
+    ) {
+        self.errors.push(FieldValidationError {
+            field: field.into(),
+            kind,
+            message: message.into(),
+        });
+    }
+
+    /// Add a min value error.
+    pub fn add_min(
+        &mut self,
+        field: impl Into<String>,
+        min: impl std::fmt::Display,
+        actual: impl std::fmt::Display,
+    ) {
+        self.add(
+            field,
+            ValidationErrorKind::Min,
+            format!("must be at least {min}, got {actual}"),
+        );
+    }
+
+    /// Add a max value error.
+    pub fn add_max(
+        &mut self,
+        field: impl Into<String>,
+        max: impl std::fmt::Display,
+        actual: impl std::fmt::Display,
+    ) {
+        self.add(
+            field,
+            ValidationErrorKind::Max,
+            format!("must be at most {max}, got {actual}"),
+        );
+    }
+
+    /// Add a min length error.
+    pub fn add_min_length(&mut self, field: impl Into<String>, min: usize, actual: usize) {
+        self.add(
+            field,
+            ValidationErrorKind::MinLength,
+            format!("must be at least {min} characters, got {actual}"),
+        );
+    }
+
+    /// Add a max length error.
+    pub fn add_max_length(&mut self, field: impl Into<String>, max: usize, actual: usize) {
+        self.add(
+            field,
+            ValidationErrorKind::MaxLength,
+            format!("must be at most {max} characters, got {actual}"),
+        );
+    }
+
+    /// Add a pattern match error.
+    pub fn add_pattern(&mut self, field: impl Into<String>, pattern: &str) {
+        self.add(
+            field,
+            ValidationErrorKind::Pattern,
+            format!("must match pattern '{pattern}'"),
+        );
+    }
+
+    /// Add a required field error.
+    pub fn add_required(&mut self, field: impl Into<String>) {
+        self.add(
+            field,
+            ValidationErrorKind::Required,
+            "is required".to_string(),
+        );
+    }
+
+    /// Add a custom validation error.
+    pub fn add_custom(&mut self, field: impl Into<String>, message: impl Into<String>) {
+        self.add(field, ValidationErrorKind::Custom, message);
+    }
+
+    /// Convert to Result, returning Ok(()) if no errors, Err(self) otherwise.
+    pub fn into_result(self) -> std::result::Result<(), Self> {
+        if self.is_empty() { Ok(()) } else { Err(self) }
+    }
+}
+
+impl Default for ValidationError {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Error {
     /// Is this a retryable error (deadlock, serialization, pool exhausted, timeouts)?
     pub fn is_retryable(&self) -> bool {
@@ -263,6 +408,7 @@ impl fmt::Display for Error {
             Error::Pool(e) => write!(f, "Pool error: {}", e.message),
             Error::Schema(e) => write!(f, "Schema error: {}", e.message),
             Error::Config(e) => write!(f, "Configuration error: {}", e.message),
+            Error::Validation(e) => write!(f, "Validation error: {}", e),
             Error::Io(e) => write!(f, "I/O error: {}", e),
             Error::Timeout => write!(f, "Operation timed out"),
             Error::Cancelled => write!(f, "Operation cancelled"),
@@ -365,6 +511,25 @@ impl fmt::Display for ConfigError {
     }
 }
 
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.errors.is_empty() {
+            write!(f, "validation passed")
+        } else if self.errors.len() == 1 {
+            let err = &self.errors[0];
+            write!(f, "validation error on '{}': {}", err.field, err.message)
+        } else {
+            writeln!(f, "validation errors:")?;
+            for err in &self.errors {
+                writeln!(f, "  - {}: {}", err.field, err.message)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
@@ -416,6 +581,12 @@ impl From<SchemaError> for Error {
 impl From<ConfigError> for Error {
     fn from(err: ConfigError) -> Self {
         Error::Config(err)
+    }
+}
+
+impl From<ValidationError> for Error {
+    fn from(err: ValidationError) -> Self {
+        Error::Validation(err)
     }
 }
 

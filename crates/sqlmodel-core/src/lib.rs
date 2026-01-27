@@ -22,8 +22,8 @@ pub mod value;
 pub use connection::{
     Connection, IsolationLevel, PreparedStatement, Transaction, TransactionInternal, TransactionOps,
 };
-pub use error::{Error, Result};
-pub use field::{Column, Field, FieldInfo};
+pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
+pub use field::{Column, Field, FieldInfo, ReferentialAction};
 pub use model::Model;
 pub use row::Row;
 pub use types::{SqlType, TypeInfo};

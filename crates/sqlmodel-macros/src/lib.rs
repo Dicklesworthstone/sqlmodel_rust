@@ -10,6 +10,7 @@ use proc_macro::TokenStream;
 mod infer;
 mod parse;
 mod validate;
+mod validate_derive;
 
 use parse::{ModelDef, parse_model};
 
@@ -345,7 +346,7 @@ fn generate_is_new(model: &ModelDef) -> proc_macro2::TokenStream {
 
 /// Derive macro for field validation.
 ///
-/// Generates validation logic based on field attributes.
+/// Generates a `validate()` method that checks field constraints at runtime.
 ///
 /// # Attributes
 ///
@@ -356,15 +357,52 @@ fn generate_is_new(model: &ModelDef) -> proc_macro2::TokenStream {
 /// - `#[validate(pattern = "regex")]` - Regex pattern for strings
 /// - `#[validate(email)]` - Email format validation
 /// - `#[validate(url)]` - URL format validation
+/// - `#[validate(required)]` - Mark an Option<T> field as required
 /// - `#[validate(custom = "fn_name")]` - Custom validation function
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlmodel::Validate;
+///
+/// #[derive(Validate)]
+/// struct User {
+///     #[validate(min_length = 1, max_length = 100)]
+///     name: String,
+///
+///     #[validate(min = 0, max = 150)]
+///     age: i32,
+///
+///     #[validate(email)]
+///     email: String,
+///
+///     #[validate(required)]
+///     team_id: Option<i64>,
+/// }
+///
+/// let user = User {
+///     name: "".to_string(),
+///     age: 200,
+///     email: "invalid".to_string(),
+///     team_id: None,
+/// };
+///
+/// // Returns Err with all validation failures
+/// let result = user.validate();
+/// assert!(result.is_err());
+/// ```
 #[proc_macro_derive(Validate, attributes(validate))]
 pub fn derive_validate(input: TokenStream) -> TokenStream {
-    // TODO: Implement Validate derive macro
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
-    let _name = &input.ident;
 
-    // Return empty for now
-    TokenStream::new()
+    // Parse the struct and its validation attributes
+    let def = match validate_derive::parse_validate(&input) {
+        Ok(d) => d,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    // Generate the validation implementation
+    validate_derive::generate_validate_impl(&def).into()
 }
 
 /// Attribute macro for defining SQL functions in handlers.
