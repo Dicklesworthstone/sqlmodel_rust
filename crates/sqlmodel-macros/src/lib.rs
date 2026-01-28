@@ -123,6 +123,9 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     // Generate is_new implementation
     let is_new_body = generate_is_new(model);
 
+    // Generate model_config implementation
+    let model_config_body = generate_model_config(model);
+
     quote::quote! {
         impl #impl_generics sqlmodel_core::Model for #name #ty_generics #where_clause {
             const TABLE_NAME: &'static str = #table_name;
@@ -150,6 +153,10 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
             fn is_new(&self) -> bool {
                 #is_new_body
+            }
+
+            fn model_config() -> sqlmodel_core::ModelConfig {
+                #model_config_body
             }
         }
     }
@@ -461,6 +468,58 @@ fn generate_is_new(model: &ModelDef) -> proc_macro2::TokenStream {
 
     // Default: cannot determine, always return true
     quote::quote! { true }
+}
+
+/// Generate the model_config method body.
+fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
+    let config = &model.config;
+
+    let table = config.table;
+    let from_attributes = config.from_attributes;
+    let validate_assignment = config.validate_assignment;
+    let strict = config.strict;
+    let populate_by_name = config.populate_by_name;
+    let use_enum_values = config.use_enum_values;
+    let arbitrary_types_allowed = config.arbitrary_types_allowed;
+    let defer_build = config.defer_build;
+    let revalidate_instances = config.revalidate_instances;
+
+    // Handle extra field behavior
+    let extra_token = match config.extra.as_str() {
+        "forbid" => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Forbid },
+        "allow" => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Allow },
+        _ => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Ignore },
+    };
+
+    // Handle optional string fields
+    let json_schema_extra_token = if let Some(ref extra) = config.json_schema_extra {
+        quote::quote! { Some(#extra) }
+    } else {
+        quote::quote! { None }
+    };
+
+    let title_token = if let Some(ref title) = config.title {
+        quote::quote! { Some(#title) }
+    } else {
+        quote::quote! { None }
+    };
+
+    quote::quote! {
+        sqlmodel_core::ModelConfig {
+            table: #table,
+            from_attributes: #from_attributes,
+            validate_assignment: #validate_assignment,
+            extra: #extra_token,
+            strict: #strict,
+            populate_by_name: #populate_by_name,
+            use_enum_values: #use_enum_values,
+            arbitrary_types_allowed: #arbitrary_types_allowed,
+            defer_build: #defer_build,
+            revalidate_instances: #revalidate_instances,
+            json_schema_extra: #json_schema_extra_token,
+            title: #title_token,
+        }
+    }
 }
 
 /// Generate the RELATIONSHIPS constant from relationship fields.
