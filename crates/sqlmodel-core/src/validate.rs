@@ -145,7 +145,10 @@ mod tests {
             uuid_pattern
         ));
         assert!(!matches_pattern("invalid-uuid", uuid_pattern));
-        assert!(!matches_pattern("550e8400e29b41d4a716446655440000", uuid_pattern));
+        assert!(!matches_pattern(
+            "550e8400e29b41d4a716446655440000",
+            uuid_pattern
+        ));
     }
 
     #[test]

@@ -997,7 +997,9 @@ impl Connection for SharedPgConnection {
     ) -> impl Future<Output = Outcome<PreparedStatement, Error>> + Send {
         let sql = sql.to_string();
         async move {
-            // TODO(bd-1sg): implement server-side prepared statements.
+            // Note: Client-side prepared statement stub. Server-side prepared statements
+            // (PostgreSQL PREPARE/EXECUTE) can be added later for performance optimization.
+            // Current implementation passes through to regular query execution.
             Outcome::Ok(PreparedStatement::new(0, sql, 0))
         }
     }

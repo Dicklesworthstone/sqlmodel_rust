@@ -94,7 +94,13 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
     // If no explicit primary key, default to "id" if present
     let pk_slice = if pk_field_names.is_empty() {
-        quote::quote! { &["id"] }
+        // Only default to "id" if an "id" field actually exists
+        let has_id_field = model.fields.iter().any(|f| f.name == "id" && !f.skip);
+        if has_id_field {
+            quote::quote! { &["id"] }
+        } else {
+            quote::quote! { &[] }
+        }
     } else {
         quote::quote! { &[#(#pk_field_names),*] }
     };
@@ -562,6 +568,7 @@ pub fn derive_validate(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn query(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    // TODO: Implement query attribute macro
+    // Stub: query attribute macro is a pass-through placeholder for future SQL validation.
+    // When implemented, it will provide compile-time SQL validation and query optimization hints.
     item
 }

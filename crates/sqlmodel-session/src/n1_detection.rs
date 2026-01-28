@@ -298,10 +298,15 @@ impl N1DetectionScope {
     /// Called automatically on drop, but can be called manually for
     /// intermediate reporting.
     pub fn log_summary(&self, final_stats: &N1Stats) {
-        let new_loads = final_stats.total_loads.saturating_sub(self.initial_stats.total_loads);
-        let new_relationships =
-            final_stats.relationships_loaded.saturating_sub(self.initial_stats.relationships_loaded);
-        let new_n1 = final_stats.potential_n1.saturating_sub(self.initial_stats.potential_n1);
+        let new_loads = final_stats
+            .total_loads
+            .saturating_sub(self.initial_stats.total_loads);
+        let new_relationships = final_stats
+            .relationships_loaded
+            .saturating_sub(self.initial_stats.relationships_loaded);
+        let new_n1 = final_stats
+            .potential_n1
+            .saturating_sub(self.initial_stats.potential_n1);
 
         if new_n1 > 0 {
             tracing::warn!(

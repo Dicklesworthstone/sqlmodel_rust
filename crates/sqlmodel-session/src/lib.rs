@@ -308,6 +308,12 @@ struct TrackedObject {
     table_name: &'static str,
     /// Column names for this object.
     column_names: Vec<&'static str>,
+    /// Current values for each column (for INSERT/UPDATE).
+    values: Vec<Value>,
+    /// Primary key column names.
+    pk_columns: Vec<&'static str>,
+    /// Primary key values (for DELETE/UPDATE WHERE clause).
+    pk_values: Vec<Value>,
 }
 
 // ============================================================================
@@ -391,10 +397,14 @@ impl<C: Connection> Session<C> {
             return;
         }
 
-        // Serialize for dirty tracking (will be used when dirty checking is implemented)
-        let _serialized = serde_json::to_vec(obj).ok();
+        // Extract column data from the model while we have the concrete type
+        let row_data = obj.to_row();
+        let column_names: Vec<&'static str> = row_data.iter().map(|(name, _)| *name).collect();
+        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
 
-        let column_names: Vec<&'static str> = M::fields().iter().map(|f| f.column_name).collect();
+        // Extract primary key info
+        let pk_columns: Vec<&'static str> = M::PRIMARY_KEY.to_vec();
+        let pk_values = obj.primary_key_value();
 
         let tracked = TrackedObject {
             object: Box::new(obj.clone()),
@@ -402,6 +412,9 @@ impl<C: Connection> Session<C> {
             state: ObjectState::New,
             table_name: M::TABLE_NAME,
             column_names,
+            values,
+            pk_columns,
+            pk_values,
         };
 
         self.identity_map.insert(key, tracked);
@@ -481,9 +494,17 @@ impl<C: Connection> Session<C> {
             Err(e) => return Outcome::Err(e),
         };
 
-        // Add to identity map
+        // Add to identity map with full tracking data
         let serialized = serde_json::to_vec(&obj).ok();
-        let column_names: Vec<&'static str> = M::fields().iter().map(|f| f.column_name).collect();
+
+        // Extract column data from the model while we have the concrete type
+        let row_data = obj.to_row();
+        let column_names: Vec<&'static str> = row_data.iter().map(|(name, _)| *name).collect();
+        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
+
+        // Extract primary key info
+        let pk_columns: Vec<&'static str> = M::PRIMARY_KEY.to_vec();
+        let obj_pk_values = obj.primary_key_value();
 
         let tracked = TrackedObject {
             object: Box::new(obj.clone()),
@@ -491,6 +512,9 @@ impl<C: Connection> Session<C> {
             state: ObjectState::Persistent,
             table_name: M::TABLE_NAME,
             column_names,
+            values,
+            pk_columns,
+            pk_values: obj_pk_values,
         };
 
         self.identity_map.insert(key, tracked);
@@ -564,15 +588,21 @@ impl<C: Connection> Session<C> {
         let deletes: Vec<ObjectKey> = std::mem::take(&mut self.pending_delete);
         for key in &deletes {
             if let Some(tracked) = self.identity_map.get(key) {
-                let pk_col = tracked.column_names.first().copied().unwrap_or("id");
+                // Build WHERE clause from primary key columns and values
+                let where_parts: Vec<String> = tracked
+                    .pk_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("\"{}\" = ${}", col, i + 1))
+                    .collect();
+
                 let sql = format!(
-                    "DELETE FROM \"{}\" WHERE \"{}\" = $1",
-                    tracked.table_name, pk_col
+                    "DELETE FROM \"{}\" WHERE {}",
+                    tracked.table_name,
+                    where_parts.join(" AND ")
                 );
 
-                // Get PK value from the object
-                // Note: This is simplified - real implementation would extract PK properly
-                match self.connection.execute(cx, &sql, &[]).await {
+                match self.connection.execute(cx, &sql, &tracked.pk_values).await {
                     Outcome::Ok(_) => {}
                     Outcome::Err(e) => {
                         self.pending_delete = deletes;
@@ -593,12 +623,12 @@ impl<C: Connection> Session<C> {
         let inserts: Vec<ObjectKey> = std::mem::take(&mut self.pending_new);
         for key in &inserts {
             if let Some(tracked) = self.identity_map.get_mut(key) {
-                // Build INSERT statement
-                let columns = tracked.column_names.clone();
+                // Build INSERT statement using stored column names and values
+                let columns = &tracked.column_names;
                 let placeholders: Vec<String> =
                     (1..=columns.len()).map(|i| format!("${}", i)).collect();
 
-                let _sql = format!(
+                let sql = format!(
                     "INSERT INTO \"{}\" ({}) VALUES ({})",
                     tracked.table_name,
                     columns
@@ -609,16 +639,90 @@ impl<C: Connection> Session<C> {
                     placeholders.join(", ")
                 );
 
-                // TODO: Execute the INSERT statement
-                // Real implementation would extract values from the object
-                // and execute: self.connection.execute(cx, &sql, &values).await
-                tracked.state = ObjectState::Persistent;
-                tracked.original_state = None; // Will be set after successful insert
+                match self.connection.execute(cx, &sql, &tracked.values).await {
+                    Outcome::Ok(_) => {
+                        tracked.state = ObjectState::Persistent;
+                        // Set original_state for future dirty checking (serialize current values)
+                        tracked.original_state =
+                            Some(serde_json::to_vec(&tracked.values).unwrap_or_default());
+                    }
+                    Outcome::Err(e) => {
+                        // Restore pending_new for retry
+                        self.pending_new = inserts;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                }
             }
         }
 
         // 3. Execute UPDATEs for dirty objects
-        // TODO: Implement dirty checking
+        let dirty: Vec<ObjectKey> = std::mem::take(&mut self.pending_dirty);
+        for key in &dirty {
+            if let Some(tracked) = self.identity_map.get_mut(key) {
+                // Check if actually dirty by comparing serialized state
+                let current_state = serde_json::to_vec(&tracked.values).unwrap_or_default();
+                let is_dirty = tracked.original_state.as_ref() != Some(&current_state);
+
+                if !is_dirty {
+                    continue;
+                }
+
+                // Build UPDATE statement with all non-PK columns
+                let mut set_parts = Vec::new();
+                let mut params = Vec::new();
+                let mut param_idx = 1;
+
+                for (i, col) in tracked.column_names.iter().enumerate() {
+                    // Skip primary key columns in SET clause
+                    if !tracked.pk_columns.contains(col) {
+                        set_parts.push(format!("\"{}\" = ${}", col, param_idx));
+                        params.push(tracked.values[i].clone());
+                        param_idx += 1;
+                    }
+                }
+
+                // Add WHERE clause for primary key
+                let where_parts: Vec<String> = tracked
+                    .pk_columns
+                    .iter()
+                    .map(|col| {
+                        let clause = format!("\"{}\" = ${}", col, param_idx);
+                        param_idx += 1;
+                        clause
+                    })
+                    .collect();
+
+                // Add PK values to params
+                params.extend(tracked.pk_values.clone());
+
+                if set_parts.is_empty() {
+                    continue; // No non-PK columns to update
+                }
+
+                let sql = format!(
+                    "UPDATE \"{}\" SET {} WHERE {}",
+                    tracked.table_name,
+                    set_parts.join(", "),
+                    where_parts.join(" AND ")
+                );
+
+                match self.connection.execute(cx, &sql, &params).await {
+                    Outcome::Ok(_) => {
+                        // Update original_state to current state
+                        tracked.original_state = Some(current_state);
+                    }
+                    Outcome::Err(e) => {
+                        // Restore pending_dirty for retry
+                        self.pending_dirty = dirty;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                }
+            }
+        }
 
         Outcome::Ok(())
     }
@@ -851,9 +955,13 @@ impl<C: Connection> Session<C> {
 
                     // Add to session identity map
                     let serialized = serde_json::to_vec(&obj).ok();
-                    let column_names: Vec<&'static str> =
-                        T::fields().iter().map(|f| f.column_name).collect();
                     let key = ObjectKey::from_pk::<T>(&pk_values);
+
+                    // Extract column data from the model while we have the concrete type
+                    let row_data = obj.to_row();
+                    let column_names: Vec<&'static str> =
+                        row_data.iter().map(|(name, _)| *name).collect();
+                    let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
 
                     let tracked = TrackedObject {
                         object: Box::new(obj.clone()),
@@ -861,6 +969,9 @@ impl<C: Connection> Session<C> {
                         state: ObjectState::Persistent,
                         table_name: T::TABLE_NAME,
                         column_names,
+                        values,
+                        pk_columns: T::PRIMARY_KEY.to_vec(),
+                        pk_values: pk_values.clone(),
                     };
                     self.identity_map.insert(key, tracked);
 
