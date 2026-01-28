@@ -321,7 +321,7 @@ pub enum DumpMode {
     Python,
 }
 
-/// Options for model_dump().
+/// Options for model_dump() and model_dump_json().
 ///
 /// Controls the serialization behavior.
 #[derive(Debug, Clone, Default)]
@@ -344,6 +344,8 @@ pub struct DumpOptions {
     pub exclude_computed_fields: bool,
     /// Enable round-trip mode (preserves types for re-parsing)
     pub round_trip: bool,
+    /// Indentation for JSON output (None = compact, Some(n) = n spaces)
+    pub indent: Option<usize>,
 }
 
 impl DumpOptions {
@@ -411,6 +413,15 @@ impl DumpOptions {
         self.round_trip = true;
         self
     }
+
+    /// Set indentation for JSON output.
+    ///
+    /// When set, JSON output will be pretty-printed with the specified number
+    /// of spaces for indentation. When None (default), JSON is compact.
+    pub fn indent(mut self, spaces: usize) -> Self {
+        self.indent = Some(spaces);
+        self
+    }
 }
 
 /// Result type for model_dump operations.
@@ -449,6 +460,50 @@ pub trait ModelDump {
     fn model_dump_json_pretty(&self) -> std::result::Result<String, serde_json::Error> {
         let value = self.model_dump(DumpOptions::default())?;
         serde_json::to_string_pretty(&value)
+    }
+
+    /// Serialize a model to a JSON string with full options support.
+    ///
+    /// This method supports all DumpOptions including the `indent` option:
+    /// - `indent: None` - compact JSON output
+    /// - `indent: Some(n)` - pretty-printed with n spaces indentation
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use sqlmodel_core::validate::{ModelDump, DumpOptions};
+    ///
+    /// // Compact JSON with exclusions
+    /// let json = user.model_dump_json_with_options(
+    ///     DumpOptions::default().exclude(["password"])
+    /// )?;
+    ///
+    /// // Pretty-printed with 4-space indent
+    /// let json = user.model_dump_json_with_options(
+    ///     DumpOptions::default().indent(4)
+    /// )?;
+    /// ```
+    fn model_dump_json_with_options(
+        &self,
+        options: DumpOptions,
+    ) -> std::result::Result<String, serde_json::Error> {
+        let value = self.model_dump(DumpOptions {
+            indent: None, // Don't pass indent to model_dump (it returns Value, not String)
+            ..options.clone()
+        })?;
+
+        match options.indent {
+            Some(spaces) => {
+                let indent_bytes = " ".repeat(spaces).into_bytes();
+                let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent_bytes);
+                let mut writer = Vec::new();
+                let mut ser = serde_json::Serializer::with_formatter(&mut writer, formatter);
+                serde::Serialize::serialize(&value, &mut ser)?;
+                // SAFETY: serde_json always produces valid UTF-8
+                Ok(String::from_utf8(writer).expect("serde_json output should be valid UTF-8"))
+            }
+            None => serde_json::to_string(&value),
+        }
     }
 }
 
@@ -794,6 +849,48 @@ pub trait SqlModelDump: Model + serde::Serialize {
         let value = self.sql_model_dump(DumpOptions::default().by_alias())?;
         serde_json::to_string(&value)
     }
+
+    /// Serialize a model to a JSON string with full options support.
+    ///
+    /// This method supports all DumpOptions including the `indent` option:
+    /// - `indent: None` - compact JSON output
+    /// - `indent: Some(n)` - pretty-printed with n spaces indentation
+    ///
+    /// Compared to `model_dump_json_with_options`, this method also applies
+    /// Model-specific transformations like serialization aliases.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use sqlmodel_core::validate::{SqlModelDump, DumpOptions};
+    ///
+    /// // With aliases and 2-space indent
+    /// let json = user.sql_model_dump_json_with_options(
+    ///     DumpOptions::default().by_alias().indent(2)
+    /// )?;
+    /// ```
+    fn sql_model_dump_json_with_options(
+        &self,
+        options: DumpOptions,
+    ) -> std::result::Result<String, serde_json::Error> {
+        let value = self.sql_model_dump(DumpOptions {
+            indent: None, // Don't pass indent to sql_model_dump (it returns Value, not String)
+            ..options.clone()
+        })?;
+
+        match options.indent {
+            Some(spaces) => {
+                let indent_bytes = " ".repeat(spaces).into_bytes();
+                let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent_bytes);
+                let mut writer = Vec::new();
+                let mut ser = serde_json::Serializer::with_formatter(&mut writer, formatter);
+                serde::Serialize::serialize(&value, &mut ser)?;
+                // SAFETY: serde_json always produces valid UTF-8
+                Ok(String::from_utf8(writer).expect("serde_json output should be valid UTF-8"))
+            }
+            None => serde_json::to_string(&value),
+        }
+    }
 }
 
 /// Blanket implementation for all Model types that implement Serialize.
@@ -1115,6 +1212,78 @@ mod tests {
         // Pretty print should have newlines
         assert!(json_str.contains('\n'));
         assert!(json_str.contains("Gadget"));
+    }
+
+    #[test]
+    fn test_model_dump_json_with_options_compact() {
+        let product = TestProduct {
+            name: "Widget".to_string(),
+            price: 19.99,
+            description: Some("A widget".to_string()),
+        };
+
+        // Compact JSON (no indent)
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default())
+            .unwrap();
+        assert!(!json_str.contains('\n')); // No newlines in compact mode
+        assert!(json_str.contains("Widget"));
+        assert!(json_str.contains("19.99"));
+    }
+
+    #[test]
+    fn test_model_dump_json_with_options_indent() {
+        let product = TestProduct {
+            name: "Widget".to_string(),
+            price: 19.99,
+            description: Some("A widget".to_string()),
+        };
+
+        // 2-space indentation
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default().indent(2))
+            .unwrap();
+        assert!(json_str.contains('\n')); // Has newlines
+        assert!(json_str.contains("  \"name\"")); // 2-space indent
+        assert!(json_str.contains("Widget"));
+
+        // 4-space indentation
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default().indent(4))
+            .unwrap();
+        assert!(json_str.contains("    \"name\"")); // 4-space indent
+    }
+
+    #[test]
+    fn test_model_dump_json_with_options_combined() {
+        let product = TestProduct {
+            name: "Widget".to_string(),
+            price: 19.99,
+            description: Some("A widget".to_string()),
+        };
+
+        // Combine indent with exclude
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default().exclude(["price"]).indent(2))
+            .unwrap();
+        assert!(json_str.contains('\n')); // Has newlines
+        assert!(json_str.contains("Widget"));
+        assert!(!json_str.contains("19.99")); // price is excluded
+    }
+
+    #[test]
+    fn test_dump_options_indent_builder() {
+        let options = DumpOptions::new().indent(4);
+        assert_eq!(options.indent, Some(4));
+
+        // Can combine with other options
+        let options2 = DumpOptions::new()
+            .indent(2)
+            .by_alias()
+            .exclude(["password"]);
+        assert_eq!(options2.indent, Some(2));
+        assert!(options2.by_alias);
+        assert!(options2.exclude.unwrap().contains("password"));
     }
 
     #[test]
