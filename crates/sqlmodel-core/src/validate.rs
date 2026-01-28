@@ -25,8 +25,9 @@ impl RegexCache {
 
     fn get_or_compile(&self, pattern: &str) -> Result<Regex, regex::Error> {
         // Fast path: check if already cached
+        // Use unwrap_or_else to recover from poisoned lock (another thread panicked)
         {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
             if let Some(regex) = cache.get(pattern) {
                 return Ok(regex.clone());
             }
@@ -35,7 +36,7 @@ impl RegexCache {
         // Slow path: compile and cache
         let regex = Regex::new(pattern)?;
         {
-            let mut cache = self.cache.write().unwrap();
+            let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
             cache.insert(pattern.to_string(), regex.clone());
         }
         Ok(regex)

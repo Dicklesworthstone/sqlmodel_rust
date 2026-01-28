@@ -544,6 +544,7 @@ pub fn encode_value(value: &Value, format: Format) -> Result<(Vec<u8>, u32), Err
                 rust_type: None,
             }));
         }
+        Value::Default => return Ok((vec![], oid::UNKNOWN)),
     };
 
     Ok((buf, type_oid))

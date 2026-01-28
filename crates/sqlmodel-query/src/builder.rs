@@ -124,28 +124,32 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
         let row = self.model.to_row();
         let fields = M::fields();
 
-        // Filter out auto-increment fields when inserting new records
         let insert_fields: Vec<_> = row
             .iter()
-            .filter(|(name, value)| {
-                // Skip NULL values for auto-increment fields
+            .map(|(name, value)| {
                 let field = fields.iter().find(|f| f.name == *name);
                 if let Some(f) = field {
                     if f.auto_increment && matches!(value, Value::Null) {
-                        return false;
+                        return (*name, Value::Default);
                     }
                 }
-                true
+                (*name, value.clone())
             })
             .collect();
 
         let columns: Vec<_> = insert_fields.iter().map(|(name, _)| *name).collect();
-        let values: Vec<_> = insert_fields
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect();
 
-        let placeholders: Vec<_> = (1..=values.len()).map(|i| dialect.placeholder(i)).collect();
+        let mut placeholders = Vec::new();
+        let mut params = Vec::new();
+
+        for (_, value) in insert_fields {
+            if matches!(value, Value::Default) {
+                placeholders.push("DEFAULT".to_string());
+            } else {
+                params.push(value);
+                placeholders.push(dialect.placeholder(params.len()));
+            }
+        }
 
         let mut sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
@@ -160,36 +164,55 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                 OnConflict::DoNothing => {
                     sql.push_str(" ON CONFLICT DO NOTHING");
                 }
-                OnConflict::DoUpdate { columns, target } => {
+                OnConflict::DoUpdate {
+                    columns: update_cols,
+                    target,
+                } => {
                     sql.push_str(" ON CONFLICT");
 
                     // Add target if specified, otherwise use primary key
-                    if !target.is_empty() {
+                    // PostgreSQL requires a conflict target for DO UPDATE
+                    let has_target = if !target.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&target.join(", "));
                         sql.push(')');
+                        true
                     } else if !M::PRIMARY_KEY.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&M::PRIMARY_KEY.join(", "));
                         sql.push(')');
-                    }
-
-                    sql.push_str(" DO UPDATE SET ");
-
-                    // If columns is empty, update all non-PK columns
-                    let update_cols: Vec<String> = if columns.is_empty() {
-                        insert_fields
-                            .iter()
-                            .filter(|(name, _)| !M::PRIMARY_KEY.contains(name))
-                            .map(|(name, _)| format!("{} = EXCLUDED.{}", name, name))
-                            .collect()
+                        true
                     } else {
-                        columns
-                            .iter()
-                            .map(|c| format!("{} = EXCLUDED.{}", c, c))
-                            .collect()
+                        // No conflict target available - fall back to DO NOTHING
+                        // since PostgreSQL requires a target for DO UPDATE
+                        tracing::warn!(
+                            table = M::TABLE_NAME,
+                            "ON CONFLICT DO UPDATE requires a conflict target (primary key or explicit target). \
+                             Falling back to DO NOTHING since no target is available."
+                        );
+                        sql.push_str(" DO NOTHING");
+                        false
                     };
-                    sql.push_str(&update_cols.join(", "));
+
+                    // Only add DO UPDATE SET if we have a valid conflict target
+                    if has_target {
+                        sql.push_str(" DO UPDATE SET ");
+
+                        // If columns is empty, update all non-PK columns
+                        let update_set: Vec<String> = if update_cols.is_empty() {
+                            columns // Use full column list from explicit insert
+                                .iter()
+                                .filter(|name| !M::PRIMARY_KEY.contains(name)) // Don't update PK
+                                .map(|name| format!("{} = EXCLUDED.{}", name, name))
+                                .collect()
+                        } else {
+                            update_cols
+                                .iter()
+                                .map(|c| format!("{} = EXCLUDED.{}", c, c))
+                                .collect()
+                        };
+                        sql.push_str(&update_set.join(", "));
+                    }
                 }
             }
         }
@@ -199,7 +222,7 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             sql.push_str(" RETURNING *");
         }
 
-        (sql, values)
+        (sql, params)
     }
 
     /// Execute the INSERT and return the inserted ID.
@@ -287,17 +310,19 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
         let fields = M::fields();
         let first_row = self.models[0].to_row();
 
-        // Determine which columns to insert (filter auto-increment nulls)
+        // Determine which columns to insert
+        // Always include auto-increment fields to handle mixed states (New vs Existing)
+        // For other fields, we still rely on first_row to filter Nulls (standard behavior)
         let insert_columns: Vec<_> = first_row
             .iter()
             .filter(|(name, value)| {
                 let field = fields.iter().find(|f| f.name == *name);
                 if let Some(f) = field {
-                    if f.auto_increment && matches!(value, Value::Null) {
-                        return false;
+                    if f.auto_increment {
+                        return true;
                     }
                 }
-                true
+                !matches!(value, Value::Null)
             })
             .map(|(name, _)| *name)
             .collect();
@@ -310,18 +335,33 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
             let values: Vec<_> = insert_columns
                 .iter()
                 .map(|col| {
-                    row.iter()
+                    let val = row
+                        .iter()
                         .find(|(name, _)| name == col)
-                        .map_or(Value::Null, |(_, v)| v.clone())
+                        .map_or(Value::Null, |(_, v)| v.clone());
+
+                    // Map Null auto-increment fields to DEFAULT
+                    let field = fields.iter().find(|f| f.name == *col);
+                    if let Some(f) = field {
+                        if f.auto_increment && matches!(val, Value::Null) {
+                            return Value::Default;
+                        }
+                    }
+                    val
                 })
                 .collect();
 
-            let start = all_values.len() + 1;
-            let placeholders: Vec<_> = (start..start + values.len())
-                .map(|i| dialect.placeholder(i))
-                .collect();
+            let mut placeholders = Vec::new();
+            for v in &values {
+                if matches!(v, Value::Default) {
+                    placeholders.push("DEFAULT".to_string());
+                } else {
+                    all_values.push(v.clone());
+                    placeholders.push(dialect.placeholder(all_values.len()));
+                }
+            }
+
             value_groups.push(format!("({})", placeholders.join(", ")));
-            all_values.extend(values);
         }
 
         let mut sql = format!(
@@ -330,7 +370,6 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
             insert_columns.join(", "),
             value_groups.join(", ")
         );
-
         // Add ON CONFLICT clause if specified
         if let Some(on_conflict) = &self.on_conflict {
             match on_conflict {
@@ -340,31 +379,46 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
                 OnConflict::DoUpdate { columns, target } => {
                     sql.push_str(" ON CONFLICT");
 
-                    if !target.is_empty() {
+                    // PostgreSQL requires a conflict target for DO UPDATE
+                    let has_target = if !target.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&target.join(", "));
                         sql.push(')');
+                        true
                     } else if !M::PRIMARY_KEY.is_empty() {
                         sql.push_str(" (");
                         sql.push_str(&M::PRIMARY_KEY.join(", "));
                         sql.push(')');
-                    }
-
-                    sql.push_str(" DO UPDATE SET ");
-
-                    let update_cols: Vec<String> = if columns.is_empty() {
-                        insert_columns
-                            .iter()
-                            .filter(|name| !M::PRIMARY_KEY.contains(name))
-                            .map(|name| format!("{} = EXCLUDED.{}", name, name))
-                            .collect()
+                        true
                     } else {
-                        columns
-                            .iter()
-                            .map(|c| format!("{} = EXCLUDED.{}", c, c))
-                            .collect()
+                        // No conflict target available - fall back to DO NOTHING
+                        tracing::warn!(
+                            table = M::TABLE_NAME,
+                            "ON CONFLICT DO UPDATE requires a conflict target (primary key or explicit target). \
+                             Falling back to DO NOTHING since no target is available."
+                        );
+                        sql.push_str(" DO NOTHING");
+                        false
                     };
-                    sql.push_str(&update_cols.join(", "));
+
+                    // Only add DO UPDATE SET if we have a valid conflict target
+                    if has_target {
+                        sql.push_str(" DO UPDATE SET ");
+
+                        let update_cols: Vec<String> = if columns.is_empty() {
+                            insert_columns
+                                .iter()
+                                .filter(|name| !M::PRIMARY_KEY.contains(name))
+                                .map(|name| format!("{} = EXCLUDED.{}", name, name))
+                                .collect()
+                        } else {
+                            columns
+                                .iter()
+                                .map(|c| format!("{} = EXCLUDED.{}", c, c))
+                                .collect()
+                        };
+                        sql.push_str(&update_cols.join(", "));
+                    }
                 }
             }
         }
@@ -848,7 +902,11 @@ mod tests {
         };
         let (sql, params) = InsertBuilder::new(&hero).build();
 
-        assert_eq!(sql, "INSERT INTO heroes (name, age) VALUES ($1, $2)");
+        // Auto-increment column with None gets DEFAULT, other columns get placeholders
+        assert_eq!(
+            sql,
+            "INSERT INTO heroes (id, name, age) VALUES (DEFAULT, $1, $2)"
+        );
         assert_eq!(params.len(), 2);
     }
 
@@ -908,8 +966,9 @@ mod tests {
         ];
         let (sql, params) = InsertManyBuilder::new(&heroes).build();
 
-        assert!(sql.starts_with("INSERT INTO heroes (name, age) VALUES"));
-        assert!(sql.contains("($1, $2), ($3, $4)"));
+        // Auto-increment columns with None get DEFAULT, other columns get placeholders
+        assert!(sql.starts_with("INSERT INTO heroes (id, name, age) VALUES"));
+        assert!(sql.contains("(DEFAULT, $1, $2), (DEFAULT, $3, $4)"));
         assert_eq!(params.len(), 4);
     }
 

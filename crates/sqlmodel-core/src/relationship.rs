@@ -596,10 +596,13 @@ impl<T: Model> RelatedMany<T> {
     /// Returns the PK values that should be INSERTed into the link table.
     /// This is used by the flush system.
     pub fn take_pending_links(&self) -> Vec<Vec<Value>> {
-        self.pending_links
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
+        match self.pending_links.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(poisoned) => {
+                // Recover data from poisoned mutex - consistent with link()/unlink()
+                std::mem::take(&mut *poisoned.into_inner())
+            }
+        }
     }
 
     /// Get and clear pending unlink operations.
@@ -607,17 +610,26 @@ impl<T: Model> RelatedMany<T> {
     /// Returns the PK values that should be DELETEd from the link table.
     /// This is used by the flush system.
     pub fn take_pending_unlinks(&self) -> Vec<Vec<Value>> {
-        self.pending_unlinks
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
+        match self.pending_unlinks.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(poisoned) => {
+                // Recover data from poisoned mutex - consistent with link()/unlink()
+                std::mem::take(&mut *poisoned.into_inner())
+            }
+        }
     }
 
     /// Check if there are pending link/unlink operations.
     #[must_use]
     pub fn has_pending_ops(&self) -> bool {
-        let has_links = self.pending_links.lock().is_ok_and(|v| !v.is_empty());
-        let has_unlinks = self.pending_unlinks.lock().is_ok_and(|v| !v.is_empty());
+        let has_links = match self.pending_links.lock() {
+            Ok(v) => !v.is_empty(),
+            Err(poisoned) => !poisoned.into_inner().is_empty(),
+        };
+        let has_unlinks = match self.pending_unlinks.lock() {
+            Ok(v) => !v.is_empty(),
+            Err(poisoned) => !poisoned.into_inner().is_empty(),
+        };
         has_links || has_unlinks
     }
 }
@@ -630,23 +642,25 @@ impl<T: Model> Default for RelatedMany<T> {
 
 impl<T: Model + Clone> Clone for RelatedMany<T> {
     fn clone(&self) -> Self {
+        // Clone pending_links, recovering from poisoned mutex
+        let cloned_links = match self.pending_links.lock() {
+            Ok(v) => v.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        // Clone pending_unlinks, recovering from poisoned mutex
+        let cloned_unlinks = match self.pending_unlinks.lock() {
+            Ok(v) => v.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
         let cloned = Self {
             loaded: OnceLock::new(),
             fk_column: self.fk_column,
             parent_pk: self.parent_pk.clone(),
             link_table: self.link_table,
-            pending_links: std::sync::Mutex::new(
-                self.pending_links
-                    .lock()
-                    .map(|v| v.clone())
-                    .unwrap_or_default(),
-            ),
-            pending_unlinks: std::sync::Mutex::new(
-                self.pending_unlinks
-                    .lock()
-                    .map(|v| v.clone())
-                    .unwrap_or_default(),
-            ),
+            pending_links: std::sync::Mutex::new(cloned_links),
+            pending_unlinks: std::sync::Mutex::new(cloned_unlinks),
         };
 
         if let Some(vec) = self.loaded.get() {

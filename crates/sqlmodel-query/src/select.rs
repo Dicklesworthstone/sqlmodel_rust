@@ -315,7 +315,7 @@ impl<M: Model> Select<M> {
         conn: &C,
     ) -> Outcome<Vec<M>, sqlmodel_core::Error> {
         // If no eager loading configured, fall back to regular all()
-        if self.eager_loader.is_none() || !self.eager_loader.as_ref().unwrap().has_includes() {
+        if !self.eager_loader.as_ref().is_some_and(|e| e.has_includes()) {
             tracing::trace!("No eager loading configured, falling back to regular all()");
             return self.all(cx, conn).await;
         }

@@ -50,8 +50,7 @@ impl Migration {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map_or(0, |d| d.as_secs());
 
         // Convert to datetime components manually (avoiding chrono dependency)
         let days = now / 86400;
@@ -339,8 +338,17 @@ pub enum MigrationStatus {
 pub struct MigrationRunner {
     /// The migrations to manage
     migrations: Vec<Migration>,
-    /// Name of the migrations tracking table
+    /// Name of the migrations tracking table (validated to be safe)
     table_name: String,
+}
+
+/// Validate and sanitize a table name to prevent SQL injection.
+///
+/// Only allows alphanumeric characters and underscores.
+fn sanitize_table_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
 }
 
 impl MigrationRunner {
@@ -353,8 +361,11 @@ impl MigrationRunner {
     }
 
     /// Set a custom migrations tracking table name.
+    ///
+    /// The name is sanitized to only allow alphanumeric characters and underscores
+    /// to prevent SQL injection.
     pub fn table_name(mut self, name: impl Into<String>) -> Self {
-        self.table_name = name.into();
+        self.table_name = sanitize_table_name(&name.into());
         self
     }
 
@@ -434,7 +445,10 @@ impl MigrationRunner {
 
         for (id, s) in status {
             if s == MigrationStatus::Pending {
-                let migration = self.migrations.iter().find(|m| m.id == id).unwrap();
+                let Some(migration) = self.migrations.iter().find(|m| m.id == id) else {
+                    // Migration not found in our list - skip it
+                    continue;
+                };
 
                 // Execute the up migration
                 match conn.execute(cx, &migration.up, &[]).await {
@@ -451,8 +465,7 @@ impl MigrationRunner {
                 );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
+                    .map_or(0, |d| d.as_secs() as i64);
 
                 match conn
                     .execute(
@@ -508,7 +521,13 @@ impl MigrationRunner {
             return Outcome::Ok(None);
         };
 
-        let migration = self.migrations.iter().find(|m| m.id == id).unwrap();
+        let Some(migration) = self.migrations.iter().find(|m| m.id == id) else {
+            // Migration not found in our list - cannot rollback
+            return Outcome::Err(Error::Custom(format!(
+                "Migration '{}' not found in migrations list",
+                id
+            )));
+        };
 
         // Execute the down migration
         match conn.execute(cx, &migration.down, &[]).await {

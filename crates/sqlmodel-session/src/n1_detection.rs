@@ -224,24 +224,29 @@ impl N1QueryTracker {
 // N1DetectionScope - RAII Guard
 // ============================================================================
 
-/// RAII guard for N+1 detection scope.
+/// Scope helper for N+1 detection tracking.
 ///
-/// This guard enables N+1 detection when created and logs a summary
-/// when dropped if any potential N+1 issues were detected.
+/// This helper captures the initial N+1 stats when created, allowing you to
+/// compare against final stats and log a summary of issues detected within
+/// the scope.
+///
+/// **Note:** This is NOT an automatic RAII guard - you must call `log_summary()`
+/// manually with the final stats. For automatic logging, wrap your code in a
+/// block and call `log_summary` at the end.
 ///
 /// # Example
 ///
 /// ```ignore
-/// {
-///     let _scope = N1DetectionScope::new(&mut session, 3);
+/// // Capture initial state
+/// let scope = N1DetectionScope::from_tracker(session.n1_tracker());
 ///
-///     // Do work that might cause N+1...
-///     for hero in &mut heroes {
-///         hero.team.load(&mut session).await?;
-///     }
-///
-///     // When _scope drops, it logs a summary if issues were found
+/// // Do work that might cause N+1...
+/// for hero in &mut heroes {
+///     hero.team.load(&mut session).await?;
 /// }
+///
+/// // Manually log summary with final stats
+/// scope.log_summary(&session.n1_stats());
 /// ```
 pub struct N1DetectionScope {
     /// Stats captured when the scope was created (for comparison)

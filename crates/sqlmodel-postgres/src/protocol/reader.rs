@@ -234,6 +234,9 @@ fn parse_ready_for_query(cur: &mut Cursor<'_>) -> Result<BackendMessage, Protoco
 
 fn parse_row_description(cur: &mut Cursor<'_>) -> Result<BackendMessage, ProtocolError> {
     let count = cur.read_i16()?;
+    if count < 0 {
+        return Err(ProtocolError::InvalidField("negative field count"));
+    }
     let mut fields = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let name = cur.read_cstring()?;
@@ -258,6 +261,9 @@ fn parse_row_description(cur: &mut Cursor<'_>) -> Result<BackendMessage, Protoco
 
 fn parse_data_row(cur: &mut Cursor<'_>) -> Result<BackendMessage, ProtocolError> {
     let count = cur.read_i16()?;
+    if count < 0 {
+        return Err(ProtocolError::InvalidField("negative column count"));
+    }
     let mut values = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let len = cur.read_i32()?;
@@ -281,6 +287,9 @@ fn parse_command_complete(cur: &mut Cursor<'_>) -> Result<BackendMessage, Protoc
 
 fn parse_parameter_description(cur: &mut Cursor<'_>) -> Result<BackendMessage, ProtocolError> {
     let count = cur.read_i16()?;
+    if count < 0 {
+        return Err(ProtocolError::InvalidField("negative parameter count"));
+    }
     let mut oids = Vec::with_capacity(count as usize);
     for _ in 0..count {
         oids.push(cur.read_u32()?);
@@ -317,6 +326,9 @@ fn parse_copy_both_response(cur: &mut Cursor<'_>) -> Result<BackendMessage, Prot
 
 fn read_column_formats(cur: &mut Cursor<'_>) -> Result<Vec<i16>, ProtocolError> {
     let count = cur.read_i16()?;
+    if count < 0 {
+        return Err(ProtocolError::InvalidField("negative format count"));
+    }
     let mut formats = Vec::with_capacity(count as usize);
     for _ in 0..count {
         formats.push(cur.read_i16()?);
@@ -571,5 +583,32 @@ mod tests {
 
         let second = reader.feed(right).unwrap();
         assert_eq!(second.len(), 1);
+    }
+
+    #[test]
+    fn parse_row_description_negative_count_rejected() {
+        // ROW_DESCRIPTION with negative field count (-1)
+        let payload = (-1_i16).to_be_bytes();
+        let msg = build_message(backend_type::ROW_DESCRIPTION, &payload);
+        let result = MessageReader::parse_message(&msg);
+        assert!(matches!(result, Err(ProtocolError::InvalidField(_))));
+    }
+
+    #[test]
+    fn parse_data_row_negative_count_rejected() {
+        // DATA_ROW with negative column count (-1)
+        let payload = (-1_i16).to_be_bytes();
+        let msg = build_message(backend_type::DATA_ROW, &payload);
+        let result = MessageReader::parse_message(&msg);
+        assert!(matches!(result, Err(ProtocolError::InvalidField(_))));
+    }
+
+    #[test]
+    fn parse_parameter_description_negative_count_rejected() {
+        // PARAMETER_DESCRIPTION with negative parameter count (-1)
+        let payload = (-1_i16).to_be_bytes();
+        let msg = build_message(backend_type::PARAMETER_DESCRIPTION, &payload);
+        let result = MessageReader::parse_message(&msg);
+        assert!(matches!(result, Err(ProtocolError::InvalidField(_))));
     }
 }

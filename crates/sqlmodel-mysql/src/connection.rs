@@ -1280,6 +1280,7 @@ fn format_value(value: &Value) -> String {
         }
         Value::Json(j) => j.to_string(),
         Value::Array(arr) => format!("[{} items]", arr.len()),
+        Value::Default => "DEFAULT".to_string(),
     }
 }
 

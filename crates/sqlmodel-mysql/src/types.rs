@@ -637,6 +637,10 @@ pub fn encode_binary_value(value: &Value, field_type: FieldType) -> Vec<u8> {
             let json = serde_json::to_string(arr).unwrap_or_default();
             encode_length_prefixed_bytes(json.as_bytes())
         }
+
+        // Default should never reach encode - query builder puts "DEFAULT"
+        // directly in SQL text. Return empty bytes as defensive fallback.
+        Value::Default => vec![],
     }
 }
 
@@ -987,6 +991,7 @@ pub fn format_value_for_sql(value: &Value) -> String {
             let json = serde_json::to_string(arr).unwrap_or_default();
             escape_string(&json)
         }
+        Value::Default => "DEFAULT".to_string(),
     }
 }
 

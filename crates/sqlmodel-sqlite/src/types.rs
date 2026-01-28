@@ -148,6 +148,10 @@ pub unsafe fn bind_value(stmt: *mut ffi::sqlite3_stmt, index: c_int, value: &Val
                     ffi::sqlite_transient(),
                 )
             }
+
+            // Default should never reach bind_value - query builder puts "DEFAULT"
+            // directly in SQL text. Bind NULL as defensive fallback.
+            Value::Default => ffi::sqlite3_bind_null(stmt, index),
         }
     }
 }
@@ -337,6 +341,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Uuid(bytes) => serde_json::Value::String(uuid_to_string(bytes)),
         Value::Json(j) => j.clone(),
         Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
+        Value::Default => serde_json::Value::Null,
     }
 }
 

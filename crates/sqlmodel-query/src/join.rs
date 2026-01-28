@@ -96,8 +96,12 @@ impl Join {
         self
     }
 
-    /// Generate SQL for this JOIN clause.
-    pub fn to_sql(&self) -> String {
+    /// Generate SQL for this JOIN clause and collect parameters.
+    ///
+    /// Returns a tuple of (sql, params) since the ON condition may contain
+    /// literal values that need to be bound as parameters.
+    pub fn to_sql(&self) -> (String, Vec<Value>) {
+        let mut params = Vec::new();
         let mut sql = format!(" {} {}", self.join_type.as_str(), self.table);
 
         if let Some(alias) = &self.alias {
@@ -106,13 +110,12 @@ impl Join {
         }
 
         if self.join_type != JoinType::Cross {
-            let mut params = Vec::new();
             let on_sql = self.on.build(&mut params, 0);
             sql.push_str(" ON ");
             sql.push_str(&on_sql);
         }
 
-        sql
+        (sql, params)
     }
 
     /// Generate SQL and collect parameters.

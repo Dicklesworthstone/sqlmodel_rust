@@ -453,17 +453,18 @@ Expr::case()
 
 ## Limitations
 
-### What SQLModel Rust Doesn't Do (Yet)
+### Implementation Status
 
 | Capability | Status | Notes |
 |------------|--------|-------|
-| Query execution | 🚧 In Progress | Protocol implemented, connection pending |
-| Connection pooling | 🚧 Planned | Waiting for asupersync channels |
-| Transactions | 🚧 Planned | Part of connection layer |
-| SQLite driver | 📋 Planned | After Postgres is complete |
-| MySQL driver | 📋 Planned | After SQLite |
+| Query execution | ✅ Complete | Full SELECT/INSERT/UPDATE/DELETE with eager loading |
+| Connection pooling | ✅ Complete | Generic pool with timeouts, health checks, metrics |
+| Transactions | ✅ Complete | BEGIN/COMMIT/ROLLBACK with savepoint support |
+| SQLite driver | ✅ Complete | Full Connection trait with transactions |
+| MySQL driver | ✅ Complete | Wire protocol + SharedMySqlConnection |
+| PostgreSQL driver | ✅ Complete | Wire protocol + SharedPgConnection with SCRAM auth |
+| Runtime migrations | ✅ Complete | Schema diffing, migration runner, version tracking |
 | Lazy loading | ❌ Not Planned | Explicit joins only—by design |
-| Runtime migrations | 🚧 Planned | Schema diffing in progress |
 
 ### Known Limitations
 
@@ -521,7 +522,7 @@ Control. We need deep integration with asupersync's capability context for cance
 
 ### Is this production-ready?
 
-Not yet. We're in active development (Phase 1). The query builder and schema generation are solid, but query execution is still being connected.
+Nearly. Core functionality is complete: query execution, connection pooling, transactions, and drivers for PostgreSQL, MySQL, and SQLite all work. However, the API may still change before 1.0, and test coverage for edge cases is ongoing.
 
 ### Does it work with tokio?
 

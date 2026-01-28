@@ -84,7 +84,21 @@ impl<T: Model> EagerLoader<T> {
     /// ```
     #[must_use]
     pub fn include_nested(mut self, path: &'static str) -> Self {
+        // Handle empty or whitespace-only paths
+        let path = path.trim();
+        if path.is_empty() {
+            return self;
+        }
+
         let parts: Vec<&'static str> = path.split('.').collect();
+        // split('.') on non-empty string always returns at least one element
+        // but we should still guard against [""] from paths like "."
+        if parts.iter().all(|p| p.is_empty()) {
+            return self;
+        }
+
+        // Filter out empty parts (handles cases like "team..headquarters")
+        let parts: Vec<&'static str> = parts.into_iter().filter(|p| !p.is_empty()).collect();
         if parts.is_empty() {
             return self;
         }
@@ -140,37 +154,46 @@ pub fn build_join_clause(
 ) -> (String, Vec<Value>) {
     let params = Vec::new();
 
+    // Get the primary key column name from the relationship, defaulting to "id"
+    let remote_pk = rel.remote_key.unwrap_or("id");
+
     let sql = match rel.kind {
         RelationshipKind::ManyToOne | RelationshipKind::OneToOne => {
             // LEFT JOIN related_table ON parent.fk = related.pk
             let local_key = rel.local_key.unwrap_or("id");
             format!(
-                " LEFT JOIN {} ON {}.{} = {}.id",
-                rel.related_table, parent_table, local_key, rel.related_table
+                " LEFT JOIN {} ON {}.{} = {}.{}",
+                rel.related_table, parent_table, local_key, rel.related_table, remote_pk
             )
         }
         RelationshipKind::OneToMany => {
             // LEFT JOIN related_table ON related.fk = parent.pk
-            let remote_key = rel.remote_key.unwrap_or("id");
+            // For OneToMany, remote_key is the FK on the related table pointing to us
+            let fk_on_related = rel.remote_key.unwrap_or("id");
+            // And we need local_key as our PK (default "id")
+            let local_pk = rel.local_key.unwrap_or("id");
             format!(
-                " LEFT JOIN {} ON {}.{} = {}.id",
-                rel.related_table, rel.related_table, remote_key, parent_table
+                " LEFT JOIN {} ON {}.{} = {}.{}",
+                rel.related_table, rel.related_table, fk_on_related, parent_table, local_pk
             )
         }
         RelationshipKind::ManyToMany => {
             // LEFT JOIN link_table ON parent.pk = link.local_col
             // LEFT JOIN related_table ON link.remote_col = related.pk
             if let Some(link) = &rel.link_table {
+                let local_pk = rel.local_key.unwrap_or("id");
                 format!(
-                    " LEFT JOIN {} ON {}.id = {}.{} LEFT JOIN {} ON {}.{} = {}.id",
+                    " LEFT JOIN {} ON {}.{} = {}.{} LEFT JOIN {} ON {}.{} = {}.{}",
                     link.table_name,
                     parent_table,
+                    local_pk,
                     link.table_name,
                     link.local_column,
                     rel.related_table,
                     link.table_name,
                     link.remote_column,
-                    rel.related_table
+                    rel.related_table,
+                    remote_pk
                 )
             } else {
                 String::new()

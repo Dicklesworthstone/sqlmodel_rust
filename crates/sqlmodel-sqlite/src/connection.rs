@@ -276,7 +276,7 @@ impl SqliteConnection {
 
     /// Execute SQL directly without preparing (for DDL, etc.)
     pub fn execute_raw(&self, sql: &str) -> Result<(), Error> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let c_sql = CString::new(sql).map_err(|_| {
             Error::Query(QueryError {
                 kind: QueryErrorKind::Syntax,
@@ -324,14 +324,14 @@ impl SqliteConnection {
 
     /// Get the last insert rowid.
     pub fn last_insert_rowid(&self) -> i64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: db is valid
         unsafe { ffi::sqlite3_last_insert_rowid(inner.db) }
     }
 
     /// Get the number of rows changed by the last statement.
     pub fn changes(&self) -> i32 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: db is valid
         unsafe { ffi::sqlite3_changes(inner.db) }
     }
@@ -341,7 +341,7 @@ impl SqliteConnection {
         #[cfg(feature = "console")]
         let start = std::time::Instant::now();
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let stmt = prepare_stmt(inner.db, sql)?;
 
         // Bind parameters
@@ -408,7 +408,7 @@ impl SqliteConnection {
         #[cfg(feature = "console")]
         let start = std::time::Instant::now();
 
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let stmt = prepare_stmt(inner.db, sql)?;
 
         // Bind parameters
@@ -454,7 +454,7 @@ impl SqliteConnection {
 
     /// Begin a transaction.
     fn begin_sync(&self, isolation: IsolationLevel) -> Result<(), Error> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.in_transaction {
             return Err(Error::Query(QueryError {
                 kind: QueryErrorKind::Database,
@@ -479,7 +479,7 @@ impl SqliteConnection {
         drop(inner); // Release lock before calling execute_raw
         self.execute_raw(begin_sql)?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.in_transaction = true;
         self.emit_transaction_state("BEGIN");
         Ok(())
@@ -487,7 +487,7 @@ impl SqliteConnection {
 
     /// Commit the current transaction.
     fn commit_sync(&self) -> Result<(), Error> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if !inner.in_transaction {
             return Err(Error::Query(QueryError {
                 kind: QueryErrorKind::Database,
@@ -504,7 +504,7 @@ impl SqliteConnection {
         drop(inner);
         self.execute_raw("COMMIT")?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.in_transaction = false;
         self.emit_transaction_state("COMMIT");
         Ok(())
@@ -512,7 +512,7 @@ impl SqliteConnection {
 
     /// Rollback the current transaction.
     fn rollback_sync(&self) -> Result<(), Error> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if !inner.in_transaction {
             return Err(Error::Query(QueryError {
                 kind: QueryErrorKind::Database,
@@ -529,7 +529,7 @@ impl SqliteConnection {
         drop(inner);
         self.execute_raw("ROLLBACK")?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.in_transaction = false;
         self.emit_transaction_state("ROLLBACK");
         Ok(())
@@ -666,7 +666,7 @@ impl Connection for SqliteConnection {
         _cx: &Cx,
         sql: &str,
     ) -> impl Future<Output = Outcome<PreparedStatement, Error>> + Send {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let result = prepare_stmt(inner.db, sql).map(|stmt| {
             // SAFETY: stmt is valid
             let param_count = unsafe { ffi::sqlite3_bind_parameter_count(stmt) } as usize;
@@ -755,19 +755,25 @@ impl TransactionOps for SqliteTransaction<'_> {
     }
 
     fn savepoint(&self, _cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let sql = format!("SAVEPOINT {}", name);
+        // Quote identifier to prevent SQL injection
+        let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
+        let sql = format!("SAVEPOINT {}", quoted_name);
         let result = self.conn.execute_raw(&sql);
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
 
     fn rollback_to(&self, _cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let sql = format!("ROLLBACK TO {}", name);
+        // Quote identifier to prevent SQL injection
+        let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
+        let sql = format!("ROLLBACK TO {}", quoted_name);
         let result = self.conn.execute_raw(&sql);
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
 
     fn release(&self, _cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let sql = format!("RELEASE {}", name);
+        // Quote identifier to prevent SQL injection
+        let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
+        let sql = format!("RELEASE {}", quoted_name);
         let result = self.conn.execute_raw(&sql);
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
@@ -937,6 +943,7 @@ fn format_value(value: &Value) -> String {
         }
         Value::Decimal(d) => d.to_string(),
         Value::Array(arr) => format!("[{} items]", arr.len()),
+        Value::Default => "DEFAULT".to_string(),
     }
 }
 

@@ -42,10 +42,20 @@ impl Dialect {
     }
 
     /// Quote an identifier for this dialect.
+    ///
+    /// Properly escapes embedded quote characters by doubling them:
+    /// - For Postgres/SQLite: `"` becomes `""`
+    /// - For MySQL: `` ` `` becomes ``` `` ```
     pub fn quote_identifier(self, name: &str) -> String {
         match self {
-            Dialect::Postgres | Dialect::Sqlite => format!("\"{}\"", name),
-            Dialect::Mysql => format!("`{}`", name),
+            Dialect::Postgres | Dialect::Sqlite => {
+                let escaped = name.replace('"', "\"\"");
+                format!("\"{}\"", escaped)
+            }
+            Dialect::Mysql => {
+                let escaped = name.replace('`', "``");
+                format!("`{}`", escaped)
+            }
         }
     }
 }
@@ -559,6 +569,9 @@ impl Expr {
 
     /// IN list of values
     pub fn in_list(self, values: Vec<impl Into<Expr>>) -> Self {
+        if values.is_empty() {
+            return Expr::raw("1 = 0");
+        }
         Expr::In {
             expr: Box::new(self),
             values: values.into_iter().map(Into::into).collect(),
@@ -568,6 +581,9 @@ impl Expr {
 
     /// NOT IN list of values
     pub fn not_in_list(self, values: Vec<impl Into<Expr>>) -> Self {
+        if values.is_empty() {
+            return Expr::raw("1 = 1");
+        }
         Expr::In {
             expr: Box::new(self),
             values: values.into_iter().map(Into::into).collect(),
@@ -981,8 +997,12 @@ impl Expr {
             }
 
             Expr::Literal(value) => {
-                params.push(value.clone());
-                dialect.placeholder(offset + params.len())
+                if matches!(value, Value::Default) {
+                    "DEFAULT".to_string()
+                } else {
+                    params.push(value.clone());
+                    dialect.placeholder(offset + params.len())
+                }
             }
 
             Expr::Placeholder(idx) => dialect.placeholder(*idx),
@@ -1686,5 +1706,45 @@ mod tests {
         assert!(BinaryOp::Mul.precedence() > BinaryOp::Add.precedence());
         assert!(BinaryOp::And.precedence() > BinaryOp::Or.precedence());
         assert!(BinaryOp::Eq.precedence() > BinaryOp::And.precedence());
+    }
+
+    // ==================== Quote Escaping Tests ====================
+
+    #[test]
+    fn test_quote_identifier_escapes_postgres() {
+        // Postgres/SQLite: double-quotes must be escaped by doubling
+        assert_eq!(Dialect::Postgres.quote_identifier("simple"), "\"simple\"");
+        assert_eq!(
+            Dialect::Postgres.quote_identifier("with\"quote"),
+            "\"with\"\"quote\""
+        );
+        assert_eq!(
+            Dialect::Postgres.quote_identifier("multi\"\"quotes"),
+            "\"multi\"\"\"\"quotes\""
+        );
+    }
+
+    #[test]
+    fn test_quote_identifier_escapes_sqlite() {
+        // SQLite also uses double-quotes
+        assert_eq!(Dialect::Sqlite.quote_identifier("simple"), "\"simple\"");
+        assert_eq!(
+            Dialect::Sqlite.quote_identifier("with\"quote"),
+            "\"with\"\"quote\""
+        );
+    }
+
+    #[test]
+    fn test_quote_identifier_escapes_mysql() {
+        // MySQL: backticks must be escaped by doubling
+        assert_eq!(Dialect::Mysql.quote_identifier("simple"), "`simple`");
+        assert_eq!(
+            Dialect::Mysql.quote_identifier("with`backtick"),
+            "`with``backtick`"
+        );
+        assert_eq!(
+            Dialect::Mysql.quote_identifier("multi``ticks"),
+            "`multi````ticks`"
+        );
     }
 }

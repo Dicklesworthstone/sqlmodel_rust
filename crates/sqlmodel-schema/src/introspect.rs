@@ -7,6 +7,17 @@ use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection, Error};
 use std::collections::HashMap;
 
+/// Sanitize an identifier (table/index name) to prevent SQL injection.
+///
+/// Only allows alphanumeric characters and underscores. This is safe for use
+/// in PRAGMA commands and MySQL SHOW statements where parameterized queries
+/// are not supported.
+fn sanitize_identifier(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
 // ============================================================================
 // Schema Types
 // ============================================================================
@@ -415,7 +426,7 @@ impl Introspector {
         conn: &C,
         table_name: &str,
     ) -> Outcome<Vec<ColumnInfo>, Error> {
-        let sql = format!("PRAGMA table_info({})", table_name);
+        let sql = format!("PRAGMA table_info({})", sanitize_identifier(table_name));
         let rows = match conn.query(cx, &sql, &[]).await {
             Outcome::Ok(rows) => rows,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -532,7 +543,10 @@ impl Introspector {
         table_name: &str,
     ) -> Outcome<Vec<ColumnInfo>, Error> {
         // Use SHOW FULL COLUMNS to get comments
-        let sql = format!("SHOW FULL COLUMNS FROM `{}`", table_name);
+        let sql = format!(
+            "SHOW FULL COLUMNS FROM `{}`",
+            sanitize_identifier(table_name)
+        );
         let rows = match conn.query(cx, &sql, &[]).await {
             Outcome::Ok(rows) => rows,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -592,7 +606,10 @@ impl Introspector {
         conn: &C,
         table_name: &str,
     ) -> Outcome<Vec<ForeignKeyInfo>, Error> {
-        let sql = format!("PRAGMA foreign_key_list({})", table_name);
+        let sql = format!(
+            "PRAGMA foreign_key_list({})",
+            sanitize_identifier(table_name)
+        );
         let rows = match conn.query(cx, &sql, &[]).await {
             Outcome::Ok(rows) => rows,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -763,7 +780,7 @@ impl Introspector {
         conn: &C,
         table_name: &str,
     ) -> Outcome<Vec<IndexInfo>, Error> {
-        let sql = format!("PRAGMA index_list({})", table_name);
+        let sql = format!("PRAGMA index_list({})", sanitize_identifier(table_name));
         let rows = match conn.query(cx, &sql, &[]).await {
             Outcome::Ok(rows) => rows,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -782,7 +799,7 @@ impl Introspector {
             let primary = origin == "pk";
 
             // Get column info for this index
-            let info_sql = format!("PRAGMA index_info({})", name);
+            let info_sql = format!("PRAGMA index_info({})", sanitize_identifier(&name));
             let info_rows = match conn.query(cx, &info_sql, &[]).await {
                 Outcome::Ok(r) => r,
                 Outcome::Err(_) => continue,
@@ -877,7 +894,7 @@ impl Introspector {
         conn: &C,
         table_name: &str,
     ) -> Outcome<Vec<IndexInfo>, Error> {
-        let sql = format!("SHOW INDEX FROM `{}`", table_name);
+        let sql = format!("SHOW INDEX FROM `{}`", sanitize_identifier(table_name));
         let rows = match conn.query(cx, &sql, &[]).await {
             Outcome::Ok(rows) => rows,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -1073,5 +1090,33 @@ mod tests {
     fn test_build_postgres_type_numeric() {
         let result = build_postgres_type("numeric", "", None, Some(10), Some(2));
         assert_eq!(result, "NUMERIC(10,2)");
+    }
+
+    #[test]
+    fn test_sanitize_identifier_normal() {
+        assert_eq!(sanitize_identifier("users"), "users");
+        assert_eq!(sanitize_identifier("my_table"), "my_table");
+        assert_eq!(sanitize_identifier("Table123"), "Table123");
+    }
+
+    #[test]
+    fn test_sanitize_identifier_sql_injection() {
+        // SQL injection attempts should be sanitized
+        assert_eq!(sanitize_identifier("users; DROP TABLE--"), "usersDROPTABLE");
+        assert_eq!(sanitize_identifier("table`; malicious"), "tablemalicious");
+        assert_eq!(sanitize_identifier("users'--"), "users");
+        assert_eq!(
+            sanitize_identifier("table\"); DROP TABLE users;--"),
+            "tableDROPTABLEusers"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_identifier_special_chars() {
+        // Various special characters should be stripped
+        assert_eq!(sanitize_identifier("table-name"), "tablename");
+        assert_eq!(sanitize_identifier("table.name"), "tablename");
+        assert_eq!(sanitize_identifier("table name"), "tablename");
+        assert_eq!(sanitize_identifier("table\nname"), "tablename");
     }
 }

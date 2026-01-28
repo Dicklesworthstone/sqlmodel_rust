@@ -540,6 +540,7 @@ impl FlushPlan {
                 return Outcome::Ok(0);
             }
 
+            let actual_count = params.len();
             let sql = format!(
                 "DELETE FROM \"{}\" WHERE \"{}\" IN ({})",
                 table,
@@ -548,7 +549,9 @@ impl FlushPlan {
             );
 
             match conn.execute(cx, &sql, &params).await {
-                Outcome::Ok(_) => Outcome::Ok(ops.len()),
+                // Return actual count of items in IN clause, not ops.len()
+                // (some ops may have been filtered out due to empty pk_values)
+                Outcome::Ok(_) => Outcome::Ok(actual_count),
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),

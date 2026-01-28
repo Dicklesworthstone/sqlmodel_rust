@@ -288,6 +288,7 @@ fn value_to_field_type(value: &Value) -> FieldType {
         Value::Timestamp(_) | Value::TimestampTz(_) => FieldType::DateTime,
         Value::Uuid(_) => FieldType::Blob,
         Value::Array(_) => FieldType::Json,
+        Value::Default => FieldType::Null,
     }
 }
 
@@ -358,6 +359,9 @@ fn encode_binary_param(writer: &mut PacketWriter, value: &Value) {
             // Encode arrays as JSON
             let s = serde_json::to_string(arr).unwrap_or_default();
             write_length_encoded_string(writer, &s);
+        }
+        Value::Default => {
+            // DEFAULT values are indicated in the NULL bitmap, no data here
         }
     }
 }

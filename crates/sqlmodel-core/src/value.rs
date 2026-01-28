@@ -61,6 +61,9 @@ pub enum Value {
 
     /// Array of values
     Array(Vec<Value>),
+
+    /// SQL DEFAULT keyword
+    Default,
 }
 
 impl Value {
@@ -90,6 +93,7 @@ impl Value {
             Value::Uuid(_) => "UUID",
             Value::Json(_) => "JSON",
             Value::Array(_) => "ARRAY",
+            Value::Default => "DEFAULT",
         }
     }
 
@@ -126,6 +130,7 @@ impl Value {
             Value::SmallInt(v) => Some(f64::from(*v)),
             Value::Int(v) => Some(f64::from(*v)),
             Value::BigInt(v) => Some(*v as f64),
+            Value::Decimal(s) => s.parse().ok(),
             _ => None,
         }
     }

@@ -198,6 +198,9 @@ fn hash_values(values: &[Value]) -> u64 {
                     hash_value(item, &mut hasher);
                 }
             }
+            Value::Default => {
+                18u8.hash(&mut hasher);
+            }
         }
     }
     hasher.finish()
@@ -277,6 +280,9 @@ fn hash_value(v: &Value, hasher: &mut impl Hasher) {
             for item in arr {
                 hash_value(item, hasher);
             }
+        }
+        Value::Default => {
+            18u8.hash(hasher);
         }
     }
 }
@@ -672,11 +678,40 @@ impl<C: Connection> Session<C> {
                         actually_deleted.push(*key);
                     }
                     Outcome::Err(e) => {
-                        self.pending_delete = deletes;
+                        // Only restore deletes that weren't already executed
+                        // (exclude actually_deleted items from restoration)
+                        self.pending_delete = deletes
+                            .into_iter()
+                            .filter(|k| !actually_deleted.contains(k))
+                            .collect();
+                        // Remove successfully deleted objects before returning error
+                        for key in &actually_deleted {
+                            self.identity_map.remove(key);
+                        }
                         return Outcome::Err(e);
                     }
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                    Outcome::Cancelled(r) => {
+                        // Same handling for cancellation
+                        self.pending_delete = deletes
+                            .into_iter()
+                            .filter(|k| !actually_deleted.contains(k))
+                            .collect();
+                        for key in &actually_deleted {
+                            self.identity_map.remove(key);
+                        }
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        // Same handling for panic
+                        self.pending_delete = deletes
+                            .into_iter()
+                            .filter(|k| !actually_deleted.contains(k))
+                            .collect();
+                        for key in &actually_deleted {
+                            self.identity_map.remove(key);
+                        }
+                        return Outcome::Panicked(p);
+                    }
                 }
             }
         }
@@ -690,6 +725,11 @@ impl<C: Connection> Session<C> {
         let inserts: Vec<ObjectKey> = std::mem::take(&mut self.pending_new);
         for key in &inserts {
             if let Some(tracked) = self.identity_map.get_mut(key) {
+                // Skip if already persistent (was inserted in a previous attempt before error)
+                if tracked.state == ObjectState::Persistent {
+                    continue;
+                }
+
                 // Build INSERT statement using stored column names and values
                 let columns = &tracked.column_names;
                 let placeholders: Vec<String> =
@@ -718,8 +758,16 @@ impl<C: Connection> Session<C> {
                         self.pending_new = inserts;
                         return Outcome::Err(e);
                     }
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                    Outcome::Cancelled(r) => {
+                        // Restore pending_new for retry (same as Err handling)
+                        self.pending_new = inserts;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        // Restore pending_new for retry (same as Err handling)
+                        self.pending_new = inserts;
+                        return Outcome::Panicked(p);
+                    }
                 }
             }
         }
@@ -799,8 +847,16 @@ impl<C: Connection> Session<C> {
                         self.pending_dirty = dirty;
                         return Outcome::Err(e);
                     }
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                    Outcome::Cancelled(r) => {
+                        // Restore pending_dirty for retry (same as Err handling)
+                        self.pending_dirty = dirty;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        // Restore pending_dirty for retry (same as Err handling)
+                        self.pending_dirty = dirty;
+                        return Outcome::Panicked(p);
+                    }
                 }
             }
         }
