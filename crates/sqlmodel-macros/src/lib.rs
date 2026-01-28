@@ -177,7 +177,8 @@ fn referential_action_token(action: &str) -> proc_macro2::TokenStream {
 fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
     let mut field_tokens = Vec::new();
 
-    for field in model.select_fields() {
+    // Use data_fields() to include computed fields in metadata (needed for serialization)
+    for field in model.data_fields() {
         let field_ident = field.name.unraw();
         let column_name = &field.column_name;
         let nullable = field.nullable;
@@ -259,9 +260,24 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
 
         let computed = field.computed;
 
+        // Decimal precision (max_digits -> precision, decimal_places -> scale)
+        let precision_token = if let Some(p) = field.max_digits {
+            quote::quote! { Some(#p) }
+        } else {
+            quote::quote! { None }
+        };
+
+        let scale_token = if let Some(s) = field.decimal_places {
+            quote::quote! { Some(#s) }
+        } else {
+            quote::quote! { None }
+        };
+
         field_tokens.push(quote::quote! {
             sqlmodel_core::FieldInfo::new(stringify!(#field_ident), #column_name, #sql_type_token)
                 .sql_type_override_opt(#sql_type_override_token)
+                .precision_opt(#precision_token)
+                .scale_opt(#scale_token)
                 .nullable(#nullable)
                 .primary_key(#primary_key)
                 .auto_increment(#auto_increment)

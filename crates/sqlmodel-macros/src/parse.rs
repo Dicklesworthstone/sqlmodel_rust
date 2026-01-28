@@ -71,6 +71,12 @@ pub struct FieldDef {
     pub serialization_alias: Option<String>,
     /// Whether this is a computed field (not stored in database).
     pub computed: bool,
+    /// Total number of digits for Decimal/Numeric types (precision).
+    /// Maps to DECIMAL(max_digits, decimal_places) in SQL.
+    pub max_digits: Option<u8>,
+    /// Number of digits after decimal point for Decimal/Numeric types (scale).
+    /// Maps to DECIMAL(max_digits, decimal_places) in SQL.
+    pub decimal_places: Option<u8>,
 }
 
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
@@ -148,6 +154,16 @@ impl ModelDef {
         self.fields
             .iter()
             .filter(|f| !f.skip && !f.computed && f.relationship.is_none())
+            .collect()
+    }
+
+    /// Returns all data fields for model metadata (Model::fields()).
+    /// Includes computed fields but excludes skipped fields and relationship fields.
+    /// This is used for serialization/validation which needs to know about all fields.
+    pub fn data_fields(&self) -> Vec<&FieldDef> {
+        self.fields
+            .iter()
+            .filter(|f| !f.skip && f.relationship.is_none())
             .collect()
     }
 
@@ -518,6 +534,8 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         validation_alias: attrs.validation_alias,
         serialization_alias: attrs.serialization_alias,
         computed: attrs.computed,
+        max_digits: attrs.max_digits,
+        decimal_places: attrs.decimal_places,
     })
 }
 
@@ -543,6 +561,10 @@ struct FieldAttrs {
     validation_alias: Option<String>,
     serialization_alias: Option<String>,
     computed: bool,
+    /// Total number of digits for Decimal/Numeric types (precision).
+    max_digits: Option<u8>,
+    /// Number of digits after decimal point for Decimal/Numeric types (scale).
+    decimal_places: Option<u8>,
 }
 
 /// Detect the relationship kind from a field's Rust type.
@@ -738,6 +760,38 @@ fn parse_field_attrs(
                 }
             } else if path.is_ident("computed") {
                 result.computed = true;
+            } else if path.is_ident("max_digits") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Int(lit_int) = value {
+                    let digits = lit_int.base10_parse::<u8>().map_err(|_| {
+                        Error::new_spanned(&lit_int, "max_digits must be a u8 (0-255)")
+                    })?;
+                    if digits == 0 {
+                        return Err(Error::new_spanned(
+                            &lit_int,
+                            "max_digits must be greater than 0",
+                        ));
+                    }
+                    result.max_digits = Some(digits);
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected integer literal for max_digits",
+                    ));
+                }
+            } else if path.is_ident("decimal_places") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Int(lit_int) = value {
+                    let places = lit_int.base10_parse::<u8>().map_err(|_| {
+                        Error::new_spanned(&lit_int, "decimal_places must be a u8 (0-255)")
+                    })?;
+                    result.decimal_places = Some(places);
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected integer literal for decimal_places",
+                    ));
+                }
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -748,7 +802,7 @@ fn parse_field_attrs(
                          Valid attributes are: primary_key, auto_increment, column, nullable, \
                          unique, foreign_key, on_delete, on_update, default, sql_type, index, \
                          skip, skip_insert, skip_update, relationship, alias, validation_alias, \
-                         serialization_alias, computed"
+                         serialization_alias, computed, max_digits, decimal_places"
                     ),
                 ));
             }
@@ -978,6 +1032,22 @@ fn validate_field_attrs(attrs: &FieldAttrs, field_name: &Ident, field_type: &Typ
 
     // auto_increment usually implies primary_key (warn, don't error)
     // We allow it for flexibility, but the generate phase may warn
+
+    // Validate decimal precision constraints
+    if let (Some(max_digits), Some(decimal_places)) = (attrs.max_digits, attrs.decimal_places) {
+        if decimal_places > max_digits {
+            return Err(Error::new_spanned(
+                field_name,
+                format!(
+                    "decimal_places ({}) cannot be greater than max_digits ({})",
+                    decimal_places, max_digits
+                ),
+            ));
+        }
+    }
+
+    // Warn if max_digits/decimal_places used without a Decimal type
+    // (We just validate syntax here; type checking is done elsewhere if needed)
 
     Ok(())
 }
