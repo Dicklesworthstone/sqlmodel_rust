@@ -8,6 +8,35 @@ use proc_macro2::Span;
 use quote::ToTokens;
 use syn::{Attribute, Data, DeriveInput, Error, Field, Fields, Generics, Ident, Lit, Result, Type};
 
+/// Model-level configuration parsed from attributes.
+#[derive(Debug, Clone, Default)]
+pub struct ModelConfigParsed {
+    /// Whether this model maps to a database table.
+    pub table: bool,
+    /// Allow reading data from object attributes (ORM mode).
+    pub from_attributes: bool,
+    /// Validate field values when they are assigned.
+    pub validate_assignment: bool,
+    /// How to handle extra fields: "ignore", "forbid", or "allow".
+    pub extra: String,
+    /// Enable strict type checking during validation.
+    pub strict: bool,
+    /// Allow populating fields by either name or alias.
+    pub populate_by_name: bool,
+    /// Use enum values instead of names during serialization.
+    pub use_enum_values: bool,
+    /// Allow arbitrary types in fields.
+    pub arbitrary_types_allowed: bool,
+    /// Defer model validation to allow forward references.
+    pub defer_build: bool,
+    /// Revalidate instances when converting to this model.
+    pub revalidate_instances: bool,
+    /// Custom JSON schema extra data.
+    pub json_schema_extra: Option<String>,
+    /// Title for JSON schema generation.
+    pub title: Option<String>,
+}
+
 /// Parsed model definition from a struct with `#[derive(Model)]`.
 #[derive(Debug)]
 pub struct ModelDef {
@@ -22,6 +51,8 @@ pub struct ModelDef {
     pub fields: Vec<FieldDef>,
     /// Generic parameters from the struct.
     pub generics: Generics,
+    /// Model-level configuration.
+    pub config: ModelConfigParsed,
 }
 
 /// Parsed field definition from a struct field.
@@ -71,6 +102,12 @@ pub struct FieldDef {
     pub serialization_alias: Option<String>,
     /// Whether this is a computed field (not stored in database).
     pub computed: bool,
+    /// Total number of digits for Decimal/Numeric types (precision).
+    /// Maps to DECIMAL(max_digits, decimal_places) in SQL.
+    pub max_digits: Option<u8>,
+    /// Number of digits after decimal point for Decimal/Numeric types (scale).
+    /// Maps to DECIMAL(max_digits, decimal_places) in SQL.
+    pub decimal_places: Option<u8>,
 }
 
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
@@ -125,20 +162,28 @@ impl ModelDef {
     }
 
     /// Returns fields that should be included in INSERT statements (reserved for future use).
+    /// Excludes skipped fields, computed fields, and relationship fields.
     #[allow(dead_code)]
     pub fn insert_fields(&self) -> Vec<&FieldDef> {
         self.fields
             .iter()
-            .filter(|f| !f.skip && !f.skip_insert && f.relationship.is_none())
+            .filter(|f| !f.skip && !f.skip_insert && !f.computed && f.relationship.is_none())
             .collect()
     }
 
     /// Returns fields that should be included in UPDATE statements (reserved for future use).
+    /// Excludes skipped fields, computed fields, primary key fields, and relationship fields.
     #[allow(dead_code)]
     pub fn update_fields(&self) -> Vec<&FieldDef> {
         self.fields
             .iter()
-            .filter(|f| !f.skip && !f.skip_update && !f.primary_key && f.relationship.is_none())
+            .filter(|f| {
+                !f.skip
+                    && !f.skip_update
+                    && !f.computed
+                    && !f.primary_key
+                    && f.relationship.is_none()
+            })
             .collect()
     }
 
@@ -148,6 +193,16 @@ impl ModelDef {
         self.fields
             .iter()
             .filter(|f| !f.skip && !f.computed && f.relationship.is_none())
+            .collect()
+    }
+
+    /// Returns all data fields for model metadata (Model::fields()).
+    /// Includes computed fields but excludes skipped fields and relationship fields.
+    /// This is used for serialization/validation which needs to know about all fields.
+    pub fn data_fields(&self) -> Vec<&FieldDef> {
+        self.fields
+            .iter()
+            .filter(|f| !f.skip && f.relationship.is_none())
             .collect()
     }
 
@@ -169,6 +224,7 @@ impl FieldDef {
     /// Returns the name to use when serializing this field (output).
     ///
     /// Priority: serialization_alias > alias > field name
+    #[allow(dead_code)]
     pub fn output_name(&self) -> &str {
         self.serialization_alias
             .as_deref()
@@ -179,6 +235,7 @@ impl FieldDef {
     /// Returns all names that should be accepted when deserializing (input).
     ///
     /// This includes: field name, alias, and validation_alias.
+    #[allow(dead_code)]
     pub fn input_names(&self) -> Vec<&str> {
         let field_name = self.name.to_string();
         let mut names = vec![field_name.leak() as &str];
@@ -199,6 +256,7 @@ impl FieldDef {
     }
 
     /// Returns true if this field has any alias configuration.
+    #[allow(dead_code)]
     pub fn has_alias(&self) -> bool {
         self.alias.is_some()
             || self.validation_alias.is_some()
@@ -220,7 +278,11 @@ pub fn parse_model(input: &DeriveInput) -> Result<ModelDef> {
     let generics = input.generics.clone();
 
     // Parse struct-level attributes
-    let (table_name, table_alias) = parse_struct_sqlmodel_attrs(&input.attrs, &name)?;
+    let StructAttrs {
+        table_name,
+        table_alias,
+        config,
+    } = parse_struct_sqlmodel_attrs(&input.attrs, &name)?;
 
     // Get struct fields
     let fields = match &input.data {
@@ -253,7 +315,15 @@ pub fn parse_model(input: &DeriveInput) -> Result<ModelDef> {
         table_alias,
         fields,
         generics,
+        config,
     })
+}
+
+/// Parsed struct-level attributes result.
+struct StructAttrs {
+    table_name: String,
+    table_alias: Option<String>,
+    config: ModelConfigParsed,
 }
 
 /// Parse struct-level `#[sqlmodel(...)]` attributes.
@@ -261,12 +331,11 @@ pub fn parse_model(input: &DeriveInput) -> Result<ModelDef> {
 /// Supported keys:
 /// - `table = "name"` (overrides derived table name)
 /// - `table_alias = "alias"` (optional table alias)
-fn parse_struct_sqlmodel_attrs(
-    attrs: &[Attribute],
-    struct_name: &Ident,
-) -> Result<(String, Option<String>)> {
+/// - Model config options (from_attributes, validate_assignment, extra, strict, etc.)
+fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Result<StructAttrs> {
     let mut table_name: Option<String> = None;
     let mut table_alias: Option<String> = None;
+    let mut config = ModelConfigParsed::default();
 
     for attr in attrs {
         if !attr.path().is_ident("sqlmodel") {
@@ -275,23 +344,28 @@ fn parse_struct_sqlmodel_attrs(
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("table") {
-                if table_name.is_some() {
-                    return Err(Error::new_spanned(
-                        meta.path,
-                        "duplicate sqlmodel attribute: table",
-                    ));
-                }
-
-                let value: Lit = meta.value()?.parse()?;
-                if let Lit::Str(lit_str) = value {
-                    table_name = Some(lit_str.value());
-                    Ok(())
+                // Check if it's a flag (no value) or has a value
+                if meta.input.peek(syn::Token![=]) {
+                    let value: Lit = meta.value()?.parse()?;
+                    if let Lit::Str(lit_str) = value {
+                        if table_name.is_some() {
+                            return Err(Error::new_spanned(
+                                meta.path,
+                                "duplicate sqlmodel attribute: table",
+                            ));
+                        }
+                        table_name = Some(lit_str.value());
+                    } else {
+                        return Err(Error::new_spanned(
+                            value,
+                            "expected string literal for table name",
+                        ));
+                    }
                 } else {
-                    Err(Error::new_spanned(
-                        value,
-                        "expected string literal for table name",
-                    ))
+                    // Flag form: #[sqlmodel(table)]
+                    config.table = true;
                 }
+                Ok(())
             } else if meta.path.is_ident("table_alias") {
                 if table_alias.is_some() {
                     return Err(Error::new_spanned(
@@ -310,17 +384,85 @@ fn parse_struct_sqlmodel_attrs(
                         "expected string literal for table_alias",
                     ))
                 }
+            // Model config options
+            } else if meta.path.is_ident("from_attributes") {
+                config.from_attributes = true;
+                Ok(())
+            } else if meta.path.is_ident("validate_assignment") {
+                config.validate_assignment = true;
+                Ok(())
+            } else if meta.path.is_ident("extra") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    let extra_value = lit_str.value().to_lowercase();
+                    if !["ignore", "forbid", "allow"].contains(&extra_value.as_str()) {
+                        return Err(Error::new_spanned(
+                            lit_str,
+                            "extra must be one of: 'ignore', 'forbid', 'allow'",
+                        ));
+                    }
+                    config.extra = extra_value;
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal for extra",
+                    ))
+                }
+            } else if meta.path.is_ident("strict") {
+                config.strict = true;
+                Ok(())
+            } else if meta.path.is_ident("populate_by_name") {
+                config.populate_by_name = true;
+                Ok(())
+            } else if meta.path.is_ident("use_enum_values") {
+                config.use_enum_values = true;
+                Ok(())
+            } else if meta.path.is_ident("arbitrary_types_allowed") {
+                config.arbitrary_types_allowed = true;
+                Ok(())
+            } else if meta.path.is_ident("defer_build") {
+                config.defer_build = true;
+                Ok(())
+            } else if meta.path.is_ident("revalidate_instances") {
+                config.revalidate_instances = true;
+                Ok(())
+            } else if meta.path.is_ident("json_schema_extra") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    config.json_schema_extra = Some(lit_str.value());
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal for json_schema_extra",
+                    ))
+                }
+            } else if meta.path.is_ident("title") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    config.title = Some(lit_str.value());
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(value, "expected string literal for title"))
+                }
             } else {
                 Err(Error::new_spanned(
                     meta.path,
-                    "unknown sqlmodel struct attribute (supported: table, table_alias)",
+                    "unknown sqlmodel struct attribute (supported: table, table_alias, from_attributes, \
+                     validate_assignment, extra, strict, populate_by_name, use_enum_values, \
+                     arbitrary_types_allowed, defer_build, revalidate_instances, json_schema_extra, title)",
                 ))
             }
         })?;
     }
 
     let table_name = table_name.unwrap_or_else(|| derive_table_name(&struct_name.to_string()));
-    Ok((table_name, table_alias))
+    Ok(StructAttrs {
+        table_name,
+        table_alias,
+        config,
+    })
 }
 
 /// Derive table name from struct name: convert to snake_case and pluralize.
@@ -518,6 +660,8 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         validation_alias: attrs.validation_alias,
         serialization_alias: attrs.serialization_alias,
         computed: attrs.computed,
+        max_digits: attrs.max_digits,
+        decimal_places: attrs.decimal_places,
     })
 }
 
@@ -543,6 +687,10 @@ struct FieldAttrs {
     validation_alias: Option<String>,
     serialization_alias: Option<String>,
     computed: bool,
+    /// Total number of digits for Decimal/Numeric types (precision).
+    max_digits: Option<u8>,
+    /// Number of digits after decimal point for Decimal/Numeric types (scale).
+    decimal_places: Option<u8>,
 }
 
 /// Detect the relationship kind from a field's Rust type.
@@ -738,6 +886,38 @@ fn parse_field_attrs(
                 }
             } else if path.is_ident("computed") {
                 result.computed = true;
+            } else if path.is_ident("max_digits") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Int(lit_int) = value {
+                    let digits = lit_int.base10_parse::<u8>().map_err(|_| {
+                        Error::new_spanned(&lit_int, "max_digits must be a u8 (0-255)")
+                    })?;
+                    if digits == 0 {
+                        return Err(Error::new_spanned(
+                            &lit_int,
+                            "max_digits must be greater than 0",
+                        ));
+                    }
+                    result.max_digits = Some(digits);
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected integer literal for max_digits",
+                    ));
+                }
+            } else if path.is_ident("decimal_places") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Int(lit_int) = value {
+                    let places = lit_int.base10_parse::<u8>().map_err(|_| {
+                        Error::new_spanned(&lit_int, "decimal_places must be a u8 (0-255)")
+                    })?;
+                    result.decimal_places = Some(places);
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected integer literal for decimal_places",
+                    ));
+                }
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -748,7 +928,7 @@ fn parse_field_attrs(
                          Valid attributes are: primary_key, auto_increment, column, nullable, \
                          unique, foreign_key, on_delete, on_update, default, sql_type, index, \
                          skip, skip_insert, skip_update, relationship, alias, validation_alias, \
-                         serialization_alias, computed"
+                         serialization_alias, computed, max_digits, decimal_places"
                     ),
                 ));
             }
@@ -978,6 +1158,22 @@ fn validate_field_attrs(attrs: &FieldAttrs, field_name: &Ident, field_type: &Typ
 
     // auto_increment usually implies primary_key (warn, don't error)
     // We allow it for flexibility, but the generate phase may warn
+
+    // Validate decimal precision constraints
+    if let (Some(max_digits), Some(decimal_places)) = (attrs.max_digits, attrs.decimal_places) {
+        if decimal_places > max_digits {
+            return Err(Error::new_spanned(
+                field_name,
+                format!(
+                    "decimal_places ({}) cannot be greater than max_digits ({})",
+                    decimal_places, max_digits
+                ),
+            ));
+        }
+    }
+
+    // Warn if max_digits/decimal_places used without a Decimal type
+    // (We just validate syntax here; type checking is done elsewhere if needed)
 
     Ok(())
 }
@@ -1641,7 +1837,10 @@ mod tests {
         let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
         assert!(name_field.alias.is_none());
         assert!(name_field.validation_alias.is_none());
-        assert_eq!(name_field.serialization_alias, Some("user-name".to_string()));
+        assert_eq!(
+            name_field.serialization_alias,
+            Some("user-name".to_string())
+        );
     }
 
     #[test]
@@ -1660,7 +1859,10 @@ mod tests {
         let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
         assert_eq!(name_field.alias, Some("nm".to_string()));
         assert_eq!(name_field.validation_alias, Some("input_name".to_string()));
-        assert_eq!(name_field.serialization_alias, Some("outputName".to_string()));
+        assert_eq!(
+            name_field.serialization_alias,
+            Some("outputName".to_string())
+        );
     }
 
     #[test]
@@ -1784,5 +1986,355 @@ mod tests {
         let def = parse_model(&input).unwrap();
         let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
         assert_eq!(name_field.alias, Some("user-name_v2".to_string()));
+    }
+
+    // =========================================================================
+    // Decimal Precision Tests (max_digits, decimal_places)
+    // =========================================================================
+
+    #[test]
+    fn test_parse_max_digits() {
+        let input: DeriveInput = parse_quote! {
+            struct Product {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(max_digits = 10)]
+                price: f64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let price_field = def.fields.iter().find(|f| f.name == "price").unwrap();
+        assert_eq!(price_field.max_digits, Some(10));
+        assert_eq!(price_field.decimal_places, None);
+    }
+
+    #[test]
+    fn test_parse_decimal_places() {
+        let input: DeriveInput = parse_quote! {
+            struct Product {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(decimal_places = 2)]
+                price: f64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let price_field = def.fields.iter().find(|f| f.name == "price").unwrap();
+        assert_eq!(price_field.max_digits, None);
+        assert_eq!(price_field.decimal_places, Some(2));
+    }
+
+    #[test]
+    fn test_parse_max_digits_and_decimal_places() {
+        let input: DeriveInput = parse_quote! {
+            struct Product {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(max_digits = 10, decimal_places = 2)]
+                price: f64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let price_field = def.fields.iter().find(|f| f.name == "price").unwrap();
+        assert_eq!(price_field.max_digits, Some(10));
+        assert_eq!(price_field.decimal_places, Some(2));
+    }
+
+    #[test]
+    fn test_decimal_places_exceeds_max_digits_errors() {
+        // decimal_places > max_digits should fail
+        let input: DeriveInput = parse_quote! {
+            struct Product {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(max_digits = 5, decimal_places = 10)]
+                price: f64,
+            }
+        };
+
+        let result = parse_model(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("decimal_places") && err.contains("max_digits"));
+    }
+
+    #[test]
+    fn test_max_digits_zero_errors() {
+        // max_digits = 0 should fail
+        let input: DeriveInput = parse_quote! {
+            struct Product {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(max_digits = 0)]
+                price: f64,
+            }
+        };
+
+        let result = parse_model(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("max_digits"));
+    }
+
+    #[test]
+    fn test_data_fields_includes_computed() {
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+                #[sqlmodel(computed)]
+                full_name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        // select_fields should exclude computed
+        assert_eq!(def.select_fields().len(), 2);
+        assert!(def.select_fields().iter().all(|f| !f.computed));
+
+        // data_fields should include computed
+        assert_eq!(def.data_fields().len(), 3);
+        assert!(def.data_fields().iter().any(|f| f.computed));
+    }
+
+    // ==================== Model Config Tests ====================
+
+    #[test]
+    fn test_model_config_defaults() {
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(!def.config.table);
+        assert!(!def.config.from_attributes);
+        assert!(!def.config.validate_assignment);
+        assert_eq!(def.config.extra, "");
+        assert!(!def.config.strict);
+        assert!(!def.config.populate_by_name);
+        assert!(!def.config.use_enum_values);
+    }
+
+    #[test]
+    fn test_model_config_table_flag() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.table);
+    }
+
+    #[test]
+    fn test_model_config_table_with_name() {
+        // table = "custom_name" should set table name, not config.table
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table = "custom_users")]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.table_name, "custom_users");
+        // config.table remains false because only the flag form sets it
+        assert!(!def.config.table);
+    }
+
+    #[test]
+    fn test_model_config_from_attributes() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(from_attributes)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.from_attributes);
+    }
+
+    #[test]
+    fn test_model_config_validate_assignment() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(validate_assignment)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.validate_assignment);
+    }
+
+    #[test]
+    fn test_model_config_extra_forbid() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(extra = "forbid")]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.config.extra, "forbid");
+    }
+
+    #[test]
+    fn test_model_config_extra_allow() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(extra = "allow")]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.config.extra, "allow");
+    }
+
+    #[test]
+    fn test_model_config_extra_invalid() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(extra = "invalid")]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let result = parse_model(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("extra"));
+    }
+
+    #[test]
+    fn test_model_config_strict() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(strict)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.strict);
+    }
+
+    #[test]
+    fn test_model_config_populate_by_name() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(populate_by_name)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.populate_by_name);
+    }
+
+    #[test]
+    fn test_model_config_use_enum_values() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(use_enum_values)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.use_enum_values);
+    }
+
+    #[test]
+    fn test_model_config_multiple_options() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table, from_attributes, validate_assignment, extra = "forbid", strict)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.table);
+        assert!(def.config.from_attributes);
+        assert!(def.config.validate_assignment);
+        assert_eq!(def.config.extra, "forbid");
+        assert!(def.config.strict);
+    }
+
+    #[test]
+    fn test_model_config_title() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(title = "User Model")]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.config.title, Some("User Model".to_string()));
+    }
+
+    #[test]
+    fn test_model_config_json_schema_extra() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(json_schema_extra = "{\"key\": \"value\"}")]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(
+            def.config.json_schema_extra,
+            Some("{\"key\": \"value\"}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_config_arbitrary_types_allowed() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(arbitrary_types_allowed)]
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.arbitrary_types_allowed);
     }
 }

@@ -5,20 +5,28 @@
 
 pub mod builder;
 pub mod clause;
+pub mod cte;
 pub mod eager;
 pub mod expr;
 pub mod join;
 pub mod select;
+pub mod set_ops;
 
 pub use builder::{
     DeleteBuilder, InsertBuilder, InsertManyBuilder, OnConflict, QueryBuilder, SetClause,
     UpdateBuilder,
 };
 pub use clause::{Limit, Offset, OrderBy, Where};
+pub use cte::{Cte, CteRef, WithQuery};
 pub use eager::{EagerLoader, IncludePath};
-pub use expr::{BinaryOp, Expr, UnaryOp};
+pub use expr::{
+    BinaryOp, Expr, UnaryOp, WindowBuilder, WindowFrame, WindowFrameBound, WindowFrameType,
+};
 pub use join::{Join, JoinType};
 pub use select::Select;
+pub use set_ops::{
+    SetOpType, SetOperation, except, except_all, intersect, intersect_all, union, union_all,
+};
 
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection, Row, Value};

@@ -181,6 +181,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
                 FieldInfo {
                     name: "name",
@@ -201,6 +202,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
                 FieldInfo {
                     name: "age",
@@ -221,6 +223,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
                 FieldInfo {
                     name: "team_id",
@@ -241,6 +244,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
             ];
             FIELDS
@@ -376,6 +380,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
                 FieldInfo {
                     name: "is_active",
@@ -396,6 +401,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
             ];
             FIELDS
@@ -453,6 +459,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
                 FieldInfo {
                     name: "post_id",
@@ -473,6 +480,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
             ];
             FIELDS
@@ -576,6 +584,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
                 FieldInfo {
                     name: "price",
@@ -596,6 +605,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
                 FieldInfo {
                     name: "sku",
@@ -616,6 +626,7 @@ mod tests {
                     alias: None,
                     validation_alias: None,
                     serialization_alias: None,
+                    computed: false,
                 },
             ];
             FIELDS

@@ -145,6 +145,18 @@ pub enum Expr {
 
     /// Special aggregate: COUNT(*)
     CountStar,
+
+    /// Window function with OVER clause
+    Window {
+        /// The function expression (aggregate or window function)
+        function: Box<Expr>,
+        /// PARTITION BY expressions
+        partition_by: Vec<Expr>,
+        /// ORDER BY clauses within the window
+        order_by: Vec<OrderBy>,
+        /// Frame specification (ROWS or RANGE)
+        frame: Option<WindowFrame>,
+    },
 }
 
 /// Binary operators.
@@ -254,6 +266,69 @@ impl UnaryOp {
             UnaryOp::Not => "NOT",
             UnaryOp::Neg => "-",
             UnaryOp::BitwiseNot => "~",
+        }
+    }
+}
+
+// ==================== Window Frame ====================
+
+/// Window frame specification for OVER clause.
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    /// Frame type: ROWS or RANGE
+    pub frame_type: WindowFrameType,
+    /// Frame start bound
+    pub start: WindowFrameBound,
+    /// Frame end bound (if BETWEEN is used)
+    pub end: Option<WindowFrameBound>,
+}
+
+/// Window frame type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameType {
+    /// ROWS - physical rows
+    Rows,
+    /// RANGE - logical range based on ORDER BY values
+    Range,
+    /// GROUPS - groups of peer rows (PostgreSQL 11+)
+    Groups,
+}
+
+impl WindowFrameType {
+    /// Get the SQL keyword for this frame type.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WindowFrameType::Rows => "ROWS",
+            WindowFrameType::Range => "RANGE",
+            WindowFrameType::Groups => "GROUPS",
+        }
+    }
+}
+
+/// Window frame bound specification.
+#[derive(Debug, Clone)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING
+    UnboundedPreceding,
+    /// UNBOUNDED FOLLOWING
+    UnboundedFollowing,
+    /// CURRENT ROW
+    CurrentRow,
+    /// N PRECEDING
+    Preceding(u64),
+    /// N FOLLOWING
+    Following(u64),
+}
+
+impl WindowFrameBound {
+    /// Generate SQL for this frame bound.
+    pub fn to_sql(&self) -> String {
+        match self {
+            WindowFrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+            WindowFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+            WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+            WindowFrameBound::Preceding(n) => format!("{n} PRECEDING"),
+            WindowFrameBound::Following(n) => format!("{n} FOLLOWING"),
         }
     }
 }
@@ -788,6 +863,171 @@ impl Expr {
         }
     }
 
+    // ==================== Window Functions ====================
+
+    /// ROW_NUMBER() window function.
+    /// Returns the sequential number of a row within a partition.
+    pub fn row_number() -> Self {
+        Expr::Function {
+            name: "ROW_NUMBER".to_string(),
+            args: vec![],
+        }
+    }
+
+    /// RANK() window function.
+    /// Returns the rank of the current row with gaps.
+    pub fn rank() -> Self {
+        Expr::Function {
+            name: "RANK".to_string(),
+            args: vec![],
+        }
+    }
+
+    /// DENSE_RANK() window function.
+    /// Returns the rank of the current row without gaps.
+    pub fn dense_rank() -> Self {
+        Expr::Function {
+            name: "DENSE_RANK".to_string(),
+            args: vec![],
+        }
+    }
+
+    /// PERCENT_RANK() window function.
+    /// Returns the relative rank of the current row.
+    pub fn percent_rank() -> Self {
+        Expr::Function {
+            name: "PERCENT_RANK".to_string(),
+            args: vec![],
+        }
+    }
+
+    /// CUME_DIST() window function.
+    /// Returns the cumulative distribution of a value.
+    pub fn cume_dist() -> Self {
+        Expr::Function {
+            name: "CUME_DIST".to_string(),
+            args: vec![],
+        }
+    }
+
+    /// NTILE(n) window function.
+    /// Divides rows into n groups and returns the group number.
+    pub fn ntile(n: i64) -> Self {
+        Expr::Function {
+            name: "NTILE".to_string(),
+            args: vec![Expr::Literal(Value::BigInt(n))],
+        }
+    }
+
+    /// LAG(expr) window function with default offset of 1.
+    /// Returns the value of expr from the row that precedes the current row.
+    pub fn lag(self) -> Self {
+        Expr::Function {
+            name: "LAG".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// LAG(expr, offset) window function.
+    /// Returns the value of expr from the row at the given offset before current row.
+    pub fn lag_offset(self, offset: i64) -> Self {
+        Expr::Function {
+            name: "LAG".to_string(),
+            args: vec![self, Expr::Literal(Value::BigInt(offset))],
+        }
+    }
+
+    /// LAG(expr, offset, default) window function.
+    /// Returns the value of expr or default if the offset row doesn't exist.
+    pub fn lag_with_default(self, offset: i64, default: impl Into<Expr>) -> Self {
+        Expr::Function {
+            name: "LAG".to_string(),
+            args: vec![self, Expr::Literal(Value::BigInt(offset)), default.into()],
+        }
+    }
+
+    /// LEAD(expr) window function with default offset of 1.
+    /// Returns the value of expr from the row that follows the current row.
+    pub fn lead(self) -> Self {
+        Expr::Function {
+            name: "LEAD".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// LEAD(expr, offset) window function.
+    /// Returns the value of expr from the row at the given offset after current row.
+    pub fn lead_offset(self, offset: i64) -> Self {
+        Expr::Function {
+            name: "LEAD".to_string(),
+            args: vec![self, Expr::Literal(Value::BigInt(offset))],
+        }
+    }
+
+    /// LEAD(expr, offset, default) window function.
+    /// Returns the value of expr or default if the offset row doesn't exist.
+    pub fn lead_with_default(self, offset: i64, default: impl Into<Expr>) -> Self {
+        Expr::Function {
+            name: "LEAD".to_string(),
+            args: vec![self, Expr::Literal(Value::BigInt(offset)), default.into()],
+        }
+    }
+
+    /// FIRST_VALUE(expr) window function.
+    /// Returns the first value within the window frame.
+    pub fn first_value(self) -> Self {
+        Expr::Function {
+            name: "FIRST_VALUE".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// LAST_VALUE(expr) window function.
+    /// Returns the last value within the window frame.
+    pub fn last_value(self) -> Self {
+        Expr::Function {
+            name: "LAST_VALUE".to_string(),
+            args: vec![self],
+        }
+    }
+
+    /// NTH_VALUE(expr, n) window function.
+    /// Returns the nth value within the window frame.
+    pub fn nth_value(self, n: i64) -> Self {
+        Expr::Function {
+            name: "NTH_VALUE".to_string(),
+            args: vec![self, Expr::Literal(Value::BigInt(n))],
+        }
+    }
+
+    // ==================== Window OVER Clause ====================
+
+    /// Start building a window function with OVER clause.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC)
+    /// Expr::row_number()
+    ///     .over()
+    ///     .partition_by(Expr::col("department"))
+    ///     .order_by(Expr::col("salary").desc())
+    ///     .build()
+    ///
+    /// // SUM(amount) OVER (PARTITION BY customer_id)
+    /// Expr::col("amount").sum()
+    ///     .over()
+    ///     .partition_by(Expr::col("customer_id"))
+    ///     .build()
+    /// ```
+    pub fn over(self) -> WindowBuilder {
+        WindowBuilder {
+            function: self,
+            partition_by: Vec::new(),
+            order_by: Vec::new(),
+            frame: None,
+        }
+    }
+
     // ==================== NULL Handling Functions ====================
 
     /// COALESCE function: returns the first non-NULL argument.
@@ -1133,6 +1373,67 @@ impl Expr {
             }
 
             Expr::CountStar => "COUNT(*)".to_string(),
+
+            Expr::Window {
+                function,
+                partition_by,
+                order_by,
+                frame,
+            } => {
+                let func_sql = function.build_with_dialect(dialect, params, offset);
+                let mut over_parts: Vec<String> = Vec::new();
+
+                // PARTITION BY clause
+                if !partition_by.is_empty() {
+                    let partition_sqls: Vec<_> = partition_by
+                        .iter()
+                        .map(|e| e.build_with_dialect(dialect, params, offset))
+                        .collect();
+                    over_parts.push(format!("PARTITION BY {}", partition_sqls.join(", ")));
+                }
+
+                // ORDER BY clause
+                if !order_by.is_empty() {
+                    let order_sqls: Vec<_> = order_by
+                        .iter()
+                        .map(|o| {
+                            let expr_sql = o.expr.build_with_dialect(dialect, params, offset);
+                            let dir = match o.direction {
+                                OrderDirection::Asc => "ASC",
+                                OrderDirection::Desc => "DESC",
+                            };
+                            let nulls = match o.nulls {
+                                Some(crate::clause::NullsOrder::First) => " NULLS FIRST",
+                                Some(crate::clause::NullsOrder::Last) => " NULLS LAST",
+                                None => "",
+                            };
+                            format!("{expr_sql} {dir}{nulls}")
+                        })
+                        .collect();
+                    over_parts.push(format!("ORDER BY {}", order_sqls.join(", ")));
+                }
+
+                // Frame specification
+                if let Some(f) = frame {
+                    let frame_sql = if let Some(end) = &f.end {
+                        format!(
+                            "{} BETWEEN {} AND {}",
+                            f.frame_type.as_str(),
+                            f.start.to_sql(),
+                            end.to_sql()
+                        )
+                    } else {
+                        format!("{} {}", f.frame_type.as_str(), f.start.to_sql())
+                    };
+                    over_parts.push(frame_sql);
+                }
+
+                if over_parts.is_empty() {
+                    format!("{func_sql} OVER ()")
+                } else {
+                    format!("{func_sql} OVER ({})", over_parts.join(" "))
+                }
+            }
         }
     }
 }
@@ -1165,6 +1466,139 @@ impl CaseBuilder {
         Expr::Case {
             when_clauses: self.when_clauses,
             else_clause: None,
+        }
+    }
+}
+
+// ==================== Window Builder ====================
+
+/// Builder for window functions with OVER clause.
+#[derive(Debug, Clone)]
+pub struct WindowBuilder {
+    function: Expr,
+    partition_by: Vec<Expr>,
+    order_by: Vec<OrderBy>,
+    frame: Option<WindowFrame>,
+}
+
+impl WindowBuilder {
+    /// Add a PARTITION BY expression.
+    ///
+    /// Can be called multiple times to partition by multiple columns.
+    pub fn partition_by(mut self, expr: impl Into<Expr>) -> Self {
+        self.partition_by.push(expr.into());
+        self
+    }
+
+    /// Add multiple PARTITION BY expressions at once.
+    pub fn partition_by_many(mut self, exprs: Vec<impl Into<Expr>>) -> Self {
+        self.partition_by.extend(exprs.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add an ORDER BY clause within the window.
+    ///
+    /// Can be called multiple times to order by multiple columns.
+    pub fn order_by(mut self, order: OrderBy) -> Self {
+        self.order_by.push(order);
+        self
+    }
+
+    /// Add ORDER BY with ascending direction.
+    pub fn order_by_asc(mut self, expr: impl Into<Expr>) -> Self {
+        self.order_by.push(OrderBy {
+            expr: expr.into(),
+            direction: OrderDirection::Asc,
+            nulls: None,
+        });
+        self
+    }
+
+    /// Add ORDER BY with descending direction.
+    pub fn order_by_desc(mut self, expr: impl Into<Expr>) -> Self {
+        self.order_by.push(OrderBy {
+            expr: expr.into(),
+            direction: OrderDirection::Desc,
+            nulls: None,
+        });
+        self
+    }
+
+    /// Set frame specification: ROWS BETWEEN start AND end.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    /// .rows_between(WindowFrameBound::Preceding(2), WindowFrameBound::CurrentRow)
+    /// ```
+    pub fn rows_between(mut self, start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            frame_type: WindowFrameType::Rows,
+            start,
+            end: Some(end),
+        });
+        self
+    }
+
+    /// Set frame specification: ROWS start (no end bound).
+    ///
+    /// # Example
+    /// ```ignore
+    /// // ROWS UNBOUNDED PRECEDING
+    /// .rows(WindowFrameBound::UnboundedPreceding)
+    /// ```
+    pub fn rows(mut self, start: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            frame_type: WindowFrameType::Rows,
+            start,
+            end: None,
+        });
+        self
+    }
+
+    /// Set frame specification: RANGE BETWEEN start AND end.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    /// .range_between(WindowFrameBound::UnboundedPreceding, WindowFrameBound::CurrentRow)
+    /// ```
+    pub fn range_between(mut self, start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            frame_type: WindowFrameType::Range,
+            start,
+            end: Some(end),
+        });
+        self
+    }
+
+    /// Set frame specification: RANGE start (no end bound).
+    pub fn range(mut self, start: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            frame_type: WindowFrameType::Range,
+            start,
+            end: None,
+        });
+        self
+    }
+
+    /// Set frame specification: GROUPS BETWEEN start AND end (PostgreSQL 11+).
+    pub fn groups_between(mut self, start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            frame_type: WindowFrameType::Groups,
+            start,
+            end: Some(end),
+        });
+        self
+    }
+
+    /// Finalize and build the window expression.
+    pub fn build(self) -> Expr {
+        Expr::Window {
+            function: Box::new(self.function),
+            partition_by: self.partition_by,
+            order_by: self.order_by,
+            frame: self.frame,
         }
     }
 }
@@ -1745,6 +2179,311 @@ mod tests {
         assert_eq!(
             Dialect::Mysql.quote_identifier("multi``ticks"),
             "`multi````ticks`"
+        );
+    }
+
+    // ==================== Window Function Tests ====================
+
+    #[test]
+    fn test_window_row_number_empty_over() {
+        let expr = Expr::row_number().over().build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "ROW_NUMBER() OVER ()");
+    }
+
+    #[test]
+    fn test_window_row_number_order_by() {
+        let expr = Expr::row_number()
+            .over()
+            .order_by_desc(Expr::col("created_at"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "ROW_NUMBER() OVER (ORDER BY \"created_at\" DESC)");
+    }
+
+    #[test]
+    fn test_window_partition_by() {
+        let expr = Expr::row_number()
+            .over()
+            .partition_by(Expr::col("department"))
+            .order_by_asc(Expr::col("hire_date"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "ROW_NUMBER() OVER (PARTITION BY \"department\" ORDER BY \"hire_date\" ASC)"
+        );
+    }
+
+    #[test]
+    fn test_window_multiple_partition_by() {
+        let expr = Expr::rank()
+            .over()
+            .partition_by(Expr::col("region"))
+            .partition_by(Expr::col("product"))
+            .order_by_desc(Expr::col("sales"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "RANK() OVER (PARTITION BY \"region\", \"product\" ORDER BY \"sales\" DESC)"
+        );
+    }
+
+    #[test]
+    fn test_window_dense_rank() {
+        let expr = Expr::dense_rank()
+            .over()
+            .order_by_asc(Expr::col("score"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "DENSE_RANK() OVER (ORDER BY \"score\" ASC)");
+    }
+
+    #[test]
+    fn test_window_ntile() {
+        let expr = Expr::ntile(4)
+            .over()
+            .order_by_asc(Expr::col("salary"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "NTILE($1) OVER (ORDER BY \"salary\" ASC)");
+        assert_eq!(params[0], Value::BigInt(4));
+    }
+
+    #[test]
+    fn test_window_lag() {
+        let expr = Expr::col("price")
+            .lag()
+            .over()
+            .order_by_asc(Expr::col("date"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "LAG(\"price\") OVER (ORDER BY \"date\" ASC)");
+    }
+
+    #[test]
+    fn test_window_lag_with_offset() {
+        let expr = Expr::col("price")
+            .lag_offset(3)
+            .over()
+            .order_by_asc(Expr::col("date"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "LAG(\"price\", $1) OVER (ORDER BY \"date\" ASC)");
+        assert_eq!(params[0], Value::BigInt(3));
+    }
+
+    #[test]
+    fn test_window_lead_with_default() {
+        let expr = Expr::col("price")
+            .lead_with_default(1, 0)
+            .over()
+            .order_by_asc(Expr::col("date"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "LEAD(\"price\", $1, $2) OVER (ORDER BY \"date\" ASC)");
+        assert_eq!(params[0], Value::BigInt(1));
+        assert_eq!(params[1], Value::Int(0));
+    }
+
+    #[test]
+    fn test_window_first_value() {
+        let expr = Expr::col("salary")
+            .first_value()
+            .over()
+            .partition_by(Expr::col("department"))
+            .order_by_desc(Expr::col("salary"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "FIRST_VALUE(\"salary\") OVER (PARTITION BY \"department\" ORDER BY \"salary\" DESC)"
+        );
+    }
+
+    #[test]
+    fn test_window_last_value() {
+        let expr = Expr::col("amount")
+            .last_value()
+            .over()
+            .order_by_asc(Expr::col("created_at"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "LAST_VALUE(\"amount\") OVER (ORDER BY \"created_at\" ASC)"
+        );
+    }
+
+    #[test]
+    fn test_window_nth_value() {
+        let expr = Expr::col("score")
+            .nth_value(3)
+            .over()
+            .order_by_desc(Expr::col("score"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "NTH_VALUE(\"score\", $1) OVER (ORDER BY \"score\" DESC)"
+        );
+        assert_eq!(params[0], Value::BigInt(3));
+    }
+
+    #[test]
+    fn test_window_aggregate_sum() {
+        let expr = Expr::col("amount")
+            .sum()
+            .over()
+            .partition_by(Expr::col("customer_id"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "SUM(\"amount\") OVER (PARTITION BY \"customer_id\")");
+    }
+
+    #[test]
+    fn test_window_aggregate_avg_running() {
+        let expr = Expr::col("price")
+            .avg()
+            .over()
+            .order_by_asc(Expr::col("date"))
+            .rows_between(
+                WindowFrameBound::UnboundedPreceding,
+                WindowFrameBound::CurrentRow,
+            )
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "AVG(\"price\") OVER (ORDER BY \"date\" ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_rows_preceding() {
+        let expr = Expr::col("value")
+            .sum()
+            .over()
+            .order_by_asc(Expr::col("idx"))
+            .rows_between(WindowFrameBound::Preceding(2), WindowFrameBound::CurrentRow)
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "SUM(\"value\") OVER (ORDER BY \"idx\" ASC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_rows_following() {
+        let expr = Expr::col("value")
+            .avg()
+            .over()
+            .order_by_asc(Expr::col("idx"))
+            .rows_between(WindowFrameBound::CurrentRow, WindowFrameBound::Following(3))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "AVG(\"value\") OVER (ORDER BY \"idx\" ASC ROWS BETWEEN CURRENT ROW AND 3 FOLLOWING)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_range_unbounded() {
+        let expr = Expr::col("total")
+            .sum()
+            .over()
+            .partition_by(Expr::col("category"))
+            .order_by_asc(Expr::col("date"))
+            .range_between(
+                WindowFrameBound::UnboundedPreceding,
+                WindowFrameBound::UnboundedFollowing,
+            )
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "SUM(\"total\") OVER (PARTITION BY \"category\" ORDER BY \"date\" ASC RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_rows_single_bound() {
+        let expr = Expr::col("value")
+            .sum()
+            .over()
+            .order_by_asc(Expr::col("idx"))
+            .rows(WindowFrameBound::UnboundedPreceding)
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "SUM(\"value\") OVER (ORDER BY \"idx\" ASC ROWS UNBOUNDED PRECEDING)"
+        );
+    }
+
+    #[test]
+    fn test_window_percent_rank() {
+        let expr = Expr::percent_rank()
+            .over()
+            .order_by_asc(Expr::col("score"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "PERCENT_RANK() OVER (ORDER BY \"score\" ASC)");
+    }
+
+    #[test]
+    fn test_window_cume_dist() {
+        let expr = Expr::cume_dist()
+            .over()
+            .partition_by(Expr::col("group_id"))
+            .order_by_asc(Expr::col("value"))
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "CUME_DIST() OVER (PARTITION BY \"group_id\" ORDER BY \"value\" ASC)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_groups() {
+        let expr = Expr::col("amount")
+            .sum()
+            .over()
+            .order_by_asc(Expr::col("group_rank"))
+            .groups_between(
+                WindowFrameBound::Preceding(1),
+                WindowFrameBound::Following(1),
+            )
+            .build();
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(
+            sql,
+            "SUM(\"amount\") OVER (ORDER BY \"group_rank\" ASC GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"
         );
     }
 }

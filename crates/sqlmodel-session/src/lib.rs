@@ -485,6 +485,32 @@ impl<C: Connection> Session<C> {
         self.pending_new.push(key);
     }
 
+    /// Add multiple objects to the session at once.
+    ///
+    /// This is equivalent to calling `add()` for each object, but provides a more
+    /// convenient API for bulk operations.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let users = vec![user1, user2, user3];
+    /// session.add_all(&users);
+    ///
+    /// // Or with an iterator
+    /// session.add_all(users.iter());
+    /// ```
+    ///
+    /// All objects will be INSERTed on the next `flush()` call.
+    pub fn add_all<'a, M, I>(&mut self, objects: I)
+    where
+        M: Model + Clone + Send + Sync + Serialize + 'static,
+        I: IntoIterator<Item = &'a M>,
+    {
+        for obj in objects {
+            self.add(obj);
+        }
+    }
+
     /// Delete an object from the session.
     ///
     /// The object will be DELETEd on the next `flush()` call.
@@ -781,192 +807,6 @@ impl<C: Connection> Session<C> {
         self.pending_new.clear();
         self.pending_delete.clear();
         self.pending_dirty.clear();
-    }
-
-    /// Merge a detached object back into the session.
-    ///
-    /// This method re-associates a detached object with the session, handling
-    /// three scenarios:
-    ///
-    /// 1. **Object exists in session**: Updates the session's copy with the
-    ///    detached object's attributes and returns the session's copy
-    /// 2. **Object exists in database**: Loads from DB, updates with the
-    ///    detached object's attributes, and tracks for UPDATE
-    /// 3. **Object doesn't exist**: Treats as new and adds for INSERT
-    ///
-    /// # Arguments
-    ///
-    /// * `cx` - The async context
-    /// * `obj` - The detached object to merge
-    /// * `load` - If true, refresh the object from the database before merging
-    ///
-    /// # Returns
-    ///
-    /// The merged object (either the session's existing copy or a new tracked copy)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Detach an object (e.g., serialize to JSON, send over network)
-    /// session.expunge(&hero);
-    /// let json = serde_json::to_string(&hero)?;
-    ///
-    /// // Later, re-attach the (possibly modified) object
-    /// let hero: Hero = serde_json::from_str(&json)?;
-    /// let merged = session.merge(&cx, hero, false).await?;
-    ///
-    /// // merged is now tracked by the session and will UPDATE on flush
-    /// session.flush(&cx).await?;
-    /// ```
-    pub async fn merge<
-        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
-    >(
-        &mut self,
-        cx: &Cx,
-        obj: M,
-        load: bool,
-    ) -> Outcome<M, Error> {
-        let pk_values = obj.primary_key_value();
-        let key = ObjectKey::from_pk::<M>(&pk_values);
-
-        // Check if all PK values are null/default (new object without PK)
-        let is_pk_empty = pk_values.iter().all(|v| matches!(v, Value::Null));
-
-        if is_pk_empty {
-            // No PK means it's a new object - add it
-            self.add(&obj);
-            return Outcome::Ok(obj);
-        }
-
-        // Scenario 1: Object already in session
-        if let Some(tracked) = self.identity_map.get_mut(&key) {
-            match tracked.state {
-                ObjectState::Persistent | ObjectState::Expired => {
-                    // Update the session's tracked object with incoming values
-                    let row_data = obj.to_row();
-                    let column_names: Vec<&'static str> =
-                        row_data.iter().map(|(name, _)| *name).collect();
-                    let new_values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
-
-                    // Check if values actually changed
-                    let current_serialized =
-                        serde_json::to_vec(&tracked.values).unwrap_or_default();
-                    let new_serialized = serde_json::to_vec(&new_values).unwrap_or_default();
-
-                    if current_serialized != new_serialized {
-                        // Update tracked object
-                        tracked.object = Box::new(obj.clone());
-                        tracked.column_names = column_names;
-                        tracked.values = new_values;
-                        tracked.pk_values = pk_values;
-
-                        // Ensure state is Persistent (in case it was Expired)
-                        tracked.state = ObjectState::Persistent;
-
-                        // Mark as dirty for UPDATE
-                        if !self.pending_dirty.contains(&key) {
-                            self.pending_dirty.push(key);
-                        }
-                    } else if tracked.state == ObjectState::Expired {
-                        // Same values but was expired - just mark as persistent
-                        tracked.state = ObjectState::Persistent;
-                    }
-
-                    return Outcome::Ok(obj);
-                }
-                ObjectState::New => {
-                    // Already pending insert - just update the values
-                    tracked.object = Box::new(obj.clone());
-                    let row_data = obj.to_row();
-                    tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
-                    tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
-                    tracked.pk_values = pk_values;
-                    return Outcome::Ok(obj);
-                }
-                ObjectState::Deleted => {
-                    // Was deleted - un-delete and update
-                    self.pending_delete.retain(|k| k != &key);
-                    tracked.object = Box::new(obj.clone());
-                    let row_data = obj.to_row();
-                    tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
-                    tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
-                    tracked.pk_values = pk_values.clone();
-                    tracked.state = ObjectState::Persistent;
-
-                    // Mark as dirty since we're restoring with new values
-                    if !self.pending_dirty.contains(&key) {
-                        self.pending_dirty.push(key);
-                    }
-                    return Outcome::Ok(obj);
-                }
-                ObjectState::Detached => {
-                    // Re-attach: update values and mark as persistent/dirty
-                    tracked.object = Box::new(obj.clone());
-                    let row_data = obj.to_row();
-                    tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
-                    tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
-                    tracked.pk_values = pk_values.clone();
-                    tracked.state = ObjectState::Persistent;
-
-                    // Mark as dirty for UPDATE
-                    if !self.pending_dirty.contains(&key) {
-                        self.pending_dirty.push(key);
-                    }
-                    return Outcome::Ok(obj);
-                }
-            }
-        }
-
-        // Scenario 2 & 3: Object not in session - check database
-        if load {
-            // Query DB to check if object exists
-            let existing = match self.get_by_pk::<M>(cx, &pk_values).await {
-                Outcome::Ok(opt) => opt,
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
-            };
-
-            if existing.is_some() {
-                // Object exists in DB and is now tracked via get_by_pk
-                // Now update with incoming values
-                if let Some(tracked) = self.identity_map.get_mut(&key) {
-                    tracked.object = Box::new(obj.clone());
-                    let row_data = obj.to_row();
-                    tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
-                    tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
-                    tracked.pk_values = pk_values;
-
-                    // Mark as dirty for UPDATE
-                    if !self.pending_dirty.contains(&key) {
-                        self.pending_dirty.push(key);
-                    }
-                }
-                return Outcome::Ok(obj);
-            }
-        }
-
-        // Scenario 3: Object doesn't exist in session or DB - treat as new
-        // Extract column data from the model
-        let row_data = obj.to_row();
-        let column_names: Vec<&'static str> = row_data.iter().map(|(name, _)| *name).collect();
-        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
-
-        let tracked = TrackedObject {
-            object: Box::new(obj.clone()),
-            original_state: None, // New objects have no original state
-            state: ObjectState::New,
-            table_name: M::TABLE_NAME,
-            column_names,
-            values,
-            pk_columns: M::PRIMARY_KEY.to_vec(),
-            pk_values,
-        };
-
-        self.identity_map.insert(key, tracked);
-        self.pending_new.push(key);
-
-        Outcome::Ok(obj)
     }
 
     // ========================================================================
@@ -2453,200 +2293,104 @@ mod tests {
         assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
     }
 
-    // ========================================================================
-    // Merge Tests
-    // ========================================================================
-
     #[test]
-    fn test_merge_new_object_without_pk() {
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("create asupersync runtime");
-        let cx = Cx::for_testing();
-
+    fn test_add_all_with_vec() {
         let state = Arc::new(Mutex::new(MockState::default()));
         let conn = MockConnection {
             state: Arc::clone(&state),
         };
         let mut session = Session::new(conn);
 
-        // Create a new team without PK
-        let team = Team {
-            id: None,
-            name: "New Team".to_string(),
-        };
+        // Each object needs a unique PK for identity tracking
+        // (objects without PKs get the same ObjectKey)
+        let teams = vec![
+            Team {
+                id: Some(100),
+                name: "Team A".to_string(),
+            },
+            Team {
+                id: Some(101),
+                name: "Team B".to_string(),
+            },
+            Team {
+                id: Some(102),
+                name: "Team C".to_string(),
+            },
+        ];
 
-        rt.block_on(async {
-            let merged = unwrap_outcome(session.merge(&cx, team.clone(), false).await);
-            assert_eq!(merged.name, "New Team");
+        session.add_all(&teams);
 
-            // Should be added as new (pending INSERT)
-            assert_eq!(session.pending_new_count(), 1);
-            assert_eq!(session.tracked_count(), 1);
-        });
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 3);
+        assert_eq!(info.tracked, 3);
     }
 
     #[test]
-    fn test_merge_object_already_in_session() {
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("create asupersync runtime");
-        let cx = Cx::for_testing();
-
+    fn test_add_all_with_empty_collection() {
         let state = Arc::new(Mutex::new(MockState::default()));
         let conn = MockConnection {
             state: Arc::clone(&state),
         };
         let mut session = Session::new(conn);
 
-        rt.block_on(async {
-            // First, get a team from DB (puts it in session as Persistent)
-            let team1 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await);
-            assert!(team1.is_some());
-            let original = team1.unwrap();
-            assert_eq!(original.name, "Avengers");
+        let teams: Vec<Team> = vec![];
+        session.add_all(&teams);
 
-            // Now merge a modified version of the same object
-            let modified = Team {
-                id: Some(1),
-                name: "Modified Avengers".to_string(),
-            };
-
-            let merged = unwrap_outcome(session.merge(&cx, modified.clone(), false).await);
-            assert_eq!(merged.name, "Modified Avengers");
-
-            // Should be marked as dirty for UPDATE
-            assert_eq!(session.pending_dirty_count(), 1);
-            // Still only 1 tracked (same object)
-            assert_eq!(session.tracked_count(), 1);
-        });
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 0);
+        assert_eq!(info.tracked, 0);
     }
 
     #[test]
-    fn test_merge_object_not_in_session_with_load() {
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("create asupersync runtime");
-        let cx = Cx::for_testing();
-
+    fn test_add_all_with_iterator() {
         let state = Arc::new(Mutex::new(MockState::default()));
         let conn = MockConnection {
             state: Arc::clone(&state),
         };
         let mut session = Session::new(conn);
 
-        rt.block_on(async {
-            // Merge an object that exists in DB (load=true should fetch it first)
-            let team = Team {
-                id: Some(1),
-                name: "Updated Avengers".to_string(),
-            };
+        let teams = vec![
+            Team {
+                id: Some(200),
+                name: "Team X".to_string(),
+            },
+            Team {
+                id: Some(201),
+                name: "Team Y".to_string(),
+            },
+        ];
 
-            let merged = unwrap_outcome(session.merge(&cx, team.clone(), true).await);
-            assert_eq!(merged.name, "Updated Avengers");
+        // Use iter() explicitly
+        session.add_all(teams.iter());
 
-            // Should be tracked and dirty (since we updated the DB's values)
-            assert_eq!(session.tracked_count(), 1);
-            assert_eq!(session.pending_dirty_count(), 1);
-
-            // Query should have been made to load from DB
-            assert!(state.lock().expect("lock poisoned").query_calls > 0);
-        });
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 2);
+        assert_eq!(info.tracked, 2);
     }
 
     #[test]
-    fn test_merge_object_not_in_db_with_load() {
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("create asupersync runtime");
-        let cx = Cx::for_testing();
-
+    fn test_add_all_with_slice() {
         let state = Arc::new(Mutex::new(MockState::default()));
         let conn = MockConnection {
             state: Arc::clone(&state),
         };
         let mut session = Session::new(conn);
 
-        rt.block_on(async {
-            // Merge an object that doesn't exist in DB (PK 999 returns empty)
-            let team = Team {
-                id: Some(999),
-                name: "Non-existent Team".to_string(),
-            };
+        let teams = [
+            Team {
+                id: Some(300),
+                name: "Team 1".to_string(),
+            },
+            Team {
+                id: Some(301),
+                name: "Team 2".to_string(),
+            },
+        ];
 
-            let merged = unwrap_outcome(session.merge(&cx, team.clone(), true).await);
-            assert_eq!(merged.name, "Non-existent Team");
+        session.add_all(&teams);
 
-            // Should be added as new (pending INSERT)
-            assert_eq!(session.pending_new_count(), 1);
-            assert_eq!(session.tracked_count(), 1);
-        });
-    }
-
-    #[test]
-    fn test_merge_object_without_load() {
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("create asupersync runtime");
-        let cx = Cx::for_testing();
-
-        let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
-        let mut session = Session::new(conn);
-
-        rt.block_on(async {
-            // Merge without loading from DB (load=false)
-            let team = Team {
-                id: Some(1),
-                name: "Detached Team".to_string(),
-            };
-
-            let merged = unwrap_outcome(session.merge(&cx, team.clone(), false).await);
-            assert_eq!(merged.name, "Detached Team");
-
-            // Without load=true and not in session, it's treated as new
-            assert_eq!(session.pending_new_count(), 1);
-            assert_eq!(session.tracked_count(), 1);
-
-            // No DB query made
-            assert_eq!(state.lock().expect("lock poisoned").query_calls, 0);
-        });
-    }
-
-    #[test]
-    fn test_merge_expunged_object() {
-        let rt = RuntimeBuilder::current_thread()
-            .build()
-            .expect("create asupersync runtime");
-        let cx = Cx::for_testing();
-
-        let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
-        let mut session = Session::new(conn);
-
-        rt.block_on(async {
-            // Get a team from DB
-            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
-            assert_eq!(session.tracked_count(), 1);
-
-            // Expunge it
-            session.expunge(&team);
-
-            // Merge it back with modifications
-            let modified = Team {
-                id: Some(1),
-                name: "Re-attached Avengers".to_string(),
-            };
-
-            let merged = unwrap_outcome(session.merge(&cx, modified.clone(), false).await);
-            assert_eq!(merged.name, "Re-attached Avengers");
-
-            // Should be marked dirty and tracked again
-            assert_eq!(session.pending_dirty_count(), 1);
-        });
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 2);
+        assert_eq!(info.tracked, 2);
     }
 }

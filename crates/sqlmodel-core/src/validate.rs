@@ -321,7 +321,7 @@ pub enum DumpMode {
     Python,
 }
 
-/// Options for model_dump().
+/// Options for model_dump() and model_dump_json().
 ///
 /// Controls the serialization behavior.
 #[derive(Debug, Clone, Default)]
@@ -344,6 +344,8 @@ pub struct DumpOptions {
     pub exclude_computed_fields: bool,
     /// Enable round-trip mode (preserves types for re-parsing)
     pub round_trip: bool,
+    /// Indentation for JSON output (None = compact, Some(n) = n spaces)
+    pub indent: Option<usize>,
 }
 
 impl DumpOptions {
@@ -411,6 +413,15 @@ impl DumpOptions {
         self.round_trip = true;
         self
     }
+
+    /// Set indentation for JSON output.
+    ///
+    /// When set, JSON output will be pretty-printed with the specified number
+    /// of spaces for indentation. When None (default), JSON is compact.
+    pub fn indent(mut self, spaces: usize) -> Self {
+        self.indent = Some(spaces);
+        self
+    }
 }
 
 /// Result type for model_dump operations.
@@ -449,6 +460,50 @@ pub trait ModelDump {
     fn model_dump_json_pretty(&self) -> std::result::Result<String, serde_json::Error> {
         let value = self.model_dump(DumpOptions::default())?;
         serde_json::to_string_pretty(&value)
+    }
+
+    /// Serialize a model to a JSON string with full options support.
+    ///
+    /// This method supports all DumpOptions including the `indent` option:
+    /// - `indent: None` - compact JSON output
+    /// - `indent: Some(n)` - pretty-printed with n spaces indentation
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use sqlmodel_core::validate::{ModelDump, DumpOptions};
+    ///
+    /// // Compact JSON with exclusions
+    /// let json = user.model_dump_json_with_options(
+    ///     DumpOptions::default().exclude(["password"])
+    /// )?;
+    ///
+    /// // Pretty-printed with 4-space indent
+    /// let json = user.model_dump_json_with_options(
+    ///     DumpOptions::default().indent(4)
+    /// )?;
+    /// ```
+    fn model_dump_json_with_options(
+        &self,
+        options: DumpOptions,
+    ) -> std::result::Result<String, serde_json::Error> {
+        let value = self.model_dump(DumpOptions {
+            indent: None, // Don't pass indent to model_dump (it returns Value, not String)
+            ..options.clone()
+        })?;
+
+        match options.indent {
+            Some(spaces) => {
+                let indent_bytes = " ".repeat(spaces).into_bytes();
+                let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent_bytes);
+                let mut writer = Vec::new();
+                let mut ser = serde_json::Serializer::with_formatter(&mut writer, formatter);
+                serde::Serialize::serialize(&value, &mut ser)?;
+                // SAFETY: serde_json always produces valid UTF-8
+                Ok(String::from_utf8(writer).expect("serde_json output should be valid UTF-8"))
+            }
+            None => serde_json::to_string(&value),
+        }
     }
 }
 
@@ -741,14 +796,9 @@ pub trait SqlModelDump: Model + serde::Serialize {
         // First, serialize to JSON value
         let mut value = serde_json::to_value(self)?;
 
-        // Apply serialization aliases if by_alias is set
-        if options.by_alias {
-            apply_serialization_aliases(&mut value, Self::fields());
-        }
-
-        // Apply other options
+        // Apply options that work on original field names BEFORE alias renaming
         if let serde_json::Value::Object(ref mut map) = value {
-            // Exclude computed fields if requested
+            // Exclude computed fields if requested (must happen before alias renaming)
             if options.exclude_computed_fields {
                 let computed_field_names: std::collections::HashSet<&str> = Self::fields()
                     .iter()
@@ -757,7 +807,15 @@ pub trait SqlModelDump: Model + serde::Serialize {
                     .collect();
                 map.retain(|k, _| !computed_field_names.contains(k.as_str()));
             }
+        }
 
+        // Apply serialization aliases if by_alias is set
+        if options.by_alias {
+            apply_serialization_aliases(&mut value, Self::fields());
+        }
+
+        // Apply remaining options (include/exclude work on the final key names)
+        if let serde_json::Value::Object(ref mut map) = value {
             // Apply include filter
             if let Some(ref include) = options.include {
                 map.retain(|k, _| include.contains(k));
@@ -793,6 +851,48 @@ pub trait SqlModelDump: Model + serde::Serialize {
     fn sql_model_dump_json_by_alias(&self) -> std::result::Result<String, serde_json::Error> {
         let value = self.sql_model_dump(DumpOptions::default().by_alias())?;
         serde_json::to_string(&value)
+    }
+
+    /// Serialize a model to a JSON string with full options support.
+    ///
+    /// This method supports all DumpOptions including the `indent` option:
+    /// - `indent: None` - compact JSON output
+    /// - `indent: Some(n)` - pretty-printed with n spaces indentation
+    ///
+    /// Compared to `model_dump_json_with_options`, this method also applies
+    /// Model-specific transformations like serialization aliases.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use sqlmodel_core::validate::{SqlModelDump, DumpOptions};
+    ///
+    /// // With aliases and 2-space indent
+    /// let json = user.sql_model_dump_json_with_options(
+    ///     DumpOptions::default().by_alias().indent(2)
+    /// )?;
+    /// ```
+    fn sql_model_dump_json_with_options(
+        &self,
+        options: DumpOptions,
+    ) -> std::result::Result<String, serde_json::Error> {
+        let value = self.sql_model_dump(DumpOptions {
+            indent: None, // Don't pass indent to sql_model_dump (it returns Value, not String)
+            ..options.clone()
+        })?;
+
+        match options.indent {
+            Some(spaces) => {
+                let indent_bytes = " ".repeat(spaces).into_bytes();
+                let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent_bytes);
+                let mut writer = Vec::new();
+                let mut ser = serde_json::Serializer::with_formatter(&mut writer, formatter);
+                serde::Serialize::serialize(&value, &mut ser)?;
+                // SAFETY: serde_json always produces valid UTF-8
+                Ok(String::from_utf8(writer).expect("serde_json output should be valid UTF-8"))
+            }
+            None => serde_json::to_string(&value),
+        }
     }
 }
 
@@ -1115,6 +1215,78 @@ mod tests {
         // Pretty print should have newlines
         assert!(json_str.contains('\n'));
         assert!(json_str.contains("Gadget"));
+    }
+
+    #[test]
+    fn test_model_dump_json_with_options_compact() {
+        let product = TestProduct {
+            name: "Widget".to_string(),
+            price: 19.99,
+            description: Some("A widget".to_string()),
+        };
+
+        // Compact JSON (no indent)
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default())
+            .unwrap();
+        assert!(!json_str.contains('\n')); // No newlines in compact mode
+        assert!(json_str.contains("Widget"));
+        assert!(json_str.contains("19.99"));
+    }
+
+    #[test]
+    fn test_model_dump_json_with_options_indent() {
+        let product = TestProduct {
+            name: "Widget".to_string(),
+            price: 19.99,
+            description: Some("A widget".to_string()),
+        };
+
+        // 2-space indentation
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default().indent(2))
+            .unwrap();
+        assert!(json_str.contains('\n')); // Has newlines
+        assert!(json_str.contains("  \"name\"")); // 2-space indent
+        assert!(json_str.contains("Widget"));
+
+        // 4-space indentation
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default().indent(4))
+            .unwrap();
+        assert!(json_str.contains("    \"name\"")); // 4-space indent
+    }
+
+    #[test]
+    fn test_model_dump_json_with_options_combined() {
+        let product = TestProduct {
+            name: "Widget".to_string(),
+            price: 19.99,
+            description: Some("A widget".to_string()),
+        };
+
+        // Combine indent with exclude
+        let json_str = product
+            .model_dump_json_with_options(DumpOptions::default().exclude(["price"]).indent(2))
+            .unwrap();
+        assert!(json_str.contains('\n')); // Has newlines
+        assert!(json_str.contains("Widget"));
+        assert!(!json_str.contains("19.99")); // price is excluded
+    }
+
+    #[test]
+    fn test_dump_options_indent_builder() {
+        let options = DumpOptions::new().indent(4);
+        assert_eq!(options.indent, Some(4));
+
+        // Can combine with other options
+        let options2 = DumpOptions::new()
+            .indent(2)
+            .by_alias()
+            .exclude(["password"]);
+        assert_eq!(options2.indent, Some(2));
+        assert!(options2.by_alias);
+        assert!(options2.exclude.unwrap().contains("password"));
     }
 
     #[test]
@@ -1562,5 +1734,91 @@ mod tests {
         assert!(options2.exclude_computed_fields);
         assert!(options2.by_alias);
         assert!(options2.exclude_none);
+    }
+
+    /// Test model with both computed fields AND serialization aliases.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct TestUserWithComputedAndAlias {
+        id: i64,
+        first_name: String,
+        #[serde(default)]
+        display_name: String, // Computed field that also has an alias
+    }
+
+    impl Model for TestUserWithComputedAndAlias {
+        const TABLE_NAME: &'static str = "users";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("first_name", "first_name", SqlType::Text)
+                    .serialization_alias("firstName"),
+                FieldInfo::new("display_name", "display_name", SqlType::Text)
+                    .computed(true)
+                    .serialization_alias("displayName"),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", Value::BigInt(self.id)),
+                ("first_name", Value::Text(self.first_name.clone())),
+            ]
+        }
+
+        fn from_row(row: &Row) -> crate::Result<Self> {
+            Ok(Self {
+                id: row.get_named("id")?,
+                first_name: row.get_named("first_name")?,
+                display_name: String::new(),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![Value::BigInt(self.id)]
+        }
+
+        fn is_new(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_exclude_computed_with_by_alias() {
+        // This test verifies that computed field exclusion works correctly
+        // even when combined with by_alias (which renames keys)
+        let user = TestUserWithComputedAndAlias {
+            id: 1,
+            first_name: "John".to_string(),
+            display_name: "John Doe".to_string(),
+        };
+
+        // Test with by_alias only - computed field should still appear (aliased)
+        let json = user
+            .sql_model_dump(DumpOptions::default().by_alias())
+            .unwrap();
+        assert_eq!(json["firstName"], "John"); // first_name aliased
+        assert_eq!(json["displayName"], "John Doe"); // display_name aliased (computed but not excluded)
+        assert!(json.get("first_name").is_none()); // Original name should not exist
+        assert!(json.get("display_name").is_none()); // Original name should not exist
+
+        // Test with exclude_computed_fields only - computed field should be excluded
+        let json = user
+            .sql_model_dump(DumpOptions::default().exclude_computed_fields())
+            .unwrap();
+        assert_eq!(json["first_name"], "John");
+        assert!(json.get("display_name").is_none()); // Computed field excluded
+
+        // Test with BOTH by_alias AND exclude_computed_fields
+        // This was buggy before the fix - computed field wasn't excluded
+        // because exclusion happened after aliasing
+        let json = user
+            .sql_model_dump(DumpOptions::default().by_alias().exclude_computed_fields())
+            .unwrap();
+        assert_eq!(json["firstName"], "John"); // first_name aliased
+        assert!(json.get("displayName").is_none()); // Computed field excluded (even though aliased)
+        assert!(json.get("display_name").is_none()); // Original name doesn't exist either
     }
 }
