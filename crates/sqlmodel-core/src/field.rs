@@ -94,6 +94,10 @@ pub struct FieldInfo {
     /// Alias used only during serialization (output-only).
     /// Overrides `alias` when outputting the field name.
     pub serialization_alias: Option<&'static str>,
+    /// Computed field method name.
+    /// Computed fields are derived from other fields and are NOT stored in the database.
+    /// They are included in serialization (model_dump) but excluded from INSERT/UPDATE/SELECT.
+    pub computed: Option<&'static str>,
 }
 
 impl FieldInfo {
@@ -118,6 +122,7 @@ impl FieldInfo {
             alias: None,
             validation_alias: None,
             serialization_alias: None,
+            computed: None,
         }
     }
 
@@ -362,6 +367,35 @@ impl FieldInfo {
         self
     }
 
+    /// Set computed field method name.
+    ///
+    /// Computed fields are derived from other fields at access time.
+    /// They are included in serialization but NOT stored in the database.
+    pub const fn computed(mut self, method_name: &'static str) -> Self {
+        self.computed = Some(method_name);
+        self
+    }
+
+    /// Set computed from optional.
+    pub const fn computed_opt(mut self, method_name: Option<&'static str>) -> Self {
+        self.computed = method_name;
+        self
+    }
+
+    /// Check if this field is a computed field.
+    #[must_use]
+    pub const fn is_computed(&self) -> bool {
+        self.computed.is_some()
+    }
+
+    /// Check if this field should be included in database operations.
+    ///
+    /// Returns false for computed fields (they're not stored in the DB).
+    #[must_use]
+    pub const fn is_db_field(&self) -> bool {
+        self.computed.is_none()
+    }
+
     /// Get the name to use when serializing (output).
     ///
     /// Priority: serialization_alias > alias > name
@@ -400,7 +434,9 @@ impl FieldInfo {
     /// Check if this field has any alias configuration.
     #[must_use]
     pub const fn has_alias(&self) -> bool {
-        self.alias.is_some() || self.validation_alias.is_some() || self.serialization_alias.is_some()
+        self.alias.is_some()
+            || self.validation_alias.is_some()
+            || self.serialization_alias.is_some()
     }
 }
 

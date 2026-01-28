@@ -69,6 +69,9 @@ pub struct FieldDef {
     pub validation_alias: Option<String>,
     /// Alias used only during serialization (output-only).
     pub serialization_alias: Option<String>,
+    /// Computed field method name (e.g., "compute_full_name").
+    /// Computed fields are NOT stored in the database but included in serialization.
+    pub computed: Option<String>,
 }
 
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
@@ -127,7 +130,9 @@ impl ModelDef {
     pub fn insert_fields(&self) -> Vec<&FieldDef> {
         self.fields
             .iter()
-            .filter(|f| !f.skip && !f.skip_insert && f.relationship.is_none())
+            .filter(|f| {
+                !f.skip && !f.skip_insert && f.relationship.is_none() && f.computed.is_none()
+            })
             .collect()
     }
 
@@ -136,16 +141,22 @@ impl ModelDef {
     pub fn update_fields(&self) -> Vec<&FieldDef> {
         self.fields
             .iter()
-            .filter(|f| !f.skip && !f.skip_update && !f.primary_key && f.relationship.is_none())
+            .filter(|f| {
+                !f.skip
+                    && !f.skip_update
+                    && !f.primary_key
+                    && f.relationship.is_none()
+                    && f.computed.is_none()
+            })
             .collect()
     }
 
     /// Returns fields that should be read from the database (SELECT).
-    /// Excludes skipped fields and relationship fields (they're not DB columns).
+    /// Excludes skipped fields, relationship fields, and computed fields (they're not DB columns).
     pub fn select_fields(&self) -> Vec<&FieldDef> {
         self.fields
             .iter()
-            .filter(|f| !f.skip && f.relationship.is_none())
+            .filter(|f| !f.skip && f.relationship.is_none() && f.computed.is_none())
             .collect()
     }
 
@@ -156,9 +167,29 @@ impl ModelDef {
             .filter(|f| f.relationship.is_some())
             .collect()
     }
+
+    /// Returns fields that are computed (derived from other fields).
+    /// Computed fields are included in serialization but not stored in the database.
+    pub fn computed_fields(&self) -> Vec<&FieldDef> {
+        self.fields
+            .iter()
+            .filter(|f| f.computed.is_some())
+            .collect()
+    }
 }
 
 impl FieldDef {
+    /// Returns true if this field is a computed field.
+    pub fn is_computed(&self) -> bool {
+        self.computed.is_some()
+    }
+
+    /// Returns true if this field should be included in database operations.
+    /// Excludes skipped, relationship, and computed fields.
+    pub fn is_db_field(&self) -> bool {
+        !self.skip && self.relationship.is_none() && self.computed.is_none()
+    }
+
     /// Returns the name to use when serializing this field (output).
     ///
     /// Priority: serialization_alias > alias > field name
@@ -510,6 +541,7 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         alias: attrs.alias,
         validation_alias: attrs.validation_alias,
         serialization_alias: attrs.serialization_alias,
+        computed: attrs.computed,
     })
 }
 
@@ -534,6 +566,7 @@ struct FieldAttrs {
     alias: Option<String>,
     validation_alias: Option<String>,
     serialization_alias: Option<String>,
+    computed: Option<String>,
 }
 
 /// Detect the relationship kind from a field's Rust type.
@@ -727,6 +760,16 @@ fn parse_field_attrs(
                         "expected string literal for serialization_alias",
                     ));
                 }
+            } else if path.is_ident("computed") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.computed = Some(lit_str.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for computed (method name)",
+                    ));
+                }
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -737,7 +780,7 @@ fn parse_field_attrs(
                          Valid attributes are: primary_key, auto_increment, column, nullable, \
                          unique, foreign_key, on_delete, on_update, default, sql_type, index, \
                          skip, skip_insert, skip_update, relationship, alias, validation_alias, \
-                         serialization_alias"
+                         serialization_alias, computed"
                     ),
                 ));
             }
@@ -963,6 +1006,30 @@ fn validate_field_attrs(attrs: &FieldAttrs, field_name: &Ident, field_type: &Typ
                 "relationship attribute can only be used on Related<T>, RelatedMany<T>, or Lazy<T> fields",
             ));
         }
+    }
+
+    // Computed fields cannot be primary keys
+    if attrs.computed.is_some() && attrs.primary_key {
+        return Err(Error::new_spanned(
+            field_name,
+            "computed fields cannot be primary keys (they are not stored in the database)",
+        ));
+    }
+
+    // Computed fields should not have foreign_key
+    if attrs.computed.is_some() && attrs.foreign_key.is_some() {
+        return Err(Error::new_spanned(
+            field_name,
+            "computed fields cannot have foreign key constraints (they are not stored in the database)",
+        ));
+    }
+
+    // Computed fields should not have default (they compute their value)
+    if attrs.computed.is_some() && attrs.default.is_some() {
+        return Err(Error::new_spanned(
+            field_name,
+            "computed fields cannot have default values (their value is computed from a method)",
+        ));
     }
 
     // auto_increment usually implies primary_key (warn, don't error)
