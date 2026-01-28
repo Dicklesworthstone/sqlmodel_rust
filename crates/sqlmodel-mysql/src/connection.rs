@@ -1385,6 +1385,8 @@ mod tests {
         use super::*;
         use sqlmodel_console::{ConsoleAware, OutputMode, SqlModelConsole};
 
+        fn assert_console_aware<T: ConsoleAware>() {}
+
         #[test]
         fn test_console_aware_trait_impl() {
             // Create a mock connection config (won't actually connect)
@@ -1398,7 +1400,6 @@ mod tests {
             // We can't easily create a MySqlConnection without a server,
             // but we can verify the trait is implemented correctly by
             // checking that the implementation compiles.
-            fn assert_console_aware<T: ConsoleAware>() {}
             assert_console_aware::<MySqlConnection>();
 
             // Verify config can be built
@@ -1414,10 +1415,10 @@ mod tests {
             assert_eq!(format_value(&Value::Bool(false)), "false");
             assert_eq!(format_value(&Value::TinyInt(42)), "42");
             assert_eq!(format_value(&Value::SmallInt(1000)), "1000");
-            assert_eq!(format_value(&Value::Int(123456)), "123456");
+            assert_eq!(format_value(&Value::Int(123_456)), "123456");
             assert_eq!(format_value(&Value::BigInt(9_999_999_999)), "9999999999");
-            assert!(format_value(&Value::Float(3.14)).starts_with("3.14"));
-            assert!(format_value(&Value::Double(2.718281828)).starts_with("2.71828"));
+            assert!(format_value(&Value::Float(1.5)).starts_with("1.5"));
+            assert!(format_value(&Value::Double(1.234_567_890)).starts_with("1.23456"));
             assert_eq!(
                 format_value(&Value::Decimal("123.45".to_string())),
                 "123.45"
@@ -1425,9 +1426,9 @@ mod tests {
             assert_eq!(format_value(&Value::Text("hello".to_string())), "hello");
             assert_eq!(format_value(&Value::Bytes(vec![1, 2, 3])), "<3 bytes>");
             assert!(format_value(&Value::Date(19000)).contains("date:"));
-            assert!(format_value(&Value::Time(43200_000_000)).contains("time:"));
-            assert!(format_value(&Value::Timestamp(1700000000_000_000)).contains("ts:"));
-            assert!(format_value(&Value::TimestampTz(1700000000_000_000)).contains("tstz:"));
+            assert!(format_value(&Value::Time(43_200_000_000)).contains("time:"));
+            assert!(format_value(&Value::Timestamp(1_700_000_000_000_000)).contains("ts:"));
+            assert!(format_value(&Value::TimestampTz(1_700_000_000_000_000)).contains("tstz:"));
 
             let uuid = [0u8; 16];
             let uuid_str = format_value(&Value::Uuid(uuid));
