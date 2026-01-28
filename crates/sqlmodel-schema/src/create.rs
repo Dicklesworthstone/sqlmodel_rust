@@ -3,10 +3,15 @@
 use sqlmodel_core::{FieldInfo, Model};
 use std::marker::PhantomData;
 
+/// Quote a SQL identifier (table, column, constraint name), escaping embedded quotes.
+///
+/// Double-quotes inside identifiers are escaped by doubling them.
+/// For example, `foo"bar` becomes `"foo""bar"`.
 fn quote_ident(ident: &str) -> String {
-    let mut out = String::with_capacity(ident.len() + 2);
+    let escaped = ident.replace('"', "\"\"");
+    let mut out = String::with_capacity(escaped.len() + 2);
     out.push('"');
-    out.push_str(ident);
+    out.push_str(&escaped);
     out.push('"');
     out
 }
@@ -41,9 +46,7 @@ impl<M: Model> CreateTable<M> {
             sql.push_str("IF NOT EXISTS ");
         }
 
-        sql.push('"');
-        sql.push_str(M::TABLE_NAME);
-        sql.push('"');
+        sql.push_str(&quote_ident(M::TABLE_NAME));
         sql.push_str(" (\n");
 
         let fields = M::fields();
@@ -55,30 +58,26 @@ impl<M: Model> CreateTable<M> {
 
             // Collect constraints
             if field.unique && !field.primary_key {
-                let mut constraint = String::new();
-                constraint.push_str("CONSTRAINT \"uk_");
-                constraint.push_str(field.column_name);
-                constraint.push_str("\" UNIQUE (\"");
-                constraint.push_str(field.column_name);
-                constraint.push_str("\")");
+                let constraint_name = format!("uk_{}", field.column_name);
+                let constraint = format!(
+                    "CONSTRAINT {} UNIQUE ({})",
+                    quote_ident(&constraint_name),
+                    quote_ident(field.column_name)
+                );
                 constraints.push(constraint);
             }
 
             if let Some(fk) = field.foreign_key {
                 let parts: Vec<&str> = fk.split('.').collect();
                 if parts.len() == 2 {
-                    let mut fk_sql = String::new();
-                    fk_sql.push_str("CONSTRAINT \"fk_");
-                    fk_sql.push_str(M::TABLE_NAME);
-                    fk_sql.push('_');
-                    fk_sql.push_str(field.column_name);
-                    fk_sql.push_str("\" FOREIGN KEY (\"");
-                    fk_sql.push_str(field.column_name);
-                    fk_sql.push_str("\") REFERENCES \"");
-                    fk_sql.push_str(parts[0]);
-                    fk_sql.push_str("\"(\"");
-                    fk_sql.push_str(parts[1]);
-                    fk_sql.push_str("\")");
+                    let constraint_name = format!("fk_{}_{}", M::TABLE_NAME, field.column_name);
+                    let mut fk_sql = format!(
+                        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({})",
+                        quote_ident(&constraint_name),
+                        quote_ident(field.column_name),
+                        quote_ident(parts[0]),
+                        quote_ident(parts[1])
+                    );
 
                     // Add ON DELETE action if specified
                     if let Some(on_delete) = field.on_delete {
@@ -119,10 +118,9 @@ impl<M: Model> CreateTable<M> {
 
     fn column_definition(&self, field: &FieldInfo) -> String {
         let sql_type = field.effective_sql_type();
-        let mut def = String::new();
-        def.push_str("  \"");
-        def.push_str(field.column_name);
-        def.push_str("\" ");
+        let mut def = String::from("  ");
+        def.push_str(&quote_ident(field.column_name));
+        def.push(' ');
         def.push_str(&sql_type);
 
         if !field.nullable && !field.auto_increment {
@@ -626,6 +624,32 @@ mod tests {
             FieldInfo::new("col", "col", SqlType::Text).sql_type_override("VARCHAR(255)");
         assert_eq!(field_with_override.effective_sql_type(), "VARCHAR(255)");
     }
+
+    #[test]
+    fn test_quote_ident_escapes_embedded_quotes() {
+        // Simple identifier - no escaping needed
+        assert_eq!(quote_ident("simple"), "\"simple\"");
+
+        // Identifier with embedded quote - must be doubled
+        assert_eq!(quote_ident("with\"quote"), "\"with\"\"quote\"");
+
+        // Identifier with multiple quotes
+        assert_eq!(quote_ident("a\"b\"c"), "\"a\"\"b\"\"c\"");
+
+        // Already-doubled quotes stay doubled-doubled
+        assert_eq!(quote_ident("test\"\"name"), "\"test\"\"\"\"name\"");
+    }
+
+    #[test]
+    fn test_schema_builder_index_with_special_chars() {
+        let statements = SchemaBuilder::new()
+            .create_index("idx\"test", "my\"table", &["col\"name"], false)
+            .build();
+        // Verify quotes are escaped (doubled)
+        assert!(statements[0].contains("\"idx\"\"test\""));
+        assert!(statements[0].contains("\"my\"\"table\""));
+        assert!(statements[0].contains("\"col\"\"name\""));
+    }
 }
 
 /// Builder for multiple schema operations.
@@ -657,16 +681,13 @@ impl SchemaBuilder {
     pub fn create_index(mut self, name: &str, table: &str, columns: &[&str], unique: bool) -> Self {
         let unique_str = if unique { "UNIQUE " } else { "" };
         let quoted_cols: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
-        let mut stmt = String::new();
-        stmt.push_str("CREATE ");
-        stmt.push_str(unique_str);
-        stmt.push_str("INDEX IF NOT EXISTS \"");
-        stmt.push_str(name);
-        stmt.push_str("\" ON \"");
-        stmt.push_str(table);
-        stmt.push_str("\" (");
-        stmt.push_str(&quoted_cols.join(", "));
-        stmt.push(')');
+        let stmt = format!(
+            "CREATE {}INDEX IF NOT EXISTS {} ON {} ({})",
+            unique_str,
+            quote_ident(name),
+            quote_ident(table),
+            quoted_cols.join(", ")
+        );
         self.statements.push(stmt);
         self
     }
