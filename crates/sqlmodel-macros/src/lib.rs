@@ -126,6 +126,9 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     // Generate model_config implementation
     let model_config_body = generate_model_config(model);
 
+    // Generate Debug impl only if any field has repr=false
+    let debug_impl = generate_debug_impl(model);
+
     quote::quote! {
         impl #impl_generics sqlmodel_core::Model for #name #ty_generics #where_clause {
             const TABLE_NAME: &'static str = #table_name;
@@ -159,6 +162,8 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
                 #model_config_body
             }
         }
+
+        #debug_impl
     }
 }
 
@@ -294,6 +299,31 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
             quote::quote! { None }
         };
 
+        // Const field
+        let const_field = field.const_field;
+
+        // Column constraints
+        let column_constraints = &field.column_constraints;
+        let column_constraints_token = if column_constraints.is_empty() {
+            quote::quote! { &[] }
+        } else {
+            quote::quote! { &[#(#column_constraints),*] }
+        };
+
+        // Column comment
+        let column_comment_token = if let Some(ref comment) = field.column_comment {
+            quote::quote! { Some(#comment) }
+        } else {
+            quote::quote! { None }
+        };
+
+        // Column info
+        let column_info_token = if let Some(ref info) = field.column_info {
+            quote::quote! { Some(#info) }
+        } else {
+            quote::quote! { None }
+        };
+
         // Decimal precision (max_digits -> precision, decimal_places -> scale)
         let precision_token = if let Some(p) = field.max_digits {
             quote::quote! { Some(#p) }
@@ -330,6 +360,10 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
                 .description_opt(#description_token)
                 .schema_extra_opt(#schema_extra_token)
                 .default_json_opt(#default_json_token)
+                .const_field(#const_field)
+                .column_constraints(#column_constraints_token)
+                .column_comment_opt(#column_comment_token)
+                .column_info_opt(#column_info_token)
         });
     }
 
@@ -550,6 +584,49 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
             revalidate_instances: #revalidate_instances,
             json_schema_extra: #json_schema_extra_token,
             title: #title_token,
+        }
+    }
+}
+
+/// Generate a custom Debug implementation if any field has repr=false.
+///
+/// This generates a Debug impl that excludes fields marked with `repr = false`,
+/// which is useful for hiding sensitive data like passwords from debug output.
+fn generate_debug_impl(model: &ModelDef) -> proc_macro2::TokenStream {
+    // Check if any field has repr=false
+    let has_hidden_fields = model.fields.iter().any(|f| !f.repr);
+
+    // Only generate custom Debug if there are hidden fields
+    if !has_hidden_fields {
+        return quote::quote! {};
+    }
+
+    let name = &model.name;
+    let (impl_generics, ty_generics, where_clause) = model.generics.split_for_impl();
+
+    // Generate field entries for Debug, excluding fields with repr=false
+    let debug_fields: Vec<_> = model
+        .fields
+        .iter()
+        .filter(|f| f.repr) // Only include fields with repr=true
+        .map(|f| {
+            let field_name = &f.name;
+            let field_name_str = field_name.to_string();
+            quote::quote! {
+                .field(#field_name_str, &self.#field_name)
+            }
+        })
+        .collect();
+
+    let struct_name_str = name.to_string();
+
+    quote::quote! {
+        impl #impl_generics ::core::fmt::Debug for #name #ty_generics #where_clause {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.debug_struct(#struct_name_str)
+                    #(#debug_fields)*
+                    .finish()
+            }
         }
     }
 }

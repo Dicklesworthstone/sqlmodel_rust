@@ -350,90 +350,20 @@ mod tests {
 
         fn fields() -> &'static [FieldInfo] {
             static FIELDS: &[FieldInfo] = &[
-                FieldInfo {
-                    name: "id",
-                    column_name: "id",
-                    sql_type: SqlType::BigInt,
-                    sql_type_override: None,
-                    precision: None,
-                    scale: None,
-                    nullable: true,
-                    primary_key: true,
-                    auto_increment: true,
-                    unique: false,
-                    default: None,
-                    foreign_key: None,
-                    on_delete: None,
-                    on_update: None,
-                    index: None,
-                    alias: None,
-                    validation_alias: None,
-                    serialization_alias: None,
-                    computed: false,
-                },
-                FieldInfo {
-                    name: "name",
-                    column_name: "name",
-                    sql_type: SqlType::Text,
-                    sql_type_override: Some("VARCHAR(100)"),
-                    precision: None,
-                    scale: None,
-                    nullable: false,
-                    primary_key: false,
-                    auto_increment: false,
-                    unique: true,
-                    default: None,
-                    foreign_key: None,
-                    on_delete: None,
-                    on_update: None,
-                    index: None,
-                    alias: None,
-                    validation_alias: None,
-                    serialization_alias: None,
-                    computed: false,
-                },
-                FieldInfo {
-                    name: "age",
-                    column_name: "age",
-                    sql_type: SqlType::Integer,
-                    sql_type_override: None,
-                    precision: None,
-                    scale: None,
-                    nullable: true,
-                    primary_key: false,
-                    auto_increment: false,
-                    unique: false,
-                    default: None,
-                    foreign_key: None,
-                    on_delete: None,
-                    on_update: None,
-                    index: Some("idx_heroes_age"),
-                    alias: None,
-                    validation_alias: None,
-                    serialization_alias: None,
-                    computed: false,
-                },
-                FieldInfo {
-                    name: "team_id",
-                    column_name: "team_id",
-                    sql_type: SqlType::BigInt,
-                    sql_type_override: None,
-                    precision: None,
-                    scale: None,
-                    nullable: true,
-                    primary_key: false,
-                    auto_increment: false,
-                    unique: false,
-                    default: None,
-                    foreign_key: Some("teams.id"),
-                    on_delete: Some(ReferentialAction::Cascade),
-                    on_update: None,
-                    index: None,
-                    alias: None,
-                    validation_alias: None,
-                    serialization_alias: None,
-                    computed: false,
-                },
+                FieldInfo::new("id", "id", SqlType::BigInt)
+                    .nullable(true)
+                    .primary_key(true)
+                    .auto_increment(true),
+                FieldInfo::new("name", "name", SqlType::Text)
+                    .sql_type_override("VARCHAR(100)")
+                    .unique(true),
+                FieldInfo::new("age", "age", SqlType::Integer)
+                    .nullable(true)
+                    .index("idx_heroes_age"),
+                FieldInfo::new("team_id", "team_id", SqlType::BigInt)
+                    .nullable(true)
+                    .foreign_key("teams.id")
+                    .on_delete(ReferentialAction::Cascade),
             ];
             FIELDS
         }
@@ -530,27 +460,12 @@ mod tests {
             const PRIMARY_KEY: &'static [&'static str] = &["id"];
 
             fn fields() -> &'static [FieldInfo] {
-                static FIELDS: &[FieldInfo] = &[FieldInfo {
-                    name: "id",
-                    column_name: "id",
-                    sql_type: SqlType::BigInt,
-                    sql_type_override: None,
-                    precision: None,
-                    scale: None,
-                    nullable: true,
-                    primary_key: true,
-                    auto_increment: true,
-                    unique: false,
-                    default: None,
-                    foreign_key: None,
-                    on_delete: None,
-                    on_update: None,
-                    index: None,
-                    alias: None,
-                    validation_alias: None,
-                    serialization_alias: None,
-                    computed: false,
-                }];
+                static FIELDS: &[FieldInfo] = &[
+                    FieldInfo::new("id", "id", SqlType::BigInt)
+                        .nullable(true)
+                        .primary_key(true)
+                        .auto_increment(true),
+                ];
                 FIELDS
             }
 

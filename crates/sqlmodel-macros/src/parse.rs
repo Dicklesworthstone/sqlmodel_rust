@@ -119,6 +119,18 @@ pub struct FieldDef {
     /// JSON representation of the field's default value (for exclude_defaults).
     /// Used by model_dump with exclude_defaults=true to compare current value.
     pub default_json: Option<String>,
+    /// Whether to include this field in Debug output (repr).
+    /// Defaults to true. Set to false for sensitive fields like passwords.
+    pub repr: bool,
+    /// Whether this field is constant (immutable after creation).
+    /// Const fields cannot be modified after initial construction.
+    pub const_field: bool,
+    /// Additional SQL constraints for DDL generation (e.g., CHECK constraints).
+    pub column_constraints: Vec<String>,
+    /// SQL comment for the column.
+    pub column_comment: Option<String>,
+    /// Extra metadata as JSON string.
+    pub column_info: Option<String>,
 }
 
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
@@ -678,6 +690,11 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         description: attrs.description,
         schema_extra: attrs.schema_extra,
         default_json: attrs.default_json,
+        repr: attrs.repr.unwrap_or(true), // Default to true if not specified
+        const_field: attrs.const_field,
+        column_constraints: attrs.column_constraints,
+        column_comment: attrs.column_comment,
+        column_info: attrs.column_info,
     })
 }
 
@@ -717,6 +734,17 @@ struct FieldAttrs {
     schema_extra: Option<String>,
     /// JSON representation of the field's default value (for exclude_defaults).
     default_json: Option<String>,
+    /// Whether to include this field in Debug output (repr).
+    /// Defaults to true (None means true).
+    repr: Option<bool>,
+    /// Whether this field is constant (immutable after creation).
+    const_field: bool,
+    /// Additional SQL constraints for DDL generation.
+    column_constraints: Vec<String>,
+    /// SQL comment for the column.
+    column_comment: Option<String>,
+    /// Extra metadata as JSON string.
+    column_info: Option<String>,
 }
 
 /// Detect the relationship kind from a field's Rust type.
@@ -986,6 +1014,51 @@ fn parse_field_attrs(
                         "expected string literal for default_json",
                     ));
                 }
+            } else if path.is_ident("repr") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Bool(lit_bool) = value {
+                    result.repr = Some(lit_bool.value);
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected boolean literal for repr",
+                    ));
+                }
+            } else if path.is_ident("const_field") {
+                result.const_field = true;
+            } else if path.is_ident("column_constraints") {
+                // Parse array of constraint strings: column_constraints = ["CHECK(...)", "CHECK(...)"]
+                let _eq: syn::Token![=] = meta.input.parse()?;
+                let content;
+                syn::bracketed!(content in meta.input);
+                while !content.is_empty() {
+                    let lit: syn::LitStr = content.parse()?;
+                    result.column_constraints.push(lit.value());
+                    if content.is_empty() {
+                        break;
+                    }
+                    let _: syn::Token![,] = content.parse()?;
+                }
+            } else if path.is_ident("column_comment") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.column_comment = Some(lit_str.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for column_comment",
+                    ));
+                }
+            } else if path.is_ident("column_info") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.column_info = Some(lit_str.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for column_info",
+                    ));
+                }
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -996,7 +1069,8 @@ fn parse_field_attrs(
                          Valid attributes are: primary_key, auto_increment, column, nullable, \
                          unique, foreign_key, on_delete, on_update, default, sql_type, index, \
                          skip, skip_insert, skip_update, relationship, alias, validation_alias, \
-                         serialization_alias, computed, max_digits, decimal_places, default_json"
+                         serialization_alias, computed, max_digits, decimal_places, default_json, repr, \
+                         const_field, column_constraints, column_comment, column_info"
                     ),
                 ));
             }
@@ -2601,5 +2675,226 @@ mod tests {
         let items_field = def.fields.iter().find(|f| f.name == "items").unwrap();
         assert_eq!(items_field.default_json, Some("[]".to_string()));
         assert!(items_field.nullable);
+    }
+
+    // =========================================================================
+    // Repr Field Control Tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_repr_default_true() {
+        // Fields without repr attribute should default to repr=true
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let id_field = def.fields.iter().find(|f| f.name == "id").unwrap();
+        assert!(id_field.repr); // Default should be true
+
+        let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
+        assert!(name_field.repr); // Default should be true
+    }
+
+    #[test]
+    fn test_parse_repr_false() {
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+                #[sqlmodel(repr = false)]
+                password: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let id_field = def.fields.iter().find(|f| f.name == "id").unwrap();
+        assert!(id_field.repr); // Default true
+
+        let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
+        assert!(name_field.repr); // Default true
+
+        let password_field = def.fields.iter().find(|f| f.name == "password").unwrap();
+        assert!(!password_field.repr); // Explicitly set to false
+    }
+
+    #[test]
+    fn test_parse_repr_true_explicit() {
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(repr = true)]
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
+        assert!(name_field.repr); // Explicitly set to true
+    }
+
+    #[test]
+    fn test_repr_combined_with_other_attrs() {
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(repr = false, alias = "pwd", exclude)]
+                password: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let password_field = def.fields.iter().find(|f| f.name == "password").unwrap();
+        assert!(!password_field.repr);
+        assert_eq!(password_field.alias, Some("pwd".to_string()));
+        assert!(password_field.exclude);
+    }
+
+    // =========================================================================
+    // Const Field Tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_const_field() {
+        let input: DeriveInput = parse_quote! {
+            struct Config {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(const_field)]
+                version: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let id_field = def.fields.iter().find(|f| f.name == "id").unwrap();
+        assert!(!id_field.const_field); // Default should be false
+
+        let version_field = def.fields.iter().find(|f| f.name == "version").unwrap();
+        assert!(version_field.const_field);
+    }
+
+    #[test]
+    fn test_const_field_combined_with_other_attrs() {
+        let input: DeriveInput = parse_quote! {
+            struct Config {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(const_field, default = "'1.0.0'")]
+                version: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let version_field = def.fields.iter().find(|f| f.name == "version").unwrap();
+        assert!(version_field.const_field);
+        assert_eq!(version_field.default, Some("'1.0.0'".to_string()));
+    }
+
+    // =========================================================================
+    // Column Constraints and Metadata Tests (sa_column_args, sa_column_kwargs)
+    // =========================================================================
+
+    #[test]
+    fn test_parse_column_constraints() {
+        let input: DeriveInput = parse_quote! {
+            struct Product {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(column_constraints = ["CHECK(price > 0)", "CHECK(price < 1000000)"])]
+                price: f64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let price_field = def.fields.iter().find(|f| f.name == "price").unwrap();
+        assert_eq!(price_field.column_constraints.len(), 2);
+        assert_eq!(price_field.column_constraints[0], "CHECK(price > 0)");
+        assert_eq!(price_field.column_constraints[1], "CHECK(price < 1000000)");
+    }
+
+    #[test]
+    fn test_parse_column_comment() {
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(column_comment = "The user's display name")]
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
+        assert_eq!(
+            name_field.column_comment,
+            Some("The user's display name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_column_info() {
+        let input: DeriveInput = parse_quote! {
+            struct User {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(column_info = r#"{"deprecated": true, "replacement": "user_email"}"#)]
+                email: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let email_field = def.fields.iter().find(|f| f.name == "email").unwrap();
+        assert_eq!(
+            email_field.column_info,
+            Some(r#"{"deprecated": true, "replacement": "user_email"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_column_constraints_combined_with_other_attrs() {
+        let input: DeriveInput = parse_quote! {
+            struct Product {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(
+                    column_constraints = ["CHECK(price > 0)"],
+                    column_comment = "Product price in cents",
+                    column_info = r#"{"currency": "USD"}"#,
+                    nullable
+                )]
+                price: Option<i32>,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let price_field = def.fields.iter().find(|f| f.name == "price").unwrap();
+        assert_eq!(price_field.column_constraints.len(), 1);
+        assert_eq!(price_field.column_constraints[0], "CHECK(price > 0)");
+        assert_eq!(
+            price_field.column_comment,
+            Some("Product price in cents".to_string())
+        );
+        assert_eq!(
+            price_field.column_info,
+            Some(r#"{"currency": "USD"}"#.to_string())
+        );
+        assert!(price_field.nullable);
     }
 }

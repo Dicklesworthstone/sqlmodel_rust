@@ -364,6 +364,9 @@ struct TrackedObject {
     pk_columns: Vec<&'static str>,
     /// Primary key values (for DELETE/UPDATE WHERE clause).
     pk_values: Vec<Value>,
+    /// Set of expired attribute names (None = all expired, Some(empty) = none expired).
+    /// When Some(non-empty), only those specific attributes need reload.
+    expired_attributes: Option<std::collections::HashSet<String>>,
 }
 
 // ============================================================================
@@ -479,6 +482,7 @@ impl<C: Connection> Session<C> {
             values,
             pk_columns,
             pk_values,
+            expired_attributes: None,
         };
 
         self.identity_map.insert(key, tracked);
@@ -586,11 +590,20 @@ impl<C: Connection> Session<C> {
         let pk_values = vec![pk_value.clone()];
         let key = ObjectKey::from_pk::<M>(&pk_values);
 
-        // Check identity map first
+        // Check identity map first (skip if expired - will reload below)
         if let Some(tracked) = self.identity_map.get(&key) {
-            if tracked.state != ObjectState::Deleted && tracked.state != ObjectState::Detached {
-                if let Some(obj) = tracked.object.downcast_ref::<M>() {
-                    return Outcome::Ok(Some(obj.clone()));
+            match tracked.state {
+                ObjectState::Deleted | ObjectState::Detached => {
+                    // Return None for deleted/detached objects
+                }
+                ObjectState::Expired => {
+                    // Skip cache, will reload from DB below
+                    tracing::debug!("Object is expired, reloading from database");
+                }
+                ObjectState::New | ObjectState::Persistent => {
+                    if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                        return Outcome::Ok(Some(obj.clone()));
+                    }
                 }
             }
         }
@@ -641,6 +654,7 @@ impl<C: Connection> Session<C> {
             values,
             pk_columns,
             pk_values: obj_pk_values,
+            expired_attributes: None,
         };
 
         self.identity_map.insert(key, tracked);
@@ -697,9 +711,18 @@ impl<C: Connection> Session<C> {
         // Check identity map first (unless with_for_update which needs fresh DB state)
         if !options.with_for_update {
             if let Some(tracked) = self.identity_map.get(&key) {
-                if tracked.state != ObjectState::Deleted && tracked.state != ObjectState::Detached {
-                    if let Some(obj) = tracked.object.downcast_ref::<M>() {
-                        return Outcome::Ok(Some(obj.clone()));
+                match tracked.state {
+                    ObjectState::Deleted | ObjectState::Detached => {
+                        // Return None for deleted/detached objects
+                    }
+                    ObjectState::Expired => {
+                        // Skip cache, will reload from DB below
+                        tracing::debug!("Object is expired, reloading from database");
+                    }
+                    ObjectState::New | ObjectState::Persistent => {
+                        if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                            return Outcome::Ok(Some(obj.clone()));
+                        }
                     }
                 }
             }
@@ -775,6 +798,7 @@ impl<C: Connection> Session<C> {
             values,
             pk_columns: pk_cols,
             pk_values: obj_pk_values,
+            expired_attributes: None,
         };
 
         self.identity_map.insert(key, tracked);
@@ -932,6 +956,217 @@ impl<C: Connection> Session<C> {
     pub fn object_state<M: Model + 'static>(&self, obj: &M) -> Option<ObjectState> {
         let key = ObjectKey::from_model(obj);
         self.identity_map.get(&key).map(|t| t.state)
+    }
+
+    // ========================================================================
+    // Expiration
+    // ========================================================================
+
+    /// Expire an object's cached attributes, forcing reload on next access.
+    ///
+    /// After calling this method, the next `get()` call for this object will reload
+    /// from the database instead of returning the cached version.
+    ///
+    /// # Arguments
+    ///
+    /// * `obj` - The object to expire.
+    /// * `attributes` - Optional list of attribute names to expire. If `None`, all
+    ///   attributes are expired.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Expire all attributes
+    /// session.expire(&user, None);
+    ///
+    /// // Expire specific attributes
+    /// session.expire(&user, Some(&["name", "email"]));
+    ///
+    /// // Next get() will reload from database
+    /// let refreshed = session.get::<User>(cx, user.id).await?;
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - Expiring an object does not discard pending changes. If the object has been
+    ///   modified but not flushed, those changes remain pending.
+    /// - Expiring a detached or new object has no effect.
+    #[tracing::instrument(level = "debug", skip(self, obj), fields(table = M::TABLE_NAME))]
+    pub fn expire<M: Model + 'static>(&mut self, obj: &M, attributes: Option<&[&str]>) {
+        let key = ObjectKey::from_model(obj);
+
+        let Some(tracked) = self.identity_map.get_mut(&key) else {
+            tracing::debug!("Object not tracked, nothing to expire");
+            return;
+        };
+
+        // Only expire persistent objects
+        match tracked.state {
+            ObjectState::New | ObjectState::Detached | ObjectState::Deleted => {
+                tracing::debug!(state = ?tracked.state, "Cannot expire object in this state");
+                return;
+            }
+            ObjectState::Persistent | ObjectState::Expired => {}
+        }
+
+        match attributes {
+            None => {
+                // Expire all attributes
+                tracked.state = ObjectState::Expired;
+                tracked.expired_attributes = None;
+                tracing::debug!("Expired all attributes");
+            }
+            Some(attrs) => {
+                // Expire specific attributes
+                let mut expired = tracked
+                    .expired_attributes
+                    .take()
+                    .unwrap_or_default();
+                for attr in attrs {
+                    expired.insert((*attr).to_string());
+                }
+                tracked.expired_attributes = Some(expired);
+
+                // If any attributes are expired, mark the object as expired
+                if tracked.state == ObjectState::Persistent {
+                    tracked.state = ObjectState::Expired;
+                }
+                tracing::debug!(attributes = ?attrs, "Expired specific attributes");
+            }
+        }
+    }
+
+    /// Expire all objects in the session.
+    ///
+    /// After calling this method, all tracked objects will be marked as expired.
+    /// The next access to any object will reload from the database.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Expire everything in the session
+    /// session.expire_all();
+    ///
+    /// // All subsequent get() calls will reload from database
+    /// let user = session.get::<User>(cx, 1).await?;  // Reloads from DB
+    /// let team = session.get::<Team>(cx, 1).await?;  // Reloads from DB
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - This does not affect new or deleted objects.
+    /// - Pending changes are not discarded.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub fn expire_all(&mut self) {
+        let mut expired_count = 0;
+        for tracked in self.identity_map.values_mut() {
+            if tracked.state == ObjectState::Persistent {
+                tracked.state = ObjectState::Expired;
+                tracked.expired_attributes = None;
+                expired_count += 1;
+            }
+        }
+        tracing::debug!(count = expired_count, "Expired all session objects");
+    }
+
+    /// Check if an object is expired (needs reload from database).
+    ///
+    /// Returns `true` if the object is marked as expired and will be reloaded
+    /// on the next access.
+    pub fn is_expired<M: Model + 'static>(&self, obj: &M) -> bool {
+        let key = ObjectKey::from_model(obj);
+        self.identity_map
+            .get(&key)
+            .is_some_and(|t| t.state == ObjectState::Expired)
+    }
+
+    /// Get the list of expired attribute names for an object.
+    ///
+    /// Returns:
+    /// - `None` if the object is not tracked or not expired
+    /// - `Some(None)` if all attributes are expired
+    /// - `Some(Some(set))` if only specific attributes are expired
+    pub fn expired_attributes<M: Model + 'static>(
+        &self,
+        obj: &M,
+    ) -> Option<Option<&std::collections::HashSet<String>>> {
+        let key = ObjectKey::from_model(obj);
+        let tracked = self.identity_map.get(&key)?;
+
+        if tracked.state != ObjectState::Expired {
+            return None;
+        }
+
+        Some(tracked.expired_attributes.as_ref())
+    }
+
+    /// Refresh an object by reloading it from the database.
+    ///
+    /// This method immediately reloads the object from the database, updating
+    /// the cached copy in the session. Unlike `expire()`, which defers the reload
+    /// until the next access, `refresh()` performs the reload immediately.
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - The async context for database operations.
+    /// * `obj` - The object to refresh.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Some(refreshed))` if the object was found in the database,
+    /// `Ok(None)` if the object no longer exists in the database, or an error.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Immediately reload from database
+    /// let refreshed = session.refresh(&cx, &user).await?;
+    ///
+    /// if let Some(user) = refreshed {
+    ///     println!("Refreshed: {}", user.name);
+    /// } else {
+    ///     println!("User was deleted from database");
+    /// }
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - This discards any changes in the session's cached copy.
+    /// - If the object has pending changes, they will be lost.
+    /// - If the object no longer exists in the database, it is removed from the session.
+    #[tracing::instrument(level = "debug", skip(self, cx, obj), fields(table = M::TABLE_NAME))]
+    pub async fn refresh<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        obj: &M,
+    ) -> Outcome<Option<M>, Error> {
+        let pk_values = obj.primary_key_value();
+        let key = ObjectKey::from_model(obj);
+
+        tracing::debug!(pk = ?pk_values, "Refreshing object from database");
+
+        // Remove from pending queues since we're reloading
+        self.pending_dirty.retain(|k| k != &key);
+
+        // Remove from identity map to force reload
+        self.identity_map.remove(&key);
+
+        // Reload from database
+        let result = self.get_by_pk::<M>(cx, &pk_values).await;
+
+        match &result {
+            Outcome::Ok(Some(_)) => {
+                tracing::debug!("Object refreshed successfully");
+            }
+            Outcome::Ok(None) => {
+                tracing::debug!("Object no longer exists in database");
+            }
+            _ => {}
+        }
+
+        result
     }
 
     // ========================================================================
@@ -1440,6 +1675,7 @@ impl<C: Connection> Session<C> {
                         values,
                         pk_columns: T::PRIMARY_KEY.to_vec(),
                         pk_values: pk_values.clone(),
+                        expired_attributes: None,
                     };
                     self.identity_map.insert(key, tracked);
 
@@ -3152,5 +3388,212 @@ mod tests {
         // New objects don't have original values to compare
         let modified = session.modified_attributes(&team);
         assert!(modified.is_empty());
+    }
+
+    // ==================== Expire Tests ====================
+
+    #[test]
+    fn test_expire_marks_object_as_expired() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object from DB (creates Persistent state)
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await);
+            assert!(team.is_some());
+            let team = team.unwrap();
+
+            // Verify it's not expired initially
+            assert!(!session.is_expired(&team));
+            assert_eq!(session.object_state(&team), Some(ObjectState::Persistent));
+
+            // Expire all attributes
+            session.expire(&team, None);
+
+            // Should now be expired
+            assert!(session.is_expired(&team));
+            assert_eq!(session.object_state(&team), Some(ObjectState::Expired));
+        });
+    }
+
+    #[test]
+    fn test_expire_specific_attributes() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object from DB
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+
+            // Expire specific attributes
+            session.expire(&team, Some(&["name"]));
+
+            // Should be expired
+            assert!(session.is_expired(&team));
+
+            // Check expired attributes
+            let expired = session.expired_attributes(&team);
+            assert!(expired.is_some());
+            let expired_set = expired.unwrap();
+            assert!(expired_set.is_some());
+            assert!(expired_set.unwrap().contains("name"));
+        });
+    }
+
+    #[test]
+    fn test_expire_all_marks_all_objects_expired() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get multiple objects from DB
+            let team1 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            let team2 = unwrap_outcome(session.get::<Team>(&cx, 2_i64).await).unwrap();
+
+            // Verify neither is expired
+            assert!(!session.is_expired(&team1));
+            assert!(!session.is_expired(&team2));
+
+            // Expire all
+            session.expire_all();
+
+            // Both should be expired
+            assert!(session.is_expired(&team1));
+            assert!(session.is_expired(&team2));
+        });
+    }
+
+    #[test]
+    fn test_expire_does_not_affect_new_objects() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        // Add a new object
+        let team = Team {
+            id: Some(100),
+            name: "New Team".to_string(),
+        };
+        session.add(&team);
+
+        // Try to expire it
+        session.expire(&team, None);
+
+        // Should still be New, not Expired
+        assert_eq!(session.object_state(&team), Some(ObjectState::New));
+        assert!(!session.is_expired(&team));
+    }
+
+    #[test]
+    fn test_expired_object_reloads_on_get() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object (query 1)
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert_eq!(team.name, "Avengers");
+
+            // Get again - should use cache (no additional query)
+            let team2 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert_eq!(team2.name, "Avengers");
+
+            // Verify only 1 query so far
+            {
+                let s = state.lock().expect("lock poisoned");
+                assert_eq!(s.query_calls, 1);
+            }
+
+            // Expire the object
+            session.expire(&team, None);
+
+            // Get again - should reload from DB (query 2)
+            let team3 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert_eq!(team3.name, "Avengers");
+
+            // Verify a second query was made
+            {
+                let s = state.lock().expect("lock poisoned");
+                assert_eq!(s.query_calls, 2);
+            }
+
+            // Should no longer be expired after reload
+            assert!(!session.is_expired(&team3));
+            assert_eq!(session.object_state(&team3), Some(ObjectState::Persistent));
+        });
+    }
+
+    #[test]
+    fn test_is_expired_returns_false_for_untracked() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let session = Session::<MockConnection>::new(conn);
+
+        let team = Team {
+            id: Some(999),
+            name: "Not Tracked".to_string(),
+        };
+
+        // Should return false for untracked objects
+        assert!(!session.is_expired(&team));
+    }
+
+    #[test]
+    fn test_expired_attributes_returns_none_for_persistent() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object (Persistent state)
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+
+            // Should return None for non-expired objects
+            let expired = session.expired_attributes(&team);
+            assert!(expired.is_none());
+        });
     }
 }

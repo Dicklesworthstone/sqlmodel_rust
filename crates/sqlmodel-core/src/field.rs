@@ -117,6 +117,19 @@ pub struct FieldInfo {
     /// Whether this field has a default value (used for exclude_unset tracking).
     /// Fields with defaults can be distinguished from fields that were explicitly set.
     pub has_default: bool,
+    /// Whether this field is constant (immutable after creation).
+    /// Const fields cannot be modified after initial construction.
+    /// This is enforced at validation/session level, not compile-time.
+    pub const_field: bool,
+    /// Additional SQL constraints for DDL generation (e.g., CHECK constraints).
+    /// Each string is a SQL constraint expression that will be added to the column definition.
+    pub column_constraints: &'static [&'static str],
+    /// SQL comment for the column (used in DDL generation).
+    /// This maps to the COMMENT ON COLUMN or inline COMMENT clause depending on the database.
+    pub column_comment: Option<&'static str>,
+    /// Extra metadata as JSON string (for custom extensions/info).
+    /// This can be used to store additional information that doesn't fit in other fields.
+    pub column_info: Option<&'static str>,
 }
 
 impl FieldInfo {
@@ -148,6 +161,10 @@ impl FieldInfo {
             schema_extra: None,
             default_json: None,
             has_default: false,
+            const_field: false,
+            column_constraints: &[],
+            column_comment: None,
+            column_info: None,
         }
     }
 
@@ -502,6 +519,68 @@ impl FieldInfo {
     /// to be explicitly set.
     pub const fn has_default(mut self, value: bool) -> Self {
         self.has_default = value;
+        self
+    }
+
+    /// Mark this field as constant (immutable after creation).
+    ///
+    /// Const fields cannot be modified after the model is initially created.
+    /// This is useful for version numbers, creation timestamps, or other
+    /// immutable identifiers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// FieldInfo::new("version", "version", SqlType::Text)
+    ///     .const_field(true)
+    /// ```
+    pub const fn const_field(mut self, value: bool) -> Self {
+        self.const_field = value;
+        self
+    }
+
+    /// Set additional SQL constraints for DDL generation.
+    ///
+    /// These constraints are added to the column definition.
+    /// Common uses include CHECK constraints.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// FieldInfo::new("age", "age", SqlType::Integer)
+    ///     .column_constraints(&["CHECK(age >= 0)", "CHECK(age <= 150)"])
+    /// ```
+    pub const fn column_constraints(mut self, constraints: &'static [&'static str]) -> Self {
+        self.column_constraints = constraints;
+        self
+    }
+
+    /// Set a SQL comment for the column.
+    ///
+    /// The comment will be included in DDL generation.
+    pub const fn column_comment(mut self, comment: &'static str) -> Self {
+        self.column_comment = Some(comment);
+        self
+    }
+
+    /// Set column comment from optional.
+    pub const fn column_comment_opt(mut self, comment: Option<&'static str>) -> Self {
+        self.column_comment = comment;
+        self
+    }
+
+    /// Set extra metadata as JSON string.
+    ///
+    /// This can be used for custom extensions or information
+    /// that doesn't fit in other fields.
+    pub const fn column_info(mut self, info: &'static str) -> Self {
+        self.column_info = Some(info);
+        self
+    }
+
+    /// Set column info from optional.
+    pub const fn column_info_opt(mut self, info: Option<&'static str>) -> Self {
+        self.column_info = info;
         self
     }
 
@@ -1000,5 +1079,61 @@ mod tests {
         assert_eq!(field.title, Some("User Name"));
         assert_eq!(field.description, Some("The full name of the user"));
         assert_eq!(field.schema_extra, Some(r#"{"examples": ["John Doe"]}"#));
+    }
+
+    #[test]
+    fn test_field_info_const_field() {
+        // Default should be false
+        let field1 = FieldInfo::new("version", "version", SqlType::Text);
+        assert!(!field1.const_field);
+
+        // Explicitly set to true
+        let field2 = FieldInfo::new("version", "version", SqlType::Text).const_field(true);
+        assert!(field2.const_field);
+
+        // Can combine with other attributes
+        let field3 = FieldInfo::new("version", "version", SqlType::Text)
+            .const_field(true)
+            .default("'1.0.0'");
+        assert!(field3.const_field);
+        assert_eq!(field3.default, Some("'1.0.0'"));
+    }
+
+    #[test]
+    fn test_field_info_column_constraints() {
+        // Default should be empty
+        let field1 = FieldInfo::new("price", "price", SqlType::Integer);
+        assert!(field1.column_constraints.is_empty());
+
+        // With constraints
+        static CONSTRAINTS: &[&str] = &["CHECK(price > 0)", "CHECK(price < 1000)"];
+        let field2 =
+            FieldInfo::new("price", "price", SqlType::Integer).column_constraints(CONSTRAINTS);
+        assert_eq!(field2.column_constraints.len(), 2);
+        assert_eq!(field2.column_constraints[0], "CHECK(price > 0)");
+    }
+
+    #[test]
+    fn test_field_info_column_comment() {
+        // Default should be None
+        let field1 = FieldInfo::new("name", "name", SqlType::Text);
+        assert_eq!(field1.column_comment, None);
+
+        // With comment
+        let field2 =
+            FieldInfo::new("name", "name", SqlType::Text).column_comment("User's display name");
+        assert_eq!(field2.column_comment, Some("User's display name"));
+    }
+
+    #[test]
+    fn test_field_info_column_info() {
+        // Default should be None
+        let field1 = FieldInfo::new("email", "email", SqlType::Text);
+        assert_eq!(field1.column_info, None);
+
+        // With info
+        let field2 =
+            FieldInfo::new("email", "email", SqlType::Text).column_info(r#"{"deprecated": true}"#);
+        assert_eq!(field2.column_info, Some(r#"{"deprecated": true}"#));
     }
 }

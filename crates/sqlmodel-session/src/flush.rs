@@ -711,27 +711,11 @@ mod tests {
         const PRIMARY_KEY: &'static [&'static str] = &["id"];
 
         fn fields() -> &'static [FieldInfo] {
-            static FIELDS: [FieldInfo; 1] = [FieldInfo {
-                name: "id",
-                column_name: "id",
-                sql_type: sqlmodel_core::SqlType::BigInt,
-                sql_type_override: None,
-                precision: None,
-                scale: None,
-                nullable: false,
-                primary_key: true,
-                auto_increment: true,
-                unique: false,
-                default: None,
-                foreign_key: None,
-                on_delete: None,
-                on_update: None,
-                index: None,
-                alias: None,
-                validation_alias: None,
-                serialization_alias: None,
-                computed: false,
-            }];
+            static FIELDS: [FieldInfo; 1] = [
+                FieldInfo::new("id", "id", sqlmodel_core::SqlType::BigInt)
+                    .primary_key(true)
+                    .auto_increment(true),
+            ];
             &FIELDS
         }
 
@@ -758,48 +742,12 @@ mod tests {
 
         fn fields() -> &'static [FieldInfo] {
             static FIELDS: [FieldInfo; 2] = [
-                FieldInfo {
-                    name: "id",
-                    column_name: "id",
-                    sql_type: sqlmodel_core::SqlType::BigInt,
-                    sql_type_override: None,
-                    precision: None,
-                    scale: None,
-                    nullable: false,
-                    primary_key: true,
-                    auto_increment: true,
-                    unique: false,
-                    default: None,
-                    foreign_key: None,
-                    on_delete: None,
-                    on_update: None,
-                    index: None,
-                    alias: None,
-                    validation_alias: None,
-                    serialization_alias: None,
-                    computed: false,
-                },
-                FieldInfo {
-                    name: "team_id",
-                    column_name: "team_id",
-                    sql_type: sqlmodel_core::SqlType::BigInt,
-                    sql_type_override: None,
-                    precision: None,
-                    scale: None,
-                    nullable: true,
-                    primary_key: false,
-                    auto_increment: false,
-                    unique: false,
-                    default: None,
-                    foreign_key: Some("teams.id"),
-                    on_delete: None,
-                    on_update: None,
-                    index: None,
-                    alias: None,
-                    validation_alias: None,
-                    serialization_alias: None,
-                    computed: false,
-                },
+                FieldInfo::new("id", "id", sqlmodel_core::SqlType::BigInt)
+                    .primary_key(true)
+                    .auto_increment(true),
+                FieldInfo::new("team_id", "team_id", sqlmodel_core::SqlType::BigInt)
+                    .nullable(true)
+                    .foreign_key("teams.id"),
             ];
             &FIELDS
         }

@@ -814,7 +814,9 @@ pub trait SqlModelDump: Model + serde::Serialize {
                     if let Some(default_json) = field.default_json {
                         if let Some(current_value) = map.get(field.name) {
                             // Parse the default JSON and compare
-                            if let Ok(default_value) = serde_json::from_str::<serde_json::Value>(default_json) {
+                            if let Ok(default_value) =
+                                serde_json::from_str::<serde_json::Value>(default_json)
+                            {
                                 if current_value == &default_value {
                                     map.remove(field.name);
                                 }
@@ -915,9 +917,261 @@ pub trait SqlModelDump: Model + serde::Serialize {
 /// Blanket implementation for all Model types that implement Serialize.
 impl<T: Model + serde::Serialize> SqlModelDump for T {}
 
+// ============================================================================
+// Model Update (sqlmodel_update)
+// ============================================================================
+
+/// Input types for sqlmodel_update().
+///
+/// Supports updating models from various input formats.
+#[derive(Debug, Clone)]
+pub enum UpdateInput {
+    /// A HashMap of field names to JSON values.
+    Dict(HashMap<String, serde_json::Value>),
+    /// A serde_json::Value for direct updating.
+    JsonValue(serde_json::Value),
+}
+
+impl From<HashMap<String, serde_json::Value>> for UpdateInput {
+    fn from(map: HashMap<String, serde_json::Value>) -> Self {
+        UpdateInput::Dict(map)
+    }
+}
+
+impl From<serde_json::Value> for UpdateInput {
+    fn from(value: serde_json::Value) -> Self {
+        UpdateInput::JsonValue(value)
+    }
+}
+
+impl From<HashMap<String, Value>> for UpdateInput {
+    fn from(map: HashMap<String, Value>) -> Self {
+        let json_map: HashMap<String, serde_json::Value> = map
+            .into_iter()
+            .map(|(k, v)| (k, value_to_json(v)))
+            .collect();
+        UpdateInput::Dict(json_map)
+    }
+}
+
+/// Options for sqlmodel_update().
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    /// Only update these fields (if Some). Other fields in the source are ignored.
+    pub update_fields: Option<std::collections::HashSet<String>>,
+}
+
+impl UpdateOptions {
+    /// Create new default options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set fields to update.
+    pub fn update_fields(mut self, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.update_fields = Some(fields.into_iter().map(Into::into).collect());
+        self
+    }
+}
+
+/// Trait for models that support sqlmodel_update().
+///
+/// This enables updating a model instance from a dictionary or another model's values.
+///
+/// # Example
+///
+/// ```ignore
+/// use sqlmodel_core::validate::{SqlModelUpdate, UpdateInput, UpdateOptions};
+///
+/// let mut user = User { id: 1, name: "Alice".to_string(), age: 30 };
+///
+/// // Update from a HashMap
+/// user.sqlmodel_update(
+///     HashMap::from([("name".to_string(), serde_json::json!("Bob"))]),
+///     UpdateOptions::default()
+/// )?;
+/// assert_eq!(user.name, "Bob");
+///
+/// // Update only specific fields
+/// user.sqlmodel_update(
+///     HashMap::from([
+///         ("name".to_string(), serde_json::json!("Carol")),
+///         ("age".to_string(), serde_json::json!(25))
+///     ]),
+///     UpdateOptions::default().update_fields(["name"])
+/// )?;
+/// assert_eq!(user.name, "Carol");
+/// assert_eq!(user.age, 30); // age was not updated
+/// ```
+pub trait SqlModelUpdate: Model + serde::Serialize + DeserializeOwned {
+    /// Update a model instance from input.
+    ///
+    /// This method merges values from the input into the current model.
+    /// Only fields present in the input (and allowed by `update_fields` option)
+    /// are updated.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - The source of update values (Dict or JsonValue)
+    /// * `options` - Update options controlling which fields to update
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if the update succeeds, or a validation error if the resulting
+    /// model fails validation.
+    fn sqlmodel_update(
+        &mut self,
+        input: impl Into<UpdateInput>,
+        options: UpdateOptions,
+    ) -> ValidateResult<()> {
+        let input = input.into();
+
+        // Convert input to a map
+        let update_map = match input {
+            UpdateInput::Dict(map) => map,
+            UpdateInput::JsonValue(value) => {
+                if let serde_json::Value::Object(map) = value {
+                    map.into_iter().collect()
+                } else {
+                    let mut err = ValidationError::new();
+                    err.add(
+                        "_update",
+                        ValidationErrorKind::Custom,
+                        "Update input must be an object".to_string(),
+                    );
+                    return Err(err);
+                }
+            }
+        };
+
+        // Serialize current model to JSON
+        let mut current = serde_json::to_value(&*self).map_err(|e| {
+            let mut err = ValidationError::new();
+            err.add(
+                "_model",
+                ValidationErrorKind::Custom,
+                format!("Failed to serialize model: {e}"),
+            );
+            err
+        })?;
+
+        // Get valid field names from model metadata
+        let valid_fields: std::collections::HashSet<&str> =
+            Self::fields().iter().map(|f| f.name).collect();
+
+        // Update the current JSON with new values
+        if let serde_json::Value::Object(ref mut current_map) = current {
+            for (key, value) in update_map {
+                // Check if field is valid
+                if !valid_fields.contains(key.as_str()) {
+                    let mut err = ValidationError::new();
+                    err.add(
+                        &key,
+                        ValidationErrorKind::Custom,
+                        format!("Unknown field: {key}"),
+                    );
+                    return Err(err);
+                }
+
+                // Check if field is allowed by update_fields option
+                if let Some(ref allowed) = options.update_fields {
+                    if !allowed.contains(&key) {
+                        continue; // Skip fields not in update_fields
+                    }
+                }
+
+                // Update the field
+                current_map.insert(key, value);
+            }
+        }
+
+        // Deserialize back to model (this also validates)
+        let updated: Self = serde_json::from_value(current).map_err(|e| {
+            let mut err = ValidationError::new();
+            err.add(
+                "_model",
+                ValidationErrorKind::Custom,
+                format!("Update failed validation: {e}"),
+            );
+            err
+        })?;
+
+        // Replace self with the updated model
+        *self = updated;
+
+        Ok(())
+    }
+
+    /// Update a model instance from a HashMap with default options.
+    fn sqlmodel_update_dict(
+        &mut self,
+        dict: HashMap<String, serde_json::Value>,
+    ) -> ValidateResult<()> {
+        self.sqlmodel_update(dict, UpdateOptions::default())
+    }
+
+    /// Copy non-None/non-null values from another model into this one.
+    ///
+    /// This is useful for partial updates where you have a "patch" model
+    /// with only the fields that should be updated (non-None values).
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The source model to copy values from
+    /// * `options` - Update options controlling which fields to update
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut user = User { id: 1, name: "Alice".to_string(), age: Some(30) };
+    /// let patch = User { id: 0, name: "Bob".to_string(), age: None };
+    ///
+    /// // Only update name, skip None age
+    /// user.sqlmodel_update_from(&patch, UpdateOptions::default())?;
+    /// assert_eq!(user.name, "Bob");
+    /// assert_eq!(user.age, Some(30)); // Unchanged because patch.age is None
+    /// ```
+    fn sqlmodel_update_from(&mut self, source: &Self, options: UpdateOptions) -> ValidateResult<()>
+    where
+        Self: Sized,
+    {
+        // Serialize source to JSON
+        let source_json = serde_json::to_value(source).map_err(|e| {
+            let mut err = ValidationError::new();
+            err.add(
+                "_source",
+                ValidationErrorKind::Custom,
+                format!("Failed to serialize source model: {e}"),
+            );
+            err
+        })?;
+
+        // Filter out null values (None fields)
+        let update_map: HashMap<String, serde_json::Value> = if let serde_json::Value::Object(map) =
+            source_json
+        {
+            map.into_iter().filter(|(_, v)| !v.is_null()).collect()
+        } else {
+            let mut err = ValidationError::new();
+            err.add(
+                "_source",
+                ValidationErrorKind::Custom,
+                "Source model must serialize to an object".to_string(),
+            );
+            return Err(err);
+        };
+
+        self.sqlmodel_update(update_map, options)
+    }
+}
+
+/// Blanket implementation for all Model types that implement Serialize + DeserializeOwned.
+impl<T: Model + serde::Serialize + DeserializeOwned> SqlModelUpdate for T {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn test_matches_email_pattern() {
@@ -1847,10 +2101,10 @@ mod tests {
     struct TestModelWithDefaults {
         id: i64,
         name: String,
-        count: i32,       // default: 0
-        active: bool,     // default: false
-        score: f64,       // default: 0.0
-        label: String,    // default: "default"
+        count: i32,    // default: 0
+        active: bool,  // default: false
+        score: f64,    // default: 0.0
+        label: String, // default: "default"
     }
 
     impl Model for TestModelWithDefaults {
@@ -1861,14 +2115,10 @@ mod tests {
             static FIELDS: &[FieldInfo] = &[
                 FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
                 FieldInfo::new("name", "name", SqlType::Text),
-                FieldInfo::new("count", "count", SqlType::Integer)
-                    .default_json("0"),
-                FieldInfo::new("active", "active", SqlType::Boolean)
-                    .default_json("false"),
-                FieldInfo::new("score", "score", SqlType::Double)
-                    .default_json("0.0"),
-                FieldInfo::new("label", "label", SqlType::Text)
-                    .default_json("\"default\""),
+                FieldInfo::new("count", "count", SqlType::Integer).default_json("0"),
+                FieldInfo::new("active", "active", SqlType::Boolean).default_json("false"),
+                FieldInfo::new("score", "score", SqlType::Double).default_json("0.0"),
+                FieldInfo::new("label", "label", SqlType::Text).default_json("\"default\""),
             ];
             FIELDS
         }
@@ -1909,9 +2159,9 @@ mod tests {
         let model = TestModelWithDefaults {
             id: 1,
             name: "Test".to_string(),
-            count: 0,           // at default
-            active: false,      // at default
-            score: 0.0,         // at default
+            count: 0,                     // at default
+            active: false,                // at default
+            score: 0.0,                   // at default
             label: "default".to_string(), // at default
         };
 
@@ -1935,9 +2185,9 @@ mod tests {
         let model = TestModelWithDefaults {
             id: 1,
             name: "Test".to_string(),
-            count: 42,          // not at default
-            active: true,       // not at default
-            score: 3.14,        // not at default
+            count: 42,                   // not at default
+            active: true,                // not at default
+            score: 3.5,                  // not at default
             label: "custom".to_string(), // not at default
         };
 
@@ -1956,7 +2206,7 @@ mod tests {
         // Verify values
         assert_eq!(json["count"], 42);
         assert_eq!(json["active"], true);
-        assert_eq!(json["score"], 3.14);
+        assert_eq!(json["score"], 3.5);
         assert_eq!(json["label"], "custom");
     }
 
@@ -1965,9 +2215,9 @@ mod tests {
         let model = TestModelWithDefaults {
             id: 1,
             name: "Test".to_string(),
-            count: 0,           // at default
-            active: true,       // not at default
-            score: 0.0,         // at default
+            count: 0,                    // at default
+            active: true,                // not at default
+            score: 0.0,                  // at default
             label: "custom".to_string(), // not at default
         };
 
@@ -1994,9 +2244,9 @@ mod tests {
         let model = TestModelWithDefaults {
             id: 1,
             name: "Test".to_string(),
-            count: 0,           // at default
-            active: false,      // at default
-            score: 0.0,         // at default
+            count: 0,                     // at default
+            active: false,                // at default
+            score: 0.0,                   // at default
             label: "default".to_string(), // at default
         };
 
@@ -2077,30 +2327,334 @@ mod tests {
 
         // count is not at default, should appear with alias
         assert!(json.get("count").is_none()); // Original name not present
-        assert_eq!(json["itemCount"], 5);     // Alias is present
+        assert_eq!(json["itemCount"], 5); // Alias is present
     }
 
     #[test]
     fn test_field_info_default_json() {
         // Test the FieldInfo builder methods for default_json
-        let field1 = FieldInfo::new("count", "count", SqlType::Integer)
-            .default_json("0");
+        let field1 = FieldInfo::new("count", "count", SqlType::Integer).default_json("0");
         assert_eq!(field1.default_json, Some("0"));
         assert!(field1.has_default);
 
-        let field2 = FieldInfo::new("name", "name", SqlType::Text)
-            .default_json_opt(Some("\"hello\""));
+        let field2 =
+            FieldInfo::new("name", "name", SqlType::Text).default_json_opt(Some("\"hello\""));
         assert_eq!(field2.default_json, Some("\"hello\""));
         assert!(field2.has_default);
 
-        let field3 = FieldInfo::new("name", "name", SqlType::Text)
-            .default_json_opt(None);
+        let field3 = FieldInfo::new("name", "name", SqlType::Text).default_json_opt(None);
         assert_eq!(field3.default_json, None);
         assert!(!field3.has_default);
 
-        let field4 = FieldInfo::new("flag", "flag", SqlType::Boolean)
-            .has_default(true);
+        let field4 = FieldInfo::new("flag", "flag", SqlType::Boolean).has_default(true);
         assert!(field4.has_default);
         assert_eq!(field4.default_json, None); // has_default alone doesn't set default_json
+    }
+
+    // ==================== SqlModelUpdate Tests ====================
+
+    #[test]
+    fn test_sqlmodel_update_from_dict() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct TestUser {
+            id: i64,
+            name: String,
+            age: i32,
+        }
+
+        impl Model for TestUser {
+            const TABLE_NAME: &'static str = "users";
+            const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+            fn fields() -> &'static [FieldInfo] {
+                static FIELDS: &[FieldInfo] = &[
+                    FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                    FieldInfo::new("name", "name", SqlType::Text),
+                    FieldInfo::new("age", "age", SqlType::Integer),
+                ];
+                FIELDS
+            }
+
+            fn to_row(&self) -> Vec<(&'static str, Value)> {
+                vec![
+                    ("id", Value::BigInt(self.id)),
+                    ("name", Value::Text(self.name.clone())),
+                    ("age", Value::Int(self.age)),
+                ]
+            }
+
+            fn from_row(row: &Row) -> crate::Result<Self> {
+                Ok(Self {
+                    id: row.get_named("id")?,
+                    name: row.get_named("name")?,
+                    age: row.get_named("age")?,
+                })
+            }
+
+            fn primary_key_value(&self) -> Vec<Value> {
+                vec![Value::BigInt(self.id)]
+            }
+
+            fn is_new(&self) -> bool {
+                false
+            }
+        }
+
+        let mut user = TestUser {
+            id: 1,
+            name: "Alice".to_string(),
+            age: 30,
+        };
+
+        // Update name only
+        let update = HashMap::from([("name".to_string(), serde_json::json!("Bob"))]);
+        user.sqlmodel_update(update, UpdateOptions::default()).unwrap();
+
+        assert_eq!(user.name, "Bob");
+        assert_eq!(user.age, 30); // Unchanged
+    }
+
+    #[test]
+    fn test_sqlmodel_update_with_update_fields_filter() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct TestUser {
+            id: i64,
+            name: String,
+            age: i32,
+        }
+
+        impl Model for TestUser {
+            const TABLE_NAME: &'static str = "users";
+            const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+            fn fields() -> &'static [FieldInfo] {
+                static FIELDS: &[FieldInfo] = &[
+                    FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                    FieldInfo::new("name", "name", SqlType::Text),
+                    FieldInfo::new("age", "age", SqlType::Integer),
+                ];
+                FIELDS
+            }
+
+            fn to_row(&self) -> Vec<(&'static str, Value)> {
+                vec![
+                    ("id", Value::BigInt(self.id)),
+                    ("name", Value::Text(self.name.clone())),
+                    ("age", Value::Int(self.age)),
+                ]
+            }
+
+            fn from_row(row: &Row) -> crate::Result<Self> {
+                Ok(Self {
+                    id: row.get_named("id")?,
+                    name: row.get_named("name")?,
+                    age: row.get_named("age")?,
+                })
+            }
+
+            fn primary_key_value(&self) -> Vec<Value> {
+                vec![Value::BigInt(self.id)]
+            }
+
+            fn is_new(&self) -> bool {
+                false
+            }
+        }
+
+        let mut user = TestUser {
+            id: 1,
+            name: "Alice".to_string(),
+            age: 30,
+        };
+
+        // Try to update both name and age, but only allow name
+        let update = HashMap::from([
+            ("name".to_string(), serde_json::json!("Bob")),
+            ("age".to_string(), serde_json::json!(25)),
+        ]);
+        user.sqlmodel_update(update, UpdateOptions::default().update_fields(["name"]))
+            .unwrap();
+
+        assert_eq!(user.name, "Bob"); // Updated
+        assert_eq!(user.age, 30); // Not updated because not in update_fields
+    }
+
+    #[test]
+    fn test_sqlmodel_update_invalid_field_error() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct TestUser {
+            id: i64,
+            name: String,
+        }
+
+        impl Model for TestUser {
+            const TABLE_NAME: &'static str = "users";
+            const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+            fn fields() -> &'static [FieldInfo] {
+                static FIELDS: &[FieldInfo] = &[
+                    FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                    FieldInfo::new("name", "name", SqlType::Text),
+                ];
+                FIELDS
+            }
+
+            fn to_row(&self) -> Vec<(&'static str, Value)> {
+                vec![
+                    ("id", Value::BigInt(self.id)),
+                    ("name", Value::Text(self.name.clone())),
+                ]
+            }
+
+            fn from_row(row: &Row) -> crate::Result<Self> {
+                Ok(Self {
+                    id: row.get_named("id")?,
+                    name: row.get_named("name")?,
+                })
+            }
+
+            fn primary_key_value(&self) -> Vec<Value> {
+                vec![Value::BigInt(self.id)]
+            }
+
+            fn is_new(&self) -> bool {
+                false
+            }
+        }
+
+        let mut user = TestUser {
+            id: 1,
+            name: "Alice".to_string(),
+        };
+
+        // Try to update an invalid field
+        let update = HashMap::from([("invalid_field".to_string(), serde_json::json!("value"))]);
+        let result = user.sqlmodel_update(update, UpdateOptions::default());
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.errors.iter().any(|e| e.field == "invalid_field"));
+    }
+
+    #[test]
+    fn test_sqlmodel_update_from_model() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct TestUser {
+            id: i64,
+            name: String,
+            email: Option<String>,
+        }
+
+        impl Model for TestUser {
+            const TABLE_NAME: &'static str = "users";
+            const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+            fn fields() -> &'static [FieldInfo] {
+                static FIELDS: &[FieldInfo] = &[
+                    FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                    FieldInfo::new("name", "name", SqlType::Text),
+                    FieldInfo::new("email", "email", SqlType::Text).nullable(true),
+                ];
+                FIELDS
+            }
+
+            fn to_row(&self) -> Vec<(&'static str, Value)> {
+                vec![
+                    ("id", Value::BigInt(self.id)),
+                    ("name", Value::Text(self.name.clone())),
+                    (
+                        "email",
+                        self.email.clone().map_or(Value::Null, Value::Text),
+                    ),
+                ]
+            }
+
+            fn from_row(row: &Row) -> crate::Result<Self> {
+                Ok(Self {
+                    id: row.get_named("id")?,
+                    name: row.get_named("name")?,
+                    email: row.get_named("email").ok(),
+                })
+            }
+
+            fn primary_key_value(&self) -> Vec<Value> {
+                vec![Value::BigInt(self.id)]
+            }
+
+            fn is_new(&self) -> bool {
+                false
+            }
+        }
+
+        let mut user = TestUser {
+            id: 1,
+            name: "Alice".to_string(),
+            email: Some("alice@example.com".to_string()),
+        };
+
+        // Patch with only name set (email is None)
+        let patch = TestUser {
+            id: 0, // Will be ignored since we're copying non-null values
+            name: "Bob".to_string(),
+            email: None, // Should not overwrite existing email
+        };
+
+        user.sqlmodel_update_from(&patch, UpdateOptions::default())
+            .unwrap();
+
+        assert_eq!(user.name, "Bob"); // Updated
+        assert_eq!(user.email, Some("alice@example.com".to_string())); // Not updated (patch.email was None)
+    }
+
+    #[test]
+    fn test_sqlmodel_update_dict_convenience() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct TestItem {
+            id: i64,
+            count: i32,
+        }
+
+        impl Model for TestItem {
+            const TABLE_NAME: &'static str = "items";
+            const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+            fn fields() -> &'static [FieldInfo] {
+                static FIELDS: &[FieldInfo] = &[
+                    FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                    FieldInfo::new("count", "count", SqlType::Integer),
+                ];
+                FIELDS
+            }
+
+            fn to_row(&self) -> Vec<(&'static str, Value)> {
+                vec![
+                    ("id", Value::BigInt(self.id)),
+                    ("count", Value::Int(self.count)),
+                ]
+            }
+
+            fn from_row(row: &Row) -> crate::Result<Self> {
+                Ok(Self {
+                    id: row.get_named("id")?,
+                    count: row.get_named("count")?,
+                })
+            }
+
+            fn primary_key_value(&self) -> Vec<Value> {
+                vec![Value::BigInt(self.id)]
+            }
+
+            fn is_new(&self) -> bool {
+                false
+            }
+        }
+
+        let mut item = TestItem { id: 1, count: 10 };
+
+        // Use the convenience method
+        item.sqlmodel_update_dict(HashMap::from([("count".to_string(), serde_json::json!(20))]))
+            .unwrap();
+
+        assert_eq!(item.count, 20);
     }
 }
