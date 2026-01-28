@@ -34,12 +34,14 @@
 
 pub mod change_tracker;
 pub mod flush;
+pub mod identity_map;
 pub mod n1_detection;
 
 pub use change_tracker::{ChangeTracker, ObjectSnapshot};
 pub use flush::{
     FlushOrderer, FlushPlan, FlushResult, LinkTableOp, PendingOp, execute_link_table_ops,
 };
+pub use identity_map::{IdentityMap, ModelReadGuard, ModelRef, ModelWriteGuard, WeakIdentityMap};
 pub use n1_detection::{CallSite, N1DetectionScope, N1QueryTracker, N1Stats};
 
 use asupersync::{Cx, Outcome};
