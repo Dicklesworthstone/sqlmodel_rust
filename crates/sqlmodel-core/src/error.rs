@@ -212,6 +212,8 @@ pub enum ValidationErrorKind {
     Required,
     /// Custom validation failed
     Custom,
+    /// Model-level validation failed
+    Model,
 }
 
 impl ValidationError {
@@ -306,6 +308,14 @@ impl ValidationError {
     /// Add a custom validation error.
     pub fn add_custom(&mut self, field: impl Into<String>, message: impl Into<String>) {
         self.add(field, ValidationErrorKind::Custom, message);
+    }
+
+    /// Add a model-level validation error.
+    ///
+    /// Model-level validators check cross-field constraints or validate the
+    /// entire model state. The error is recorded with field "__model__".
+    pub fn add_model_error(&mut self, message: impl Into<String>) {
+        self.add("__model__", ValidationErrorKind::Model, message);
     }
 
     /// Convert to Result, returning Ok(()) if no errors, Err(self) otherwise.

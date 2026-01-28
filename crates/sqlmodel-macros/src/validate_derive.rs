@@ -10,6 +10,25 @@ use syn::{
     Type,
 };
 
+/// Mode for model-level validators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValidatorMode {
+    /// Run before field validation, can preprocess input.
+    Before,
+    /// Run after field validation (default).
+    #[default]
+    After,
+}
+
+/// Parsed model-level validator.
+#[derive(Debug)]
+pub struct ModelValidator {
+    /// The function name to call for validation.
+    pub function: String,
+    /// The mode (before or after field validation).
+    pub mode: ValidatorMode,
+}
+
 /// Parsed validation definition from a struct with `#[derive(Validate)]`.
 #[derive(Debug)]
 pub struct ValidateDef {
@@ -17,6 +36,8 @@ pub struct ValidateDef {
     pub name: Ident,
     /// Parsed field validation rules.
     pub fields: Vec<ValidateFieldDef>,
+    /// Model-level validators.
+    pub model_validators: Vec<ModelValidator>,
     /// Generics from the struct.
     pub generics: syn::Generics,
 }
@@ -49,6 +70,9 @@ pub fn parse_validate(input: &DeriveInput) -> Result<ValidateDef> {
     let name = input.ident.clone();
     let generics = input.generics.clone();
 
+    // Parse struct-level attributes for model validators
+    let model_validators = parse_model_validators(&input.attrs)?;
+
     let fields = match &input.data {
         Data::Struct(data) => parse_validate_fields(&data.fields)?,
         Data::Enum(_) => {
@@ -68,8 +92,109 @@ pub fn parse_validate(input: &DeriveInput) -> Result<ValidateDef> {
     Ok(ValidateDef {
         name,
         fields,
+        model_validators,
         generics,
     })
+}
+
+/// Parse struct-level `#[validate(...)]` attributes for model validators.
+fn parse_model_validators(attrs: &[syn::Attribute]) -> Result<Vec<ModelValidator>> {
+    let mut validators = Vec::new();
+
+    for attr in attrs {
+        if !attr.path().is_ident("validate") {
+            continue;
+        }
+
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("model") {
+                // Parse: #[validate(model = "fn_name")] or
+                // #[validate(model(fn = "fn_name", mode = "after"))]
+                if meta.input.peek(syn::Token![=]) {
+                    // Simple form: model = "fn_name"
+                    let value: Lit = meta.value()?.parse()?;
+                    if let Lit::Str(lit_str) = value {
+                        validators.push(ModelValidator {
+                            function: lit_str.value(),
+                            mode: ValidatorMode::After,
+                        });
+                    } else {
+                        return Err(Error::new_spanned(
+                            value,
+                            "expected string literal for model validator function name",
+                        ));
+                    }
+                } else if meta.input.peek(syn::token::Paren) {
+                    // Extended form: model(fn = "fn_name", mode = "after")
+                    let mut function: Option<String> = None;
+                    let mut mode = ValidatorMode::After;
+
+                    meta.parse_nested_meta(|inner| {
+                        if inner.path.is_ident("fn") {
+                            let value: Lit = inner.value()?.parse()?;
+                            if let Lit::Str(lit_str) = value {
+                                function = Some(lit_str.value());
+                            } else {
+                                return Err(Error::new_spanned(
+                                    value,
+                                    "expected string literal for fn",
+                                ));
+                            }
+                        } else if inner.path.is_ident("mode") {
+                            let value: Lit = inner.value()?.parse()?;
+                            if let Lit::Str(lit_str) = value {
+                                mode = match lit_str.value().as_str() {
+                                    "before" => ValidatorMode::Before,
+                                    "after" => ValidatorMode::After,
+                                    other => {
+                                        return Err(Error::new_spanned(
+                                            lit_str,
+                                            format!(
+                                                "invalid mode '{other}', expected 'before' or 'after'"
+                                            ),
+                                        ))
+                                    }
+                                };
+                            } else {
+                                return Err(Error::new_spanned(
+                                    value,
+                                    "expected string literal for mode",
+                                ));
+                            }
+                        } else {
+                            return Err(Error::new_spanned(
+                                inner.path,
+                                "unknown model validator attribute, expected 'fn' or 'mode'",
+                            ));
+                        }
+                        Ok(())
+                    })?;
+
+                    let function = function.ok_or_else(|| {
+                        Error::new(
+                            proc_macro2::Span::call_site(),
+                            "model validator requires 'fn' attribute",
+                        )
+                    })?;
+
+                    validators.push(ModelValidator { function, mode });
+                } else {
+                    return Err(Error::new_spanned(
+                        meta.path,
+                        "expected '=' or '(...)' after 'model'",
+                    ));
+                }
+                Ok(())
+            } else {
+                Err(Error::new_spanned(
+                    meta.path,
+                    "unknown struct-level validate attribute, expected 'model'",
+                ))
+            }
+        })?;
+    }
+
+    Ok(validators)
 }
 
 /// Parse all fields from a struct for validation.
@@ -263,8 +388,38 @@ pub fn generate_validate_impl(def: &ValidateDef) -> TokenStream {
         .map(generate_field_validation)
         .collect();
 
-    // If no validations, generate a trivial impl
-    if field_validations.is_empty() {
+    // Generate model validator calls (before)
+    let before_validators: Vec<TokenStream> = def
+        .model_validators
+        .iter()
+        .filter(|v| v.mode == ValidatorMode::Before)
+        .map(|v| {
+            let fn_name = syn::Ident::new(&v.function, proc_macro2::Span::call_site());
+            quote! {
+                if let Err(msg) = self.#fn_name() {
+                    errors.add_model_error(msg);
+                }
+            }
+        })
+        .collect();
+
+    // Generate model validator calls (after)
+    let after_validators: Vec<TokenStream> = def
+        .model_validators
+        .iter()
+        .filter(|v| v.mode == ValidatorMode::After)
+        .map(|v| {
+            let fn_name = syn::Ident::new(&v.function, proc_macro2::Span::call_site());
+            quote! {
+                if let Err(msg) = self.#fn_name() {
+                    errors.add_model_error(msg);
+                }
+            }
+        })
+        .collect();
+
+    // If no validations and no model validators, generate a trivial impl
+    if field_validations.is_empty() && def.model_validators.is_empty() {
         return quote! {
             impl #impl_generics #name #ty_generics #where_clause {
                 /// Validate this model's fields.
@@ -280,14 +435,26 @@ pub fn generate_validate_impl(def: &ValidateDef) -> TokenStream {
 
     quote! {
         impl #impl_generics #name #ty_generics #where_clause {
-            /// Validate this model's fields.
+            /// Validate this model's fields and model-level constraints.
             ///
             /// Returns `Ok(())` if all validations pass, or `Err(ValidationError)`
-            /// with details about which fields failed.
+            /// with details about which fields or model constraints failed.
+            ///
+            /// Validation order:
+            /// 1. Model validators with mode="before"
+            /// 2. Field-level validations
+            /// 3. Model validators with mode="after" (default)
             pub fn validate(&self) -> std::result::Result<(), sqlmodel_core::ValidationError> {
                 let mut errors = sqlmodel_core::ValidationError::new();
 
+                // 1. Before validators (run before field validation)
+                #(#before_validators)*
+
+                // 2. Field validations
                 #(#field_validations)*
+
+                // 3. After validators (run after field validation, default mode)
+                #(#after_validators)*
 
                 errors.into_result()
             }
@@ -493,5 +660,114 @@ mod tests {
             custom: None,
         };
         assert!(!has_validation(&field));
+    }
+
+    // ==================== Model Validator Tests ====================
+
+    #[test]
+    fn test_parse_model_validator_simple() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[validate(model = "validate_passwords")]
+            struct User {
+                password: String,
+                confirm_password: String,
+            }
+        };
+
+        let def = parse_validate(&input).unwrap();
+        assert_eq!(def.model_validators.len(), 1);
+        assert_eq!(def.model_validators[0].function, "validate_passwords");
+        assert_eq!(def.model_validators[0].mode, ValidatorMode::After);
+    }
+
+    #[test]
+    fn test_parse_model_validator_with_mode_after() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[validate(model(fn = "check_dates", mode = "after"))]
+            struct Event {
+                start_date: String,
+                end_date: String,
+            }
+        };
+
+        let def = parse_validate(&input).unwrap();
+        assert_eq!(def.model_validators.len(), 1);
+        assert_eq!(def.model_validators[0].function, "check_dates");
+        assert_eq!(def.model_validators[0].mode, ValidatorMode::After);
+    }
+
+    #[test]
+    fn test_parse_model_validator_with_mode_before() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[validate(model(fn = "preprocess_data", mode = "before"))]
+            struct Data {
+                value: String,
+            }
+        };
+
+        let def = parse_validate(&input).unwrap();
+        assert_eq!(def.model_validators.len(), 1);
+        assert_eq!(def.model_validators[0].function, "preprocess_data");
+        assert_eq!(def.model_validators[0].mode, ValidatorMode::Before);
+    }
+
+    #[test]
+    fn test_parse_multiple_model_validators() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[validate(model = "validate_first")]
+            #[validate(model(fn = "validate_second", mode = "before"))]
+            struct Complex {
+                field: String,
+            }
+        };
+
+        let def = parse_validate(&input).unwrap();
+        assert_eq!(def.model_validators.len(), 2);
+
+        assert_eq!(def.model_validators[0].function, "validate_first");
+        assert_eq!(def.model_validators[0].mode, ValidatorMode::After);
+
+        assert_eq!(def.model_validators[1].function, "validate_second");
+        assert_eq!(def.model_validators[1].mode, ValidatorMode::Before);
+    }
+
+    #[test]
+    fn test_parse_model_validator_invalid_mode() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[validate(model(fn = "validate_fn", mode = "invalid"))]
+            struct Data {
+                field: String,
+            }
+        };
+
+        let result = parse_validate(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid mode"));
+    }
+
+    #[test]
+    fn test_validator_mode_default() {
+        let mode = ValidatorMode::default();
+        assert_eq!(mode, ValidatorMode::After);
+    }
+
+    #[test]
+    fn test_model_validator_with_field_validators() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[validate(model = "validate_passwords")]
+            struct User {
+                #[validate(min_length = 8)]
+                password: String,
+                #[validate(min_length = 8)]
+                confirm_password: String,
+            }
+        };
+
+        let def = parse_validate(&input).unwrap();
+        assert_eq!(def.model_validators.len(), 1);
+        assert_eq!(def.fields.len(), 2);
+        assert!(def.fields[0].min_length.is_some());
+        assert!(def.fields[1].min_length.is_some());
     }
 }
