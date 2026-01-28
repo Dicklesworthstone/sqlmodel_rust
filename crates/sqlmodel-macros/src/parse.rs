@@ -1711,7 +1711,10 @@ mod tests {
         let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
         assert!(name_field.alias.is_none());
         assert!(name_field.validation_alias.is_none());
-        assert_eq!(name_field.serialization_alias, Some("user-name".to_string()));
+        assert_eq!(
+            name_field.serialization_alias,
+            Some("user-name".to_string())
+        );
     }
 
     #[test]
@@ -1730,7 +1733,10 @@ mod tests {
         let name_field = def.fields.iter().find(|f| f.name == "name").unwrap();
         assert_eq!(name_field.alias, Some("nm".to_string()));
         assert_eq!(name_field.validation_alias, Some("input_name".to_string()));
-        assert_eq!(name_field.serialization_alias, Some("outputName".to_string()));
+        assert_eq!(
+            name_field.serialization_alias,
+            Some("outputName".to_string())
+        );
     }
 
     #[test]
