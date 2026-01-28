@@ -25,11 +25,6 @@ pub use connection::{
     Connection, IsolationLevel, PreparedStatement, Transaction, TransactionInternal, TransactionOps,
 };
 pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
-pub use validate::{
-    apply_serialization_aliases, apply_validation_aliases, DumpMode, DumpOptions, DumpResult,
-    ModelDump, ModelValidate, SqlModelDump, SqlModelValidate, ValidateInput, ValidateOptions,
-    ValidateResult,
-};
 pub use field::{Column, Field, FieldInfo, ReferentialAction};
 pub use model::{AutoIncrement, Model, ModelEvents, SoftDelete, Timestamps};
 pub use relationship::{
@@ -38,4 +33,9 @@ pub use relationship::{
 };
 pub use row::Row;
 pub use types::{SqlType, TypeInfo};
+pub use validate::{
+    DumpMode, DumpOptions, DumpResult, ModelDump, ModelValidate, SqlModelDump, SqlModelValidate,
+    ValidateInput, ValidateOptions, ValidateResult, apply_serialization_aliases,
+    apply_validation_aliases,
+};
 pub use value::Value;

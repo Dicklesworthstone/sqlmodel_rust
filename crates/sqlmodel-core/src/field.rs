@@ -418,7 +418,9 @@ impl FieldInfo {
     /// Check if this field has any alias configuration.
     #[must_use]
     pub const fn has_alias(&self) -> bool {
-        self.alias.is_some() || self.validation_alias.is_some() || self.serialization_alias.is_some()
+        self.alias.is_some()
+            || self.validation_alias.is_some()
+            || self.serialization_alias.is_some()
     }
 }
 

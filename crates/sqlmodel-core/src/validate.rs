@@ -660,13 +660,15 @@ pub trait SqlModelValidate: Model + DeserializeOwned + Sized {
                     .collect();
                 serde_json::Value::Object(map)
             }
-            ValidateInput::Json(json_str) => {
-                serde_json::from_str(&json_str).map_err(|e| {
-                    let mut err = ValidationError::new();
-                    err.add("_json", ValidationErrorKind::Custom, format!("Invalid JSON: {e}"));
-                    err
-                })?
-            }
+            ValidateInput::Json(json_str) => serde_json::from_str(&json_str).map_err(|e| {
+                let mut err = ValidationError::new();
+                err.add(
+                    "_json",
+                    ValidationErrorKind::Custom,
+                    format!("Invalid JSON: {e}"),
+                );
+                err
+            })?,
             ValidateInput::JsonValue(value) => value,
         };
 
@@ -708,11 +710,11 @@ pub trait SqlModelValidate: Model + DeserializeOwned + Sized {
 /// Blanket implementation for all Model types that implement DeserializeOwned.
 impl<T: Model + DeserializeOwned> SqlModelValidate for T {}
 
-/// Model-aware dump that supports field aliases.
+/// Model-aware dump that supports field aliases and computed field exclusion.
 ///
 /// Unlike the generic `ModelDump`, this trait uses the `Model::fields()`
 /// metadata to transform field names to their serialization aliases
-/// in the output.
+/// in the output and to handle computed fields properly.
 ///
 /// # Example
 ///
@@ -721,11 +723,17 @@ impl<T: Model + DeserializeOwned> SqlModelValidate for T {}
 /// struct User {
 ///     #[sqlmodel(serialization_alias = "userName")]
 ///     name: String,
+///     #[sqlmodel(computed)]
+///     full_name: String, // Derived field, not in DB
 /// }
 ///
-/// let user = User { name: "Alice".to_string() };
+/// let user = User { name: "Alice".to_string(), full_name: "Alice Smith".to_string() };
 /// let json = user.sql_model_dump(DumpOptions::default().by_alias())?;
 /// assert_eq!(json["userName"], "Alice");
+///
+/// // Exclude computed fields
+/// let json = user.sql_model_dump(DumpOptions::default().exclude_computed_fields())?;
+/// assert!(json.get("full_name").is_none());
 /// ```
 pub trait SqlModelDump: Model + serde::Serialize {
     /// Serialize a model to a JSON value, optionally applying aliases.
@@ -740,6 +748,16 @@ pub trait SqlModelDump: Model + serde::Serialize {
 
         // Apply other options
         if let serde_json::Value::Object(ref mut map) = value {
+            // Exclude computed fields if requested
+            if options.exclude_computed_fields {
+                let computed_field_names: std::collections::HashSet<&str> = Self::fields()
+                    .iter()
+                    .filter(|f| f.computed)
+                    .map(|f| f.name)
+                    .collect();
+                map.retain(|k, _| !computed_field_names.contains(k.as_str()));
+            }
+
             // Apply include filter
             if let Some(ref include) = options.include {
                 map.retain(|k, _| include.contains(k));
@@ -1207,8 +1225,7 @@ mod tests {
                 FieldInfo::new("name", "name", SqlType::Text)
                     .validation_alias("userName")
                     .serialization_alias("displayName"),
-                FieldInfo::new("email", "email", SqlType::Text)
-                    .alias("emailAddress"), // Both input and output
+                FieldInfo::new("email", "email", SqlType::Text).alias("emailAddress"), // Both input and output
             ];
             FIELDS
         }
@@ -1328,7 +1345,9 @@ mod tests {
             email: "alice@example.com".to_string(),
         };
 
-        let json = user.sql_model_dump(DumpOptions::default().by_alias()).unwrap();
+        let json = user
+            .sql_model_dump(DumpOptions::default().by_alias())
+            .unwrap();
 
         // name should be serialized as displayName
         assert_eq!(json["displayName"], "Alice");
@@ -1373,5 +1392,175 @@ mod tests {
         assert_eq!(json["name"], "FieldName");
         // userName should be removed (but couldn't insert because "name" exists)
         assert!(json.get("userName").is_none());
+    }
+
+    // ========================================================================
+    // Computed Field Tests
+    // ========================================================================
+
+    /// Test model with computed fields.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct TestUserWithComputed {
+        id: i64,
+        first_name: String,
+        last_name: String,
+        #[serde(default)]
+        full_name: String, // Computed field - derived from first_name + last_name
+    }
+
+    impl Model for TestUserWithComputed {
+        const TABLE_NAME: &'static str = "users";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("first_name", "first_name", SqlType::Text),
+                FieldInfo::new("last_name", "last_name", SqlType::Text),
+                FieldInfo::new("full_name", "full_name", SqlType::Text).computed(true),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            // Computed field is NOT included in DB operations
+            vec![
+                ("id", Value::BigInt(self.id)),
+                ("first_name", Value::Text(self.first_name.clone())),
+                ("last_name", Value::Text(self.last_name.clone())),
+            ]
+        }
+
+        fn from_row(row: &Row) -> crate::Result<Self> {
+            Ok(Self {
+                id: row.get_named("id")?,
+                first_name: row.get_named("first_name")?,
+                last_name: row.get_named("last_name")?,
+                // Computed field initialized with Default (empty string)
+                full_name: String::new(),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![Value::BigInt(self.id)]
+        }
+
+        fn is_new(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_computed_field_included_by_default() {
+        let user = TestUserWithComputed {
+            id: 1,
+            first_name: "John".to_string(),
+            last_name: "Doe".to_string(),
+            full_name: "John Doe".to_string(),
+        };
+
+        // By default, computed fields ARE included in model_dump
+        let json = user.sql_model_dump(DumpOptions::default()).unwrap();
+
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["first_name"], "John");
+        assert_eq!(json["last_name"], "Doe");
+        assert_eq!(json["full_name"], "John Doe"); // Computed field is present
+    }
+
+    #[test]
+    fn test_computed_field_excluded_with_option() {
+        let user = TestUserWithComputed {
+            id: 1,
+            first_name: "John".to_string(),
+            last_name: "Doe".to_string(),
+            full_name: "John Doe".to_string(),
+        };
+
+        // With exclude_computed_fields, computed fields are excluded
+        let json = user
+            .sql_model_dump(DumpOptions::default().exclude_computed_fields())
+            .unwrap();
+
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["first_name"], "John");
+        assert_eq!(json["last_name"], "Doe");
+        assert!(json.get("full_name").is_none()); // Computed field is excluded
+    }
+
+    #[test]
+    fn test_computed_field_not_in_to_row() {
+        let user = TestUserWithComputed {
+            id: 1,
+            first_name: "Jane".to_string(),
+            last_name: "Smith".to_string(),
+            full_name: "Jane Smith".to_string(),
+        };
+
+        // to_row() should not include computed field (for DB INSERT/UPDATE)
+        let row = user.to_row();
+
+        // Should have 3 fields: id, first_name, last_name
+        assert_eq!(row.len(), 3);
+        let field_names: Vec<&str> = row.iter().map(|(name, _)| *name).collect();
+        assert!(field_names.contains(&"id"));
+        assert!(field_names.contains(&"first_name"));
+        assert!(field_names.contains(&"last_name"));
+        assert!(!field_names.contains(&"full_name")); // Computed field NOT in row
+    }
+
+    #[test]
+    fn test_computed_field_select_fields_excludes() {
+        let fields = TestUserWithComputed::fields();
+
+        // Check that computed field is marked
+        let computed: Vec<&FieldInfo> = fields.iter().filter(|f| f.computed).collect();
+        assert_eq!(computed.len(), 1);
+        assert_eq!(computed[0].name, "full_name");
+
+        // Non-computed fields
+        let non_computed: Vec<&FieldInfo> = fields.iter().filter(|f| !f.computed).collect();
+        assert_eq!(non_computed.len(), 3);
+    }
+
+    #[test]
+    fn test_computed_field_with_other_dump_options() {
+        let user = TestUserWithComputed {
+            id: 1,
+            first_name: "John".to_string(),
+            last_name: "Doe".to_string(),
+            full_name: "John Doe".to_string(),
+        };
+
+        // Combine exclude_computed_fields with include filter
+        let json = user
+            .sql_model_dump(DumpOptions::default().exclude_computed_fields().include([
+                "id",
+                "first_name",
+                "full_name",
+            ]))
+            .unwrap();
+
+        // full_name is excluded because it's computed, even though in include list
+        // (exclude_computed_fields is applied before include filter)
+        assert!(json.get("id").is_some());
+        assert!(json.get("first_name").is_some());
+        assert!(json.get("full_name").is_none()); // Excluded as computed
+        assert!(json.get("last_name").is_none()); // Not in include list
+    }
+
+    #[test]
+    fn test_dump_options_exclude_computed_fields_builder() {
+        let options = DumpOptions::new().exclude_computed_fields();
+        assert!(options.exclude_computed_fields);
+
+        // Can combine with other options
+        let options2 = DumpOptions::new()
+            .exclude_computed_fields()
+            .by_alias()
+            .exclude_none();
+        assert!(options2.exclude_computed_fields);
+        assert!(options2.by_alias);
+        assert!(options2.exclude_none);
     }
 }
