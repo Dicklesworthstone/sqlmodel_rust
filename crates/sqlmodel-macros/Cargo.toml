@@ -16,6 +16,7 @@ workspace = true
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
+regex = "1"  # For compile-time pattern validation
 
 [dev-dependencies]
 sqlmodel-core.workspace = true

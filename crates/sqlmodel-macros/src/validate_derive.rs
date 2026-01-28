@@ -126,7 +126,15 @@ fn parse_validate_field(field: &Field) -> Result<ValidateFieldDef> {
             } else if path.is_ident("pattern") {
                 let value: Lit = meta.value()?.parse()?;
                 if let Lit::Str(lit_str) = value {
-                    pattern = Some(lit_str.value());
+                    let pattern_str = lit_str.value();
+                    // Validate regex at compile time
+                    if let Err(e) = regex::Regex::new(&pattern_str) {
+                        return Err(Error::new_spanned(
+                            lit_str,
+                            format!("invalid regex pattern: {e}"),
+                        ));
+                    }
+                    pattern = Some(pattern_str);
                 } else {
                     return Err(Error::new_spanned(
                         value,
@@ -400,46 +408,23 @@ fn generate_field_validation(field: &ValidateFieldDef) -> TokenStream {
     }
 
     // Pattern check (regex)
-    // Note: We use a simple contains/starts_with approach for common patterns
-    // Full regex would require the `regex` crate dependency
+    // Uses sqlmodel_core::validate::matches_pattern for full regex support
     if let Some(ref pattern) = field.pattern {
-        // For email pattern, use a simple check
-        if pattern.contains('@') && pattern.contains(r"\.[a-zA-Z]") {
-            if is_optional {
-                checks.push(quote! {
-                    if let Some(ref value) = self.#field_name {
-                        if !value.contains('@') || !value.contains('.') {
-                            errors.add_pattern(#field_name_str, #pattern);
-                        }
-                    }
-                });
-            } else {
-                checks.push(quote! {
-                    if !self.#field_name.contains('@') || !self.#field_name.contains('.') {
+        if is_optional {
+            checks.push(quote! {
+                if let Some(ref value) = self.#field_name {
+                    if !sqlmodel_core::validate::matches_pattern(value.as_ref(), #pattern) {
                         errors.add_pattern(#field_name_str, #pattern);
                     }
-                });
-            }
-        } else if pattern.starts_with("^https?://") {
-            // URL pattern
-            if is_optional {
-                checks.push(quote! {
-                    if let Some(ref value) = self.#field_name {
-                        if !value.starts_with("http://") && !value.starts_with("https://") {
-                            errors.add_pattern(#field_name_str, #pattern);
-                        }
-                    }
-                });
-            } else {
-                checks.push(quote! {
-                    if !self.#field_name.starts_with("http://") && !self.#field_name.starts_with("https://") {
-                        errors.add_pattern(#field_name_str, #pattern);
-                    }
-                });
-            }
+                }
+            });
+        } else {
+            checks.push(quote! {
+                if !sqlmodel_core::validate::matches_pattern(self.#field_name.as_ref(), #pattern) {
+                    errors.add_pattern(#field_name_str, #pattern);
+                }
+            });
         }
-        // For other patterns, we'd need regex crate - skip for now
-        // Users can use custom validators for complex patterns
     }
 
     // Custom validation function

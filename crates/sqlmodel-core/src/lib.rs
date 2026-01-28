@@ -18,6 +18,7 @@ pub mod model;
 pub mod relationship;
 pub mod row;
 pub mod types;
+pub mod validate;
 pub mod value;
 
 pub use connection::{
