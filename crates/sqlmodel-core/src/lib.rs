@@ -25,10 +25,6 @@ pub use connection::{
     Connection, IsolationLevel, PreparedStatement, Transaction, TransactionInternal, TransactionOps,
 };
 pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
-pub use validate::{
-    DumpMode, DumpOptions, DumpResult, ModelDump, ModelValidate, ValidateInput, ValidateOptions,
-    ValidateResult,
-};
 pub use field::{Column, Field, FieldInfo, ReferentialAction};
 pub use model::Model;
 pub use relationship::{
@@ -37,4 +33,8 @@ pub use relationship::{
 };
 pub use row::Row;
 pub use types::{SqlType, TypeInfo};
+pub use validate::{
+    DumpMode, DumpOptions, DumpResult, ModelDump, ModelValidate, ValidateInput, ValidateOptions,
+    ValidateResult,
+};
 pub use value::Value;

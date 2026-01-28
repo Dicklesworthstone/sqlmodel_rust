@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde::de::DeserializeOwned;
 
-use crate::error::{ValidationError, ValidationErrorKind};
 use crate::Value;
+use crate::error::{ValidationError, ValidationErrorKind};
 
 /// Thread-safe regex cache for compiled patterns.
 ///
@@ -258,13 +258,15 @@ impl<T: DeserializeOwned> ModelValidate for T {
                     .collect();
                 serde_json::Value::Object(map)
             }
-            ValidateInput::Json(json_str) => {
-                serde_json::from_str(&json_str).map_err(|e| {
-                    let mut err = ValidationError::new();
-                    err.add("_json", ValidationErrorKind::Custom, format!("Invalid JSON: {e}"));
-                    err
-                })?
-            }
+            ValidateInput::Json(json_str) => serde_json::from_str(&json_str).map_err(|e| {
+                let mut err = ValidationError::new();
+                err.add(
+                    "_json",
+                    ValidationErrorKind::Custom,
+                    format!("Invalid JSON: {e}"),
+                );
+                err
+            })?,
             ValidateInput::JsonValue(value) => value,
         };
 
@@ -533,9 +535,7 @@ fn value_to_json(value: Value) -> serde_json::Value {
             serde_json::Value::String(formatted)
         }
         Value::Json(j) => j,
-        Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(value_to_json).collect())
-        }
+        Value::Array(arr) => serde_json::Value::Array(arr.into_iter().map(value_to_json).collect()),
         Value::Default => serde_json::Value::Null,
     }
 }
@@ -713,7 +713,11 @@ mod tests {
         let result: ValidateResult<TestUser> = TestUser::model_validate_json(json);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.errors.iter().any(|e| e.message.contains("Invalid JSON")));
+        assert!(
+            err.errors
+                .iter()
+                .any(|e| e.message.contains("Invalid JSON"))
+        );
     }
 
     #[test]
@@ -930,9 +934,7 @@ mod tests {
             active: true,
         };
         // Include name and age, but exclude age
-        let options = DumpOptions::new()
-            .include(["name", "age"])
-            .exclude(["age"]);
+        let options = DumpOptions::new().include(["name", "age"]).exclude(["age"]);
         let json = user.model_dump(options).unwrap();
         // Include is applied first, then exclude
         assert!(json.get("name").is_some());
