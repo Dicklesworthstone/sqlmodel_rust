@@ -140,7 +140,8 @@ struct IdentityEntry {
     /// Type-erased Arc. Actually stores `Arc<RwLock<M>>` for some M.
     /// We type-erase the Arc itself so we can return clones of the same Arc.
     arc: Box<dyn Any + Send + Sync>,
-    /// The primary key values for this entry.
+    /// The primary key values for this entry (stored for debugging/introspection).
+    #[allow(dead_code)]
     pk_values: Vec<Value>,
 }
 
@@ -314,6 +315,9 @@ impl IdentityMap {
     }
 }
 
+/// Type alias for the boxed type-erased value used in weak identity maps.
+type WeakEntryValue = Weak<RwLock<Box<dyn Any + Send + Sync>>>;
+
 /// A weak-reference based identity map that allows objects to be garbage collected.
 ///
 /// This variant uses `Weak<RwLock<>>` instead of `Arc<RwLock<>>`, allowing
@@ -322,7 +326,7 @@ impl IdentityMap {
 #[derive(Default)]
 pub struct WeakIdentityMap {
     /// Map from (TypeId, pk_hash) to weak reference.
-    entries: HashMap<(TypeId, u64), Weak<RwLock<Box<dyn Any + Send + Sync>>>>,
+    entries: HashMap<(TypeId, u64), WeakEntryValue>,
 }
 
 impl WeakIdentityMap {
@@ -406,6 +410,7 @@ pub type ModelWriteGuard<'a, M> = std::sync::RwLockWriteGuard<'a, M>;
 // ============================================================================
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use sqlmodel_core::{FieldInfo, Row, SqlType};

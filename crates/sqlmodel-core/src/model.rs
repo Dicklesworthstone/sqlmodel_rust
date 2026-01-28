@@ -440,7 +440,7 @@ mod tests {
         }
 
         fn to_row(&self) -> Vec<(&'static str, Value)> {
-            vec![("id", self.id.map(Value::from).unwrap_or(Value::Null))]
+            vec![("id", self.id.map_or(Value::Null, Value::from))]
         }
 
         fn from_row(_row: &Row) -> Result<Self> {
@@ -452,7 +452,7 @@ mod tests {
         }
 
         fn primary_key_value(&self) -> Vec<Value> {
-            vec![self.id.map(Value::from).unwrap_or(Value::Null)]
+            vec![self.id.map_or(Value::Null, Value::from)]
         }
 
         fn is_new(&self) -> bool {

@@ -524,12 +524,12 @@ impl FlushPlan {
             let mut params: Vec<Value> = Vec::new();
             let placeholders: Vec<String> = ops
                 .iter()
-                .enumerate()
-                .filter_map(|(i, op)| {
+                .filter_map(|op| {
                     if let PendingOp::Delete { pk_values, .. } = op {
                         if let Some(pk) = pk_values.first() {
                             params.push(pk.clone());
-                            return Some(format!("${}", i + 1));
+                            // Use params.len() for correct placeholder index after push
+                            return Some(format!("${}", params.len()));
                         }
                     }
                     None

@@ -268,10 +268,10 @@ impl UnitOfWork {
         let mut cycle_path = Vec::new();
 
         for table in &self.tables {
-            if !visited.contains(table) {
-                if self.detect_cycle_dfs(table, &mut visited, &mut rec_stack, &mut cycle_path) {
-                    return Err(UowError::CycleDetected { tables: cycle_path });
-                }
+            if !visited.contains(table)
+                && self.detect_cycle_dfs(table, &mut visited, &mut rec_stack, &mut cycle_path)
+            {
+                return Err(UowError::CycleDetected { tables: cycle_path });
             }
         }
 

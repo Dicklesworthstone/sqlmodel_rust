@@ -2349,7 +2349,7 @@ mod tests {
         };
         let mut session = Session::new(conn);
 
-        let teams = vec![
+        let teams = [
             Team {
                 id: Some(200),
                 name: "Team X".to_string(),
