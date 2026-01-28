@@ -26,7 +26,9 @@ pub use connection::{
 };
 pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
 pub use field::{Column, Field, FieldInfo, ReferentialAction};
-pub use model::{AutoIncrement, Model, ModelEvents, SoftDelete, Timestamps};
+pub use model::{
+    AutoIncrement, ExtraFieldsBehavior, Model, ModelConfig, ModelEvents, SoftDelete, Timestamps,
+};
 pub use relationship::{
     Lazy, LazyLoader, LinkTableInfo, Related, RelatedMany, RelationshipInfo, RelationshipKind,
     find_back_relationship, find_relationship, validate_back_populates,

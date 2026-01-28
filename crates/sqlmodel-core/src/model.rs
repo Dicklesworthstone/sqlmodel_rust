@@ -10,6 +10,132 @@ use crate::relationship::RelationshipInfo;
 use crate::row::Row;
 use crate::value::Value;
 
+/// Behavior for handling extra fields during validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtraFieldsBehavior {
+    /// Allow extra fields (ignore them).
+    #[default]
+    Ignore,
+    /// Forbid extra fields (return validation error).
+    Forbid,
+    /// Allow extra fields and preserve them.
+    Allow,
+}
+
+/// Model-level configuration matching Pydantic's model_config.
+///
+/// This struct holds configuration options that affect model behavior
+/// during validation, serialization, and database operations.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Model)]
+/// #[sqlmodel(
+///     table,
+///     from_attributes,
+///     validate_assignment,
+///     extra = "forbid",
+///     strict,
+///     populate_by_name,
+///     use_enum_values
+/// )]
+/// struct User {
+///     // ...
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ModelConfig {
+    /// Whether this model maps to a database table.
+    /// If true, DDL can be generated for this model.
+    pub table: bool,
+
+    /// Allow reading data from object attributes (ORM mode).
+    /// When true, model_validate can accept objects with attributes
+    /// in addition to dicts.
+    pub from_attributes: bool,
+
+    /// Validate field values when they are assigned.
+    /// When true, assignment to fields triggers validation.
+    pub validate_assignment: bool,
+
+    /// How to handle extra fields during validation.
+    pub extra: ExtraFieldsBehavior,
+
+    /// Enable strict type checking during validation.
+    /// When true, types must match exactly (no coercion).
+    pub strict: bool,
+
+    /// Allow populating fields by either name or alias.
+    /// When true, both the field name and any aliases are accepted
+    /// during deserialization.
+    pub populate_by_name: bool,
+
+    /// Use enum values instead of names during serialization.
+    /// When true, enum fields serialize to their underlying values
+    /// rather than variant names.
+    pub use_enum_values: bool,
+
+    /// Allow arbitrary types in fields.
+    /// When true, fields can use types that aren't natively supported
+    /// by the validation system.
+    pub arbitrary_types_allowed: bool,
+
+    /// Defer model validation to allow forward references.
+    /// When true, validation of field types is deferred until
+    /// the model is first used.
+    pub defer_build: bool,
+
+    /// Revalidate instances when converting to this model.
+    /// Controls whether existing model instances are revalidated.
+    pub revalidate_instances: bool,
+
+    /// Custom JSON schema extra data.
+    /// Additional data to include in generated JSON schema.
+    pub json_schema_extra: Option<&'static str>,
+
+    /// Title for JSON schema generation.
+    pub title: Option<&'static str>,
+}
+
+impl ModelConfig {
+    /// Create a new ModelConfig with all defaults.
+    pub const fn new() -> Self {
+        Self {
+            table: false,
+            from_attributes: false,
+            validate_assignment: false,
+            extra: ExtraFieldsBehavior::Ignore,
+            strict: false,
+            populate_by_name: false,
+            use_enum_values: false,
+            arbitrary_types_allowed: false,
+            defer_build: false,
+            revalidate_instances: false,
+            json_schema_extra: None,
+            title: None,
+        }
+    }
+
+    /// Create a config for a database table model.
+    pub const fn table() -> Self {
+        Self {
+            table: true,
+            from_attributes: false,
+            validate_assignment: false,
+            extra: ExtraFieldsBehavior::Ignore,
+            strict: false,
+            populate_by_name: false,
+            use_enum_values: false,
+            arbitrary_types_allowed: false,
+            defer_build: false,
+            revalidate_instances: false,
+            json_schema_extra: None,
+            title: None,
+        }
+    }
+}
+
 /// Trait for types that can be mapped to database tables.
 ///
 /// This trait provides metadata about the table structure and
@@ -58,6 +184,14 @@ pub trait Model: Sized + Send + Sync {
 
     /// Check if this is a new record (primary key is None/default).
     fn is_new(&self) -> bool;
+
+    /// Get the model configuration.
+    ///
+    /// Returns model-level configuration that affects validation,
+    /// serialization, and database operations.
+    fn model_config() -> ModelConfig {
+        ModelConfig::new()
+    }
 }
 
 /// Marker trait for models that support automatic ID generation.
