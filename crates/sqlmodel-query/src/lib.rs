@@ -5,6 +5,7 @@
 
 pub mod builder;
 pub mod clause;
+pub mod cte;
 pub mod eager;
 pub mod expr;
 pub mod join;
@@ -15,6 +16,7 @@ pub use builder::{
     UpdateBuilder,
 };
 pub use clause::{Limit, Offset, OrderBy, Where};
+pub use cte::{Cte, CteRef, WithQuery};
 pub use eager::{EagerLoader, IncludePath};
 pub use expr::{
     BinaryOp, Expr, UnaryOp, WindowBuilder, WindowFrame, WindowFrameBound, WindowFrameType,
