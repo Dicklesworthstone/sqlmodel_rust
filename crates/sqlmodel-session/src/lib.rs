@@ -36,6 +36,7 @@ pub mod change_tracker;
 pub mod flush;
 pub mod identity_map;
 pub mod n1_detection;
+pub mod unit_of_work;
 
 pub use change_tracker::{ChangeTracker, ObjectSnapshot};
 pub use flush::{
@@ -43,6 +44,7 @@ pub use flush::{
 };
 pub use identity_map::{IdentityMap, ModelReadGuard, ModelRef, ModelWriteGuard, WeakIdentityMap};
 pub use n1_detection::{CallSite, N1DetectionScope, N1QueryTracker, N1Stats};
+pub use unit_of_work::{PendingCounts, UnitOfWork, UowError};
 
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
