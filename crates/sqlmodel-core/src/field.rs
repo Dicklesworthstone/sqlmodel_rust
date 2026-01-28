@@ -85,6 +85,15 @@ pub struct FieldInfo {
     pub on_update: Option<ReferentialAction>,
     /// Index name if indexed
     pub index: Option<&'static str>,
+    /// Alias for both input and output (like serde rename).
+    /// When set, this name is used instead of `name` for serialization/deserialization.
+    pub alias: Option<&'static str>,
+    /// Alias used only during deserialization/validation (input-only).
+    /// Accepts this name as an alternative to `name` or `alias` during parsing.
+    pub validation_alias: Option<&'static str>,
+    /// Alias used only during serialization (output-only).
+    /// Overrides `alias` when outputting the field name.
+    pub serialization_alias: Option<&'static str>,
 }
 
 impl FieldInfo {
@@ -106,6 +115,9 @@ impl FieldInfo {
             on_delete: None,
             on_update: None,
             index: None,
+            alias: None,
+            validation_alias: None,
+            serialization_alias: None,
         }
     }
 
@@ -303,6 +315,92 @@ impl FieldInfo {
     pub const fn index_opt(mut self, name: Option<&'static str>) -> Self {
         self.index = name;
         self
+    }
+
+    /// Set alias for both input and output.
+    ///
+    /// When set, this name is used instead of the field name for both
+    /// serialization and deserialization.
+    pub const fn alias(mut self, name: &'static str) -> Self {
+        self.alias = Some(name);
+        self
+    }
+
+    /// Set alias from optional.
+    pub const fn alias_opt(mut self, name: Option<&'static str>) -> Self {
+        self.alias = name;
+        self
+    }
+
+    /// Set validation alias (input-only).
+    ///
+    /// This name is accepted as an alternative during deserialization,
+    /// in addition to the field name and regular alias.
+    pub const fn validation_alias(mut self, name: &'static str) -> Self {
+        self.validation_alias = Some(name);
+        self
+    }
+
+    /// Set validation alias from optional.
+    pub const fn validation_alias_opt(mut self, name: Option<&'static str>) -> Self {
+        self.validation_alias = name;
+        self
+    }
+
+    /// Set serialization alias (output-only).
+    ///
+    /// This name is used instead of the field name or regular alias
+    /// when serializing the field.
+    pub const fn serialization_alias(mut self, name: &'static str) -> Self {
+        self.serialization_alias = Some(name);
+        self
+    }
+
+    /// Set serialization alias from optional.
+    pub const fn serialization_alias_opt(mut self, name: Option<&'static str>) -> Self {
+        self.serialization_alias = name;
+        self
+    }
+
+    /// Get the name to use when serializing (output).
+    ///
+    /// Priority: serialization_alias > alias > name
+    #[must_use]
+    pub const fn output_name(&self) -> &'static str {
+        if let Some(ser_alias) = self.serialization_alias {
+            ser_alias
+        } else if let Some(alias) = self.alias {
+            alias
+        } else {
+            self.name
+        }
+    }
+
+    /// Check if a given name matches this field for input (deserialization).
+    ///
+    /// Matches: name, alias, or validation_alias
+    #[must_use]
+    pub fn matches_input_name(&self, input: &str) -> bool {
+        if input == self.name {
+            return true;
+        }
+        if let Some(alias) = self.alias {
+            if input == alias {
+                return true;
+            }
+        }
+        if let Some(val_alias) = self.validation_alias {
+            if input == val_alias {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if this field has any alias configuration.
+    #[must_use]
+    pub const fn has_alias(&self) -> bool {
+        self.alias.is_some() || self.validation_alias.is_some() || self.serialization_alias.is_some()
     }
 }
 

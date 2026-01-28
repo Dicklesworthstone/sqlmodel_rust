@@ -63,6 +63,12 @@ pub struct FieldDef {
     pub skip_update: bool,
     /// Relationship definition (if this is a relationship field).
     pub relationship: Option<RelationshipAttr>,
+    /// Alias for both input and output (like serde rename).
+    pub alias: Option<String>,
+    /// Alias used only during deserialization/validation (input-only).
+    pub validation_alias: Option<String>,
+    /// Alias used only during serialization (output-only).
+    pub serialization_alias: Option<String>,
 }
 
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
@@ -149,6 +155,47 @@ impl ModelDef {
             .iter()
             .filter(|f| f.relationship.is_some())
             .collect()
+    }
+}
+
+impl FieldDef {
+    /// Returns the name to use when serializing this field (output).
+    ///
+    /// Priority: serialization_alias > alias > field name
+    pub fn output_name(&self) -> &str {
+        self.serialization_alias
+            .as_deref()
+            .or(self.alias.as_deref())
+            .unwrap_or_else(|| self.name.to_string().leak())
+    }
+
+    /// Returns all names that should be accepted when deserializing (input).
+    ///
+    /// This includes: field name, alias, and validation_alias.
+    pub fn input_names(&self) -> Vec<&str> {
+        let field_name = self.name.to_string();
+        let mut names = vec![field_name.leak() as &str];
+
+        if let Some(ref alias) = self.alias {
+            if !names.contains(&alias.as_str()) {
+                names.push(alias.as_str());
+            }
+        }
+
+        if let Some(ref val_alias) = self.validation_alias {
+            if !names.contains(&val_alias.as_str()) {
+                names.push(val_alias.as_str());
+            }
+        }
+
+        names
+    }
+
+    /// Returns true if this field has any alias configuration.
+    pub fn has_alias(&self) -> bool {
+        self.alias.is_some()
+            || self.validation_alias.is_some()
+            || self.serialization_alias.is_some()
     }
 }
 
@@ -460,6 +507,9 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         skip_insert: attrs.skip_insert,
         skip_update: attrs.skip_update,
         relationship: attrs.relationship,
+        alias: attrs.alias,
+        validation_alias: attrs.validation_alias,
+        serialization_alias: attrs.serialization_alias,
     })
 }
 
@@ -481,6 +531,9 @@ struct FieldAttrs {
     skip_insert: bool,
     skip_update: bool,
     relationship: Option<RelationshipAttr>,
+    alias: Option<String>,
+    validation_alias: Option<String>,
+    serialization_alias: Option<String>,
 }
 
 /// Detect the relationship kind from a field's Rust type.
@@ -644,6 +697,36 @@ fn parse_field_attrs(
                 // Parse relationship(...) attribute
                 let rel_attr = parse_relationship_content(&meta, field_type)?;
                 result.relationship = Some(rel_attr);
+            } else if path.is_ident("alias") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.alias = Some(lit_str.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for alias",
+                    ));
+                }
+            } else if path.is_ident("validation_alias") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.validation_alias = Some(lit_str.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for validation_alias",
+                    ));
+                }
+            } else if path.is_ident("serialization_alias") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.serialization_alias = Some(lit_str.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for serialization_alias",
+                    ));
+                }
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -653,7 +736,8 @@ fn parse_field_attrs(
                         "unknown sqlmodel attribute `{attr_name}`. \
                          Valid attributes are: primary_key, auto_increment, column, nullable, \
                          unique, foreign_key, on_delete, on_update, default, sql_type, index, \
-                         skip, skip_insert, skip_update, relationship"
+                         skip, skip_insert, skip_update, relationship, alias, validation_alias, \
+                         serialization_alias"
                     ),
                 ));
             }

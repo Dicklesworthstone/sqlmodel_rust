@@ -238,6 +238,25 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
             quote::quote! { None }
         };
 
+        // Alias tokens
+        let alias_token = if let Some(ref alias) = field.alias {
+            quote::quote! { Some(#alias) }
+        } else {
+            quote::quote! { None }
+        };
+
+        let validation_alias_token = if let Some(ref val_alias) = field.validation_alias {
+            quote::quote! { Some(#val_alias) }
+        } else {
+            quote::quote! { None }
+        };
+
+        let serialization_alias_token = if let Some(ref ser_alias) = field.serialization_alias {
+            quote::quote! { Some(#ser_alias) }
+        } else {
+            quote::quote! { None }
+        };
+
         field_tokens.push(quote::quote! {
             sqlmodel_core::FieldInfo::new(stringify!(#field_ident), #column_name, #sql_type_token)
                 .sql_type_override_opt(#sql_type_override_token)
@@ -250,6 +269,9 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
                 .on_delete_opt(#on_delete_token)
                 .on_update_opt(#on_update_token)
                 .index_opt(#index_token)
+                .alias_opt(#alias_token)
+                .validation_alias_opt(#validation_alias_token)
+                .serialization_alias_opt(#serialization_alias_token)
         });
     }
 
