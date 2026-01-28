@@ -1817,6 +1817,170 @@ impl<C: Connection> Session<C> {
     }
 
     // ========================================================================
+    // Merge (Detached Object Reattachment)
+    // ========================================================================
+
+    /// Merge a detached object back into the session.
+    ///
+    /// This method reattaches a detached or externally-created object to the session,
+    /// copying its state to the session-tracked instance if one exists.
+    ///
+    /// # Behavior
+    ///
+    /// 1. **If object with same PK exists in session**: Updates the tracked object
+    ///    with values from the provided object and returns a clone of the tracked version.
+    ///
+    /// 2. **If `load` is true and object not in session**: Queries the database for
+    ///    an existing row, merges the provided values onto it, and tracks it.
+    ///
+    /// 3. **If object not in session or DB**: Treats it as new (will INSERT on flush).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Object from previous session or external source
+    /// let mut detached_user = User { id: Some(1), name: "Updated Name".into(), .. };
+    ///
+    /// // Merge into current session
+    /// let attached_user = session.merge(&cx, detached_user, true).await?;
+    ///
+    /// // attached_user is now tracked, changes will be persisted on flush
+    /// session.flush(&cx).await?;
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `cx`: The async context for database operations.
+    /// - `model`: The detached model instance to merge.
+    /// - `load`: If true, load from database when not in identity map.
+    ///
+    /// # Returns
+    ///
+    /// The session-attached version of the object. If the object was already tracked,
+    /// returns a clone of the updated tracked object. Otherwise, returns a clone of
+    /// the newly tracked object.
+    #[tracing::instrument(level = "debug", skip(self, cx, model), fields(table = M::TABLE_NAME))]
+    pub async fn merge<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        model: M,
+        load: bool,
+    ) -> Outcome<M, Error> {
+        let pk_values = model.primary_key_value();
+        let key = ObjectKey::from_model(&model);
+
+        tracing::debug!(
+            pk = ?pk_values,
+            load = load,
+            in_identity_map = self.identity_map.contains_key(&key),
+            "Merging object"
+        );
+
+        // 1. Check identity map first
+        if let Some(tracked) = self.identity_map.get_mut(&key) {
+            // Skip if detached - we shouldn't merge into detached objects
+            if tracked.state == ObjectState::Detached {
+                tracing::debug!("Found detached object, treating as new");
+            } else {
+                tracing::debug!(
+                    state = ?tracked.state,
+                    "Found tracked object, updating with merged values"
+                );
+
+                // Update the tracked object with values from the provided model
+                let row_data = model.to_row();
+                tracked.object = Box::new(model.clone());
+                tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
+                tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
+                tracked.pk_values.clone_from(&pk_values);
+
+                // If persistent, mark as dirty for UPDATE
+                if tracked.state == ObjectState::Persistent
+                    && !self.pending_dirty.contains(&key)
+                {
+                    self.pending_dirty.push(key);
+                }
+
+                // Return clone of the tracked object
+                if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                    return Outcome::Ok(obj.clone());
+                }
+            }
+        }
+
+        // 2. If load=true, try to fetch from database
+        if load {
+            // Check if we have a valid primary key (not null/default)
+            let has_valid_pk = pk_values.iter().all(|v| !matches!(v, Value::Null | Value::Default));
+
+            if has_valid_pk {
+                tracing::debug!("Loading from database");
+
+                let db_result = self.get_by_pk::<M>(cx, &pk_values).await;
+                match db_result {
+                    Outcome::Ok(Some(_existing)) => {
+                        // Now update the tracked object (which was added by get_by_pk)
+                        // with the values from our model
+                        if let Some(tracked) = self.identity_map.get_mut(&key) {
+                            let row_data = model.to_row();
+                            tracked.object = Box::new(model.clone());
+                            tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
+                            tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
+                            // pk_values stay the same from DB
+
+                            // Mark as dirty since we're updating with new values
+                            if !self.pending_dirty.contains(&key) {
+                                self.pending_dirty.push(key);
+                            }
+
+                            tracing::debug!("Merged values onto DB object");
+
+                            if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                                return Outcome::Ok(obj.clone());
+                            }
+                        }
+                    }
+                    Outcome::Ok(None) => {
+                        tracing::debug!("Object not found in database, treating as new");
+                    }
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                }
+            }
+        }
+
+        // 3. Treat as new - add to session
+        tracing::debug!("Adding as new object");
+        self.add(&model);
+
+        Outcome::Ok(model)
+    }
+
+    /// Merge a detached object without loading from database.
+    ///
+    /// This is a convenience method equivalent to `merge(cx, model, false)`.
+    /// Use this when you know the object doesn't exist in the database or
+    /// you don't want to query the database.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let attached = session.merge_without_load(&cx, detached_user).await?;
+    /// ```
+    pub async fn merge_without_load<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        model: M,
+    ) -> Outcome<M, Error> {
+        self.merge(cx, model, false).await
+    }
+
+    // ========================================================================
     // Debug Diagnostics
     // ========================================================================
 
@@ -2392,5 +2556,222 @@ mod tests {
         let info = session.debug_state();
         assert_eq!(info.pending_new, 2);
         assert_eq!(info.tracked, 2);
+    }
+
+    // ==================== Merge Tests ====================
+
+    #[test]
+    fn test_merge_new_object_without_load() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge a new object without loading from DB
+            let team = Team {
+                id: Some(100),
+                name: "New Team".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, team.clone(), false).await);
+
+            // Should be the same object
+            assert_eq!(merged.id, Some(100));
+            assert_eq!(merged.name, "New Team");
+
+            // Should be tracked as new
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+            assert_eq!(info.tracked, 1);
+        });
+
+        // Should not have queried DB (load=false)
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 0);
+    }
+
+    #[test]
+    fn test_merge_updates_existing_tracked_object() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // First add an object
+            let original = Team {
+                id: Some(1),
+                name: "Original".to_string(),
+            };
+            session.add(&original);
+
+            // Now merge an updated version
+            let updated = Team {
+                id: Some(1),
+                name: "Updated".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, updated, false).await);
+
+            // Should have the updated name
+            assert_eq!(merged.id, Some(1));
+            assert_eq!(merged.name, "Updated");
+
+            // Should still be tracked (not duplicated)
+            let info = session.debug_state();
+            assert_eq!(info.tracked, 1);
+        });
+    }
+
+    #[test]
+    fn test_merge_with_load_queries_database() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge an object that exists in the "database" (mock returns it for id=1)
+            let detached = Team {
+                id: Some(1),
+                name: "Detached Update".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, detached, true).await);
+
+            // Should have the name from our detached object (merged onto DB values)
+            assert_eq!(merged.id, Some(1));
+            assert_eq!(merged.name, "Detached Update");
+
+            // Should be tracked and marked as dirty
+            let info = session.debug_state();
+            assert_eq!(info.tracked, 1);
+            assert_eq!(info.pending_dirty, 1);
+        });
+
+        // Should have queried DB once (load=true)
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
+    }
+
+    #[test]
+    fn test_merge_with_load_not_found_creates_new() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge an object that doesn't exist in DB (mock returns None for id=999)
+            let detached = Team {
+                id: Some(999),
+                name: "Not In DB".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, detached, true).await);
+
+            // Should keep the values we provided
+            assert_eq!(merged.id, Some(999));
+            assert_eq!(merged.name, "Not In DB");
+
+            // Should be tracked as new
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+            assert_eq!(info.tracked, 1);
+        });
+
+        // Should have queried DB once
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
+    }
+
+    #[test]
+    fn test_merge_without_load_convenience() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            let team = Team {
+                id: Some(42),
+                name: "Test".to_string(),
+            };
+
+            // Use the convenience method
+            let merged = unwrap_outcome(session.merge_without_load(&cx, team).await);
+
+            assert_eq!(merged.id, Some(42));
+            assert_eq!(merged.name, "Test");
+
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+        });
+
+        // Should not have queried DB
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 0);
+    }
+
+    #[test]
+    fn test_merge_null_pk_treated_as_new() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection {
+            state: Arc::clone(&state),
+        };
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge object with null PK (new record)
+            let new_team = Team {
+                id: None,
+                name: "Brand New".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, new_team, true).await);
+
+            // Should keep the null id
+            assert_eq!(merged.id, None);
+            assert_eq!(merged.name, "Brand New");
+
+            // Should be tracked as new (no DB query for null PK)
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+        });
+
+        // Should not have queried DB for null PK
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 0);
     }
 }
