@@ -1,6 +1,10 @@
 # SQLModel Rust
 
 <div align="center">
+  <img src="sqlmodel_rust_illustration.webp" alt="SQLModel Rust - SQL databases in Rust, designed to be intuitive and type-safe">
+</div>
+
+<div align="center">
 
 **SQL databases in Rust, designed to be intuitive and type-safe.**
 
