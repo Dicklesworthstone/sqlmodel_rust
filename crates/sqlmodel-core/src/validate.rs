@@ -314,19 +314,20 @@ fn value_to_json(value: Value) -> serde_json::Value {
         Value::SmallInt(i) => serde_json::Value::Number(i.into()),
         Value::Int(i) => serde_json::Value::Number(i.into()),
         Value::BigInt(i) => serde_json::Value::Number(i.into()),
-        Value::Float(f) => serde_json::Number::from_f64(f as f64)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+        Value::Float(f) => serde_json::Number::from_f64(f64::from(f))
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::Double(f) => serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::Decimal(s) => serde_json::Value::String(s),
         Value::Text(s) => serde_json::Value::String(s),
         Value::Bytes(b) => {
-            // Encode bytes as base64
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&b);
-            serde_json::Value::String(encoded)
+            // Encode bytes as hex string
+            use std::fmt::Write;
+            let hex = b.iter().fold(String::new(), |mut acc, byte| {
+                let _ = write!(acc, "{byte:02x}");
+                acc
+            });
+            serde_json::Value::String(hex)
         }
         // Date is i32 (days since epoch) - convert to number
         Value::Date(d) => serde_json::Value::Number(d.into()),
@@ -336,9 +337,13 @@ fn value_to_json(value: Value) -> serde_json::Value {
         Value::Timestamp(ts) => serde_json::Value::Number(ts.into()),
         // TimestampTz is i64 (microseconds since epoch, UTC)
         Value::TimestampTz(ts) => serde_json::Value::Number(ts.into()),
-        // UUID is [u8; 16] - format as hex string
+        // UUID is [u8; 16] - format as UUID string with dashes
         Value::Uuid(u) => {
-            let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
+            use std::fmt::Write;
+            let hex = u.iter().fold(String::with_capacity(32), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
             // Format as UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
             let formatted = format!(
                 "{}-{}-{}-{}-{}",
@@ -604,9 +609,14 @@ mod tests {
             value_to_json(Value::Text("hello".to_string())),
             serde_json::json!("hello")
         );
+        // UUID is [u8; 16]
+        let uuid_bytes: [u8; 16] = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
         assert_eq!(
-            value_to_json(Value::Uuid("abc-123".to_string())),
-            serde_json::json!("abc-123")
+            value_to_json(Value::Uuid(uuid_bytes)),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000")
         );
 
         // Array conversion
