@@ -139,11 +139,13 @@ pub fn caching_sha2_password(password: &str, auth_data: &[u8]) -> Vec<u8> {
 }
 
 /// Generate a random nonce for client-side use.
+///
+/// Uses `OsRng` for cryptographically secure random generation.
 pub fn generate_nonce(length: usize) -> Vec<u8> {
     use rand::RngCore;
-    let mut rng = rand::thread_rng();
+    use rand::rngs::OsRng;
     let mut bytes = vec![0u8; length];
-    rng.fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     bytes
 }
 

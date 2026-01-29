@@ -2,10 +2,11 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, Mac};
-use rand::{Rng, distributions::Alphanumeric, thread_rng};
+use rand::{Rng, distributions::Alphanumeric, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use sqlmodel_core::Error;
 use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind, ProtocolError};
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -26,9 +27,11 @@ pub struct ScramClient {
 
 impl ScramClient {
     pub fn new(username: &str, password: &str) -> Self {
-        let client_nonce: String = thread_rng()
+        // Use OsRng for cryptographically secure nonce generation.
+        // 32 characters of alphanumeric provides ~190 bits of entropy.
+        let client_nonce: String = OsRng
             .sample_iter(&Alphanumeric)
-            .take(24)
+            .take(32)
             .map(char::from)
             .collect();
 
@@ -164,11 +167,14 @@ impl ScramClient {
         let server_key = hmac_sha256(salted_password, b"Server Key")?;
         let expected_signature = hmac_sha256(&server_key, auth_message.as_bytes())?;
 
-        if server_signature != expected_signature.to_vec() {
-            return Err(auth_error("Server signature mismatch"));
+        // Use constant-time comparison to prevent timing attacks.
+        // An attacker observing response times could otherwise recover
+        // the expected signature byte-by-byte.
+        if server_signature.ct_eq(&expected_signature).into() {
+            Ok(())
+        } else {
+            Err(auth_error("Server signature mismatch"))
         }
-
-        Ok(())
     }
 }
 
