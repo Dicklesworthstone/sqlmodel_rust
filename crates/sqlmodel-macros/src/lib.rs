@@ -942,7 +942,6 @@ fn generate_sql_enum_impl(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
     }
 
     let type_name = to_snake_case(&name.to_string());
-    let _variant_count = variant_names.len();
 
     // Generate static VARIANTS array
     let variant_str_refs: Vec<_> = variant_strings.iter().map(|s| s.as_str()).collect();
@@ -1052,10 +1051,17 @@ fn generate_sql_enum_impl(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
 
 fn to_snake_case(s: &str) -> String {
     let mut result = String::with_capacity(s.len() + 4);
-    for (i, ch) in s.chars().enumerate() {
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
         if ch.is_uppercase() {
             if i > 0 {
-                result.push('_');
+                let prev_lower = chars[i - 1].is_lowercase();
+                let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+                // "FooBar" -> "foo_bar": insert _ when prev is lowercase
+                // "HTTPStatus" -> "http_status": insert _ when next is lowercase (acronym boundary)
+                if prev_lower || (next_lower && chars[i - 1].is_uppercase()) {
+                    result.push('_');
+                }
             }
             result.push(ch.to_ascii_lowercase());
         } else {

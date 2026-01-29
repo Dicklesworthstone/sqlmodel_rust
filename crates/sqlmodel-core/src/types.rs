@@ -81,9 +81,8 @@ impl SqlType {
             SqlType::Uuid => "UUID".to_string(),
             SqlType::Json => "JSON".to_string(),
             SqlType::JsonB => "JSONB".to_string(),
-            SqlType::Enum(variants) => {
+            SqlType::Enum(_) => {
                 // Default: just use TEXT; dialect-specific DDL handles the real type
-                let _ = variants;
                 "TEXT".to_string()
             }
             SqlType::Array(inner) => format!("{}[]", inner.sql_name()),
