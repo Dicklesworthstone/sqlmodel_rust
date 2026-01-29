@@ -2505,6 +2505,97 @@ impl<C: Connection> Session<C> {
             in_transaction: self.in_transaction,
         }
     }
+
+    // ========================================================================
+    // Bulk Operations
+    // ========================================================================
+
+    /// Bulk insert multiple model instances without object tracking.
+    ///
+    /// This generates a single multi-row INSERT statement and bypasses
+    /// the identity map entirely, making it much faster for large batches.
+    ///
+    /// Models are inserted in chunks of `batch_size` to avoid excessively
+    /// large SQL statements. The default batch size is 1000.
+    ///
+    /// Returns the total number of rows inserted.
+    pub async fn bulk_insert<M: Model + Clone + Send + Sync + 'static>(
+        &mut self,
+        cx: &Cx,
+        models: &[M],
+    ) -> Outcome<u64, Error> {
+        self.bulk_insert_with_batch_size(cx, models, 1000).await
+    }
+
+    /// Bulk insert with a custom batch size.
+    pub async fn bulk_insert_with_batch_size<M: Model + Clone + Send + Sync + 'static>(
+        &mut self,
+        cx: &Cx,
+        models: &[M],
+        batch_size: usize,
+    ) -> Outcome<u64, Error> {
+        if models.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        let batch_size = batch_size.max(1);
+        let mut total_inserted: u64 = 0;
+
+        for chunk in models.chunks(batch_size) {
+            let builder = sqlmodel_query::InsertManyBuilder::new(chunk);
+            let (sql, params) = builder.build();
+
+            if sql.is_empty() {
+                continue;
+            }
+
+            match self.connection.execute(cx, &sql, &params).await {
+                Outcome::Ok(count) => total_inserted += count,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+
+        Outcome::Ok(total_inserted)
+    }
+
+    /// Bulk update multiple model instances without individual tracking.
+    ///
+    /// Each model is updated individually using its primary key, but
+    /// all updates are executed in a single transaction without going
+    /// through the identity map or change tracking.
+    ///
+    /// Returns the total number of rows updated.
+    pub async fn bulk_update<M: Model + Clone + Send + Sync + 'static>(
+        &mut self,
+        cx: &Cx,
+        models: &[M],
+    ) -> Outcome<u64, Error> {
+        if models.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        let mut total_updated: u64 = 0;
+
+        for model in models {
+            let builder = sqlmodel_query::UpdateBuilder::new(model);
+            let (sql, params) = builder.build();
+
+            if sql.is_empty() {
+                continue;
+            }
+
+            match self.connection.execute(cx, &sql, &params).await {
+                Outcome::Ok(count) => total_updated += count,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+
+        Outcome::Ok(total_updated)
+    }
 }
 
 impl<C, M> LazyLoader<M> for Session<C>
