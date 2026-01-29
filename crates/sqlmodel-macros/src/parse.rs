@@ -131,6 +131,9 @@ pub struct FieldDef {
     pub column_comment: Option<String>,
     /// Extra metadata as JSON string.
     pub column_info: Option<String>,
+    /// Complete column specification override (sa_column).
+    /// When set, provides full column control and disables other column attributes.
+    pub sa_column: Option<SaColumnDef>,
 }
 
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
@@ -192,6 +195,43 @@ pub enum PassiveDeletesAttr {
     Passive,
     /// Passive + disable orphan tracking entirely.
     All,
+}
+
+/// Complete column specification override via `sa_column(...)`.
+///
+/// When used, this provides full control over the column definition,
+/// replacing individual column attributes like `sql_type`, `nullable`, etc.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Model)]
+/// struct User {
+///     #[sqlmodel(sa_column(
+///         sql_type = "VARCHAR(50)",
+///         check = "status IN ('active', 'inactive', 'pending')",
+///         server_default = "'pending'",
+///         comment = "User account status"
+///     ))]
+///     status: String,
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct SaColumnDef {
+    /// SQL type override (e.g., "VARCHAR(50)", "DECIMAL(10,2)").
+    pub sql_type: Option<String>,
+    /// CHECK constraints for the column.
+    pub check: Vec<String>,
+    /// Server default value expression (e.g., "'pending'", "NOW()").
+    pub server_default: Option<String>,
+    /// Column comment.
+    pub comment: Option<String>,
+    /// Whether the column is nullable (overrides type inference).
+    pub nullable: Option<bool>,
+    /// Whether the column should have a unique constraint.
+    pub unique: Option<bool>,
+    /// Index name if this column should be indexed.
+    pub index: Option<String>,
 }
 
 impl ModelDef {
@@ -711,6 +751,7 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         column_constraints: attrs.column_constraints,
         column_comment: attrs.column_comment,
         column_info: attrs.column_info,
+        sa_column: attrs.sa_column,
     })
 }
 
@@ -761,6 +802,8 @@ struct FieldAttrs {
     column_comment: Option<String>,
     /// Extra metadata as JSON string.
     column_info: Option<String>,
+    /// Complete column specification override (sa_column).
+    sa_column: Option<SaColumnDef>,
 }
 
 /// Detect the relationship kind from a field's Rust type.
@@ -1075,6 +1118,10 @@ fn parse_field_attrs(
                         "expected string literal for column_info",
                     ));
                 }
+            } else if path.is_ident("sa_column") {
+                // Parse sa_column(...) attribute for full column override
+                let sa_col = parse_sa_column_content(&meta)?;
+                result.sa_column = Some(sa_col);
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -1086,7 +1133,7 @@ fn parse_field_attrs(
                          unique, foreign_key, on_delete, on_update, default, sql_type, index, \
                          skip, skip_insert, skip_update, relationship, alias, validation_alias, \
                          serialization_alias, computed, max_digits, decimal_places, default_json, repr, \
-                         const_field, column_constraints, column_comment, column_info"
+                         const_field, column_constraints, column_comment, column_info, sa_column"
                     ),
                 ));
             }
@@ -1326,6 +1373,121 @@ fn parse_relationship_content(
     })
 }
 
+/// Parse the content of an sa_column(...) attribute.
+///
+/// This provides full column specification override, similar to SQLAlchemy's Column().
+/// When used, other column-related attributes should be forbidden.
+fn parse_sa_column_content(meta: &syn::meta::ParseNestedMeta<'_>) -> Result<SaColumnDef> {
+    let mut result = SaColumnDef::default();
+
+    meta.parse_nested_meta(|nested| {
+        let path = nested.path.clone();
+
+        if path.is_ident("sql_type") {
+            let value: Lit = nested.value()?.parse()?;
+            if let Lit::Str(lit_str) = value {
+                result.sql_type = Some(lit_str.value());
+            } else {
+                return Err(Error::new_spanned(
+                    value,
+                    "expected string literal for sql_type",
+                ));
+            }
+        } else if path.is_ident("check") {
+            let value: Lit = nested.value()?.parse()?;
+            if let Lit::Str(lit_str) = value {
+                result.check.push(lit_str.value());
+            } else {
+                return Err(Error::new_spanned(
+                    value,
+                    "expected string literal for check",
+                ));
+            }
+        } else if path.is_ident("server_default") {
+            let value: Lit = nested.value()?.parse()?;
+            if let Lit::Str(lit_str) = value {
+                result.server_default = Some(lit_str.value());
+            } else {
+                return Err(Error::new_spanned(
+                    value,
+                    "expected string literal for server_default",
+                ));
+            }
+        } else if path.is_ident("comment") {
+            let value: Lit = nested.value()?.parse()?;
+            if let Lit::Str(lit_str) = value {
+                result.comment = Some(lit_str.value());
+            } else {
+                return Err(Error::new_spanned(
+                    value,
+                    "expected string literal for comment",
+                ));
+            }
+        } else if path.is_ident("nullable") {
+            // Check if it's a bare flag or has a value
+            if nested.input.peek(syn::Token![=]) {
+                let value: Lit = nested.value()?.parse()?;
+                if let Lit::Bool(lit_bool) = value {
+                    result.nullable = Some(lit_bool.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected boolean literal for nullable",
+                    ));
+                }
+            } else {
+                result.nullable = Some(true);
+            }
+        } else if path.is_ident("unique") {
+            // Check if it's a bare flag or has a value
+            if nested.input.peek(syn::Token![=]) {
+                let value: Lit = nested.value()?.parse()?;
+                if let Lit::Bool(lit_bool) = value {
+                    result.unique = Some(lit_bool.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected boolean literal for unique",
+                    ));
+                }
+            } else {
+                result.unique = Some(true);
+            }
+        } else if path.is_ident("index") {
+            // Check if it's a bare flag or has a value
+            if nested.input.peek(syn::Token![=]) {
+                let value: Lit = nested.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.index = Some(lit_str.value());
+                } else if let Lit::Bool(lit_bool) = value {
+                    if lit_bool.value() {
+                        // true means create an index (name auto-generated)
+                        result.index = Some(String::new());
+                    }
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string or boolean literal for index",
+                    ));
+                }
+            } else {
+                // Bare flag means create an index
+                result.index = Some(String::new());
+            }
+        } else {
+            return Err(Error::new_spanned(
+                path,
+                "unknown sa_column attribute. \
+                 Valid: sql_type, check, server_default, comment, nullable, unique, index",
+            ));
+        }
+
+        Ok(())
+    })?;
+
+    Ok(result)
+}
+
 /// Validate that attribute combinations make sense.
 fn validate_field_attrs(attrs: &FieldAttrs, field_name: &Ident, field_type: &Type) -> Result<()> {
     // Cannot use skip with primary_key
@@ -1374,6 +1536,54 @@ fn validate_field_attrs(attrs: &FieldAttrs, field_name: &Ident, field_type: &Typ
 
     // Warn if max_digits/decimal_places used without a Decimal type
     // (We just validate syntax here; type checking is done elsewhere if needed)
+
+    // Validate sa_column mutual exclusivity
+    // When sa_column is used, certain other column-related attributes are forbidden
+    if attrs.sa_column.is_some() {
+        let mut conflicts = Vec::new();
+
+        if attrs.sql_type.is_some() {
+            conflicts.push("sql_type");
+        }
+        if attrs.nullable.is_some() {
+            conflicts.push("nullable");
+        }
+        if attrs.unique {
+            conflicts.push("unique");
+        }
+        if attrs.index.is_some() {
+            conflicts.push("index");
+        }
+        if attrs.foreign_key.is_some() {
+            conflicts.push("foreign_key");
+        }
+        if attrs.on_delete.is_some() {
+            conflicts.push("on_delete");
+        }
+        if attrs.on_update.is_some() {
+            conflicts.push("on_update");
+        }
+        if attrs.default.is_some() {
+            conflicts.push("default");
+        }
+        if !attrs.column_constraints.is_empty() {
+            conflicts.push("column_constraints");
+        }
+        if attrs.column_comment.is_some() {
+            conflicts.push("column_comment");
+        }
+
+        if !conflicts.is_empty() {
+            return Err(Error::new_spanned(
+                field_name,
+                format!(
+                    "`sa_column` provides full column override and cannot be combined with: {}. \
+                     Use sa_column sub-attributes instead (e.g., sa_column(sql_type = \"...\"))",
+                    conflicts.join(", ")
+                ),
+            ));
+        }
+    }
 
     Ok(())
 }
