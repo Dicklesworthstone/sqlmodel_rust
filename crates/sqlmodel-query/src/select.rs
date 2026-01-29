@@ -522,6 +522,41 @@ impl<M: Model> Select<M> {
         Expr::not_exists(sql, params)
     }
 
+    /// Convert this SELECT into a LATERAL JOIN.
+    ///
+    /// Creates a `Join` with `lateral: true` that can be added to another query.
+    /// The subquery can reference columns from the outer query.
+    ///
+    /// Supported by PostgreSQL (9.3+) and MySQL (8.0.14+). Not supported by SQLite.
+    ///
+    /// # Arguments
+    ///
+    /// * `alias` - Required alias for the lateral subquery
+    /// * `join_type` - The join type (typically `Left` or `Inner`)
+    /// * `on` - ON condition (use `Expr::raw("TRUE")` for implicit TRUE)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Get top 3 recent orders per customer
+    /// let recent_orders = Select::<Order>::new()
+    ///     .filter(Expr::raw("orders.customer_id = customers.id"))
+    ///     .order_by(OrderBy::desc("date"))
+    ///     .limit(3)
+    ///     .into_lateral_join("recent_orders", JoinType::Left, Expr::raw("TRUE"));
+    ///
+    /// let query = Select::<Customer>::new().join(recent_orders);
+    /// ```
+    pub fn into_lateral_join(
+        self,
+        alias: impl Into<String>,
+        join_type: crate::JoinType,
+        on: Expr,
+    ) -> crate::Join {
+        let (sql, params) = self.build();
+        crate::Join::lateral(join_type, sql, alias, on, params)
+    }
+
     /// Build an optimized EXISTS subquery (SELECT 1 instead of SELECT *).
     fn build_exists_subquery(&self) -> (String, Vec<Value>) {
         let mut sql = String::new();
