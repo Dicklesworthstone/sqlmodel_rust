@@ -12,6 +12,7 @@
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
 
 pub mod connection;
+pub mod dynamic;
 pub mod error;
 pub mod field;
 pub mod model;
