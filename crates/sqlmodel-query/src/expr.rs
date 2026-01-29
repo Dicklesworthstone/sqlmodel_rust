@@ -169,6 +169,142 @@ pub enum Expr {
         /// Frame specification (ROWS or RANGE)
         frame: Option<WindowFrame>,
     },
+
+    /// JSON path extraction (returns JSON value)
+    ///
+    /// - PostgreSQL: `expr -> 'path'` or `expr -> path_expr`
+    /// - MySQL: `JSON_EXTRACT(expr, '$.path')`
+    /// - SQLite: `json_extract(expr, '$.path')`
+    JsonExtract {
+        /// The JSON expression to extract from
+        expr: Box<Expr>,
+        /// The path to extract (can be a key name or array index)
+        path: JsonPath,
+    },
+
+    /// JSON path extraction as text (returns text/string)
+    ///
+    /// - PostgreSQL: `expr ->> 'path'`
+    /// - MySQL: `JSON_UNQUOTE(JSON_EXTRACT(expr, '$.path'))`
+    /// - SQLite: `json_extract(expr, '$.path')` (SQLite returns text by default)
+    JsonExtractText {
+        /// The JSON expression to extract from
+        expr: Box<Expr>,
+        /// The path to extract
+        path: JsonPath,
+    },
+
+    /// JSON path extraction with nested path (returns JSON)
+    ///
+    /// - PostgreSQL: `expr #> '{path, to, value}'`
+    /// - MySQL/SQLite: `JSON_EXTRACT(expr, '$.path.to.value')`
+    JsonExtractPath {
+        /// The JSON expression
+        expr: Box<Expr>,
+        /// Nested path segments
+        path: Vec<String>,
+    },
+
+    /// JSON path extraction with nested path as text
+    ///
+    /// - PostgreSQL: `expr #>> '{path, to, value}'`
+    /// - MySQL: `JSON_UNQUOTE(JSON_EXTRACT(expr, '$.path.to.value'))`
+    /// - SQLite: `json_extract(expr, '$.path.to.value')`
+    JsonExtractPathText {
+        /// The JSON expression
+        expr: Box<Expr>,
+        /// Nested path segments
+        path: Vec<String>,
+    },
+
+    /// JSON containment check (left contains right)
+    ///
+    /// - PostgreSQL: `expr @> other` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS(expr, other)`
+    /// - SQLite: Not directly supported (requires json_each workaround)
+    JsonContains {
+        /// The JSON expression to check
+        expr: Box<Expr>,
+        /// The JSON value to check for
+        other: Box<Expr>,
+    },
+
+    /// JSON contained-by check (left is contained by right)
+    ///
+    /// - PostgreSQL: `expr <@ other` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS(other, expr)`
+    /// - SQLite: Not directly supported
+    JsonContainedBy {
+        /// The JSON expression to check
+        expr: Box<Expr>,
+        /// The containing JSON value
+        other: Box<Expr>,
+    },
+
+    /// JSON key existence check
+    ///
+    /// - PostgreSQL: `expr ? 'key'` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS_PATH(expr, 'one', '$.key')`
+    /// - SQLite: `json_type(expr, '$.key') IS NOT NULL`
+    JsonHasKey {
+        /// The JSON expression
+        expr: Box<Expr>,
+        /// The key to check for
+        key: String,
+    },
+
+    /// JSON any key existence (has any of the keys)
+    ///
+    /// - PostgreSQL: `expr ?| array['key1', 'key2']` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS_PATH(expr, 'one', '$.key1', '$.key2')`
+    /// - SQLite: Requires OR of json_type checks
+    JsonHasAnyKey {
+        /// The JSON expression
+        expr: Box<Expr>,
+        /// The keys to check for
+        keys: Vec<String>,
+    },
+
+    /// JSON all keys existence (has all of the keys)
+    ///
+    /// - PostgreSQL: `expr ?& array['key1', 'key2']` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS_PATH(expr, 'all', '$.key1', '$.key2')`
+    /// - SQLite: Requires AND of json_type checks
+    JsonHasAllKeys {
+        /// The JSON expression
+        expr: Box<Expr>,
+        /// The keys to check for
+        keys: Vec<String>,
+    },
+
+    /// JSON array length
+    ///
+    /// - PostgreSQL: `jsonb_array_length(expr)`
+    /// - MySQL: `JSON_LENGTH(expr)`
+    /// - SQLite: `json_array_length(expr)`
+    JsonArrayLength {
+        /// The JSON array expression
+        expr: Box<Expr>,
+    },
+
+    /// JSON typeof (returns the type of the JSON value)
+    ///
+    /// - PostgreSQL: `jsonb_typeof(expr)`
+    /// - MySQL: `JSON_TYPE(expr)`
+    /// - SQLite: `json_type(expr)`
+    JsonTypeof {
+        /// The JSON expression
+        expr: Box<Expr>,
+    },
+}
+
+/// JSON path segment for extraction operations.
+#[derive(Debug, Clone)]
+pub enum JsonPath {
+    /// Object key access (e.g., `-> 'name'`)
+    Key(String),
+    /// Array index access (e.g., `-> 0`)
+    Index(i64),
 }
 
 /// Binary operators.
@@ -1267,6 +1403,242 @@ impl Expr {
         }
     }
 
+    // ==================== JSON Functions ====================
+
+    /// Extract a JSON value by key (returns JSON).
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr -> 'key'`
+    /// - MySQL: `JSON_EXTRACT(expr, '$.key')`
+    /// - SQLite: `json_extract(expr, '$.key')`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_get("name")
+    /// // PostgreSQL: "data" -> 'name'
+    /// // MySQL: JSON_EXTRACT("data", '$.name')
+    /// ```
+    pub fn json_get(self, key: impl Into<String>) -> Self {
+        Expr::JsonExtract {
+            expr: Box::new(self),
+            path: JsonPath::Key(key.into()),
+        }
+    }
+
+    /// Extract a JSON value by array index (returns JSON).
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr -> 0`
+    /// - MySQL: `JSON_EXTRACT(expr, '$[0]')`
+    /// - SQLite: `json_extract(expr, '$[0]')`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("items").json_get_index(0)
+    /// // PostgreSQL: "items" -> 0
+    /// ```
+    pub fn json_get_index(self, index: i64) -> Self {
+        Expr::JsonExtract {
+            expr: Box::new(self),
+            path: JsonPath::Index(index),
+        }
+    }
+
+    /// Extract a JSON value as text by key.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr ->> 'key'`
+    /// - MySQL: `JSON_UNQUOTE(JSON_EXTRACT(expr, '$.key'))`
+    /// - SQLite: `json_extract(expr, '$.key')` (returns text)
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_get_text("name")
+    /// // PostgreSQL: "data" ->> 'name'
+    /// ```
+    pub fn json_get_text(self, key: impl Into<String>) -> Self {
+        Expr::JsonExtractText {
+            expr: Box::new(self),
+            path: JsonPath::Key(key.into()),
+        }
+    }
+
+    /// Extract a JSON value as text by array index.
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("items").json_get_text_index(0)
+    /// // PostgreSQL: "items" ->> 0
+    /// ```
+    pub fn json_get_text_index(self, index: i64) -> Self {
+        Expr::JsonExtractText {
+            expr: Box::new(self),
+            path: JsonPath::Index(index),
+        }
+    }
+
+    /// Extract a nested JSON value by path (returns JSON).
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr #> '{path, to, value}'`
+    /// - MySQL: `JSON_EXTRACT(expr, '$.path.to.value')`
+    /// - SQLite: `json_extract(expr, '$.path.to.value')`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_path(&["address", "city"])
+    /// // PostgreSQL: "data" #> '{address, city}'
+    /// ```
+    pub fn json_path(self, path: &[&str]) -> Self {
+        Expr::JsonExtractPath {
+            expr: Box::new(self),
+            path: path.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Extract a nested JSON value by path as text.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr #>> '{path, to, value}'`
+    /// - MySQL: `JSON_UNQUOTE(JSON_EXTRACT(expr, '$.path.to.value'))`
+    /// - SQLite: `json_extract(expr, '$.path.to.value')`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_path_text(&["address", "city"])
+    /// // PostgreSQL: "data" #>> '{address, city}'
+    /// ```
+    pub fn json_path_text(self, path: &[&str]) -> Self {
+        Expr::JsonExtractPathText {
+            expr: Box::new(self),
+            path: path.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Check if JSON contains another JSON value.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr @> other` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS(expr, other)`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("tags").json_contains(Expr::lit(r#"["rust"]"#))
+    /// // PostgreSQL: "tags" @> '["rust"]'
+    /// ```
+    pub fn json_contains(self, other: impl Into<Expr>) -> Self {
+        Expr::JsonContains {
+            expr: Box::new(self),
+            other: Box::new(other.into()),
+        }
+    }
+
+    /// Check if JSON is contained by another JSON value.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr <@ other` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS(other, expr)`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("tags").json_contained_by(Expr::lit(r#"["rust", "python", "go"]"#))
+    /// ```
+    pub fn json_contained_by(self, other: impl Into<Expr>) -> Self {
+        Expr::JsonContainedBy {
+            expr: Box::new(self),
+            other: Box::new(other.into()),
+        }
+    }
+
+    /// Check if JSON object has a specific key.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr ? 'key'` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS_PATH(expr, 'one', '$.key')`
+    /// - SQLite: `json_type(expr, '$.key') IS NOT NULL`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_has_key("email")
+    /// // PostgreSQL: "data" ? 'email'
+    /// ```
+    pub fn json_has_key(self, key: impl Into<String>) -> Self {
+        Expr::JsonHasKey {
+            expr: Box::new(self),
+            key: key.into(),
+        }
+    }
+
+    /// Check if JSON object has any of the specified keys.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr ?| array['key1', 'key2']` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS_PATH(expr, 'one', '$.key1', '$.key2')`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_has_any_key(&["email", "phone"])
+    /// // PostgreSQL: "data" ?| array['email', 'phone']
+    /// ```
+    pub fn json_has_any_key(self, keys: &[&str]) -> Self {
+        Expr::JsonHasAnyKey {
+            expr: Box::new(self),
+            keys: keys.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Check if JSON object has all of the specified keys.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `expr ?& array['key1', 'key2']` (JSONB only)
+    /// - MySQL: `JSON_CONTAINS_PATH(expr, 'all', '$.key1', '$.key2')`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_has_all_keys(&["email", "phone"])
+    /// // PostgreSQL: "data" ?& array['email', 'phone']
+    /// ```
+    pub fn json_has_all_keys(self, keys: &[&str]) -> Self {
+        Expr::JsonHasAllKeys {
+            expr: Box::new(self),
+            keys: keys.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Get the length of a JSON array.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `jsonb_array_length(expr)`
+    /// - MySQL: `JSON_LENGTH(expr)`
+    /// - SQLite: `json_array_length(expr)`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("items").json_array_length()
+    /// ```
+    pub fn json_array_length(self) -> Self {
+        Expr::JsonArrayLength {
+            expr: Box::new(self),
+        }
+    }
+
+    /// Get the type of a JSON value.
+    ///
+    /// Generates dialect-specific SQL:
+    /// - PostgreSQL: `jsonb_typeof(expr)`
+    /// - MySQL: `JSON_TYPE(expr)`
+    /// - SQLite: `json_type(expr)`
+    ///
+    /// # Example
+    /// ```ignore
+    /// Expr::col("data").json_typeof()
+    /// ```
+    pub fn json_typeof(self) -> Self {
+        Expr::JsonTypeof {
+            expr: Box::new(self),
+        }
+    }
+
     // ==================== SQL Generation ====================
 
     /// Build SQL string and collect parameters (default PostgreSQL dialect).
@@ -1515,6 +1887,194 @@ impl Expr {
                     format!("{func_sql} OVER ()")
                 } else {
                     format!("{func_sql} OVER ({})", over_parts.join(" "))
+                }
+            }
+
+            // ==================== JSON Expressions ====================
+
+            Expr::JsonExtract { expr, path } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => {
+                        match path {
+                            JsonPath::Key(key) => format!("{expr_sql} -> '{key}'"),
+                            JsonPath::Index(idx) => format!("{expr_sql} -> {idx}"),
+                        }
+                    }
+                    Dialect::Mysql => {
+                        let json_path = match path {
+                            JsonPath::Key(key) => format!("$.{key}"),
+                            JsonPath::Index(idx) => format!("$[{idx}]"),
+                        };
+                        format!("JSON_EXTRACT({expr_sql}, '{json_path}')")
+                    }
+                    Dialect::Sqlite => {
+                        let json_path = match path {
+                            JsonPath::Key(key) => format!("$.{key}"),
+                            JsonPath::Index(idx) => format!("$[{idx}]"),
+                        };
+                        format!("json_extract({expr_sql}, '{json_path}')")
+                    }
+                }
+            }
+
+            Expr::JsonExtractText { expr, path } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => {
+                        match path {
+                            JsonPath::Key(key) => format!("{expr_sql} ->> '{key}'"),
+                            JsonPath::Index(idx) => format!("{expr_sql} ->> {idx}"),
+                        }
+                    }
+                    Dialect::Mysql => {
+                        let json_path = match path {
+                            JsonPath::Key(key) => format!("$.{key}"),
+                            JsonPath::Index(idx) => format!("$[{idx}]"),
+                        };
+                        format!("JSON_UNQUOTE(JSON_EXTRACT({expr_sql}, '{json_path}'))")
+                    }
+                    Dialect::Sqlite => {
+                        // SQLite's json_extract returns text for scalar values
+                        let json_path = match path {
+                            JsonPath::Key(key) => format!("$.{key}"),
+                            JsonPath::Index(idx) => format!("$[{idx}]"),
+                        };
+                        format!("json_extract({expr_sql}, '{json_path}')")
+                    }
+                }
+            }
+
+            Expr::JsonExtractPath { expr, path } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => {
+                        let path_array = path.join(", ");
+                        format!("{expr_sql} #> '{{{path_array}}}'")
+                    }
+                    Dialect::Mysql | Dialect::Sqlite => {
+                        let json_path = format!("$.{}", path.join("."));
+                        let func = if dialect == Dialect::Mysql {
+                            "JSON_EXTRACT"
+                        } else {
+                            "json_extract"
+                        };
+                        format!("{func}({expr_sql}, '{json_path}')")
+                    }
+                }
+            }
+
+            Expr::JsonExtractPathText { expr, path } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => {
+                        let path_array = path.join(", ");
+                        format!("{expr_sql} #>> '{{{path_array}}}'")
+                    }
+                    Dialect::Mysql => {
+                        let json_path = format!("$.{}", path.join("."));
+                        format!("JSON_UNQUOTE(JSON_EXTRACT({expr_sql}, '{json_path}'))")
+                    }
+                    Dialect::Sqlite => {
+                        let json_path = format!("$.{}", path.join("."));
+                        format!("json_extract({expr_sql}, '{json_path}')")
+                    }
+                }
+            }
+
+            Expr::JsonContains { expr, other } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                let other_sql = other.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => format!("{expr_sql} @> {other_sql}"),
+                    Dialect::Mysql => format!("JSON_CONTAINS({expr_sql}, {other_sql})"),
+                    Dialect::Sqlite => {
+                        // SQLite doesn't have direct containment, fallback to expression
+                        format!("/* JSON containment not supported in SQLite */ ({expr_sql} = {other_sql})")
+                    }
+                }
+            }
+
+            Expr::JsonContainedBy { expr, other } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                let other_sql = other.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => format!("{expr_sql} <@ {other_sql}"),
+                    Dialect::Mysql => format!("JSON_CONTAINS({other_sql}, {expr_sql})"),
+                    Dialect::Sqlite => {
+                        format!("/* JSON contained-by not supported in SQLite */ ({expr_sql} = {other_sql})")
+                    }
+                }
+            }
+
+            Expr::JsonHasKey { expr, key } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => format!("{expr_sql} ? '{key}'"),
+                    Dialect::Mysql => format!("JSON_CONTAINS_PATH({expr_sql}, 'one', '$.{key}')"),
+                    Dialect::Sqlite => format!("json_type({expr_sql}, '$.{key}') IS NOT NULL"),
+                }
+            }
+
+            Expr::JsonHasAnyKey { expr, keys } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => {
+                        let keys_array = keys.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+                        format!("{expr_sql} ?| array[{keys_array}]")
+                    }
+                    Dialect::Mysql => {
+                        let paths = keys.iter().map(|k| format!("'$.{k}'")).collect::<Vec<_>>().join(", ");
+                        format!("JSON_CONTAINS_PATH({expr_sql}, 'one', {paths})")
+                    }
+                    Dialect::Sqlite => {
+                        let checks = keys
+                            .iter()
+                            .map(|k| format!("json_type({expr_sql}, '$.{k}') IS NOT NULL"))
+                            .collect::<Vec<_>>()
+                            .join(" OR ");
+                        format!("({checks})")
+                    }
+                }
+            }
+
+            Expr::JsonHasAllKeys { expr, keys } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => {
+                        let keys_array = keys.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+                        format!("{expr_sql} ?& array[{keys_array}]")
+                    }
+                    Dialect::Mysql => {
+                        let paths = keys.iter().map(|k| format!("'$.{k}'")).collect::<Vec<_>>().join(", ");
+                        format!("JSON_CONTAINS_PATH({expr_sql}, 'all', {paths})")
+                    }
+                    Dialect::Sqlite => {
+                        let checks = keys
+                            .iter()
+                            .map(|k| format!("json_type({expr_sql}, '$.{k}') IS NOT NULL"))
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        format!("({checks})")
+                    }
+                }
+            }
+
+            Expr::JsonArrayLength { expr } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => format!("jsonb_array_length({expr_sql})"),
+                    Dialect::Mysql => format!("JSON_LENGTH({expr_sql})"),
+                    Dialect::Sqlite => format!("json_array_length({expr_sql})"),
+                }
+            }
+
+            Expr::JsonTypeof { expr } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                match dialect {
+                    Dialect::Postgres => format!("jsonb_typeof({expr_sql})"),
+                    Dialect::Mysql => format!("JSON_TYPE({expr_sql})"),
+                    Dialect::Sqlite => format!("json_type({expr_sql})"),
                 }
             }
         }
@@ -2805,5 +3365,209 @@ mod tests {
         let sql = "SELECT * FROM t WHERE a = ? AND b = ?";
         let adjusted = super::adjust_placeholder_indices(sql, 3, Dialect::Mysql);
         assert_eq!(adjusted, sql);
+    }
+
+    // ==================== JSON Expression Tests ====================
+
+    #[test]
+    fn test_json_get_key_postgres() {
+        let expr = Expr::col("data").json_get("name");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" -> 'name'");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_json_get_key_mysql() {
+        let expr = Expr::col("data").json_get("name");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_EXTRACT(`data`, '$.name')");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_json_get_key_sqlite() {
+        let expr = Expr::col("data").json_get("name");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Sqlite, &mut params, 0);
+        assert_eq!(sql, "json_extract(\"data\", '$.name')");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_json_get_index_postgres() {
+        let expr = Expr::col("items").json_get_index(0);
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"items\" -> 0");
+    }
+
+    #[test]
+    fn test_json_get_index_mysql() {
+        let expr = Expr::col("items").json_get_index(0);
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_EXTRACT(`items`, '$[0]')");
+    }
+
+    #[test]
+    fn test_json_get_text_postgres() {
+        let expr = Expr::col("data").json_get_text("name");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" ->> 'name'");
+    }
+
+    #[test]
+    fn test_json_get_text_mysql() {
+        let expr = Expr::col("data").json_get_text("name");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_UNQUOTE(JSON_EXTRACT(`data`, '$.name'))");
+    }
+
+    #[test]
+    fn test_json_path_postgres() {
+        let expr = Expr::col("data").json_path(&["address", "city"]);
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" #> '{address, city}'");
+    }
+
+    #[test]
+    fn test_json_path_mysql() {
+        let expr = Expr::col("data").json_path(&["address", "city"]);
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_EXTRACT(`data`, '$.address.city')");
+    }
+
+    #[test]
+    fn test_json_path_text_postgres() {
+        let expr = Expr::col("data").json_path_text(&["address", "city"]);
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" #>> '{address, city}'");
+    }
+
+    #[test]
+    fn test_json_contains_postgres() {
+        let expr = Expr::col("tags").json_contains(Expr::raw("'[\"rust\"]'"));
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"tags\" @> '[\"rust\"]'");
+    }
+
+    #[test]
+    fn test_json_contains_mysql() {
+        let expr = Expr::col("tags").json_contains(Expr::raw("'[\"rust\"]'"));
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_CONTAINS(`tags`, '[\"rust\"]')");
+    }
+
+    #[test]
+    fn test_json_has_key_postgres() {
+        let expr = Expr::col("data").json_has_key("email");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" ? 'email'");
+    }
+
+    #[test]
+    fn test_json_has_key_mysql() {
+        let expr = Expr::col("data").json_has_key("email");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_CONTAINS_PATH(`data`, 'one', '$.email')");
+    }
+
+    #[test]
+    fn test_json_has_key_sqlite() {
+        let expr = Expr::col("data").json_has_key("email");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Sqlite, &mut params, 0);
+        assert_eq!(sql, "json_type(\"data\", '$.email') IS NOT NULL");
+    }
+
+    #[test]
+    fn test_json_has_any_key_postgres() {
+        let expr = Expr::col("data").json_has_any_key(&["email", "phone"]);
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" ?| array['email', 'phone']");
+    }
+
+    #[test]
+    fn test_json_has_all_keys_postgres() {
+        let expr = Expr::col("data").json_has_all_keys(&["email", "phone"]);
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" ?& array['email', 'phone']");
+    }
+
+    #[test]
+    fn test_json_array_length_postgres() {
+        let expr = Expr::col("items").json_array_length();
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "jsonb_array_length(\"items\")");
+    }
+
+    #[test]
+    fn test_json_array_length_mysql() {
+        let expr = Expr::col("items").json_array_length();
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_LENGTH(`items`)");
+    }
+
+    #[test]
+    fn test_json_array_length_sqlite() {
+        let expr = Expr::col("items").json_array_length();
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Sqlite, &mut params, 0);
+        assert_eq!(sql, "json_array_length(\"items\")");
+    }
+
+    #[test]
+    fn test_json_typeof_postgres() {
+        let expr = Expr::col("data").json_typeof();
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "jsonb_typeof(\"data\")");
+    }
+
+    #[test]
+    fn test_json_typeof_mysql() {
+        let expr = Expr::col("data").json_typeof();
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
+        assert_eq!(sql, "JSON_TYPE(`data`)");
+    }
+
+    #[test]
+    fn test_json_chained_extraction() {
+        // Test chaining: data -> 'user' ->> 'name'
+        let expr = Expr::col("data").json_get("user").json_get_text("name");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        // The inner expression is first evaluated, then text extraction
+        // This tests nested JSON expressions
+        assert_eq!(sql, "\"data\" -> 'user' ->> 'name'");
+    }
+
+    #[test]
+    fn test_json_in_where_clause() {
+        // Test JSON expression in a comparison
+        let expr = Expr::col("data")
+            .json_get_text("status")
+            .eq("active");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"data\" ->> 'status' = $1");
+        assert_eq!(params.len(), 1);
     }
 }
