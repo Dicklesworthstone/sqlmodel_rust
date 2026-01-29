@@ -136,7 +136,23 @@ pub struct PoolError {
     pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl PoolError {
+    /// Create a new pool error indicating the internal mutex was poisoned.
+    ///
+    /// The `operation` parameter should describe what operation was being attempted
+    /// when the poisoned lock was encountered (e.g., "acquire", "close", "stats").
+    pub fn poisoned(operation: &str) -> Self {
+        Self {
+            kind: PoolErrorKind::Poisoned,
+            message: format!(
+                "pool mutex poisoned during {operation}; a thread panicked while holding the lock"
+            ),
+            source: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolErrorKind {
     /// Pool exhausted (no available connections)
     Exhausted,
@@ -146,6 +162,11 @@ pub enum PoolErrorKind {
     Closed,
     /// Configuration error
     Config,
+    /// Internal mutex was poisoned (a thread panicked while holding the lock)
+    ///
+    /// This indicates a serious internal error. The pool may still be usable
+    /// for read-only operations, but mutation operations will fail.
+    Poisoned,
 }
 
 #[derive(Debug)]
@@ -411,6 +432,14 @@ impl Error {
             Error::Timeout => true,
             _ => false,
         }
+    }
+
+    /// Is this error due to a poisoned mutex in the connection pool?
+    ///
+    /// A poisoned mutex indicates a thread panicked while holding the lock.
+    /// This is a serious internal error and the pool may be in an inconsistent state.
+    pub fn is_pool_poisoned(&self) -> bool {
+        matches!(self, Error::Pool(p) if p.kind == PoolErrorKind::Poisoned)
     }
 
     /// Is this a connection error that likely requires reconnection?
@@ -731,5 +760,47 @@ mod tests {
             source: None,
         });
         assert!(conn_error.is_connection_error());
+    }
+
+    #[test]
+    fn pool_poisoned_error() {
+        // Test the convenience constructor
+        let err = PoolError::poisoned("acquire");
+        assert_eq!(err.kind, PoolErrorKind::Poisoned);
+        assert!(err.message.contains("acquire"));
+        assert!(err.message.contains("poisoned"));
+        assert!(err.message.contains("panicked"));
+
+        // Test wrapped in Error
+        let error = Error::Pool(err);
+        assert!(error.is_pool_poisoned());
+        assert!(!error.is_retryable()); // Poisoned errors are NOT retryable
+        assert!(!error.is_connection_error());
+
+        // Test Display
+        let display = format!("{}", error);
+        assert!(display.contains("Pool error"));
+        assert!(display.contains("poisoned"));
+    }
+
+    #[test]
+    fn pool_poisoned_not_retryable() {
+        let poisoned = Error::Pool(PoolError::poisoned("close"));
+        let exhausted = Error::Pool(PoolError {
+            kind: PoolErrorKind::Exhausted,
+            message: "no connections".to_string(),
+            source: None,
+        });
+        let timeout = Error::Pool(PoolError {
+            kind: PoolErrorKind::Timeout,
+            message: "timed out".to_string(),
+            source: None,
+        });
+
+        // Poisoned is NOT retryable (it's a permanent failure)
+        assert!(!poisoned.is_retryable());
+        // But exhausted and timeout ARE retryable
+        assert!(exhausted.is_retryable());
+        assert!(timeout.is_retryable());
     }
 }
