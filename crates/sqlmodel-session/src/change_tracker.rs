@@ -59,7 +59,17 @@ impl ChangeTracker {
     /// This stores the serialized state of the object for later comparison.
     #[tracing::instrument(level = "trace", skip(self, obj))]
     pub fn snapshot<T: Model + Serialize>(&mut self, key: ObjectKey, obj: &T) {
-        let data = serde_json::to_vec(obj).unwrap_or_default();
+        let data = match serde_json::to_vec(obj) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    model = std::any::type_name::<T>(),
+                    error = %e,
+                    "Snapshot serialization failed, storing empty snapshot"
+                );
+                Vec::new()
+            }
+        };
         tracing::trace!(
             model = std::any::type_name::<T>(),
             pk_hash = key.pk_hash(),
@@ -90,7 +100,17 @@ impl ChangeTracker {
             return true;
         };
 
-        let current = serde_json::to_vec(obj).unwrap_or_default();
+        let current = match serde_json::to_vec(obj) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    model = std::any::type_name::<T>(),
+                    error = %e,
+                    "Dirty check serialization failed, treating as dirty"
+                );
+                return true;
+            }
+        };
         let dirty = current != snapshot.data;
         tracing::trace!(pk_hash = key.pk_hash(), dirty = dirty, "Dirty check result");
         dirty

@@ -571,8 +571,13 @@ pub trait ModelDump {
                 let mut writer = Vec::new();
                 let mut ser = serde_json::Serializer::with_formatter(&mut writer, formatter);
                 serde::Serialize::serialize(&value, &mut ser)?;
-                // SAFETY: serde_json always produces valid UTF-8
-                Ok(String::from_utf8(writer).expect("serde_json output should be valid UTF-8"))
+                // serde_json always produces valid UTF-8, but propagate error instead of panicking
+                String::from_utf8(writer).map_err(|e| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("UTF-8 encoding error: {e}"),
+                    ))
+                })
             }
             None => serde_json::to_string(&value),
         }
@@ -629,10 +634,12 @@ fn value_to_json(value: Value) -> serde_json::Value {
         Value::Bytes(b) => {
             // Encode bytes as hex string
             use std::fmt::Write;
-            let hex = b.iter().fold(String::new(), |mut acc, byte| {
-                let _ = write!(acc, "{byte:02x}");
-                acc
-            });
+            let hex = b
+                .iter()
+                .fold(String::with_capacity(b.len() * 2), |mut acc, byte| {
+                    let _ = write!(acc, "{byte:02x}");
+                    acc
+                });
             serde_json::Value::String(hex)
         }
         // Date is i32 (days since epoch) - convert to number
@@ -978,8 +985,13 @@ pub trait SqlModelDump: Model + serde::Serialize {
                 let mut writer = Vec::new();
                 let mut ser = serde_json::Serializer::with_formatter(&mut writer, formatter);
                 serde::Serialize::serialize(&value, &mut ser)?;
-                // SAFETY: serde_json always produces valid UTF-8
-                Ok(String::from_utf8(writer).expect("serde_json output should be valid UTF-8"))
+                // serde_json always produces valid UTF-8, but propagate error instead of panicking
+                String::from_utf8(writer).map_err(|e| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("UTF-8 encoding error: {e}"),
+                    ))
+                })
             }
             None => serde_json::to_string(&value),
         }

@@ -82,9 +82,12 @@ pub async fn drop_table<C: Connection>(
     if_exists: bool,
 ) -> Outcome<(), sqlmodel_core::Error> {
     let sql = if if_exists {
-        format!("DROP TABLE IF EXISTS {}", table_name)
+        format!(
+            "DROP TABLE IF EXISTS \"{}\"",
+            table_name.replace('"', "\"\"")
+        )
     } else {
-        format!("DROP TABLE {}", table_name)
+        format!("DROP TABLE \"{}\"", table_name.replace('"', "\"\""))
     };
 
     conn.execute(cx, &sql, &[]).await.map(|_| ())

@@ -147,9 +147,12 @@ impl<C: Connection> ReplicaPool<C> {
                 idx % self.replicas.len()
             }
             ReplicaStrategy::Random => {
-                // Simple pseudo-random using counter with stride
-                let idx = self.round_robin_counter.fetch_add(7, Ordering::Relaxed);
-                idx % self.replicas.len()
+                // Mix counter bits to approximate uniform distribution without
+                // pulling in a random number generator dependency.
+                let seq = self.round_robin_counter.fetch_add(1, Ordering::Relaxed);
+                // Multiplicative hash (Knuth's) to spread sequential values
+                let mixed = seq.wrapping_mul(2_654_435_761);
+                mixed % self.replicas.len()
             }
         }
     }

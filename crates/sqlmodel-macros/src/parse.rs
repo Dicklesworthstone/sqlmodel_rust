@@ -339,30 +339,30 @@ impl FieldDef {
     ///
     /// Priority: serialization_alias > alias > field name
     #[allow(dead_code)]
-    pub fn output_name(&self) -> &str {
+    pub fn output_name(&self) -> String {
         self.serialization_alias
             .as_deref()
             .or(self.alias.as_deref())
-            .unwrap_or_else(|| self.name.to_string().leak())
+            .map_or_else(|| self.name.to_string(), String::from)
     }
 
     /// Returns all names that should be accepted when deserializing (input).
     ///
     /// This includes: field name, alias, and validation_alias.
     #[allow(dead_code)]
-    pub fn input_names(&self) -> Vec<&str> {
+    pub fn input_names(&self) -> Vec<String> {
         let field_name = self.name.to_string();
-        let mut names = vec![field_name.leak() as &str];
+        let mut names = vec![field_name];
 
         if let Some(ref alias) = self.alias {
-            if !names.contains(&alias.as_str()) {
-                names.push(alias.as_str());
+            if !names.iter().any(|n| n == alias) {
+                names.push(alias.clone());
             }
         }
 
         if let Some(ref val_alias) = self.validation_alias {
-            if !names.contains(&val_alias.as_str()) {
-                names.push(val_alias.as_str());
+            if !names.iter().any(|n| n == val_alias) {
+                names.push(val_alias.clone());
             }
         }
 
@@ -2598,8 +2598,8 @@ mod tests {
         let def2 = parse_model(&input2).unwrap();
         let field2 = def2.fields.iter().find(|f| f.name == "name").unwrap();
         let names2 = field2.input_names();
-        assert!(names2.contains(&"name"));
-        assert!(names2.contains(&"user_name"));
+        assert!(names2.iter().any(|n| n == "name"));
+        assert!(names2.iter().any(|n| n == "user_name"));
 
         // With alias - accepts both
         let input3: DeriveInput = parse_quote! {
@@ -2613,8 +2613,8 @@ mod tests {
         let def3 = parse_model(&input3).unwrap();
         let field3 = def3.fields.iter().find(|f| f.name == "name").unwrap();
         let names3 = field3.input_names();
-        assert!(names3.contains(&"name"));
-        assert!(names3.contains(&"nm"));
+        assert!(names3.iter().any(|n| n == "name"));
+        assert!(names3.iter().any(|n| n == "nm"));
     }
 
     #[test]
