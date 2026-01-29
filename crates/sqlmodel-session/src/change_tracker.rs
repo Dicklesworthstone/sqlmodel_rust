@@ -145,10 +145,28 @@ impl ChangeTracker {
         };
 
         // Parse both as JSON objects and compare fields
-        let original: serde_json::Value =
-            serde_json::from_slice(&snapshot.data).unwrap_or(serde_json::Value::Null);
-        let current: serde_json::Value =
-            serde_json::to_value(obj).unwrap_or(serde_json::Value::Null);
+        let original: serde_json::Value = match serde_json::from_slice(&snapshot.data) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    model = std::any::type_name::<T>(),
+                    error = %e,
+                    "Snapshot deserialization failed in changed_fields, treating all as changed"
+                );
+                serde_json::Value::Null
+            }
+        };
+        let current: serde_json::Value = match serde_json::to_value(obj) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    model = std::any::type_name::<T>(),
+                    error = %e,
+                    "Current serialization failed in changed_fields, treating all as changed"
+                );
+                serde_json::Value::Null
+            }
+        };
 
         let mut changed = Vec::new();
         for field in T::fields() {
@@ -172,17 +190,33 @@ impl ChangeTracker {
     pub fn changed_fields_raw(
         &self,
         key: &ObjectKey,
-        current: &[u8],
+        current_bytes: &[u8],
         field_names: &[&'static str],
     ) -> Vec<&'static str> {
         let Some(snapshot) = self.snapshots.get(key) else {
             return field_names.to_vec();
         };
 
-        let original: serde_json::Value =
-            serde_json::from_slice(&snapshot.data).unwrap_or(serde_json::Value::Null);
-        let current: serde_json::Value =
-            serde_json::from_slice(current).unwrap_or(serde_json::Value::Null);
+        let original: serde_json::Value = match serde_json::from_slice(&snapshot.data) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Snapshot deserialization failed in changed_fields_raw, treating all as changed"
+                );
+                serde_json::Value::Null
+            }
+        };
+        let current: serde_json::Value = match serde_json::from_slice(current_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Current deserialization failed in changed_fields_raw, treating all as changed"
+                );
+                serde_json::Value::Null
+            }
+        };
 
         let mut changed = Vec::new();
         for name in field_names {
@@ -207,10 +241,28 @@ impl ChangeTracker {
             return Vec::new();
         };
 
-        let original: serde_json::Value =
-            serde_json::from_slice(&snapshot.data).unwrap_or(serde_json::Value::Null);
-        let current: serde_json::Value =
-            serde_json::to_value(obj).unwrap_or(serde_json::Value::Null);
+        let original: serde_json::Value = match serde_json::from_slice(&snapshot.data) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    model = std::any::type_name::<T>(),
+                    error = %e,
+                    "Snapshot deserialization failed in attribute_changes, treating as empty"
+                );
+                serde_json::Value::Null
+            }
+        };
+        let current: serde_json::Value = match serde_json::to_value(obj) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    model = std::any::type_name::<T>(),
+                    error = %e,
+                    "Current serialization failed in attribute_changes, treating as empty"
+                );
+                serde_json::Value::Null
+            }
+        };
 
         let mut changes = Vec::new();
         for field in T::fields() {

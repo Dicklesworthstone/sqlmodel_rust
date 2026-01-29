@@ -150,9 +150,12 @@ impl<C: Connection> ReplicaPool<C> {
                 // Mix counter bits to approximate uniform distribution without
                 // pulling in a random number generator dependency.
                 let seq = self.round_robin_counter.fetch_add(1, Ordering::Relaxed);
-                // Multiplicative hash (Knuth's) to spread sequential values
-                let mixed = seq.wrapping_mul(2_654_435_761);
-                mixed % self.replicas.len()
+                // Multiplicative hash using golden ratio constant.
+                // Use 32-bit mixing and cast to usize for portability across architectures.
+                #[allow(clippy::cast_possible_truncation)]
+                let seq32 = seq as u32;
+                let mixed = seq32.wrapping_mul(2_654_435_761_u32);
+                (mixed as usize) % self.replicas.len()
             }
         }
     }
