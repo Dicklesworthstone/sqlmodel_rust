@@ -1891,16 +1891,13 @@ impl Expr {
             }
 
             // ==================== JSON Expressions ====================
-
             Expr::JsonExtract { expr, path } => {
                 let expr_sql = expr.build_with_dialect(dialect, params, offset);
                 match dialect {
-                    Dialect::Postgres => {
-                        match path {
-                            JsonPath::Key(key) => format!("{expr_sql} -> '{key}'"),
-                            JsonPath::Index(idx) => format!("{expr_sql} -> {idx}"),
-                        }
-                    }
+                    Dialect::Postgres => match path {
+                        JsonPath::Key(key) => format!("{expr_sql} -> '{key}'"),
+                        JsonPath::Index(idx) => format!("{expr_sql} -> {idx}"),
+                    },
                     Dialect::Mysql => {
                         let json_path = match path {
                             JsonPath::Key(key) => format!("$.{key}"),
@@ -1921,12 +1918,10 @@ impl Expr {
             Expr::JsonExtractText { expr, path } => {
                 let expr_sql = expr.build_with_dialect(dialect, params, offset);
                 match dialect {
-                    Dialect::Postgres => {
-                        match path {
-                            JsonPath::Key(key) => format!("{expr_sql} ->> '{key}'"),
-                            JsonPath::Index(idx) => format!("{expr_sql} ->> {idx}"),
-                        }
-                    }
+                    Dialect::Postgres => match path {
+                        JsonPath::Key(key) => format!("{expr_sql} ->> '{key}'"),
+                        JsonPath::Index(idx) => format!("{expr_sql} ->> {idx}"),
+                    },
                     Dialect::Mysql => {
                         let json_path = match path {
                             JsonPath::Key(key) => format!("$.{key}"),
@@ -1990,7 +1985,9 @@ impl Expr {
                     Dialect::Mysql => format!("JSON_CONTAINS({expr_sql}, {other_sql})"),
                     Dialect::Sqlite => {
                         // SQLite doesn't have direct containment, fallback to expression
-                        format!("/* JSON containment not supported in SQLite */ ({expr_sql} = {other_sql})")
+                        format!(
+                            "/* JSON containment not supported in SQLite */ ({expr_sql} = {other_sql})"
+                        )
                     }
                 }
             }
@@ -2002,7 +1999,9 @@ impl Expr {
                     Dialect::Postgres => format!("{expr_sql} <@ {other_sql}"),
                     Dialect::Mysql => format!("JSON_CONTAINS({other_sql}, {expr_sql})"),
                     Dialect::Sqlite => {
-                        format!("/* JSON contained-by not supported in SQLite */ ({expr_sql} = {other_sql})")
+                        format!(
+                            "/* JSON contained-by not supported in SQLite */ ({expr_sql} = {other_sql})"
+                        )
                     }
                 }
             }
@@ -2020,11 +2019,19 @@ impl Expr {
                 let expr_sql = expr.build_with_dialect(dialect, params, offset);
                 match dialect {
                     Dialect::Postgres => {
-                        let keys_array = keys.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+                        let keys_array = keys
+                            .iter()
+                            .map(|k| format!("'{k}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         format!("{expr_sql} ?| array[{keys_array}]")
                     }
                     Dialect::Mysql => {
-                        let paths = keys.iter().map(|k| format!("'$.{k}'")).collect::<Vec<_>>().join(", ");
+                        let paths = keys
+                            .iter()
+                            .map(|k| format!("'$.{k}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         format!("JSON_CONTAINS_PATH({expr_sql}, 'one', {paths})")
                     }
                     Dialect::Sqlite => {
@@ -2042,11 +2049,19 @@ impl Expr {
                 let expr_sql = expr.build_with_dialect(dialect, params, offset);
                 match dialect {
                     Dialect::Postgres => {
-                        let keys_array = keys.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+                        let keys_array = keys
+                            .iter()
+                            .map(|k| format!("'{k}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         format!("{expr_sql} ?& array[{keys_array}]")
                     }
                     Dialect::Mysql => {
-                        let paths = keys.iter().map(|k| format!("'$.{k}'")).collect::<Vec<_>>().join(", ");
+                        let paths = keys
+                            .iter()
+                            .map(|k| format!("'$.{k}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         format!("JSON_CONTAINS_PATH({expr_sql}, 'all', {paths})")
                     }
                     Dialect::Sqlite => {
@@ -3562,9 +3577,7 @@ mod tests {
     #[test]
     fn test_json_in_where_clause() {
         // Test JSON expression in a comparison
-        let expr = Expr::col("data")
-            .json_get_text("status")
-            .eq("active");
+        let expr = Expr::col("data").json_get_text("status").eq("active");
         let mut params = Vec::new();
         let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
         assert_eq!(sql, "\"data\" ->> 'status' = $1");
