@@ -43,6 +43,31 @@ pub enum PassiveDeletes {
     All,
 }
 
+/// Lazy loading strategy for relationships.
+///
+/// Controls how and when related objects are loaded from the database.
+/// Maps to SQLAlchemy's relationship lazy parameter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LazyLoadStrategy {
+    /// Load items on first access via separate SELECT (default).
+    #[default]
+    Select,
+    /// Eager load via JOIN in parent query.
+    Joined,
+    /// Eager load via separate SELECT using IN clause.
+    Subquery,
+    /// Eager load via subquery correlated to parent.
+    Selectin,
+    /// Return a query object instead of loading items (for large collections).
+    Dynamic,
+    /// Never load - access raises error (useful for write-only relationships).
+    NoLoad,
+    /// Always raise error on access (strict write-only).
+    RaiseOnSql,
+    /// Write-only collection (append/remove only, no iteration).
+    WriteOnly,
+}
+
 /// Information about a link/join table for many-to-many relationships.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkTableInfo {
@@ -98,7 +123,7 @@ pub struct RelationshipInfo {
     /// The field on the related model that points back.
     pub back_populates: Option<&'static str>,
 
-    /// Whether to use lazy loading.
+    /// Whether to use lazy loading (simple flag).
     pub lazy: bool,
 
     /// Cascade delete behavior.
@@ -106,6 +131,21 @@ pub struct RelationshipInfo {
 
     /// Passive delete behavior - whether ORM emits DELETE or relies on DB cascade.
     pub passive_deletes: PassiveDeletes,
+
+    /// Default ordering for related items (e.g., "name", "created_at DESC").
+    pub order_by: Option<&'static str>,
+
+    /// Loading strategy for this relationship.
+    pub lazy_strategy: Option<LazyLoadStrategy>,
+
+    /// Full cascade options string (e.g., "all, delete-orphan").
+    pub cascade: Option<&'static str>,
+
+    /// Force list or single (override field type inference).
+    /// - `Some(true)`: Always return a list
+    /// - `Some(false)`: Always return a single item
+    /// - `None`: Infer from field type
+    pub uselist: Option<bool>,
 }
 
 impl RelationshipInfo {
@@ -127,6 +167,10 @@ impl RelationshipInfo {
             lazy: false,
             cascade_delete: false,
             passive_deletes: PassiveDeletes::Active,
+            order_by: None,
+            lazy_strategy: None,
+            cascade: None,
+            uselist: None,
         }
     }
 
@@ -180,6 +224,62 @@ impl RelationshipInfo {
     #[must_use]
     pub const fn passive_deletes(mut self, value: PassiveDeletes) -> Self {
         self.passive_deletes = value;
+        self
+    }
+
+    /// Set default ordering for related items.
+    #[must_use]
+    pub const fn order_by(mut self, ordering: &'static str) -> Self {
+        self.order_by = Some(ordering);
+        self
+    }
+
+    /// Set default ordering from optional.
+    #[must_use]
+    pub const fn order_by_opt(mut self, ordering: Option<&'static str>) -> Self {
+        self.order_by = ordering;
+        self
+    }
+
+    /// Set the lazy loading strategy.
+    #[must_use]
+    pub const fn lazy_strategy(mut self, strategy: LazyLoadStrategy) -> Self {
+        self.lazy_strategy = Some(strategy);
+        self
+    }
+
+    /// Set the lazy loading strategy from optional.
+    #[must_use]
+    pub const fn lazy_strategy_opt(mut self, strategy: Option<LazyLoadStrategy>) -> Self {
+        self.lazy_strategy = strategy;
+        self
+    }
+
+    /// Set full cascade options string.
+    #[must_use]
+    pub const fn cascade(mut self, opts: &'static str) -> Self {
+        self.cascade = Some(opts);
+        self
+    }
+
+    /// Set cascade options from optional.
+    #[must_use]
+    pub const fn cascade_opt(mut self, opts: Option<&'static str>) -> Self {
+        self.cascade = opts;
+        self
+    }
+
+    /// Force list or single.
+    #[must_use]
+    pub const fn uselist(mut self, value: bool) -> Self {
+        self.uselist = Some(value);
+        self
+    }
+
+    /// Set uselist from optional.
+    #[must_use]
+    pub const fn uselist_opt(mut self, value: Option<bool>) -> Self {
+        self.uselist = value;
         self
     }
 
@@ -1835,6 +1935,10 @@ mod tests {
             lazy: false,
             cascade_delete: false,
             passive_deletes: PassiveDeletes::Active,
+            order_by: None,
+            lazy_strategy: None,
+            cascade: None,
+            uselist: None,
         }];
 
         fn fields() -> &'static [FieldInfo] {
@@ -1885,6 +1989,10 @@ mod tests {
             lazy: false,
             cascade_delete: false,
             passive_deletes: PassiveDeletes::Active,
+            order_by: None,
+            lazy_strategy: None,
+            cascade: None,
+            uselist: None,
         }];
 
         fn fields() -> &'static [FieldInfo] {

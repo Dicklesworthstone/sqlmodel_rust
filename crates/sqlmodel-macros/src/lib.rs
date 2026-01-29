@@ -733,6 +733,57 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
             }
         };
 
+        // New sa_relationship fields
+        let order_by_call = if let Some(ref ob) = rel.order_by {
+            quote::quote! { .order_by(#ob) }
+        } else {
+            quote::quote! {}
+        };
+
+        let lazy_strategy_call = if let Some(ref strategy) = rel.lazy_strategy {
+            let strategy_token = match strategy {
+                crate::parse::LazyLoadStrategyAttr::Select => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Select }
+                }
+                crate::parse::LazyLoadStrategyAttr::Joined => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Joined }
+                }
+                crate::parse::LazyLoadStrategyAttr::Subquery => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Subquery }
+                }
+                crate::parse::LazyLoadStrategyAttr::Selectin => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Selectin }
+                }
+                crate::parse::LazyLoadStrategyAttr::Dynamic => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Dynamic }
+                }
+                crate::parse::LazyLoadStrategyAttr::NoLoad => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::NoLoad }
+                }
+                crate::parse::LazyLoadStrategyAttr::RaiseOnSql => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::RaiseOnSql }
+                }
+                crate::parse::LazyLoadStrategyAttr::WriteOnly => {
+                    quote::quote! { sqlmodel_core::LazyLoadStrategy::WriteOnly }
+                }
+            };
+            quote::quote! { .lazy_strategy(#strategy_token) }
+        } else {
+            quote::quote! {}
+        };
+
+        let cascade_call = if let Some(ref c) = rel.cascade {
+            quote::quote! { .cascade(#c) }
+        } else {
+            quote::quote! {}
+        };
+
+        let uselist_call = if let Some(ul) = rel.uselist {
+            quote::quote! { .uselist(#ul) }
+        } else {
+            quote::quote! {}
+        };
+
         relationship_tokens.push(quote::quote! {
             sqlmodel_core::RelationshipInfo::new(
                 stringify!(#field_name),
@@ -746,6 +797,10 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
             .lazy(#lazy_val)
             .cascade_delete(#cascade_val)
             .passive_deletes(#passive_deletes_token)
+            #order_by_call
+            #lazy_strategy_call
+            #cascade_call
+            #uselist_call
         });
     }
 

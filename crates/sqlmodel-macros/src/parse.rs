@@ -149,7 +149,7 @@ pub struct RelationshipAttr {
     pub link_table: Option<LinkTableAttr>,
     /// The field on the related model that points back.
     pub back_populates: Option<String>,
-    /// Whether to use lazy loading.
+    /// Whether to use lazy loading (simple flag, superseded by lazy_strategy).
     pub lazy: bool,
     /// Cascade delete behavior.
     pub cascade_delete: bool,
@@ -157,6 +157,37 @@ pub struct RelationshipAttr {
     pub passive_deletes: PassiveDeletesAttr,
     /// Inferred relationship kind from field type.
     pub kind: RelationshipKindAttr,
+    /// Default ordering for related items (e.g., "Child::name" or "name DESC").
+    pub order_by: Option<String>,
+    /// Loading strategy for the relationship.
+    pub lazy_strategy: Option<LazyLoadStrategyAttr>,
+    /// Full cascade options string (e.g., "all, delete-orphan").
+    pub cascade: Option<String>,
+    /// Force list or single (override inference from field type).
+    pub uselist: Option<bool>,
+}
+
+/// Lazy loading strategy for relationships.
+///
+/// Maps to SQLAlchemy's relationship lazy parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LazyLoadStrategyAttr {
+    /// Load items on first access (default).
+    Select,
+    /// Eager load via JOIN.
+    Joined,
+    /// Eager load via separate SELECT with IN clause.
+    Subquery,
+    /// Load via subquery into parent query.
+    Selectin,
+    /// Return a query object instead of loading items.
+    Dynamic,
+    /// Never load (raise error on access).
+    NoLoad,
+    /// Always raise error on access (for write-only relationships).
+    RaiseOnSql,
+    /// Write-only collection.
+    WriteOnly,
 }
 
 /// Link table configuration for many-to-many relationships.
@@ -1163,6 +1194,11 @@ fn parse_relationship_content(
     let mut link_table: Option<LinkTableAttr> = None;
     let mut one_to_one = false;
     let mut many_to_many = false;
+    // New sa_relationship fields
+    let mut order_by: Option<String> = None;
+    let mut lazy_strategy: Option<LazyLoadStrategyAttr> = None;
+    let mut cascade: Option<String> = None;
+    let mut uselist: Option<bool> = None;
 
     meta.parse_nested_meta(|nested| {
         let path = &nested.path;
@@ -1330,12 +1366,74 @@ fn parse_relationship_content(
                     "link_table requires table, local_column, and remote_column",
                 ));
             }
+        } else if path.is_ident("order_by") {
+            let value: Lit = nested.value()?.parse()?;
+            if let Lit::Str(lit_str) = value {
+                order_by = Some(lit_str.value());
+            } else {
+                return Err(Error::new_spanned(
+                    value,
+                    "expected string literal for order_by",
+                ));
+            }
+        } else if path.is_ident("lazy_strategy") {
+            let value: Lit = nested.value()?.parse()?;
+            if let Lit::Str(lit_str) = value {
+                let strategy = match lit_str.value().to_lowercase().as_str() {
+                    "select" => LazyLoadStrategyAttr::Select,
+                    "joined" => LazyLoadStrategyAttr::Joined,
+                    "subquery" => LazyLoadStrategyAttr::Subquery,
+                    "selectin" => LazyLoadStrategyAttr::Selectin,
+                    "dynamic" => LazyLoadStrategyAttr::Dynamic,
+                    "noload" | "no_load" => LazyLoadStrategyAttr::NoLoad,
+                    "raise_on_sql" | "raiseonsql" => LazyLoadStrategyAttr::RaiseOnSql,
+                    "write_only" | "writeonly" => LazyLoadStrategyAttr::WriteOnly,
+                    other => {
+                        return Err(Error::new_spanned(
+                            lit_str,
+                            format!(
+                                "unknown lazy strategy '{}'. Valid: select, joined, \
+                                 subquery, selectin, dynamic, noload, raise_on_sql, write_only",
+                                other
+                            ),
+                        ));
+                    }
+                };
+                lazy_strategy = Some(strategy);
+            } else {
+                return Err(Error::new_spanned(
+                    value,
+                    "expected string literal for lazy_strategy",
+                ));
+            }
+        } else if path.is_ident("cascade") {
+            let value: Lit = nested.value()?.parse()?;
+            if let Lit::Str(lit_str) = value {
+                cascade = Some(lit_str.value());
+            } else {
+                return Err(Error::new_spanned(
+                    value,
+                    "expected string literal for cascade",
+                ));
+            }
+        } else if path.is_ident("uselist") {
+            if nested.input.peek(syn::Token![=]) {
+                let value: Lit = nested.value()?.parse()?;
+                if let Lit::Bool(lit_bool) = value {
+                    uselist = Some(lit_bool.value());
+                } else {
+                    return Err(Error::new_spanned(value, "expected boolean for uselist"));
+                }
+            } else {
+                uselist = Some(true);
+            }
         } else {
             return Err(Error::new_spanned(
                 path,
                 "unknown relationship attribute. \
                  Valid: model, foreign_key, remote_key, back_populates, lazy, \
-                 cascade_delete, passive_deletes, one_to_one, many_to_many, link_table",
+                 cascade_delete, passive_deletes, one_to_one, many_to_many, link_table, \
+                 order_by, lazy_strategy, cascade, uselist",
             ));
         }
 
@@ -1370,6 +1468,10 @@ fn parse_relationship_content(
         cascade_delete,
         passive_deletes,
         kind,
+        order_by,
+        lazy_strategy,
+        cascade,
+        uselist,
     })
 }
 
@@ -3468,6 +3570,145 @@ mod tests {
         assert!(
             err_msg.contains("unknown sa_column attribute"),
             "Expected unknown attribute error, got: {}",
+            err_msg
+        );
+    }
+
+    // =========================================================================
+    // sa_relationship Tests (Relationship Override Attributes)
+    // =========================================================================
+
+    #[test]
+    fn test_parse_relationship_order_by() {
+        let input: DeriveInput = parse_quote! {
+            struct Team {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(relationship(
+                    model = "heroes",
+                    order_by = "name ASC"
+                ))]
+                members: Related<Vec<Hero>>,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let rel_fields = def.relationship_fields();
+        assert_eq!(rel_fields.len(), 1);
+
+        let rel = rel_fields[0].relationship.as_ref().unwrap();
+        assert_eq!(rel.order_by.as_deref(), Some("name ASC"));
+    }
+
+    #[test]
+    fn test_parse_relationship_lazy_strategy() {
+        let input: DeriveInput = parse_quote! {
+            struct Team {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(relationship(
+                    model = "heroes",
+                    lazy_strategy = "selectin"
+                ))]
+                members: Related<Vec<Hero>>,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let rel_fields = def.relationship_fields();
+        let rel = rel_fields[0].relationship.as_ref().unwrap();
+        assert_eq!(rel.lazy_strategy, Some(LazyLoadStrategyAttr::Selectin));
+    }
+
+    #[test]
+    fn test_parse_relationship_cascade() {
+        let input: DeriveInput = parse_quote! {
+            struct Team {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(relationship(
+                    model = "heroes",
+                    cascade = "all, delete-orphan"
+                ))]
+                members: Related<Vec<Hero>>,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let rel_fields = def.relationship_fields();
+        let rel = rel_fields[0].relationship.as_ref().unwrap();
+        assert_eq!(rel.cascade.as_deref(), Some("all, delete-orphan"));
+    }
+
+    #[test]
+    fn test_parse_relationship_uselist() {
+        let input: DeriveInput = parse_quote! {
+            struct Team {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(relationship(
+                    model = "teams",
+                    uselist = false
+                ))]
+                parent: Related<Team>,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let rel_fields = def.relationship_fields();
+        let rel = rel_fields[0].relationship.as_ref().unwrap();
+        assert_eq!(rel.uselist, Some(false));
+    }
+
+    #[test]
+    fn test_parse_relationship_all_new_attrs() {
+        let input: DeriveInput = parse_quote! {
+            struct Parent {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(relationship(
+                    model = "children",
+                    remote_key = "parent_id",
+                    order_by = "created_at DESC",
+                    lazy_strategy = "dynamic",
+                    cascade = "save-update, merge",
+                    uselist
+                ))]
+                children: Related<Vec<Child>>,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        let rel_fields = def.relationship_fields();
+        let rel = rel_fields[0].relationship.as_ref().unwrap();
+
+        assert_eq!(rel.model, "children");
+        assert_eq!(rel.remote_key.as_deref(), Some("parent_id"));
+        assert_eq!(rel.order_by.as_deref(), Some("created_at DESC"));
+        assert_eq!(rel.lazy_strategy, Some(LazyLoadStrategyAttr::Dynamic));
+        assert_eq!(rel.cascade.as_deref(), Some("save-update, merge"));
+        assert_eq!(rel.uselist, Some(true));
+    }
+
+    #[test]
+    fn test_parse_relationship_invalid_lazy_strategy() {
+        let input: DeriveInput = parse_quote! {
+            struct Team {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(relationship(
+                    model = "heroes",
+                    lazy_strategy = "invalid_strategy"
+                ))]
+                members: Related<Vec<Hero>>,
+            }
+        };
+
+        let err = parse_model(&input).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("unknown lazy strategy"),
+            "Expected unknown lazy strategy error, got: {}",
             err_msg
         );
     }
