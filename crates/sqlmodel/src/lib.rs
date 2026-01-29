@@ -100,7 +100,9 @@ pub use sqlmodel_schema::{
     create_table, drop_table,
 };
 
-pub use sqlmodel_pool::{Pool, PoolConfig, PoolStats, PooledConnection};
+pub use sqlmodel_pool::{
+    Pool, PoolConfig, PoolStats, PooledConnection, ReplicaPool, ReplicaStrategy,
+};
 
 // Session management
 pub mod session;
