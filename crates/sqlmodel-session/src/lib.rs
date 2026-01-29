@@ -55,6 +55,73 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 
 // ============================================================================
+// Session Events
+// ============================================================================
+
+/// Type alias for session event callbacks.
+///
+/// Callbacks receive no arguments and return `Result<(), Error>`.
+/// Returning `Err` will abort the operation (e.g., prevent commit).
+type SessionEventFn = Box<dyn FnMut() -> Result<(), Error> + Send>;
+
+/// Holds registered session-level event callbacks.
+///
+/// These are fired at key points in the session lifecycle:
+/// before/after flush, commit, and rollback.
+#[derive(Default)]
+pub struct SessionEventCallbacks {
+    before_flush: Vec<SessionEventFn>,
+    after_flush: Vec<SessionEventFn>,
+    before_commit: Vec<SessionEventFn>,
+    after_commit: Vec<SessionEventFn>,
+    after_rollback: Vec<SessionEventFn>,
+}
+
+impl std::fmt::Debug for SessionEventCallbacks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEventCallbacks")
+            .field("before_flush", &self.before_flush.len())
+            .field("after_flush", &self.after_flush.len())
+            .field("before_commit", &self.before_commit.len())
+            .field("after_commit", &self.after_commit.len())
+            .field("after_rollback", &self.after_rollback.len())
+            .finish()
+    }
+}
+
+impl SessionEventCallbacks {
+    #[allow(clippy::result_large_err)]
+    fn fire(&mut self, event: SessionEvent) -> Result<(), Error> {
+        let callbacks = match event {
+            SessionEvent::BeforeFlush => &mut self.before_flush,
+            SessionEvent::AfterFlush => &mut self.after_flush,
+            SessionEvent::BeforeCommit => &mut self.before_commit,
+            SessionEvent::AfterCommit => &mut self.after_commit,
+            SessionEvent::AfterRollback => &mut self.after_rollback,
+        };
+        for cb in callbacks.iter_mut() {
+            cb()?;
+        }
+        Ok(())
+    }
+}
+
+/// Session lifecycle events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// Fired before flush executes pending changes.
+    BeforeFlush,
+    /// Fired after flush completes successfully.
+    AfterFlush,
+    /// Fired before commit (after flush).
+    BeforeCommit,
+    /// Fired after commit completes successfully.
+    AfterCommit,
+    /// Fired after rollback completes.
+    AfterRollback,
+}
+
+// ============================================================================
 // Session Configuration
 // ============================================================================
 
@@ -394,6 +461,8 @@ pub struct Session<C: Connection> {
     config: SessionConfig,
     /// N+1 query detection tracker (optional).
     n1_tracker: Option<N1QueryTracker>,
+    /// Session-level event callbacks.
+    event_callbacks: SessionEventCallbacks,
 }
 
 impl<C: Connection> Session<C> {
@@ -413,6 +482,7 @@ impl<C: Connection> Session<C> {
             pending_dirty: Vec::new(),
             config,
             n1_tracker: None,
+            event_callbacks: SessionEventCallbacks::default(),
         }
     }
 
@@ -424,6 +494,39 @@ impl<C: Connection> Session<C> {
     /// Get the session configuration.
     pub fn config(&self) -> &SessionConfig {
         &self.config
+    }
+
+    // ========================================================================
+    // Session Events
+    // ========================================================================
+
+    /// Register a callback to run before flush.
+    ///
+    /// The callback can abort the flush by returning `Err`.
+    pub fn on_before_flush(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.before_flush.push(Box::new(f));
+    }
+
+    /// Register a callback to run after a successful flush.
+    pub fn on_after_flush(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.after_flush.push(Box::new(f));
+    }
+
+    /// Register a callback to run before commit (after flush).
+    ///
+    /// The callback can abort the commit by returning `Err`.
+    pub fn on_before_commit(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.before_commit.push(Box::new(f));
+    }
+
+    /// Register a callback to run after a successful commit.
+    pub fn on_after_commit(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.after_commit.push(Box::new(f));
+    }
+
+    /// Register a callback to run after rollback.
+    pub fn on_after_rollback(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.after_rollback.push(Box::new(f));
     }
 
     // ========================================================================
@@ -1191,6 +1294,11 @@ impl<C: Connection> Session<C> {
     ///
     /// This executes INSERT, UPDATE, and DELETE statements but does NOT commit.
     pub async fn flush(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        // Fire before_flush event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::BeforeFlush) {
+            return Outcome::Err(e);
+        }
+
         // Auto-begin transaction if configured
         if self.config.auto_begin && !self.in_transaction {
             match self.begin(cx).await {
@@ -1422,6 +1530,11 @@ impl<C: Connection> Session<C> {
             }
         }
 
+        // Fire after_flush event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterFlush) {
+            return Outcome::Err(e);
+        }
+
         Outcome::Ok(())
     }
 
@@ -1433,6 +1546,11 @@ impl<C: Connection> Session<C> {
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+
+        // Fire before_commit event (can abort)
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::BeforeCommit) {
+            return Outcome::Err(e);
         }
 
         if self.in_transaction {
@@ -1453,6 +1571,11 @@ impl<C: Connection> Session<C> {
                     tracked.state = ObjectState::Expired;
                 }
             }
+        }
+
+        // Fire after_commit event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterCommit) {
+            return Outcome::Err(e);
         }
 
         Outcome::Ok(())
@@ -1492,6 +1615,11 @@ impl<C: Connection> Session<C> {
 
         for key in to_remove {
             self.identity_map.remove(&key);
+        }
+
+        // Fire after_rollback event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterRollback) {
+            return Outcome::Err(e);
         }
 
         Outcome::Ok(())
