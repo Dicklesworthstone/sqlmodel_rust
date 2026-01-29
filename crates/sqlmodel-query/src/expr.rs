@@ -353,6 +353,14 @@ pub enum BinaryOp {
     // String
     /// String concatenation (||)
     Concat,
+
+    // Array (PostgreSQL)
+    /// Array contains (@>)
+    ArrayContains,
+    /// Array is contained by (<@)
+    ArrayContainedBy,
+    /// Array overlap (&&)
+    ArrayOverlap,
 }
 
 impl BinaryOp {
@@ -376,6 +384,9 @@ impl BinaryOp {
             BinaryOp::BitOr => "|",
             BinaryOp::BitXor => "^",
             BinaryOp::Concat => "||",
+            BinaryOp::ArrayContains => "@>",
+            BinaryOp::ArrayContainedBy => "<@",
+            BinaryOp::ArrayOverlap => "&&",
         }
     }
 
@@ -389,7 +400,10 @@ impl BinaryOp {
             | BinaryOp::Lt
             | BinaryOp::Le
             | BinaryOp::Gt
-            | BinaryOp::Ge => 3,
+            | BinaryOp::Ge
+            | BinaryOp::ArrayContains
+            | BinaryOp::ArrayContainedBy
+            | BinaryOp::ArrayOverlap => 3,
             BinaryOp::BitOr => 4,
             BinaryOp::BitXor => 5,
             BinaryOp::BitAnd => 6,
@@ -899,6 +913,50 @@ impl Expr {
             left: Box::new(self),
             op: BinaryOp::Concat,
             right: Box::new(other.into()),
+        }
+    }
+
+    // ==================== Array Operations (PostgreSQL) ====================
+
+    /// Array contains (@>). Tests if this array contains all elements of `other`.
+    pub fn array_contains(self, other: impl Into<Expr>) -> Self {
+        Expr::Binary {
+            left: Box::new(self),
+            op: BinaryOp::ArrayContains,
+            right: Box::new(other.into()),
+        }
+    }
+
+    /// Array contained by (<@). Tests if this array is contained by `other`.
+    pub fn array_contained_by(self, other: impl Into<Expr>) -> Self {
+        Expr::Binary {
+            left: Box::new(self),
+            op: BinaryOp::ArrayContainedBy,
+            right: Box::new(other.into()),
+        }
+    }
+
+    /// Array overlap (&&). Tests if this array has any elements in common with `other`.
+    pub fn array_overlap(self, other: impl Into<Expr>) -> Self {
+        Expr::Binary {
+            left: Box::new(self),
+            op: BinaryOp::ArrayOverlap,
+            right: Box::new(other.into()),
+        }
+    }
+
+    /// ANY(array) = value. Tests if any element of the array equals the value.
+    ///
+    /// Generates: `value = ANY(array_column)`
+    pub fn array_any_eq(self, value: impl Into<Expr>) -> Self {
+        let val = value.into();
+        Expr::Binary {
+            left: Box::new(val),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Function {
+                name: "ANY".to_string(),
+                args: vec![self],
+            }),
         }
     }
 
@@ -3581,6 +3639,41 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
         assert_eq!(sql, "\"data\" ->> 'status' = $1");
+        assert_eq!(params.len(), 1);
+    }
+
+    // ==================== Array Operations ====================
+
+    #[test]
+    fn test_array_contains() {
+        let expr = Expr::col("tags").array_contains(Expr::col("other_tags"));
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"tags\" @> \"other_tags\"");
+    }
+
+    #[test]
+    fn test_array_contained_by() {
+        let expr = Expr::col("tags").array_contained_by(Expr::col("all_tags"));
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"tags\" <@ \"all_tags\"");
+    }
+
+    #[test]
+    fn test_array_overlap() {
+        let expr = Expr::col("tags").array_overlap(Expr::col("search_tags"));
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"tags\" && \"search_tags\"");
+    }
+
+    #[test]
+    fn test_array_any_eq() {
+        let expr = Expr::col("tags").array_any_eq("admin");
+        let mut params = Vec::new();
+        let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "$1 = ANY(\"tags\")");
         assert_eq!(params.len(), 1);
     }
 }

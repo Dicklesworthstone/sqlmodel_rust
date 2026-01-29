@@ -822,4 +822,44 @@ mod tests {
         let recovered: i64 = value.try_into().unwrap();
         assert_eq!(recovered, i64::MIN);
     }
+
+    #[test]
+    fn test_array_string_roundtrip() {
+        let v: Value = vec!["a".to_string(), "b".to_string()].into();
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Text("a".to_string()),
+                Value::Text("b".to_string())
+            ])
+        );
+        let recovered: Vec<String> = v.try_into().unwrap();
+        assert_eq!(recovered, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_array_i32_roundtrip() {
+        let v: Value = vec![1i32, 2, 3].into();
+        assert_eq!(
+            v,
+            Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+        let recovered: Vec<i32> = v.try_into().unwrap();
+        assert_eq!(recovered, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_array_empty() {
+        let v: Value = Vec::<String>::new().into();
+        assert_eq!(v, Value::Array(vec![]));
+        let recovered: Vec<String> = v.try_into().unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn test_array_type_error() {
+        let v = Value::Text("not an array".to_string());
+        let result: Result<Vec<String>, _> = v.try_into();
+        assert!(result.is_err());
+    }
 }
