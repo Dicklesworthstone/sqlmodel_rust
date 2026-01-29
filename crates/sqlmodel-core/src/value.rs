@@ -267,6 +267,41 @@ impl From<[u8; 16]> for Value {
     }
 }
 
+/// Convert a `Vec<String>` into a `Value::Array`.
+impl From<Vec<String>> for Value {
+    fn from(v: Vec<String>) -> Self {
+        Value::Array(v.into_iter().map(Value::Text).collect())
+    }
+}
+
+/// Convert a `Vec<i32>` into a `Value::Array`.
+impl From<Vec<i32>> for Value {
+    fn from(v: Vec<i32>) -> Self {
+        Value::Array(v.into_iter().map(Value::Int).collect())
+    }
+}
+
+/// Convert a `Vec<i64>` into a `Value::Array`.
+impl From<Vec<i64>> for Value {
+    fn from(v: Vec<i64>) -> Self {
+        Value::Array(v.into_iter().map(Value::BigInt).collect())
+    }
+}
+
+/// Convert a `Vec<f64>` into a `Value::Array`.
+impl From<Vec<f64>> for Value {
+    fn from(v: Vec<f64>) -> Self {
+        Value::Array(v.into_iter().map(Value::Double).collect())
+    }
+}
+
+/// Convert a `Vec<bool>` into a `Value::Array`.
+impl From<Vec<bool>> for Value {
+    fn from(v: Vec<bool>) -> Self {
+        Value::Array(v.into_iter().map(Value::Bool).collect())
+    }
+}
+
 // TryFrom implementations for extracting values
 
 use crate::error::{Error, TypeError};
@@ -499,6 +534,74 @@ where
         match value {
             Value::Null => Ok(None),
             v => T::try_from(v).map(Some),
+        }
+    }
+}
+
+/// TryFrom for `Vec<String>` - extracts text array.
+impl TryFrom<Value> for Vec<String> {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Array(arr) => arr.into_iter().map(String::try_from).collect(),
+            other => Err(Error::Type(TypeError {
+                expected: "ARRAY",
+                actual: other.type_name().to_string(),
+                column: None,
+                rust_type: None,
+            })),
+        }
+    }
+}
+
+/// TryFrom for `Vec<i32>` - extracts integer array.
+impl TryFrom<Value> for Vec<i32> {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Array(arr) => arr.into_iter().map(i32::try_from).collect(),
+            other => Err(Error::Type(TypeError {
+                expected: "ARRAY",
+                actual: other.type_name().to_string(),
+                column: None,
+                rust_type: None,
+            })),
+        }
+    }
+}
+
+/// TryFrom for `Vec<i64>` - extracts bigint array.
+impl TryFrom<Value> for Vec<i64> {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Array(arr) => arr.into_iter().map(i64::try_from).collect(),
+            other => Err(Error::Type(TypeError {
+                expected: "ARRAY",
+                actual: other.type_name().to_string(),
+                column: None,
+                rust_type: None,
+            })),
+        }
+    }
+}
+
+/// TryFrom for `Vec<bool>` - extracts boolean array.
+impl TryFrom<Value> for Vec<bool> {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Array(arr) => arr.into_iter().map(bool::try_from).collect(),
+            other => Err(Error::Type(TypeError {
+                expected: "ARRAY",
+                actual: other.type_name().to_string(),
+                column: None,
+                rust_type: None,
+            })),
         }
     }
 }
