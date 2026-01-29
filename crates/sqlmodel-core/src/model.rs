@@ -328,6 +328,44 @@ pub trait ModelEvents: Model {
     fn on_refresh(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Called when individual attributes are detected as changed.
+    ///
+    /// This is invoked during flush when the change tracker detects that
+    /// specific fields have been modified. Each change includes the field
+    /// name and the old/new values as JSON.
+    ///
+    /// Return an error to abort the flush.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// impl ModelEvents for User {
+    ///     fn on_attribute_change(&mut self, changes: &[AttributeChange]) -> Result<()> {
+    ///         for change in changes {
+    ///             if change.field_name == "email" {
+    ///                 // trigger verification
+    ///             }
+    ///         }
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    #[allow(unused_variables, clippy::result_large_err)]
+    fn on_attribute_change(&mut self, changes: &[AttributeChange]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Describes a single attribute change detected by the change tracker.
+#[derive(Debug, Clone)]
+pub struct AttributeChange {
+    /// The field name that changed.
+    pub field_name: &'static str,
+    /// The old value (as JSON).
+    pub old_value: serde_json::Value,
+    /// The new value (as JSON).
+    pub new_value: serde_json::Value,
 }
 
 #[cfg(test)]

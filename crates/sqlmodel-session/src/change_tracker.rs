@@ -175,6 +175,44 @@ impl ChangeTracker {
         changed
     }
 
+    /// Get detailed attribute changes between snapshot and current state.
+    ///
+    /// Returns `AttributeChange` structs with field name, old value, and new value.
+    pub fn attribute_changes<T: Model + Serialize>(
+        &self,
+        key: &ObjectKey,
+        obj: &T,
+    ) -> Vec<sqlmodel_core::AttributeChange> {
+        let Some(snapshot) = self.snapshots.get(key) else {
+            return Vec::new();
+        };
+
+        let original: serde_json::Value =
+            serde_json::from_slice(&snapshot.data).unwrap_or(serde_json::Value::Null);
+        let current: serde_json::Value =
+            serde_json::to_value(obj).unwrap_or(serde_json::Value::Null);
+
+        let mut changes = Vec::new();
+        for field in T::fields() {
+            let orig_val = original
+                .get(field.name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let curr_val = current
+                .get(field.name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if orig_val != curr_val {
+                changes.push(sqlmodel_core::AttributeChange {
+                    field_name: field.name,
+                    old_value: orig_val,
+                    new_value: curr_val,
+                });
+            }
+        }
+        changes
+    }
+
     /// Check if a snapshot exists for the given key.
     pub fn has_snapshot(&self, key: &ObjectKey) -> bool {
         self.snapshots.contains_key(key)
@@ -502,5 +540,62 @@ mod tests {
 
         // No longer dirty
         assert!(!tracker.is_dirty(&key, &modified_hero));
+    }
+
+    #[test]
+    fn test_attribute_changes_empty_when_unchanged() {
+        let mut tracker = ChangeTracker::new();
+        let hero = TestHero {
+            id: 1,
+            name: "Spider-Man".to_string(),
+            age: Some(25),
+        };
+        let key = ObjectKey::from_model(&hero);
+        tracker.snapshot(key, &hero);
+
+        let changes = tracker.attribute_changes(&key, &hero);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn test_attribute_changes_detects_field_change() {
+        let mut tracker = ChangeTracker::new();
+        let hero = TestHero {
+            id: 1,
+            name: "Spider-Man".to_string(),
+            age: Some(25),
+        };
+        let key = ObjectKey::from_model(&hero);
+        tracker.snapshot(key, &hero);
+
+        let modified = TestHero {
+            id: 1,
+            name: "Peter Parker".to_string(),
+            age: Some(26),
+        };
+
+        let changes = tracker.attribute_changes(&key, &modified);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].field_name, "name");
+        assert_eq!(changes[0].old_value, serde_json::json!("Spider-Man"));
+        assert_eq!(changes[0].new_value, serde_json::json!("Peter Parker"));
+        assert_eq!(changes[1].field_name, "age");
+        assert_eq!(changes[1].old_value, serde_json::json!(25));
+        assert_eq!(changes[1].new_value, serde_json::json!(26));
+    }
+
+    #[test]
+    fn test_attribute_changes_empty_without_snapshot() {
+        let tracker = ChangeTracker::new();
+        let hero = TestHero {
+            id: 1,
+            name: "Spider-Man".to_string(),
+            age: Some(25),
+        };
+        let key = ObjectKey::from_model(&hero);
+
+        // No snapshot → empty changes (not all fields)
+        let changes = tracker.attribute_changes(&key, &hero);
+        assert!(changes.is_empty());
     }
 }

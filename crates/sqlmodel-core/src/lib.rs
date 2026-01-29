@@ -30,7 +30,8 @@ pub use error::{Error, FieldValidationError, Result, ValidationError, Validation
 pub use field::{Column, Field, FieldInfo, ReferentialAction};
 pub use hybrid::Hybrid;
 pub use model::{
-    AutoIncrement, ExtraFieldsBehavior, Model, ModelConfig, ModelEvents, SoftDelete, Timestamps,
+    AttributeChange, AutoIncrement, ExtraFieldsBehavior, Model, ModelConfig, ModelEvents,
+    SoftDelete, Timestamps,
 };
 pub use relationship::{
     Lazy, LazyLoader, LinkTableInfo, PassiveDeletes, Related, RelatedMany, RelationshipInfo,
