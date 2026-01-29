@@ -1063,6 +1063,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "sqlmodel-core",
+ "tracing",
 ]
 
 [[package]]

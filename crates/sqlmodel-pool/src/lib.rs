@@ -568,21 +568,21 @@ impl<C: Connection> Pool<C> {
     /// Get the number of idle connections.
     #[must_use]
     pub fn idle_count(&self) -> usize {
-        let inner = self.shared.inner.lock().expect("pool lock poisoned");
+        let inner = self.shared.lock_or_recover();
         inner.idle.len()
     }
 
     /// Get the number of active connections.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        let inner = self.shared.inner.lock().expect("pool lock poisoned");
+        let inner = self.shared.lock_or_recover();
         inner.active_count
     }
 
     /// Get the total number of connections.
     #[must_use]
     pub fn total_count(&self) -> usize {
-        let inner = self.shared.inner.lock().expect("pool lock poisoned");
+        let inner = self.shared.lock_or_recover();
         inner.total_count
     }
 }
@@ -624,10 +624,22 @@ impl<C: Connection> PooledConnection<C> {
     /// This is useful when you need to close a connection explicitly.
     pub fn detach(mut self) -> C {
         if let Some(pool) = self.pool.upgrade() {
-            let mut inner = pool.inner.lock().expect("pool lock poisoned");
-            inner.total_count -= 1;
-            inner.active_count -= 1;
-            pool.connections_closed.fetch_add(1, Ordering::Relaxed);
+            // Try to update pool counters, but don't panic if mutex is poisoned.
+            // The connection is being detached anyway, so counts being off is acceptable.
+            match pool.inner.lock() {
+                Ok(mut inner) => {
+                    inner.total_count -= 1;
+                    inner.active_count -= 1;
+                    pool.connections_closed.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_poisoned) => {
+                    tracing::error!(
+                        "Pool mutex poisoned during detach; pool counters will be inconsistent"
+                    );
+                    // Still increment the atomic counter for tracking
+                    pool.connections_closed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         self.meta.take().expect("connection already detached").conn
     }
@@ -672,8 +684,20 @@ impl<C: Connection> Drop for PooledConnection<C> {
         if let Some(mut meta) = self.meta.take() {
             meta.touch(); // Update last used time
             if let Some(pool) = self.pool.upgrade() {
-                // Return to pool
-                let mut inner = pool.inner.lock().expect("pool lock poisoned");
+                // Return to pool - but if mutex is poisoned, we must not panic in Drop.
+                // Instead, log the error and leak the connection.
+                let mut inner = match pool.inner.lock() {
+                    Ok(guard) => guard,
+                    Err(_poisoned) => {
+                        tracing::error!(
+                            "Pool mutex poisoned during connection return; \
+                             connection will be leaked. A thread panicked while holding the lock."
+                        );
+                        // Connection is leaked - we can't safely return it or update counts.
+                        // The pool is likely in a bad state anyway.
+                        return;
+                    }
+                };
 
                 if inner.closed {
                     inner.total_count -= 1;

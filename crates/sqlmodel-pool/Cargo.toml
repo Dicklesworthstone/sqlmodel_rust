@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 sqlmodel-core.workspace = true
 asupersync.workspace = true
+tracing.workspace = true
