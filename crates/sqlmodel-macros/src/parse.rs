@@ -8,6 +8,20 @@ use proc_macro2::Span;
 use quote::ToTokens;
 use syn::{Attribute, Data, DeriveInput, Error, Field, Fields, Generics, Ident, Lit, Result, Type};
 
+/// Table inheritance strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InheritanceStrategy {
+    /// No inheritance (default).
+    #[default]
+    None,
+    /// Single table inheritance: all subclasses share one table with discriminator.
+    Single,
+    /// Joined table inheritance: each class has its own table with FK to parent.
+    Joined,
+    /// Concrete table inheritance: each class is independent, no DB-level inheritance.
+    Concrete,
+}
+
 /// Model-level configuration parsed from attributes.
 #[derive(Debug, Clone, Default)]
 pub struct ModelConfigParsed {
@@ -35,6 +49,12 @@ pub struct ModelConfigParsed {
     pub json_schema_extra: Option<String>,
     /// Title for JSON schema generation.
     pub title: Option<String>,
+    /// Table inheritance strategy for this model (base class).
+    pub inheritance: InheritanceStrategy,
+    /// Parent model name this model inherits from.
+    pub inherits: Option<String>,
+    /// Discriminator value for single table inheritance.
+    pub discriminator_value: Option<String>,
 }
 
 /// Parsed model definition from a struct with `#[derive(Model)]`.
@@ -563,12 +583,58 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
                 } else {
                     Err(Error::new_spanned(value, "expected string literal for title"))
                 }
+            // Table inheritance attributes
+            } else if meta.path.is_ident("inheritance") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    let strategy = lit_str.value().to_lowercase();
+                    config.inheritance = match strategy.as_str() {
+                        "single" => InheritanceStrategy::Single,
+                        "joined" => InheritanceStrategy::Joined,
+                        "concrete" => InheritanceStrategy::Concrete,
+                        _ => {
+                            return Err(Error::new_spanned(
+                                lit_str,
+                                "inheritance must be one of: 'single', 'joined', 'concrete'",
+                            ));
+                        }
+                    };
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal for inheritance",
+                    ))
+                }
+            } else if meta.path.is_ident("inherits") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    config.inherits = Some(lit_str.value());
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal for inherits",
+                    ))
+                }
+            } else if meta.path.is_ident("discriminator_value") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    config.discriminator_value = Some(lit_str.value());
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal for discriminator_value",
+                    ))
+                }
             } else {
                 Err(Error::new_spanned(
                     meta.path,
                     "unknown sqlmodel struct attribute (supported: table, table_alias, from_attributes, \
                      validate_assignment, extra, strict, populate_by_name, use_enum_values, \
-                     arbitrary_types_allowed, defer_build, revalidate_instances, json_schema_extra, title)",
+                     arbitrary_types_allowed, defer_build, revalidate_instances, json_schema_extra, title, \
+                     inheritance, inherits, discriminator_value)",
                 ))
             }
         })?;
@@ -4020,5 +4086,124 @@ mod tests {
         } else {
             panic!("Expected type parameter");
         }
+    }
+
+    // =========================================================================
+    // Table Inheritance Tests
+    // =========================================================================
+
+    #[test]
+    fn test_inheritance_single() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table, inheritance = "single")]
+            struct Employee {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                type_: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.table);
+        assert_eq!(def.config.inheritance, InheritanceStrategy::Single);
+        assert!(def.config.inherits.is_none());
+        assert!(def.config.discriminator_value.is_none());
+    }
+
+    #[test]
+    fn test_inheritance_joined() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table, inheritance = "joined")]
+            struct Person {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.table);
+        assert_eq!(def.config.inheritance, InheritanceStrategy::Joined);
+    }
+
+    #[test]
+    fn test_inheritance_concrete() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table, inheritance = "concrete")]
+            struct BaseEntity {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.table);
+        assert_eq!(def.config.inheritance, InheritanceStrategy::Concrete);
+    }
+
+    #[test]
+    fn test_inherits_with_discriminator_value() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(inherits = "Employee", discriminator_value = "manager")]
+            struct Manager {
+                department: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.config.inherits.as_deref(), Some("Employee"));
+        assert_eq!(def.config.discriminator_value.as_deref(), Some("manager"));
+    }
+
+    #[test]
+    fn test_inherits_joined_child() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table, inherits = "Person")]
+            struct Employee {
+                #[sqlmodel(primary_key)]
+                employee_id: i64,
+                department: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.table);
+        assert_eq!(def.config.inherits.as_deref(), Some("Person"));
+        assert!(def.config.discriminator_value.is_none());
+    }
+
+    #[test]
+    fn test_inheritance_invalid_strategy() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table, inheritance = "invalid")]
+            struct Foo {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let err = parse_model(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("single")
+                || err.to_string().contains("joined")
+                || err.to_string().contains("concrete"),
+            "Expected inheritance strategy error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_inheritance_default_none() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table)]
+            struct NormalModel {
+                #[sqlmodel(primary_key)]
+                id: i64,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.config.inheritance, InheritanceStrategy::None);
+        assert!(def.config.inherits.is_none());
+        assert!(def.config.discriminator_value.is_none());
     }
 }

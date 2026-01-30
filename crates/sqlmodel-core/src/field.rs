@@ -762,6 +762,158 @@ impl<T> Field<T> {
     }
 }
 
+/// Table inheritance strategy.
+///
+/// Determines how model hierarchies are mapped to database tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InheritanceStrategy {
+    /// No inheritance (default). Model is standalone.
+    #[default]
+    None,
+    /// Single table inheritance: all subclasses share one table with discriminator column.
+    ///
+    /// The base model specifies this strategy and the discriminator column name.
+    /// Child models inherit from the base and specify their discriminator value.
+    ///
+    /// Example:
+    /// ```ignore
+    /// #[derive(Model)]
+    /// #[sqlmodel(table, inheritance = "single", discriminator = "type")]
+    /// struct Employee { type_: String, ... }
+    ///
+    /// #[derive(Model)]
+    /// #[sqlmodel(inherits = "Employee", discriminator_value = "manager")]
+    /// struct Manager { department: String, ... }
+    /// ```
+    Single,
+    /// Joined table inheritance: each class has its own table with FK to parent.
+    ///
+    /// Base and child models each have their own table. Child tables have a foreign
+    /// key column referencing the parent's primary key. Queries join the tables.
+    ///
+    /// Example:
+    /// ```ignore
+    /// #[derive(Model)]
+    /// #[sqlmodel(table, inheritance = "joined")]
+    /// struct Person { id: i64, name: String }
+    ///
+    /// #[derive(Model)]
+    /// #[sqlmodel(table, inherits = "Person")]
+    /// struct Employee { employee_id: i64, department: String }
+    /// ```
+    Joined,
+    /// Concrete table inheritance: each class is independent, no DB-level inheritance.
+    ///
+    /// Each model has its own complete table with all columns. There's no database
+    /// relationship between parent and child tables. Useful for shared behavior
+    /// without database relationships.
+    Concrete,
+}
+
+impl InheritanceStrategy {
+    /// Check if this strategy uses a discriminator column.
+    #[must_use]
+    pub const fn uses_discriminator(&self) -> bool {
+        matches!(self, Self::Single)
+    }
+
+    /// Check if this strategy requires table joins for child models.
+    #[must_use]
+    pub const fn requires_join(&self) -> bool {
+        matches!(self, Self::Joined)
+    }
+
+    /// Check if this is any form of inheritance (not None).
+    #[must_use]
+    pub const fn is_inheritance(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Inheritance metadata for a model.
+///
+/// This struct captures the inheritance configuration for models that participate
+/// in table inheritance hierarchies.
+#[derive(Debug, Clone, Default)]
+pub struct InheritanceInfo {
+    /// The inheritance strategy for this model.
+    pub strategy: InheritanceStrategy,
+    /// The parent model name (for child models).
+    ///
+    /// When set, this model inherits from the specified parent model.
+    pub parent: Option<&'static str>,
+    /// The discriminator value for this model (single table inheritance).
+    ///
+    /// For single table inheritance, this value is stored in the discriminator
+    /// column to identify rows belonging to this specific model type.
+    pub discriminator_value: Option<&'static str>,
+}
+
+impl InheritanceInfo {
+    /// Create a new InheritanceInfo with no inheritance.
+    pub const fn none() -> Self {
+        Self {
+            strategy: InheritanceStrategy::None,
+            parent: None,
+            discriminator_value: None,
+        }
+    }
+
+    /// Create inheritance info for a base model with single table inheritance.
+    pub const fn single_table() -> Self {
+        Self {
+            strategy: InheritanceStrategy::Single,
+            parent: None,
+            discriminator_value: None,
+        }
+    }
+
+    /// Create inheritance info for a base model with joined table inheritance.
+    pub const fn joined_table() -> Self {
+        Self {
+            strategy: InheritanceStrategy::Joined,
+            parent: None,
+            discriminator_value: None,
+        }
+    }
+
+    /// Create inheritance info for a base model with concrete table inheritance.
+    pub const fn concrete_table() -> Self {
+        Self {
+            strategy: InheritanceStrategy::Concrete,
+            parent: None,
+            discriminator_value: None,
+        }
+    }
+
+    /// Create inheritance info for a child model.
+    pub const fn child(parent: &'static str) -> Self {
+        Self {
+            strategy: InheritanceStrategy::None, // Inherits from parent's strategy
+            parent: Some(parent),
+            discriminator_value: None,
+        }
+    }
+
+    /// Set the discriminator value (builder pattern).
+    pub const fn with_discriminator(mut self, value: &'static str) -> Self {
+        self.discriminator_value = Some(value);
+        self
+    }
+
+    /// Check if this model is a child in an inheritance hierarchy.
+    #[must_use]
+    pub const fn is_child(&self) -> bool {
+        self.parent.is_some()
+    }
+
+    /// Check if this model is a base model in an inheritance hierarchy.
+    #[must_use]
+    pub const fn is_base(&self) -> bool {
+        self.parent.is_none() && self.strategy.is_inheritance()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

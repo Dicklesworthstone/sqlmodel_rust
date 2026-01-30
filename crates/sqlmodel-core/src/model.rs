@@ -5,7 +5,7 @@
 //! `#[derive(Model)]` macro from `sqlmodel-macros`.
 
 use crate::Result;
-use crate::field::FieldInfo;
+use crate::field::{FieldInfo, InheritanceInfo};
 use crate::relationship::RelationshipInfo;
 use crate::row::Row;
 use crate::value::Value;
@@ -168,6 +168,15 @@ pub trait Model: Sized + Send + Sync {
     /// The derive macro will populate this for relationship fields; models with
     /// no relationships can rely on the default empty slice.
     const RELATIONSHIPS: &'static [RelationshipInfo] = &[];
+
+    /// Inheritance metadata for this model.
+    ///
+    /// Returns information about table inheritance if this model participates
+    /// in an inheritance hierarchy (single, joined, or concrete table).
+    /// The default implementation returns no inheritance.
+    fn inheritance() -> InheritanceInfo {
+        InheritanceInfo::none()
+    }
 
     /// Get field metadata for all columns.
     fn fields() -> &'static [FieldInfo];

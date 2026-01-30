@@ -126,6 +126,9 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     // Generate model_config implementation
     let model_config_body = generate_model_config(model);
 
+    // Generate inheritance implementation
+    let inheritance_body = generate_inheritance(model);
+
     // Generate Debug impl only if any field has repr=false
     let debug_impl = generate_debug_impl(model);
 
@@ -163,6 +166,10 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
             fn model_config() -> sqlmodel_core::ModelConfig {
                 #model_config_body
+            }
+
+            fn inheritance() -> sqlmodel_core::InheritanceInfo {
+                #inheritance_body
             }
         }
 
@@ -674,6 +681,51 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
             revalidate_instances: #revalidate_instances,
             json_schema_extra: #json_schema_extra_token,
             title: #title_token,
+        }
+    }
+}
+
+/// Generate the inheritance method body.
+fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
+    use crate::parse::InheritanceStrategy;
+
+    let config = &model.config;
+
+    // Determine the inheritance strategy token
+    let strategy_token = match config.inheritance {
+        InheritanceStrategy::None => {
+            quote::quote! { sqlmodel_core::InheritanceStrategy::None }
+        }
+        InheritanceStrategy::Single => {
+            quote::quote! { sqlmodel_core::InheritanceStrategy::Single }
+        }
+        InheritanceStrategy::Joined => {
+            quote::quote! { sqlmodel_core::InheritanceStrategy::Joined }
+        }
+        InheritanceStrategy::Concrete => {
+            quote::quote! { sqlmodel_core::InheritanceStrategy::Concrete }
+        }
+    };
+
+    // Handle parent model name
+    let parent_token = if let Some(ref parent) = config.inherits {
+        quote::quote! { Some(#parent) }
+    } else {
+        quote::quote! { None }
+    };
+
+    // Handle discriminator value
+    let discriminator_value_token = if let Some(ref value) = config.discriminator_value {
+        quote::quote! { Some(#value) }
+    } else {
+        quote::quote! { None }
+    };
+
+    quote::quote! {
+        sqlmodel_core::InheritanceInfo {
+            strategy: #strategy_token,
+            parent: #parent_token,
+            discriminator_value: #discriminator_value_token,
         }
     }
 }
