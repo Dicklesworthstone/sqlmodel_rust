@@ -137,6 +137,28 @@ pub struct FieldInfo {
     /// The macro generates a `{field}_expr()` associated function that returns
     /// `Expr::raw(this_sql)`.
     pub hybrid_sql: Option<&'static str>,
+    /// Discriminator field name for union types.
+    ///
+    /// When this field contains a union/enum type, the discriminator specifies
+    /// which field within the union variants is used to determine the type.
+    /// This maps to Pydantic's `Field(discriminator='field_name')`.
+    ///
+    /// In Rust, discriminated unions are typically handled by serde's
+    /// `#[serde(tag = "field_name")]` attribute on the enum. This field
+    /// stores the discriminator info for:
+    /// - JSON Schema generation (OpenAPI discriminator)
+    /// - Documentation purposes
+    /// - Runtime validation hints
+    ///
+    /// Example:
+    /// ```ignore
+    /// #[derive(Model)]
+    /// struct Owner {
+    ///     #[sqlmodel(discriminator = "pet_type")]
+    ///     pet: PetUnion, // PetUnion should have #[serde(tag = "pet_type")]
+    /// }
+    /// ```
+    pub discriminator: Option<&'static str>,
 }
 
 impl FieldInfo {
@@ -173,6 +195,7 @@ impl FieldInfo {
             column_comment: None,
             column_info: None,
             hybrid_sql: None,
+            discriminator: None,
         }
     }
 
@@ -601,6 +624,22 @@ impl FieldInfo {
     /// Set hybrid SQL expression from optional.
     pub const fn hybrid_sql_opt(mut self, sql: Option<&'static str>) -> Self {
         self.hybrid_sql = sql;
+        self
+    }
+
+    /// Set discriminator field name for union types.
+    ///
+    /// This specifies which field in the union variants is used to determine
+    /// the concrete type during deserialization. The union type should have
+    /// a matching `#[serde(tag = "discriminator_field")]` attribute.
+    pub const fn discriminator(mut self, field: &'static str) -> Self {
+        self.discriminator = Some(field);
+        self
+    }
+
+    /// Set discriminator from optional.
+    pub const fn discriminator_opt(mut self, field: Option<&'static str>) -> Self {
+        self.discriminator = field;
         self
     }
 
@@ -1156,5 +1195,24 @@ mod tests {
         let field2 =
             FieldInfo::new("email", "email", SqlType::Text).column_info(r#"{"deprecated": true}"#);
         assert_eq!(field2.column_info, Some(r#"{"deprecated": true}"#));
+    }
+
+    #[test]
+    fn test_field_info_discriminator() {
+        // Default should be None
+        let field1 = FieldInfo::new("pet", "pet", SqlType::Json);
+        assert_eq!(field1.discriminator, None);
+
+        // With discriminator
+        let field2 = FieldInfo::new("pet", "pet", SqlType::Json).discriminator("pet_type");
+        assert_eq!(field2.discriminator, Some("pet_type"));
+
+        // With discriminator_opt(None)
+        let field3 = FieldInfo::new("pet", "pet", SqlType::Json).discriminator_opt(None);
+        assert_eq!(field3.discriminator, None);
+
+        // With discriminator_opt(Some)
+        let field4 = FieldInfo::new("pet", "pet", SqlType::Json).discriminator_opt(Some("kind"));
+        assert_eq!(field4.discriminator, Some("kind"));
     }
 }

@@ -405,6 +405,13 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
             quote::quote! { None }
         };
 
+        // Discriminator for union types
+        let discriminator_token = if let Some(ref disc) = field.discriminator {
+            quote::quote! { Some(#disc) }
+        } else {
+            quote::quote! { None }
+        };
+
         // Decimal precision (max_digits -> precision, decimal_places -> scale)
         let precision_token = if let Some(p) = field.max_digits {
             quote::quote! { Some(#p) }
@@ -446,6 +453,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
                 .column_comment_opt(#column_comment_token)
                 .column_info_opt(#column_info_token)
                 .hybrid_sql_opt(#hybrid_sql_token)
+                .discriminator_opt(#discriminator_token)
         });
     }
 

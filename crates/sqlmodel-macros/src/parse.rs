@@ -138,6 +138,9 @@ pub struct FieldDef {
     pub hybrid: bool,
     /// SQL expression for hybrid properties.
     pub hybrid_sql: Option<String>,
+    /// Discriminator field name for union types.
+    /// Used to identify which field in a union determines the concrete type.
+    pub discriminator: Option<String>,
 }
 
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
@@ -789,6 +792,7 @@ fn parse_field(field: &Field) -> Result<FieldDef> {
         sa_column: attrs.sa_column,
         hybrid: attrs.hybrid,
         hybrid_sql: attrs.hybrid_sql,
+        discriminator: attrs.discriminator,
     })
 }
 
@@ -845,6 +849,8 @@ struct FieldAttrs {
     hybrid: bool,
     /// SQL expression for hybrid properties.
     hybrid_sql: Option<String>,
+    /// Discriminator field name for union types.
+    discriminator: Option<String>,
 }
 
 /// Detect the relationship kind from a field's Rust type.
@@ -1177,6 +1183,17 @@ fn parse_field_attrs(
                         "expected string literal for sql",
                     ));
                 }
+            } else if path.is_ident("discriminator") {
+                // Parse discriminator = "field_name" for union type discrimination
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    result.discriminator = Some(lit_str.value());
+                } else {
+                    return Err(Error::new_spanned(
+                        value,
+                        "expected string literal for discriminator",
+                    ));
+                }
             } else {
                 // Unknown attribute
                 let attr_name = path.to_token_stream().to_string();
@@ -1189,7 +1206,7 @@ fn parse_field_attrs(
                          skip, skip_insert, skip_update, relationship, alias, validation_alias, \
                          serialization_alias, computed, max_digits, decimal_places, default_json, repr, \
                          const_field, column_constraints, column_comment, column_info, sa_column, \
-                         hybrid, sql"
+                         hybrid, sql, discriminator"
                     ),
                 ));
             }
@@ -3809,5 +3826,199 @@ mod tests {
             "Expected unknown lazy strategy error, got: {}",
             err_msg
         );
+    }
+
+    // ==================== Discriminator Tests ====================
+
+    #[test]
+    fn test_discriminator_field_parsed() {
+        let input: DeriveInput = parse_quote! {
+            struct Owner {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: String,
+                #[sqlmodel(discriminator = "pet_type")]
+                pet: String, // Would normally be a union type
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let pet_field = def.fields.iter().find(|f| f.name == "pet").unwrap();
+        assert_eq!(pet_field.discriminator.as_deref(), Some("pet_type"));
+    }
+
+    #[test]
+    fn test_discriminator_requires_string_literal() {
+        let input: DeriveInput = parse_quote! {
+            struct Owner {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(discriminator = 123)]
+                pet: String,
+            }
+        };
+
+        let err = parse_model(&input).unwrap_err();
+        assert!(err.to_string().contains("expected string literal"));
+    }
+
+    #[test]
+    fn test_discriminator_with_alias() {
+        // discriminator can be combined with other attributes
+        let input: DeriveInput = parse_quote! {
+            struct Owner {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                #[sqlmodel(discriminator = "pet_type", alias = "animal")]
+                pet: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+
+        let pet_field = def.fields.iter().find(|f| f.name == "pet").unwrap();
+        assert_eq!(pet_field.discriminator.as_deref(), Some("pet_type"));
+        assert_eq!(pet_field.alias.as_deref(), Some("animal"));
+    }
+
+    // ==================== Generic Model Tests ====================
+
+    #[test]
+    fn test_generic_model_single_type_param() {
+        let input: DeriveInput = parse_quote! {
+            struct Response<T> {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                data: T,
+                error: Option<String>,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.name, "Response");
+        assert_eq!(def.fields.len(), 3);
+
+        // Check that generics are captured
+        assert!(!def.generics.params.is_empty());
+        assert_eq!(def.generics.params.len(), 1);
+    }
+
+    #[test]
+    fn test_generic_model_with_bounds() {
+        let input: DeriveInput = parse_quote! {
+            struct Container<T: Clone + Send> {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                value: T,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.name, "Container");
+        assert_eq!(def.generics.params.len(), 1);
+
+        // The bound should be captured in generics
+        let type_param = def.generics.params.first().unwrap();
+        if let syn::GenericParam::Type(tp) = type_param {
+            assert_eq!(tp.ident, "T");
+            assert!(!tp.bounds.is_empty()); // Has bounds
+        } else {
+            panic!("Expected type parameter");
+        }
+    }
+
+    #[test]
+    fn test_generic_model_multiple_type_params() {
+        let input: DeriveInput = parse_quote! {
+            struct Pair<K, V> {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                key: K,
+                value: V,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.name, "Pair");
+        assert_eq!(def.generics.params.len(), 2);
+    }
+
+    #[test]
+    fn test_generic_model_with_where_clause() {
+        let input: DeriveInput = parse_quote! {
+            struct Wrapper<T>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned,
+            {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                inner: T,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.name, "Wrapper");
+        assert!(def.generics.where_clause.is_some());
+    }
+
+    #[test]
+    fn test_generic_model_with_lifetime() {
+        let input: DeriveInput = parse_quote! {
+            struct BorrowedData<'a> {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                name: &'a str,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.name, "BorrowedData");
+        assert_eq!(def.generics.params.len(), 1);
+
+        // Should be a lifetime parameter
+        let param = def.generics.params.first().unwrap();
+        assert!(matches!(param, syn::GenericParam::Lifetime(_)));
+    }
+
+    #[test]
+    fn test_generic_model_with_const_generic() {
+        let input: DeriveInput = parse_quote! {
+            struct FixedArray<const N: usize> {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                data: [u8; N],
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.name, "FixedArray");
+        assert_eq!(def.generics.params.len(), 1);
+
+        // Should be a const parameter
+        let param = def.generics.params.first().unwrap();
+        assert!(matches!(param, syn::GenericParam::Const(_)));
+    }
+
+    #[test]
+    fn test_generic_model_with_default() {
+        let input: DeriveInput = parse_quote! {
+            struct Optional<T = String> {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                value: T,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert_eq!(def.name, "Optional");
+        assert_eq!(def.generics.params.len(), 1);
+
+        // Check default is captured
+        if let syn::GenericParam::Type(tp) = def.generics.params.first().unwrap() {
+            assert!(tp.default.is_some());
+        } else {
+            panic!("Expected type parameter");
+        }
     }
 }
