@@ -1,6 +1,6 @@
 //! CREATE TABLE statement builder.
 
-use sqlmodel_core::{FieldInfo, Model, quote_ident};
+use sqlmodel_core::{FieldInfo, InheritanceStrategy, Model, quote_ident};
 use std::marker::PhantomData;
 
 /// Builder for CREATE TABLE statements.
@@ -26,7 +26,26 @@ impl<M: Model> CreateTable<M> {
     }
 
     /// Build the CREATE TABLE SQL.
+    ///
+    /// # Inheritance Handling
+    ///
+    /// - **Single Table Inheritance (child)**: Returns empty string (child uses parent's table)
+    /// - **Joined Table Inheritance (child)**: Adds FK constraint to parent table
+    /// - **Concrete Table Inheritance**: Each model gets independent table (normal behavior)
     pub fn build(&self) -> String {
+        let inheritance = M::inheritance();
+
+        // Single table inheritance: child models don't create their own table
+        // They share the parent's table and are distinguished by the discriminator column
+        if inheritance.strategy == InheritanceStrategy::None
+            && inheritance.parent.is_some()
+            && inheritance.discriminator_value.is_some()
+        {
+            // This is a single table inheritance child - no table to create
+            // The parent table already exists with all columns
+            return String::new();
+        }
+
         let mut sql = String::from("CREATE TABLE ");
 
         if self.if_not_exists {
@@ -83,6 +102,27 @@ impl<M: Model> CreateTable<M> {
             }
         }
 
+        // For joined table inheritance child models, add FK to parent table
+        if inheritance.strategy == InheritanceStrategy::Joined && inheritance.parent.is_some() {
+            // Get the primary key column(s) - these become the FK to parent
+            let pk_cols = M::PRIMARY_KEY;
+            if !pk_cols.is_empty() {
+                // Assume first PK column references parent's PK
+                // In joined inheritance, child's PK is also FK to parent
+                let parent_table = inheritance.parent.unwrap();
+                let pk_col = pk_cols[0];
+                let constraint_name = format!("fk_{}_parent", M::TABLE_NAME);
+                let fk_sql = format!(
+                    "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE CASCADE",
+                    quote_ident(&constraint_name),
+                    quote_ident(pk_col),
+                    quote_ident(parent_table),
+                    quote_ident(pk_col)
+                );
+                constraints.push(fk_sql);
+            }
+        }
+
         // Add primary key constraint
         let pk_cols = M::PRIMARY_KEY;
         if !pk_cols.is_empty() {
@@ -101,6 +141,18 @@ impl<M: Model> CreateTable<M> {
         sql.push_str("\n)");
 
         sql
+    }
+
+    /// Check if this model should skip table creation.
+    ///
+    /// Returns true for single table inheritance child models, which
+    /// share their parent's table rather than having their own.
+    pub fn should_skip_table_creation() -> bool {
+        let inheritance = M::inheritance();
+        // Single table inheritance child: has parent + discriminator_value but no explicit strategy
+        inheritance.strategy == InheritanceStrategy::None
+            && inheritance.parent.is_some()
+            && inheritance.discriminator_value.is_some()
     }
 
     fn column_definition(&self, field: &FieldInfo) -> String {
@@ -870,6 +922,253 @@ mod tests {
         assert!(stmts[0].contains("ON \"tbl\"\"name\""));
         assert!(stmts[0].contains("(\"col\"\"a\", \"col\"\"b\")"));
     }
+
+    // ================================================================================
+    // Table Inheritance Schema Generation Tests
+    // ================================================================================
+
+    use sqlmodel_core::InheritanceInfo;
+
+    // Single Table Inheritance Base Model
+    struct SingleTableBase;
+
+    impl Model for SingleTableBase {
+        const TABLE_NAME: &'static str = "employees";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("name", "name", SqlType::Text),
+                FieldInfo::new("type_", "type_", SqlType::Text), // Discriminator column
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(SingleTableBase)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+
+        fn inheritance() -> InheritanceInfo {
+            InheritanceInfo {
+                strategy: sqlmodel_core::InheritanceStrategy::Single,
+                parent: None,
+                discriminator_column: Some("type_"),
+                discriminator_value: None,
+            }
+        }
+    }
+
+    // Single Table Inheritance Child Model (should not create table)
+    struct SingleTableChild;
+
+    impl Model for SingleTableChild {
+        const TABLE_NAME: &'static str = "managers"; // Would be this if it had own table
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("department", "department", SqlType::Text),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(SingleTableChild)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+
+        fn inheritance() -> InheritanceInfo {
+            // Child model: has parent and discriminator_value but strategy is None
+            // (inherits from parent's strategy implicitly)
+            InheritanceInfo {
+                strategy: sqlmodel_core::InheritanceStrategy::None,
+                parent: Some("Employee"),
+                discriminator_column: None,
+                discriminator_value: Some("manager"),
+            }
+        }
+    }
+
+    // Joined Table Inheritance Base Model
+    struct JoinedTableBase;
+
+    impl Model for JoinedTableBase {
+        const TABLE_NAME: &'static str = "persons";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("name", "name", SqlType::Text),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(JoinedTableBase)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+
+        fn inheritance() -> InheritanceInfo {
+            InheritanceInfo {
+                strategy: sqlmodel_core::InheritanceStrategy::Joined,
+                parent: None,
+                discriminator_column: None,
+                discriminator_value: None,
+            }
+        }
+    }
+
+    // Joined Table Inheritance Child Model (has FK to parent)
+    struct JoinedTableChild;
+
+    impl Model for JoinedTableChild {
+        const TABLE_NAME: &'static str = "students";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("grade", "grade", SqlType::Text),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(JoinedTableChild)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+
+        fn inheritance() -> InheritanceInfo {
+            InheritanceInfo {
+                strategy: sqlmodel_core::InheritanceStrategy::Joined,
+                parent: Some("persons"),
+                discriminator_column: None,
+                discriminator_value: None,
+            }
+        }
+    }
+
+    #[test]
+    fn test_single_table_inheritance_base_creates_table() {
+        let sql = CreateTable::<SingleTableBase>::new().build();
+        assert!(sql.contains("CREATE TABLE \"employees\""));
+        assert!(sql.contains("\"type_\" TEXT NOT NULL")); // Discriminator column
+    }
+
+    #[test]
+    fn test_single_table_inheritance_child_skips_table_creation() {
+        // Child model should not create its own table
+        let sql = CreateTable::<SingleTableChild>::new().build();
+        assert!(sql.is_empty(), "Single table inheritance child should not create a table");
+    }
+
+    #[test]
+    fn test_single_table_inheritance_child_should_skip() {
+        assert!(
+            CreateTable::<SingleTableChild>::should_skip_table_creation(),
+            "should_skip_table_creation should return true for STI child"
+        );
+        assert!(
+            !CreateTable::<SingleTableBase>::should_skip_table_creation(),
+            "should_skip_table_creation should return false for STI base"
+        );
+    }
+
+    #[test]
+    fn test_joined_table_inheritance_base_creates_table() {
+        let sql = CreateTable::<JoinedTableBase>::new().build();
+        assert!(sql.contains("CREATE TABLE \"persons\""));
+        assert!(sql.contains("\"id\" BIGINT"));
+        assert!(sql.contains("\"name\" TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn test_joined_table_inheritance_child_creates_table_with_fk() {
+        let sql = CreateTable::<JoinedTableChild>::new().build();
+        assert!(sql.contains("CREATE TABLE \"students\""));
+        assert!(sql.contains("\"id\" BIGINT"));
+        assert!(sql.contains("\"grade\" TEXT NOT NULL"));
+        // Should have FK to parent table
+        assert!(
+            sql.contains("FOREIGN KEY (\"id\") REFERENCES \"persons\"(\"id\") ON DELETE CASCADE"),
+            "Joined table child should have FK to parent: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_schema_builder_skips_sti_child() {
+        let statements = SchemaBuilder::new()
+            .create_table::<SingleTableBase>()
+            .create_table::<SingleTableChild>() // Should be skipped
+            .build();
+
+        // Only one table should be created (the base)
+        assert_eq!(statements.len(), 1, "STI child should be skipped by SchemaBuilder");
+        assert!(statements[0].contains("CREATE TABLE IF NOT EXISTS \"employees\""));
+    }
+
+    #[test]
+    fn test_schema_builder_creates_both_joined_tables() {
+        let statements = SchemaBuilder::new()
+            .create_table::<JoinedTableBase>()
+            .create_table::<JoinedTableChild>()
+            .build();
+
+        // Both tables should be created
+        assert_eq!(statements.len(), 2, "Both joined inheritance tables should be created");
+        assert!(statements[0].contains("CREATE TABLE IF NOT EXISTS \"persons\""));
+        assert!(statements[1].contains("CREATE TABLE IF NOT EXISTS \"students\""));
+        assert!(statements[1].contains("FOREIGN KEY"));
+    }
 }
 
 /// Builder for multiple schema operations.
@@ -885,7 +1184,14 @@ impl SchemaBuilder {
     }
 
     /// Add a CREATE TABLE statement.
+    ///
+    /// For single table inheritance child models, this is a no-op since
+    /// they share their parent's table.
     pub fn create_table<M: Model>(mut self) -> Self {
+        // Skip single table inheritance child models - they don't have their own table
+        if CreateTable::<M>::should_skip_table_creation() {
+            return self;
+        }
         self.statements
             .push(CreateTable::<M>::new().if_not_exists().build());
         self

@@ -37,6 +37,9 @@
 pub mod replica;
 pub use replica::{ReplicaPool, ReplicaStrategy};
 
+pub mod sharding;
+pub use sharding::{ModuloShardChooser, QueryHints, ShardChooser, ShardedPool, ShardedPoolStats};
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
