@@ -215,16 +215,19 @@ mod generic_model_tests {
     #[test]
     fn test_generic_model_table_name() {
         // Table name should be derived from struct name (pluralized by default)
-        assert_eq!(<TaggedModel<UserData> as Model>::TABLE_NAME, "tagged_models");
-        assert_eq!(<TypedResponse<UserData> as Model>::TABLE_NAME, "typed_responses");
+        assert_eq!(
+            <TaggedModel<UserData> as Model>::TABLE_NAME,
+            "tagged_models"
+        );
+        assert_eq!(
+            <TypedResponse<UserData> as Model>::TABLE_NAME,
+            "typed_responses"
+        );
     }
 
     #[test]
     fn test_generic_model_primary_key() {
-        assert_eq!(
-            <TaggedModel<UserData> as Model>::PRIMARY_KEY,
-            &["id"]
-        );
+        assert_eq!(<TaggedModel<UserData> as Model>::PRIMARY_KEY, &["id"]);
     }
 
     #[test]

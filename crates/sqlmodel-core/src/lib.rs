@@ -28,7 +28,9 @@ pub use connection::{
     Connection, IsolationLevel, PreparedStatement, Transaction, TransactionInternal, TransactionOps,
 };
 pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
-pub use field::{Column, Field, FieldInfo, InheritanceInfo, InheritanceStrategy, ReferentialAction};
+pub use field::{
+    Column, Field, FieldInfo, InheritanceInfo, InheritanceStrategy, ReferentialAction,
+};
 pub use hybrid::Hybrid;
 pub use identifiers::{quote_ident, quote_ident_mysql, sanitize_identifier};
 pub use model::{

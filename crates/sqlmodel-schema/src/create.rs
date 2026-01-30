@@ -103,23 +103,24 @@ impl<M: Model> CreateTable<M> {
         }
 
         // For joined table inheritance child models, add FK to parent table
-        if inheritance.strategy == InheritanceStrategy::Joined && inheritance.parent.is_some() {
-            // Get the primary key column(s) - these become the FK to parent
-            let pk_cols = M::PRIMARY_KEY;
-            if !pk_cols.is_empty() {
-                // Assume first PK column references parent's PK
-                // In joined inheritance, child's PK is also FK to parent
-                let parent_table = inheritance.parent.unwrap();
-                let pk_col = pk_cols[0];
-                let constraint_name = format!("fk_{}_parent", M::TABLE_NAME);
-                let fk_sql = format!(
-                    "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE CASCADE",
-                    quote_ident(&constraint_name),
-                    quote_ident(pk_col),
-                    quote_ident(parent_table),
-                    quote_ident(pk_col)
-                );
-                constraints.push(fk_sql);
+        if inheritance.strategy == InheritanceStrategy::Joined {
+            if let Some(parent_table) = inheritance.parent {
+                // Get the primary key column(s) - these become the FK to parent
+                let pk_cols = M::PRIMARY_KEY;
+                if !pk_cols.is_empty() {
+                    // Assume first PK column references parent's PK
+                    // In joined inheritance, child's PK is also FK to parent
+                    let pk_col = pk_cols[0];
+                    let constraint_name = format!("fk_{}_parent", M::TABLE_NAME);
+                    let fk_sql = format!(
+                        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE CASCADE",
+                        quote_ident(&constraint_name),
+                        quote_ident(pk_col),
+                        quote_ident(parent_table),
+                        quote_ident(pk_col)
+                    );
+                    constraints.push(fk_sql);
+                }
             }
         }
 
@@ -1107,7 +1108,10 @@ mod tests {
     fn test_single_table_inheritance_child_skips_table_creation() {
         // Child model should not create its own table
         let sql = CreateTable::<SingleTableChild>::new().build();
-        assert!(sql.is_empty(), "Single table inheritance child should not create a table");
+        assert!(
+            sql.is_empty(),
+            "Single table inheritance child should not create a table"
+        );
     }
 
     #[test]
@@ -1152,7 +1156,11 @@ mod tests {
             .build();
 
         // Only one table should be created (the base)
-        assert_eq!(statements.len(), 1, "STI child should be skipped by SchemaBuilder");
+        assert_eq!(
+            statements.len(),
+            1,
+            "STI child should be skipped by SchemaBuilder"
+        );
         assert!(statements[0].contains("CREATE TABLE IF NOT EXISTS \"employees\""));
     }
 
@@ -1164,7 +1172,11 @@ mod tests {
             .build();
 
         // Both tables should be created
-        assert_eq!(statements.len(), 2, "Both joined inheritance tables should be created");
+        assert_eq!(
+            statements.len(),
+            2,
+            "Both joined inheritance tables should be created"
+        );
         assert!(statements[0].contains("CREATE TABLE IF NOT EXISTS \"persons\""));
         assert!(statements[1].contains("CREATE TABLE IF NOT EXISTS \"students\""));
         assert!(statements[1].contains("FOREIGN KEY"));

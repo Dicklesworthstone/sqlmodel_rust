@@ -370,6 +370,7 @@ impl<C: Connection, S: ShardChooser> ShardedPool<C, S> {
     ///
     /// Returns the shard name. Use this when you need to know the shard
     /// without acquiring a connection.
+    #[allow(clippy::result_large_err)]
     pub fn choose_for_model<M: Model>(&self, model: &M) -> Result<String, Error> {
         let shard_key = model.shard_key_value().ok_or_else(|| {
             Error::Pool(PoolError {
@@ -445,19 +446,16 @@ impl<C: Connection, S: ShardChooser> ShardedPool<C, S> {
         F: Fn() -> Fut,
         Fut: Future<Output = Outcome<C, Error>>,
     {
-        let pool = match self.shards.get(shard_name) {
-            Some(p) => p,
-            None => {
-                return Outcome::Err(Error::Pool(PoolError {
-                    kind: PoolErrorKind::Config,
-                    message: format!(
-                        "shard '{}' not found; available shards: {:?}",
-                        shard_name,
-                        self.shard_names()
-                    ),
-                    source: None,
-                }))
-            }
+        let Some(pool) = self.shards.get(shard_name) else {
+            return Outcome::Err(Error::Pool(PoolError {
+                kind: PoolErrorKind::Config,
+                message: format!(
+                    "shard '{}' not found; available shards: {:?}",
+                    shard_name,
+                    self.shard_names()
+                ),
+                source: None,
+            }));
         };
 
         pool.acquire(cx, factory).await
