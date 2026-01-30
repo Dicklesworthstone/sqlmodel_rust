@@ -201,6 +201,22 @@ pub trait Model: Sized + Send + Sync {
     fn model_config() -> ModelConfig {
         ModelConfig::new()
     }
+
+    /// The shard key field name for horizontal sharding.
+    ///
+    /// Returns `None` if the model doesn't use sharding. When set,
+    /// the sharded pool will use this field's value to determine
+    /// which shard to route queries to.
+    const SHARD_KEY: Option<&'static str> = None;
+
+    /// Get the shard key value for this model instance.
+    ///
+    /// Returns `None` if the model doesn't have a shard key defined.
+    /// The returned value is used by `ShardedPool` to determine the
+    /// appropriate shard for insert/update/delete operations.
+    fn shard_key_value(&self) -> Option<Value> {
+        None
+    }
 }
 
 /// Marker trait for models that support automatic ID generation.

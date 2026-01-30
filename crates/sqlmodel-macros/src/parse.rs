@@ -57,6 +57,8 @@ pub struct ModelConfigParsed {
     pub discriminator_column: Option<String>,
     /// Discriminator value for single table inheritance (on child model).
     pub discriminator_value: Option<String>,
+    /// Shard key field name for horizontal sharding.
+    pub shard_key: Option<String>,
 }
 
 /// Parsed model definition from a struct with `#[derive(Model)]`.
@@ -642,13 +644,25 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
                         "expected string literal for discriminator_value",
                     ))
                 }
+            // Horizontal sharding attribute
+            } else if meta.path.is_ident("shard_key") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    config.shard_key = Some(lit_str.value());
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal for shard_key",
+                    ))
+                }
             } else {
                 Err(Error::new_spanned(
                     meta.path,
                     "unknown sqlmodel struct attribute (supported: table, table_alias, from_attributes, \
                      validate_assignment, extra, strict, populate_by_name, use_enum_values, \
                      arbitrary_types_allowed, defer_build, revalidate_instances, json_schema_extra, title, \
-                     inheritance, inherits, discriminator, discriminator_value)",
+                     inheritance, inherits, discriminator, discriminator_value, shard_key)",
                 ))
             }
         })?;

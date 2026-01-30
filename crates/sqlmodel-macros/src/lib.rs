@@ -129,6 +129,9 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     // Generate inheritance implementation
     let inheritance_body = generate_inheritance(model);
 
+    // Generate shard_key implementation
+    let (shard_key_const, shard_key_value_body) = generate_shard_key(model);
+
     // Generate Debug impl only if any field has repr=false
     let debug_impl = generate_debug_impl(model);
 
@@ -140,6 +143,7 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
             const TABLE_NAME: &'static str = #table_name;
             const PRIMARY_KEY: &'static [&'static str] = #pk_slice;
             const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] = #relationships;
+            const SHARD_KEY: Option<&'static str> = #shard_key_const;
 
             fn fields() -> &'static [sqlmodel_core::FieldInfo] {
                 static FIELDS: &[sqlmodel_core::FieldInfo] = &[
@@ -170,6 +174,10 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
             fn inheritance() -> sqlmodel_core::InheritanceInfo {
                 #inheritance_body
+            }
+
+            fn shard_key_value(&self) -> Option<sqlmodel_core::Value> {
+                #shard_key_value_body
             }
         }
 
@@ -735,6 +743,52 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
             discriminator_column: #discriminator_column_token,
             discriminator_value: #discriminator_value_token,
         }
+    }
+}
+
+/// Generate the shard_key constant and shard_key_value method body.
+///
+/// Returns a tuple of (const token, method body token) for:
+/// - `const SHARD_KEY: Option<&'static str>`
+/// - `fn shard_key_value(&self) -> Option<Value>`
+fn generate_shard_key(model: &ModelDef) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let config = &model.config;
+
+    if let Some(ref shard_key_name) = config.shard_key {
+        // Find the shard key field to get its type info
+        let shard_field = model.fields.iter().find(|f| f.name == shard_key_name);
+
+        let const_token = quote::quote! { Some(#shard_key_name) };
+
+        // Generate the method body based on whether the field exists and its type
+        let value_body = if let Some(field) = shard_field {
+            let field_ident = &field.name;
+            if parse::is_option_type(&field.ty) {
+                // Option<T> field: return Some(value) if Some, None if None
+                quote::quote! {
+                    match &self.#field_ident {
+                        Some(v) => Some(sqlmodel_core::Value::from(v.clone())),
+                        None => None,
+                    }
+                }
+            } else {
+                // Non-optional field: always has a value
+                quote::quote! {
+                    Some(sqlmodel_core::Value::from(self.#field_ident.clone()))
+                }
+            }
+        } else {
+            // Field not found - this is a compile error in validation,
+            // but generate safe fallback code
+            quote::quote! { None }
+        };
+
+        (const_token, value_body)
+    } else {
+        // No shard key configured
+        let const_token = quote::quote! { None };
+        let value_body = quote::quote! { None };
+        (const_token, value_body)
     }
 }
 
