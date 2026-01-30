@@ -1520,15 +1520,15 @@ mod tests {
 
         // lock_or_error should return an error
         let result = shared.lock_or_error("test_operation");
-        assert!(result.is_err());
 
         // Verify it's a pool poisoning error
-        match result.unwrap_err() {
-            Error::Pool(pool_err) => {
+        match result {
+            Err(Error::Pool(pool_err)) => {
                 assert!(matches!(pool_err.kind, PoolErrorKind::Poisoned));
                 assert!(pool_err.message.contains("poisoned"));
             }
-            other => panic!("Expected Pool error, got: {:?}", other),
+            Err(other) => panic!("Expected Pool error, got: {:?}", other),
+            Ok(_) => panic!("Expected error, got Ok"),
         }
     }
 
