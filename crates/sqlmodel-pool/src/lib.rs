@@ -1392,4 +1392,387 @@ mod tests {
         // connections_closed should reflect the 3 idle connections
         assert_eq!(pool.stats().connections_closed, 3);
     }
+
+    // ==================== Lock Poisoning Safety Tests ====================
+    //
+    // These tests verify that the pool correctly handles mutex poisoning,
+    // which occurs when a thread panics while holding the lock.
+    //
+    // Tier 1 (mutations): Return Error if poisoned
+    // Tier 2 (read-only): Recover and return valid data
+    // Tier 3 (Drop): Log error and leak connection (don't panic)
+
+    /// Helper to poison a pool's mutex by panicking while holding the lock.
+    ///
+    /// Returns the pool with a poisoned mutex.
+    fn poison_pool_mutex() -> Pool<MockConnection> {
+        use std::panic;
+        use std::thread;
+
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(5));
+
+        // Set up some valid state before poisoning
+        {
+            let mut inner = pool.shared.inner.lock().unwrap();
+            inner.total_count = 2;
+            inner.active_count = 1;
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::new(1)));
+        }
+
+        // Spawn a thread that will panic while holding the lock
+        let shared_clone = Arc::clone(&pool.shared);
+        let handle = thread::spawn(move || {
+            let _guard = shared_clone.inner.lock().unwrap();
+            // Panic while holding the lock - this poisons the mutex
+            panic!("intentional panic to poison mutex");
+        });
+
+        // Wait for the thread to panic (ignore the panic result)
+        let _ = handle.join();
+
+        // Verify the mutex is now poisoned
+        assert!(pool.shared.inner.lock().is_err());
+
+        pool
+    }
+
+    // -------------------- Tier 2: Read-Only Methods --------------------
+
+    #[test]
+    fn test_config_after_poisoning_returns_valid_data() {
+        let pool = poison_pool_mutex();
+
+        // config() should recover and return the configuration
+        let config = pool.config();
+        assert_eq!(config.max_connections, 5);
+    }
+
+    #[test]
+    fn test_stats_after_poisoning_returns_valid_data() {
+        let pool = poison_pool_mutex();
+
+        // stats() should recover and return valid statistics
+        let stats = pool.stats();
+        // The state before poisoning was: total=2, active=1, idle=1
+        assert_eq!(stats.total_connections, 2);
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.idle_connections, 1);
+    }
+
+    #[test]
+    fn test_at_capacity_after_poisoning() {
+        let pool = poison_pool_mutex();
+
+        // at_capacity() should recover and return correct value
+        // Pool has 2 connections, max is 5, so not at capacity
+        assert!(!pool.at_capacity());
+    }
+
+    #[test]
+    fn test_is_closed_after_poisoning() {
+        let pool = poison_pool_mutex();
+
+        // is_closed() should recover and return correct value
+        assert!(!pool.is_closed());
+    }
+
+    #[test]
+    fn test_idle_count_after_poisoning() {
+        let pool = poison_pool_mutex();
+
+        // idle_count() should recover and return correct value
+        assert_eq!(pool.idle_count(), 1);
+    }
+
+    #[test]
+    fn test_active_count_after_poisoning() {
+        let pool = poison_pool_mutex();
+
+        // active_count() should recover and return correct value
+        assert_eq!(pool.active_count(), 1);
+    }
+
+    #[test]
+    fn test_total_count_after_poisoning() {
+        let pool = poison_pool_mutex();
+
+        // total_count() should recover and return correct value
+        assert_eq!(pool.total_count(), 2);
+    }
+
+    // -------------------- Tier 1: Mutation Methods --------------------
+
+    #[test]
+    fn test_lock_or_error_returns_error_when_poisoned() {
+        use std::thread;
+
+        let shared = Arc::new(PoolShared::<MockConnection>::new(PoolConfig::new(5)));
+
+        // Poison the mutex
+        let shared_clone = Arc::clone(&shared);
+        let handle = thread::spawn(move || {
+            let _guard = shared_clone.inner.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        });
+        let _ = handle.join();
+
+        // lock_or_error should return an error
+        let result = shared.lock_or_error("test_operation");
+        assert!(result.is_err());
+
+        // Verify it's a pool poisoning error
+        match result.unwrap_err() {
+            Error::Pool(pool_err) => {
+                assert!(matches!(pool_err.kind, PoolErrorKind::Poisoned));
+                assert!(pool_err.message.contains("poisoned"));
+            }
+            other => panic!("Expected Pool error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lock_or_recover_succeeds_when_poisoned() {
+        use std::thread;
+
+        let shared = Arc::new(PoolShared::<MockConnection>::new(PoolConfig::new(5)));
+
+        // Set up some state
+        {
+            let mut inner = shared.inner.lock().unwrap();
+            inner.total_count = 42;
+        }
+
+        // Poison the mutex
+        let shared_clone = Arc::clone(&shared);
+        let handle = thread::spawn(move || {
+            let _guard = shared_clone.inner.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        });
+        let _ = handle.join();
+
+        // Verify mutex is poisoned
+        assert!(shared.inner.lock().is_err());
+
+        // lock_or_recover should still succeed and provide access to data
+        let inner = shared.lock_or_recover();
+        assert_eq!(inner.total_count, 42);
+    }
+
+    #[test]
+    fn test_close_after_poisoning_recovers_and_closes() {
+        let pool = poison_pool_mutex();
+
+        // close() should recover from poisoning and still close the pool
+        pool.close();
+
+        // After close, the pool should be marked as closed
+        assert!(pool.is_closed());
+
+        // Idle connections should be cleared
+        assert_eq!(pool.idle_count(), 0);
+    }
+
+    // -------------------- Tier 3: Drop Safety --------------------
+
+    #[test]
+    fn test_drop_pooled_connection_after_poisoning_does_not_panic() {
+        use std::panic;
+        use std::thread;
+
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(5));
+
+        // Set up a connection that's "checked out"
+        {
+            let mut inner = pool.shared.inner.lock().unwrap();
+            inner.total_count = 1;
+            inner.active_count = 1;
+        }
+
+        // Create a pooled connection
+        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+
+        // Poison the mutex by panicking in another thread
+        let shared_clone = Arc::clone(&pool.shared);
+        let handle = thread::spawn(move || {
+            let _guard = shared_clone.inner.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        });
+        let _ = handle.join();
+
+        // Verify mutex is poisoned
+        assert!(pool.shared.inner.lock().is_err());
+
+        // Drop the pooled connection - should NOT panic
+        // The connection will be leaked, but that's the correct behavior
+        let drop_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            drop(pooled);
+        }));
+
+        // Dropping should not panic
+        assert!(
+            drop_result.is_ok(),
+            "Dropping PooledConnection after mutex poisoning should not panic"
+        );
+    }
+
+    #[test]
+    fn test_detach_after_poisoning_does_not_panic() {
+        use std::panic;
+        use std::thread;
+
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(5));
+
+        // Set up a connection that's "checked out"
+        {
+            let mut inner = pool.shared.inner.lock().unwrap();
+            inner.total_count = 1;
+            inner.active_count = 1;
+        }
+
+        // Create a pooled connection
+        let meta = ConnectionMeta::new(MockConnection::new(42));
+        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+
+        // Poison the mutex
+        let shared_clone = Arc::clone(&pool.shared);
+        let handle = thread::spawn(move || {
+            let _guard = shared_clone.inner.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        });
+        let _ = handle.join();
+
+        // Verify mutex is poisoned
+        assert!(pool.shared.inner.lock().is_err());
+
+        // Detach should not panic, even though it can't update counters
+        let detach_result = panic::catch_unwind(panic::AssertUnwindSafe(|| pooled.detach()));
+
+        assert!(
+            detach_result.is_ok(),
+            "detach() after mutex poisoning should not panic"
+        );
+
+        // Should still get the connection back
+        let conn = detach_result.unwrap();
+        assert_eq!(conn.id, 42);
+    }
+
+    // -------------------- Integration: Pool Survives Thread Panic --------------------
+
+    #[test]
+    fn test_pool_survives_thread_panic_during_acquire() {
+        use std::thread;
+
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(5));
+        let pool_arc = Arc::new(pool);
+
+        // Simulate a thread that acquires, does work, then panics
+        // The connection should be leaked but pool should remain usable for reads
+        let pool_clone = Arc::clone(&pool_arc);
+        let handle = thread::spawn(move || {
+            // Manually simulate having acquired a connection
+            {
+                let mut inner = pool_clone.shared.inner.lock().unwrap();
+                inner.total_count = 1;
+                inner.active_count = 1;
+            }
+
+            // Now panic while "using" the connection
+            // (In real code, this would be while holding a PooledConnection)
+            let _guard = pool_clone.shared.inner.lock().unwrap();
+            panic!("simulated panic during database operation");
+        });
+
+        // Wait for thread to panic
+        let _ = handle.join();
+
+        // Pool's mutex is now poisoned, but read-only methods should still work
+        assert_eq!(pool_arc.total_count(), 1);
+        assert_eq!(pool_arc.config().max_connections, 5);
+
+        // Stats should be recoverable
+        let stats = pool_arc.stats();
+        assert_eq!(stats.total_connections, 1);
+    }
+
+    #[test]
+    fn test_pool_close_after_thread_panic() {
+        use std::thread;
+
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(5));
+
+        // Add some idle connections
+        {
+            let mut inner = pool.shared.inner.lock().unwrap();
+            inner.total_count = 2;
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::new(1)));
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::new(2)));
+        }
+
+        // Poison the mutex
+        let shared_clone = Arc::clone(&pool.shared);
+        let handle = thread::spawn(move || {
+            let _guard = shared_clone.inner.lock().unwrap();
+            panic!("intentional panic");
+        });
+        let _ = handle.join();
+
+        // close() should recover and still work
+        pool.close();
+
+        // Pool should be closed and idle connections cleared
+        assert!(pool.is_closed());
+        assert_eq!(pool.idle_count(), 0);
+    }
+
+    #[test]
+    fn test_multiple_reads_after_poisoning() {
+        let pool = poison_pool_mutex();
+
+        // Multiple read operations should all succeed
+        for _ in 0..10 {
+            let _ = pool.config();
+            let _ = pool.stats();
+            let _ = pool.at_capacity();
+            let _ = pool.is_closed();
+            let _ = pool.idle_count();
+            let _ = pool.active_count();
+            let _ = pool.total_count();
+        }
+
+        // All reads should have recovered successfully
+        assert_eq!(pool.total_count(), 2);
+    }
+
+    #[test]
+    fn test_waiters_count_after_poisoning() {
+        use std::thread;
+
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(5));
+
+        // Set up waiter count
+        {
+            let mut inner = pool.shared.inner.lock().unwrap();
+            inner.waiter_count = 3;
+        }
+
+        // Poison the mutex
+        let shared_clone = Arc::clone(&pool.shared);
+        let handle = thread::spawn(move || {
+            let _guard = shared_clone.inner.lock().unwrap();
+            panic!("intentional panic");
+        });
+        let _ = handle.join();
+
+        // stats() should recover and show correct waiter count
+        let stats = pool.stats();
+        assert_eq!(stats.pending_requests, 3);
+    }
 }
