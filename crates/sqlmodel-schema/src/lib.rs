@@ -89,3 +89,114 @@ pub async fn drop_table<C: Connection>(
 
     conn.execute(cx, &sql, &[]).await.map(|_| ())
 }
+
+/// Generate DROP TABLE SQL (for testing/inspection).
+///
+/// This is the same SQL that `drop_table` would execute.
+pub fn drop_table_sql(table_name: &str, if_exists: bool) -> String {
+    if if_exists {
+        format!("DROP TABLE IF EXISTS {}", quote_ident(table_name))
+    } else {
+        format!("DROP TABLE {}", quote_ident(table_name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ================================================================================
+    // DROP TABLE Identifier Quoting Tests
+    // ================================================================================
+
+    #[test]
+    fn test_drop_table_sql_simple() {
+        let sql = drop_table_sql("users", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"users\"");
+
+        let sql = drop_table_sql("heroes", false);
+        assert_eq!(sql, "DROP TABLE \"heroes\"");
+    }
+
+    #[test]
+    fn test_drop_table_sql_with_keyword_name() {
+        // SQL keywords must be quoted
+        let sql = drop_table_sql("order", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"order\"");
+
+        let sql = drop_table_sql("select", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"select\"");
+
+        let sql = drop_table_sql("user", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"user\"");
+    }
+
+    #[test]
+    fn test_drop_table_sql_with_embedded_quotes() {
+        // Embedded quotes must be doubled
+        let sql = drop_table_sql("my\"table", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"my\"\"table\"");
+
+        let sql = drop_table_sql("test\"\"name", false);
+        assert_eq!(sql, "DROP TABLE \"test\"\"\"\"name\"");
+
+        // Just a quote
+        let sql = drop_table_sql("\"", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"\"\"\"");
+    }
+
+    #[test]
+    fn test_drop_table_sql_with_spaces() {
+        let sql = drop_table_sql("my table", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"my table\"");
+    }
+
+    #[test]
+    fn test_drop_table_sql_with_unicode() {
+        let sql = drop_table_sql("用户", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"用户\"");
+
+        let sql = drop_table_sql("tâble_émoji_🦀", false);
+        assert_eq!(sql, "DROP TABLE \"tâble_émoji_🦀\"");
+    }
+
+    #[test]
+    fn test_drop_table_sql_edge_cases() {
+        // Empty table name (unusual but should be quoted)
+        let sql = drop_table_sql("", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"\"");
+
+        // Single character
+        let sql = drop_table_sql("x", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"x\"");
+
+        // Numbers at start (not valid unquoted identifier in most DBs)
+        let sql = drop_table_sql("123table", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"123table\"");
+
+        // Special characters
+        let sql = drop_table_sql("table-with-dashes", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"table-with-dashes\"");
+
+        let sql = drop_table_sql("table.with.dots", true);
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"table.with.dots\"");
+    }
+
+    #[test]
+    fn test_drop_table_sql_sql_injection_attempt_neutralized() {
+        // SQL injection attempt - the quote_ident should neutralize it
+        let malicious = "users\"; DROP TABLE secrets; --";
+        let sql = drop_table_sql(malicious, true);
+        // The embedded quote should be doubled, neutralizing the injection
+        assert_eq!(
+            sql,
+            "DROP TABLE IF EXISTS \"users\"\"; DROP TABLE secrets; --\""
+        );
+        // Verify the whole thing is treated as a single identifier
+        assert!(sql.starts_with("DROP TABLE IF EXISTS \""));
+        assert!(sql.ends_with("\""));
+        // Count quotes - should be start quote, doubled embedded quote, end quote
+        let quote_count = sql.matches('"').count();
+        assert_eq!(quote_count, 4); // opening, doubled embedded, closing
+    }
+}

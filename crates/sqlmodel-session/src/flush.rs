@@ -138,6 +138,36 @@ impl LinkTableOp {
         matches!(self, LinkTableOp::Unlink { .. })
     }
 
+    /// Generate the SQL that would be executed for this operation.
+    ///
+    /// Useful for testing and debugging.
+    pub fn to_sql(&self) -> String {
+        match self {
+            LinkTableOp::Link {
+                table,
+                local_column,
+                remote_column,
+                ..
+            } => format!(
+                "INSERT INTO {} ({}, {}) VALUES ($1, $2)",
+                quote_ident(table),
+                quote_ident(local_column),
+                quote_ident(remote_column)
+            ),
+            LinkTableOp::Unlink {
+                table,
+                local_column,
+                remote_column,
+                ..
+            } => format!(
+                "DELETE FROM {} WHERE {} = $1 AND {} = $2",
+                quote_ident(table),
+                quote_ident(local_column),
+                quote_ident(remote_column)
+            ),
+        }
+    }
+
     /// Execute this link table operation.
     #[tracing::instrument(level = "debug", skip(cx, conn))]
     pub async fn execute<C: Connection>(&self, cx: &Cx, conn: &C) -> Outcome<(), Error> {
@@ -241,6 +271,87 @@ impl PendingOp {
     /// Check if this is a delete operation.
     pub fn is_delete(&self) -> bool {
         matches!(self, PendingOp::Delete { .. })
+    }
+
+    /// Generate the SQL that would be executed for this operation.
+    ///
+    /// This is useful for testing and debugging. For INSERT/DELETE operations,
+    /// this generates the batch SQL with a single row. For UPDATE, it generates
+    /// the full UPDATE statement.
+    pub fn to_sql(&self) -> String {
+        match self {
+            PendingOp::Insert {
+                table,
+                columns,
+                values,
+                ..
+            } => {
+                let col_list: String = columns
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let placeholders: Vec<String> =
+                    (1..=values.len()).map(|i| format!("${}", i)).collect();
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    quote_ident(table),
+                    col_list,
+                    placeholders.join(", ")
+                )
+            }
+            PendingOp::Delete {
+                table, pk_columns, ..
+            } => {
+                if pk_columns.len() == 1 {
+                    format!(
+                        "DELETE FROM {} WHERE {} IN ($1)",
+                        quote_ident(table),
+                        quote_ident(pk_columns[0])
+                    )
+                } else {
+                    let where_clause: String = pk_columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, col)| format!("{} = ${}", quote_ident(col), i + 1))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    format!("DELETE FROM {} WHERE {}", quote_ident(table), where_clause)
+                }
+            }
+            PendingOp::Update {
+                table,
+                pk_columns,
+                set_columns,
+                ..
+            } => {
+                let mut param_idx = 1;
+                let set_clause: String = set_columns
+                    .iter()
+                    .map(|col| {
+                        let s = format!("{} = ${}", quote_ident(col), param_idx);
+                        param_idx += 1;
+                        s
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let where_clause: String = pk_columns
+                    .iter()
+                    .map(|col| {
+                        let s = format!("{} = ${}", quote_ident(col), param_idx);
+                        param_idx += 1;
+                        s
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    quote_ident(table),
+                    set_clause,
+                    where_clause
+                )
+            }
+        }
     }
 }
 
@@ -1176,5 +1287,385 @@ mod tests {
             }
             LinkTableOp::Unlink { .. } => std::panic::panic_any("Expected Link"),
         }
+    }
+
+    // ================================================================================
+    // DML Identifier Quoting Integration Tests
+    // ================================================================================
+
+    // Helper to create PendingOp::Insert with custom names
+    fn make_custom_insert(table: &'static str, columns: Vec<&'static str>, pk: i64) -> PendingOp {
+        PendingOp::Insert {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: pk as u64,
+            },
+            table,
+            columns,
+            values: vec![Value::BigInt(pk), Value::Text("Test".to_string())],
+        }
+    }
+
+    // Helper to create PendingOp::Delete with custom pk columns
+    fn make_custom_delete(
+        table: &'static str,
+        pk_columns: Vec<&'static str>,
+        pk: i64,
+    ) -> PendingOp {
+        PendingOp::Delete {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: pk as u64,
+            },
+            table,
+            pk_columns,
+            pk_values: vec![Value::BigInt(pk)],
+        }
+    }
+
+    // Helper to create PendingOp::Update with custom column names
+    fn make_custom_update(
+        table: &'static str,
+        pk_columns: Vec<&'static str>,
+        set_columns: Vec<&'static str>,
+        pk: i64,
+    ) -> PendingOp {
+        PendingOp::Update {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: pk as u64,
+            },
+            table,
+            pk_columns,
+            pk_values: vec![Value::BigInt(pk)],
+            set_columns,
+            set_values: vec![Value::Text("Updated".to_string())],
+        }
+    }
+
+    // ------ LinkTableOp SQL Generation Tests ------
+
+    #[test]
+    fn test_link_table_op_to_sql_simple() {
+        let op = LinkTableOp::link(
+            "hero_powers".to_string(),
+            "hero_id".to_string(),
+            Value::BigInt(1),
+            "power_id".to_string(),
+            Value::BigInt(5),
+        );
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"hero_powers\" (\"hero_id\", \"power_id\") VALUES ($1, $2)"
+        );
+    }
+
+    #[test]
+    fn test_link_table_op_to_sql_with_keywords() {
+        let op = LinkTableOp::link(
+            "order".to_string(),  // SQL keyword table
+            "select".to_string(), // SQL keyword column
+            Value::BigInt(1),
+            "from".to_string(), // SQL keyword column
+            Value::BigInt(2),
+        );
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"order\" (\"select\", \"from\") VALUES ($1, $2)"
+        );
+    }
+
+    #[test]
+    fn test_link_table_op_to_sql_with_embedded_quotes() {
+        let op = LinkTableOp::link(
+            "my\"table".to_string(),
+            "col\"a".to_string(),
+            Value::BigInt(1),
+            "col\"b".to_string(),
+            Value::BigInt(2),
+        );
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"my\"\"table\" (\"col\"\"a\", \"col\"\"b\") VALUES ($1, $2)"
+        );
+    }
+
+    #[test]
+    fn test_link_table_op_unlink_to_sql_with_keywords() {
+        let op = LinkTableOp::unlink(
+            "user".to_string(),
+            "index".to_string(),
+            Value::BigInt(1),
+            "key".to_string(),
+            Value::BigInt(2),
+        );
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "DELETE FROM \"user\" WHERE \"index\" = $1 AND \"key\" = $2"
+        );
+    }
+
+    #[test]
+    fn test_link_table_op_to_sql_with_unicode() {
+        let op = LinkTableOp::link(
+            "用户表".to_string(),
+            "用户id".to_string(),
+            Value::BigInt(1),
+            "角色id".to_string(),
+            Value::BigInt(2),
+        );
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"用户表\" (\"用户id\", \"角色id\") VALUES ($1, $2)"
+        );
+    }
+
+    #[test]
+    fn test_link_table_op_to_sql_with_spaces() {
+        let op = LinkTableOp::link(
+            "link table".to_string(),
+            "local id".to_string(),
+            Value::BigInt(1),
+            "remote id".to_string(),
+            Value::BigInt(2),
+        );
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"link table\" (\"local id\", \"remote id\") VALUES ($1, $2)"
+        );
+    }
+
+    // ------ PendingOp::Insert SQL Generation Tests ------
+
+    #[test]
+    fn test_pending_op_insert_to_sql_simple() {
+        let op = make_insert("teams", 1);
+        let sql = op.to_sql();
+        assert!(sql.starts_with("INSERT INTO \"teams\""));
+        assert!(sql.contains("(\"id\", \"name\")"));
+        assert!(sql.contains("VALUES ($1, $2)"));
+    }
+
+    #[test]
+    fn test_pending_op_insert_to_sql_with_keyword_table() {
+        let op = make_custom_insert("order", vec!["id", "select"], 1);
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"order\" (\"id\", \"select\") VALUES ($1, $2)"
+        );
+    }
+
+    #[test]
+    fn test_pending_op_insert_to_sql_with_quoted_names() {
+        let op = make_custom_insert("my\"table", vec!["pk\"id", "data\"col"], 1);
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"my\"\"table\" (\"pk\"\"id\", \"data\"\"col\") VALUES ($1, $2)"
+        );
+    }
+
+    // ------ PendingOp::Delete SQL Generation Tests ------
+
+    #[test]
+    fn test_pending_op_delete_to_sql_single_pk() {
+        let op = make_delete("teams", 1);
+        let sql = op.to_sql();
+        assert_eq!(sql, "DELETE FROM \"teams\" WHERE \"id\" IN ($1)");
+    }
+
+    #[test]
+    fn test_pending_op_delete_to_sql_with_keyword_table() {
+        let op = make_custom_delete("order", vec!["id"], 1);
+        let sql = op.to_sql();
+        assert_eq!(sql, "DELETE FROM \"order\" WHERE \"id\" IN ($1)");
+    }
+
+    #[test]
+    fn test_pending_op_delete_to_sql_composite_pk() {
+        let op = PendingOp::Delete {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: 1,
+            },
+            table: "order_items",
+            pk_columns: vec!["order_id", "item_id"],
+            pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+        };
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "DELETE FROM \"order_items\" WHERE \"order_id\" = $1 AND \"item_id\" = $2"
+        );
+    }
+
+    #[test]
+    fn test_pending_op_delete_to_sql_with_keyword_pk_columns() {
+        let op = PendingOp::Delete {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: 1,
+            },
+            table: "user",
+            pk_columns: vec!["select", "from"],
+            pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+        };
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "DELETE FROM \"user\" WHERE \"select\" = $1 AND \"from\" = $2"
+        );
+    }
+
+    // ------ PendingOp::Update SQL Generation Tests ------
+
+    #[test]
+    fn test_pending_op_update_to_sql_simple() {
+        let op = make_update("teams", 1);
+        let sql = op.to_sql();
+        assert_eq!(sql, "UPDATE \"teams\" SET \"name\" = $1 WHERE \"id\" = $2");
+    }
+
+    #[test]
+    fn test_pending_op_update_to_sql_with_keyword_names() {
+        let op = make_custom_update("order", vec!["id"], vec!["select", "from"], 1);
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "UPDATE \"order\" SET \"select\" = $1, \"from\" = $2 WHERE \"id\" = $3"
+        );
+    }
+
+    #[test]
+    fn test_pending_op_update_to_sql_with_quoted_names() {
+        let op = make_custom_update("my\"table", vec!["pk\"id"], vec!["data\"col"], 1);
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "UPDATE \"my\"\"table\" SET \"data\"\"col\" = $1 WHERE \"pk\"\"id\" = $2"
+        );
+    }
+
+    #[test]
+    fn test_pending_op_update_to_sql_composite_pk() {
+        let op = PendingOp::Update {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: 1,
+            },
+            table: "order_items",
+            pk_columns: vec!["order_id", "item_id"],
+            pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+            set_columns: vec!["quantity"],
+            set_values: vec![Value::Int(5)],
+        };
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "UPDATE \"order_items\" SET \"quantity\" = $1 WHERE \"order_id\" = $2 AND \"item_id\" = $3"
+        );
+    }
+
+    // ------ SQL Injection Neutralization Tests ------
+
+    #[test]
+    fn test_link_op_sql_injection_neutralized() {
+        // Attempt SQL injection through table name
+        let op = LinkTableOp::link(
+            "links\"; DROP TABLE users; --".to_string(),
+            "col1".to_string(),
+            Value::BigInt(1),
+            "col2".to_string(),
+            Value::BigInt(2),
+        );
+        let sql = op.to_sql();
+        // The embedded quote should be doubled, keeping everything as an identifier
+        assert!(sql.contains("\"links\"\"; DROP TABLE users; --\""));
+        // Count quotes - injection is neutralized
+        assert!(sql.starts_with("INSERT INTO \""));
+    }
+
+    #[test]
+    fn test_pending_op_insert_sql_injection_neutralized() {
+        let op = make_custom_insert("users\"; DROP TABLE secrets; --", vec!["id", "name"], 1);
+        let sql = op.to_sql();
+        // Injection attempt should be contained within quotes
+        assert!(sql.contains("\"users\"\"; DROP TABLE secrets; --\""));
+        assert!(sql.starts_with("INSERT INTO \""));
+    }
+
+    #[test]
+    fn test_pending_op_update_sql_injection_neutralized() {
+        let op = make_custom_update("data", vec!["id"], vec!["col\"; DROP TABLE data; --"], 1);
+        let sql = op.to_sql();
+        // The malicious column name is safely quoted
+        assert!(sql.contains("\"col\"\"; DROP TABLE data; --\""));
+    }
+
+    // ------ Edge Cases ------
+
+    #[test]
+    fn test_pending_op_insert_many_columns() {
+        let op = PendingOp::Insert {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: 1,
+            },
+            table: "wide_table",
+            columns: vec!["a", "b", "c", "d", "e"],
+            values: vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5),
+            ],
+        };
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"wide_table\" (\"a\", \"b\", \"c\", \"d\", \"e\") VALUES ($1, $2, $3, $4, $5)"
+        );
+    }
+
+    #[test]
+    fn test_pending_op_update_many_set_columns() {
+        let op = PendingOp::Update {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: 1,
+            },
+            table: "items",
+            pk_columns: vec!["id"],
+            pk_values: vec![Value::BigInt(1)],
+            set_columns: vec!["a", "b", "c"],
+            set_values: vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+        };
+        let sql = op.to_sql();
+        assert_eq!(
+            sql,
+            "UPDATE \"items\" SET \"a\" = $1, \"b\" = $2, \"c\" = $3 WHERE \"id\" = $4"
+        );
+    }
+
+    #[test]
+    fn test_link_table_op_empty_strings() {
+        // Edge case: empty identifiers (unusual but should still be quoted)
+        let op = LinkTableOp::link(
+            "".to_string(),
+            "".to_string(),
+            Value::BigInt(1),
+            "".to_string(),
+            Value::BigInt(2),
+        );
+        let sql = op.to_sql();
+        assert_eq!(sql, "INSERT INTO \"\" (\"\", \"\") VALUES ($1, $2)");
     }
 }

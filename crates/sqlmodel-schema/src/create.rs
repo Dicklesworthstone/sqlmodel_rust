@@ -477,6 +477,399 @@ mod tests {
         assert!(statements[0].contains("\"my\"\"table\""));
         assert!(statements[0].contains("\"col\"\"name\""));
     }
+
+    // ================================================================================
+    // DDL Identifier Quoting Integration Tests
+    // ================================================================================
+
+    // Test model with SQL keyword table name
+    struct TestOrderTable;
+
+    impl Model for TestOrderTable {
+        const TABLE_NAME: &'static str = "order"; // SQL keyword!
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt)
+                    .nullable(true)
+                    .primary_key(true),
+                FieldInfo::new("select", "select", SqlType::Text), // SQL keyword column!
+                FieldInfo::new("from", "from", SqlType::Text),     // SQL keyword column!
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestOrderTable)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_keyword_table_name() {
+        let sql = CreateTable::<TestOrderTable>::new().build();
+        // Table name "order" must be quoted
+        assert!(sql.contains("CREATE TABLE \"order\""));
+        // Column names that are keywords must be quoted
+        assert!(sql.contains("\"select\" TEXT NOT NULL"));
+        assert!(sql.contains("\"from\" TEXT NOT NULL"));
+        assert!(sql.contains("\"id\" BIGINT"));
+        assert!(sql.contains("PRIMARY KEY (\"id\")"));
+    }
+
+    #[test]
+    fn test_schema_builder_with_keyword_table_name() {
+        let statements = SchemaBuilder::new()
+            .create_table::<TestOrderTable>()
+            .build();
+        assert!(statements[0].contains("CREATE TABLE IF NOT EXISTS \"order\""));
+        assert!(statements[0].contains("\"select\" TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn test_create_index_with_keyword_names() {
+        let statements = SchemaBuilder::new()
+            .create_index("idx_order_select", "order", &["select", "from"], false)
+            .build();
+        // All identifiers must be quoted
+        assert!(statements[0].contains("\"idx_order_select\""));
+        assert!(statements[0].contains("ON \"order\""));
+        assert!(statements[0].contains("(\"select\", \"from\")"));
+    }
+
+    // Test model with embedded quotes in table/column names
+    struct TestQuotedNames;
+
+    impl Model for TestQuotedNames {
+        const TABLE_NAME: &'static str = "my\"table"; // Embedded quote!
+        const PRIMARY_KEY: &'static [&'static str] = &["pk"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("pk", "pk", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("data\"col", "data\"col", SqlType::Text), // Embedded quote!
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestQuotedNames)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_embedded_quotes() {
+        let sql = CreateTable::<TestQuotedNames>::new().build();
+        // Embedded quotes must be doubled
+        assert!(sql.contains("CREATE TABLE \"my\"\"table\""));
+        assert!(sql.contains("\"data\"\"col\" TEXT NOT NULL"));
+        // Primary key also needs quote escaping
+        assert!(sql.contains("PRIMARY KEY (\"pk\")"));
+    }
+
+    // Test model with unicode characters
+    struct TestUnicodeTable;
+
+    impl Model for TestUnicodeTable {
+        const TABLE_NAME: &'static str = "用户表"; // Chinese "user table"
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("名前", "名前", SqlType::Text), // Japanese "name"
+                FieldInfo::new("émoji_🦀", "émoji_🦀", SqlType::Text), // Emoji in column name
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestUnicodeTable)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_unicode_names() {
+        let sql = CreateTable::<TestUnicodeTable>::new().build();
+        // Unicode should be preserved and quoted
+        assert!(sql.contains("CREATE TABLE \"用户表\""));
+        assert!(sql.contains("\"名前\" TEXT NOT NULL"));
+        assert!(sql.contains("\"émoji_🦀\" TEXT NOT NULL"));
+    }
+
+    // Test model with spaces in names
+    struct TestSpacedNames;
+
+    impl Model for TestSpacedNames {
+        const TABLE_NAME: &'static str = "my table";
+        const PRIMARY_KEY: &'static [&'static str] = &["my id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("my id", "my id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("full name", "full name", SqlType::Text),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestSpacedNames)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_spaces_in_names() {
+        let sql = CreateTable::<TestSpacedNames>::new().build();
+        // Spaces must be preserved within quotes
+        assert!(sql.contains("CREATE TABLE \"my table\""));
+        assert!(sql.contains("\"my id\" BIGINT"));
+        assert!(sql.contains("\"full name\" TEXT NOT NULL"));
+        assert!(sql.contains("PRIMARY KEY (\"my id\")"));
+    }
+
+    // Test foreign key with keyword table reference
+    struct TestFkToKeyword;
+
+    impl Model for TestFkToKeyword {
+        const TABLE_NAME: &'static str = "user_orders";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt)
+                    .nullable(true)
+                    .primary_key(true),
+                FieldInfo::new("order_id", "order_id", SqlType::BigInt)
+                    .nullable(true)
+                    .foreign_key("order.id"), // FK to keyword table!
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestFkToKeyword)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_foreign_key_to_keyword_table() {
+        let sql = CreateTable::<TestFkToKeyword>::new().build();
+        // FK reference must quote the keyword table name
+        assert!(sql.contains("FOREIGN KEY (\"order_id\") REFERENCES \"order\"(\"id\")"));
+    }
+
+    // Test unique constraint with keyword column name
+    struct TestUniqueKeyword;
+
+    impl Model for TestUniqueKeyword {
+        const TABLE_NAME: &'static str = "items";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("index", "index", SqlType::Integer).unique(true), // keyword!
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestUniqueKeyword)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_unique_constraint_with_keyword_column() {
+        let sql = CreateTable::<TestUniqueKeyword>::new().build();
+        // Unique constraint with keyword column name
+        assert!(sql.contains("CONSTRAINT \"uk_index\" UNIQUE (\"index\")"));
+        assert!(sql.contains("\"index\" INTEGER NOT NULL"));
+    }
+
+    // Edge cases: empty string, single quote, backslash
+    #[test]
+    fn test_quote_ident_edge_cases() {
+        // Empty string
+        assert_eq!(quote_ident(""), "\"\"");
+
+        // Single character
+        assert_eq!(quote_ident("x"), "\"x\"");
+
+        // Just a quote
+        assert_eq!(quote_ident("\""), "\"\"\"\"");
+
+        // Backslash (should pass through)
+        assert_eq!(quote_ident("back\\slash"), "\"back\\slash\"");
+
+        // Multiple consecutive quotes
+        assert_eq!(quote_ident("\"\"\""), "\"\"\"\"\"\"\"\"");
+
+        // Mixed quotes and other chars
+        assert_eq!(quote_ident("a\"b\"c\"d"), "\"a\"\"b\"\"c\"\"d\"");
+    }
+
+    // Test that all SQL keywords are properly quoted
+    #[test]
+    fn test_various_sql_keywords_as_identifiers() {
+        // All these are SQL reserved words
+        let keywords = [
+            "select",
+            "from",
+            "where",
+            "order",
+            "group",
+            "by",
+            "having",
+            "insert",
+            "update",
+            "delete",
+            "create",
+            "drop",
+            "table",
+            "index",
+            "primary",
+            "foreign",
+            "key",
+            "references",
+            "constraint",
+            "unique",
+            "not",
+            "null",
+            "default",
+            "and",
+            "or",
+            "in",
+            "between",
+            "like",
+            "is",
+            "as",
+            "join",
+            "inner",
+            "outer",
+            "left",
+            "right",
+            "on",
+            "into",
+            "values",
+            "set",
+            "limit",
+            "offset",
+            "asc",
+            "desc",
+            "user",
+            "database",
+        ];
+
+        for keyword in keywords {
+            let quoted = quote_ident(keyword);
+            // Must be quoted with double quotes
+            assert!(
+                quoted.starts_with('"') && quoted.ends_with('"'),
+                "Keyword '{}' not properly quoted: {}",
+                keyword,
+                quoted
+            );
+            // Content should be the keyword itself
+            assert_eq!(
+                &quoted[1..quoted.len() - 1],
+                keyword,
+                "Keyword '{}' mangled in quoting",
+                keyword
+            );
+        }
+    }
+
+    // SchemaBuilder edge cases
+    #[test]
+    fn test_schema_builder_create_index_with_keywords() {
+        let stmts = SchemaBuilder::new()
+            .create_index("idx_user_select", "user", &["select"], true)
+            .build();
+        assert!(stmts[0].contains("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_user_select\""));
+        assert!(stmts[0].contains("ON \"user\" (\"select\")"));
+    }
+
+    #[test]
+    fn test_schema_builder_multi_column_index_with_quotes() {
+        let stmts = SchemaBuilder::new()
+            .create_index("idx\"multi", "tbl\"name", &["col\"a", "col\"b"], false)
+            .build();
+        assert!(stmts[0].contains("\"idx\"\"multi\""));
+        assert!(stmts[0].contains("ON \"tbl\"\"name\""));
+        assert!(stmts[0].contains("(\"col\"\"a\", \"col\"\"b\")"));
+    }
 }
 
 /// Builder for multiple schema operations.
