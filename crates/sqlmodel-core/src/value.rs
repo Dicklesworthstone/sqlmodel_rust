@@ -152,6 +152,39 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Convert a `u64` to `Value`, clamping to `i64::MAX` if it overflows.
+    ///
+    /// This is a convenience method for cases where you want to store large `u64`
+    /// values as the largest representable signed integer rather than erroring.
+    /// A warning is logged when clamping occurs.
+    ///
+    /// For strict conversion that errors on overflow, use `Value::try_from(u64)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sqlmodel_core::Value;
+    ///
+    /// // Small values convert normally
+    /// assert_eq!(Value::from_u64_clamped(42), Value::BigInt(42));
+    ///
+    /// // Large values are clamped to i64::MAX
+    /// assert_eq!(Value::from_u64_clamped(u64::MAX), Value::BigInt(i64::MAX));
+    /// ```
+    #[must_use]
+    pub fn from_u64_clamped(v: u64) -> Self {
+        if let Ok(signed) = i64::try_from(v) {
+            Value::BigInt(signed)
+        } else {
+            tracing::warn!(
+                value = v,
+                clamped_to = i64::MAX,
+                "u64 value exceeds i64::MAX; clamping to i64::MAX"
+            );
+            Value::BigInt(i64::MAX)
+        }
+    }
 }
 
 // Conversion implementations
@@ -248,10 +281,22 @@ impl From<u32> for Value {
     }
 }
 
-impl From<u64> for Value {
-    fn from(v: u64) -> Self {
-        // May overflow for very large values, but best effort
-        Value::BigInt(v as i64)
+/// Convert a `u64` to `Value`, returning an error if the value exceeds `i64::MAX`.
+///
+/// SQL BIGINT is signed, so values larger than `i64::MAX` cannot be stored directly.
+/// Use `Value::from_u64_clamped()` if you want silent clamping instead of an error.
+impl TryFrom<u64> for Value {
+    type Error = Error;
+
+    fn try_from(v: u64) -> Result<Self, Self::Error> {
+        i64::try_from(v).map(Value::BigInt).map_err(|_| {
+            Error::Type(TypeError {
+                expected: "u64 <= i64::MAX",
+                actual: format!("u64 value {} exceeds i64::MAX ({})", v, i64::MAX),
+                column: None,
+                rust_type: Some("u64"),
+            })
+        })
     }
 }
 
@@ -645,7 +690,7 @@ mod tests {
         assert_eq!(Value::from(42u8), Value::SmallInt(42));
         assert_eq!(Value::from(42u16), Value::Int(42));
         assert_eq!(Value::from(42u32), Value::BigInt(42));
-        assert_eq!(Value::from(42u64), Value::BigInt(42));
+        // u64 uses TryFrom, not From (see test_try_from_u64 and test_from_u64_clamped)
     }
 
     #[test]
@@ -877,5 +922,54 @@ mod tests {
         let v = Value::Text("not an array".to_string());
         let result: Result<Vec<String>, _> = v.try_into();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_from_u64_success() {
+        // Values within i64 range should succeed
+        let v: Value = Value::try_from(42u64).unwrap();
+        assert_eq!(v, Value::BigInt(42));
+
+        // Maximum valid value: i64::MAX
+        let v: Value = Value::try_from(i64::MAX as u64).unwrap();
+        assert_eq!(v, Value::BigInt(i64::MAX));
+
+        // Zero should work
+        let v: Value = Value::try_from(0u64).unwrap();
+        assert_eq!(v, Value::BigInt(0));
+    }
+
+    #[test]
+    fn test_try_from_u64_overflow_error() {
+        // Values exceeding i64::MAX should error
+        let result = Value::try_from(u64::MAX);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Type(_)));
+
+        // One more than i64::MAX should also error
+        let result = Value::try_from((i64::MAX as u64) + 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_u64_clamped_normal() {
+        // Normal values convert without clamping
+        assert_eq!(Value::from_u64_clamped(0), Value::BigInt(0));
+        assert_eq!(Value::from_u64_clamped(42), Value::BigInt(42));
+        assert_eq!(
+            Value::from_u64_clamped(i64::MAX as u64),
+            Value::BigInt(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn test_from_u64_clamped_overflow() {
+        // Values exceeding i64::MAX are clamped
+        assert_eq!(Value::from_u64_clamped(u64::MAX), Value::BigInt(i64::MAX));
+        assert_eq!(
+            Value::from_u64_clamped((i64::MAX as u64) + 1),
+            Value::BigInt(i64::MAX)
+        );
     }
 }
