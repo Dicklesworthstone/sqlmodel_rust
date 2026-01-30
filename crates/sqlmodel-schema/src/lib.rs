@@ -32,7 +32,7 @@ pub use introspect::{
 pub use migrate::{Migration, MigrationFormat, MigrationRunner, MigrationStatus, MigrationWriter};
 
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Model};
+use sqlmodel_core::{Connection, Model, quote_ident};
 
 /// Create a table for a model type.
 ///
@@ -82,12 +82,9 @@ pub async fn drop_table<C: Connection>(
     if_exists: bool,
 ) -> Outcome<(), sqlmodel_core::Error> {
     let sql = if if_exists {
-        format!(
-            "DROP TABLE IF EXISTS \"{}\"",
-            table_name.replace('"', "\"\"")
-        )
+        format!("DROP TABLE IF EXISTS {}", quote_ident(table_name))
     } else {
-        format!("DROP TABLE \"{}\"", table_name.replace('"', "\"\""))
+        format!("DROP TABLE {}", quote_ident(table_name))
     };
 
     conn.execute(cx, &sql, &[]).await.map(|_| ())

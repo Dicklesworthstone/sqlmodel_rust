@@ -1,20 +1,7 @@
 //! CREATE TABLE statement builder.
 
-use sqlmodel_core::{FieldInfo, Model};
+use sqlmodel_core::{FieldInfo, Model, quote_ident};
 use std::marker::PhantomData;
-
-/// Quote a SQL identifier (table, column, constraint name), escaping embedded quotes.
-///
-/// Double-quotes inside identifiers are escaped by doubling them.
-/// For example, `foo"bar` becomes `"foo""bar"`.
-fn quote_ident(ident: &str) -> String {
-    let escaped = ident.replace('"', "\"\"");
-    let mut out = String::with_capacity(escaped.len() + 2);
-    out.push('"');
-    out.push_str(&escaped);
-    out.push('"');
-    out
-}
 
 /// Builder for CREATE TABLE statements.
 #[derive(Debug)]

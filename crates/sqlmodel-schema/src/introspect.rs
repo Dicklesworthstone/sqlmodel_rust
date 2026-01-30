@@ -4,19 +4,8 @@
 //! It extracts metadata about tables, columns, constraints, and indexes.
 
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Error};
+use sqlmodel_core::{Connection, Error, sanitize_identifier};
 use std::collections::HashMap;
-
-/// Sanitize an identifier (table/index name) to prevent SQL injection.
-///
-/// Only allows alphanumeric characters and underscores. This is safe for use
-/// in PRAGMA commands and MySQL SHOW statements where parameterized queries
-/// are not supported.
-fn sanitize_identifier(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect()
-}
 
 // ============================================================================
 // Schema Types
