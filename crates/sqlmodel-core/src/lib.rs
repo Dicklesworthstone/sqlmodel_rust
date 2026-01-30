@@ -30,6 +30,7 @@ pub use connection::{
 pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
 pub use field::{Column, Field, FieldInfo, ReferentialAction};
 pub use hybrid::Hybrid;
+pub use identifiers::{quote_ident, quote_ident_mysql, sanitize_identifier};
 pub use model::{
     AttributeChange, AutoIncrement, ExtraFieldsBehavior, Model, ModelConfig, ModelEvents,
     SoftDelete, Timestamps,
@@ -46,4 +47,3 @@ pub use validate::{
     apply_validation_aliases,
 };
 pub use value::Value;
-pub use identifiers::{quote_ident, quote_ident_mysql, sanitize_identifier};
