@@ -1367,4 +1367,98 @@ mod tests {
         let field4 = FieldInfo::new("pet", "pet", SqlType::Json).discriminator_opt(Some("kind"));
         assert_eq!(field4.discriminator, Some("kind"));
     }
+
+    // =========================================================================
+    // InheritanceStrategy Tests
+    // =========================================================================
+
+    #[test]
+    fn test_inheritance_strategy_default() {
+        let strategy = InheritanceStrategy::default();
+        assert_eq!(strategy, InheritanceStrategy::None);
+        assert!(!strategy.is_inheritance());
+        assert!(!strategy.uses_discriminator());
+        assert!(!strategy.requires_join());
+    }
+
+    #[test]
+    fn test_inheritance_strategy_single() {
+        let strategy = InheritanceStrategy::Single;
+        assert!(strategy.is_inheritance());
+        assert!(strategy.uses_discriminator());
+        assert!(!strategy.requires_join());
+    }
+
+    #[test]
+    fn test_inheritance_strategy_joined() {
+        let strategy = InheritanceStrategy::Joined;
+        assert!(strategy.is_inheritance());
+        assert!(!strategy.uses_discriminator());
+        assert!(strategy.requires_join());
+    }
+
+    #[test]
+    fn test_inheritance_strategy_concrete() {
+        let strategy = InheritanceStrategy::Concrete;
+        assert!(strategy.is_inheritance());
+        assert!(!strategy.uses_discriminator());
+        assert!(!strategy.requires_join());
+    }
+
+    // =========================================================================
+    // InheritanceInfo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_inheritance_info_none() {
+        let info = InheritanceInfo::none();
+        assert_eq!(info.strategy, InheritanceStrategy::None);
+        assert!(info.parent.is_none());
+        assert!(info.discriminator_value.is_none());
+        assert!(!info.is_child());
+        assert!(!info.is_base());
+    }
+
+    #[test]
+    fn test_inheritance_info_single_table_base() {
+        let info = InheritanceInfo::single_table();
+        assert_eq!(info.strategy, InheritanceStrategy::Single);
+        assert!(info.parent.is_none());
+        assert!(info.is_base());
+        assert!(!info.is_child());
+    }
+
+    #[test]
+    fn test_inheritance_info_joined_table_base() {
+        let info = InheritanceInfo::joined_table();
+        assert_eq!(info.strategy, InheritanceStrategy::Joined);
+        assert!(info.parent.is_none());
+        assert!(info.is_base());
+        assert!(!info.is_child());
+    }
+
+    #[test]
+    fn test_inheritance_info_concrete_table_base() {
+        let info = InheritanceInfo::concrete_table();
+        assert_eq!(info.strategy, InheritanceStrategy::Concrete);
+        assert!(info.parent.is_none());
+        assert!(info.is_base());
+        assert!(!info.is_child());
+    }
+
+    #[test]
+    fn test_inheritance_info_child() {
+        let info = InheritanceInfo::child("Employee");
+        assert_eq!(info.parent, Some("Employee"));
+        assert!(info.is_child());
+        assert!(!info.is_base());
+    }
+
+    #[test]
+    fn test_inheritance_info_child_with_discriminator() {
+        let info = InheritanceInfo::child("Employee").with_discriminator("manager");
+        assert_eq!(info.parent, Some("Employee"));
+        assert_eq!(info.discriminator_value, Some("manager"));
+        assert!(info.is_child());
+    }
 }

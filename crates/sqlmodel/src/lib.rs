@@ -284,6 +284,145 @@ mod generic_model_tests {
     }
 }
 
+// ============================================================================
+// Table Inheritance Integration Tests
+// ============================================================================
+//
+// These tests verify that the Model derive macro correctly handles table
+// inheritance attributes and generates the appropriate inheritance() method.
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use sqlmodel_core::InheritanceStrategy;
+
+    // Single table inheritance base model
+    #[derive(Model, Debug, Clone, Serialize, Deserialize)]
+    #[sqlmodel(table, inheritance = "single")]
+    struct Employee {
+        #[sqlmodel(primary_key)]
+        id: i64,
+        name: String,
+        type_: String,
+    }
+
+    // Single table inheritance child model
+    #[derive(Model, Debug, Clone, Serialize, Deserialize)]
+    #[sqlmodel(inherits = "Employee", discriminator_value = "manager")]
+    struct Manager {
+        #[sqlmodel(primary_key)]
+        id: i64,
+        department: String,
+    }
+
+    // Joined table inheritance base model
+    #[derive(Model, Debug, Clone, Serialize, Deserialize)]
+    #[sqlmodel(table, inheritance = "joined")]
+    struct Person {
+        #[sqlmodel(primary_key)]
+        id: i64,
+        name: String,
+    }
+
+    // Joined table inheritance child model
+    #[derive(Model, Debug, Clone, Serialize, Deserialize)]
+    #[sqlmodel(table, inherits = "Person")]
+    struct Student {
+        #[sqlmodel(primary_key)]
+        student_id: i64,
+        grade: String,
+    }
+
+    // Concrete table inheritance base model
+    #[derive(Model, Debug, Clone, Serialize, Deserialize)]
+    #[sqlmodel(table, inheritance = "concrete")]
+    struct BaseEntity {
+        #[sqlmodel(primary_key)]
+        id: i64,
+        created_at: i64,
+    }
+
+    // Normal model without inheritance
+    #[derive(Model, Debug, Clone, Serialize, Deserialize)]
+    #[sqlmodel(table)]
+    struct NormalModel {
+        #[sqlmodel(primary_key)]
+        id: i64,
+        data: String,
+    }
+
+    #[test]
+    fn test_single_table_inheritance_base() {
+        let info = <Employee as Model>::inheritance();
+        assert_eq!(info.strategy, InheritanceStrategy::Single);
+        assert!(info.parent.is_none());
+        assert!(info.discriminator_value.is_none());
+        assert!(info.is_base());
+        assert!(!info.is_child());
+    }
+
+    #[test]
+    fn test_single_table_inheritance_child() {
+        let info = <Manager as Model>::inheritance();
+        assert_eq!(info.parent, Some("Employee"));
+        assert_eq!(info.discriminator_value, Some("manager"));
+        assert!(info.is_child());
+        assert!(!info.is_base());
+    }
+
+    #[test]
+    fn test_joined_table_inheritance_base() {
+        let info = <Person as Model>::inheritance();
+        assert_eq!(info.strategy, InheritanceStrategy::Joined);
+        assert!(info.parent.is_none());
+        assert!(info.is_base());
+    }
+
+    #[test]
+    fn test_joined_table_inheritance_child() {
+        let info = <Student as Model>::inheritance();
+        assert_eq!(info.parent, Some("Person"));
+        assert!(info.is_child());
+    }
+
+    #[test]
+    fn test_concrete_table_inheritance_base() {
+        let info = <BaseEntity as Model>::inheritance();
+        assert_eq!(info.strategy, InheritanceStrategy::Concrete);
+        assert!(info.parent.is_none());
+        assert!(info.is_base());
+    }
+
+    #[test]
+    fn test_no_inheritance() {
+        let info = <NormalModel as Model>::inheritance();
+        assert_eq!(info.strategy, InheritanceStrategy::None);
+        assert!(info.parent.is_none());
+        assert!(info.discriminator_value.is_none());
+        assert!(!info.is_base());
+        assert!(!info.is_child());
+    }
+
+    #[test]
+    fn test_inheritance_strategy_methods() {
+        // Single table uses discriminator
+        let single = <Employee as Model>::inheritance();
+        assert!(single.strategy.uses_discriminator());
+        assert!(!single.strategy.requires_join());
+
+        // Joined table requires join
+        let joined = <Person as Model>::inheritance();
+        assert!(!joined.strategy.uses_discriminator());
+        assert!(joined.strategy.requires_join());
+
+        // Concrete table neither
+        let concrete = <BaseEntity as Model>::inheritance();
+        assert!(!concrete.strategy.uses_discriminator());
+        assert!(!concrete.strategy.requires_join());
+    }
+}
+
 /// Prelude module for convenient imports.
 ///
 /// ```ignore
