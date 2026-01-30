@@ -273,6 +273,21 @@ impl<C> PoolShared<C> {
             poisoned.into_inner()
         })
     }
+
+    /// Lock the inner mutex, returning an error if poisoned.
+    ///
+    /// Use this for mutation operations where the pool state may be inconsistent
+    /// after a panic. Unlike `lock_or_recover()`, this propagates the error
+    /// to the caller.
+    #[allow(clippy::result_large_err)] // Error type is large by design for rich diagnostics
+    fn lock_or_error(
+        &self,
+        operation: &'static str,
+    ) -> Result<std::sync::MutexGuard<'_, PoolInner<C>>, Error> {
+        self.inner
+            .lock()
+            .map_err(|_| Error::Pool(PoolError::poisoned(operation)))
+    }
 }
 
 /// A connection pool for database connections.
@@ -377,7 +392,10 @@ impl<C: Connection> Pool<C> {
 
             // Try to get an idle connection or determine if we can create new
             let action = {
-                let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
+                let mut inner = match self.shared.lock_or_error("acquire") {
+                    Ok(guard) => guard,
+                    Err(e) => return Outcome::Err(e),
+                };
 
                 if inner.closed {
                     AcquireAction::PoolClosed
@@ -453,21 +471,25 @@ impl<C: Connection> Pool<C> {
                         }
                         Outcome::Err(e) => {
                             // Failed to create, decrement counts
-                            let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
-                            inner.total_count -= 1;
-                            inner.active_count -= 1;
+                            if let Ok(mut inner) = self.shared.lock_or_error("acquire_cleanup") {
+                                inner.total_count -= 1;
+                                inner.active_count -= 1;
+                            }
+                            // Even if we can't decrement counts, still return the original error
                             return Outcome::Err(e);
                         }
                         Outcome::Cancelled(reason) => {
-                            let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
-                            inner.total_count -= 1;
-                            inner.active_count -= 1;
+                            if let Ok(mut inner) = self.shared.lock_or_error("acquire_cleanup") {
+                                inner.total_count -= 1;
+                                inner.active_count -= 1;
+                            }
                             return Outcome::Cancelled(reason);
                         }
                         Outcome::Panicked(info) => {
-                            let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
-                            inner.total_count -= 1;
-                            inner.active_count -= 1;
+                            if let Ok(mut inner) = self.shared.lock_or_error("acquire_cleanup") {
+                                inner.total_count -= 1;
+                                inner.active_count -= 1;
+                            }
                             return Outcome::Panicked(info);
                         }
                     }
@@ -476,8 +498,9 @@ impl<C: Connection> Pool<C> {
                     // Wait for a connection to become available
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
-                        inner.waiter_count -= 1;
+                        if let Ok(mut inner) = self.shared.lock_or_error("acquire_timeout") {
+                            inner.waiter_count -= 1;
+                        }
                         self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
                         return Outcome::Err(Error::Pool(PoolError {
                             kind: PoolErrorKind::Timeout,
@@ -489,18 +512,25 @@ impl<C: Connection> Pool<C> {
                     // Wait with timeout (use shorter interval for cancellation checks)
                     let wait_time = remaining.min(Duration::from_millis(100));
                     {
-                        let inner = self.shared.inner.lock().expect("pool lock poisoned");
+                        let inner = match self.shared.lock_or_error("acquire_wait") {
+                            Ok(guard) => guard,
+                            Err(e) => return Outcome::Err(e),
+                        };
+                        // wait_timeout can also return a poisoned error, handle it
                         let _ = self
                             .shared
                             .conn_available
                             .wait_timeout(inner, wait_time)
-                            .expect("pool lock poisoned");
+                            .map_err(|_| {
+                                tracing::error!("Pool mutex poisoned during wait_timeout");
+                            });
                     }
 
                     // Decrement waiter count after waking
                     {
-                        let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
-                        inner.waiter_count = inner.waiter_count.saturating_sub(1);
+                        if let Ok(mut inner) = self.shared.lock_or_error("acquire_wake") {
+                            inner.waiter_count = inner.waiter_count.saturating_sub(1);
+                        }
                     }
 
                     // Loop back to try again
@@ -526,9 +556,10 @@ impl<C: Connection> Pool<C> {
                 Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => {
                     // Connection is invalid, decrement counts and try again
                     {
-                        let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
-                        inner.total_count -= 1;
-                        inner.active_count -= 1;
+                        if let Ok(mut inner) = self.shared.lock_or_error("validate_cleanup") {
+                            inner.total_count -= 1;
+                            inner.active_count -= 1;
+                        }
                     }
                     self.shared
                         .connections_closed
@@ -548,20 +579,41 @@ impl<C: Connection> Pool<C> {
     }
 
     /// Close the pool, preventing new connections and closing all idle connections.
+    ///
+    /// If the pool mutex is poisoned, this logs an error but still wakes waiters.
     pub fn close(&self) {
-        let mut inner = self.shared.inner.lock().expect("pool lock poisoned");
-        inner.closed = true;
+        match self.shared.inner.lock() {
+            Ok(mut inner) => {
+                inner.closed = true;
 
-        // Close all idle connections
-        let idle_count = inner.idle.len();
-        inner.idle.clear();
-        inner.total_count -= idle_count;
-        self.shared
-            .connections_closed
-            .fetch_add(idle_count as u64, Ordering::Relaxed);
+                // Close all idle connections
+                let idle_count = inner.idle.len();
+                inner.idle.clear();
+                inner.total_count -= idle_count;
+                self.shared
+                    .connections_closed
+                    .fetch_add(idle_count as u64, Ordering::Relaxed);
+                drop(inner);
+            }
+            Err(poisoned) => {
+                // Recover from poisoning - we still want to mark the pool as closed
+                // and wake waiters even if counts may be inconsistent.
+                tracing::error!(
+                    "Pool mutex poisoned during close; attempting recovery. \
+                     Pool state may be inconsistent."
+                );
+                let mut inner = poisoned.into_inner();
+                inner.closed = true;
+                let idle_count = inner.idle.len();
+                inner.idle.clear();
+                inner.total_count -= idle_count;
+                self.shared
+                    .connections_closed
+                    .fetch_add(idle_count as u64, Ordering::Relaxed);
+            }
+        }
 
         // Wake all waiters so they see the pool is closed
-        drop(inner);
         self.shared.conn_available.notify_all();
     }
 
