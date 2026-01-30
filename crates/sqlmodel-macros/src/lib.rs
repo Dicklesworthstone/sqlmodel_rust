@@ -714,7 +714,14 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
         quote::quote! { None }
     };
 
-    // Handle discriminator value
+    // Handle discriminator column (for base models)
+    let discriminator_column_token = if let Some(ref column) = config.discriminator_column {
+        quote::quote! { Some(#column) }
+    } else {
+        quote::quote! { None }
+    };
+
+    // Handle discriminator value (for child models)
     let discriminator_value_token = if let Some(ref value) = config.discriminator_value {
         quote::quote! { Some(#value) }
     } else {
@@ -725,6 +732,7 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
         sqlmodel_core::InheritanceInfo {
             strategy: #strategy_token,
             parent: #parent_token,
+            discriminator_column: #discriminator_column_token,
             discriminator_value: #discriminator_value_token,
         }
     }

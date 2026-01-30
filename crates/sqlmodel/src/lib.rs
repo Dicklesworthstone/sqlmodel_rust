@@ -77,6 +77,9 @@ pub use sqlmodel_core::{
     Field,
     FieldInfo,
     Hybrid,
+    // Inheritance types
+    InheritanceInfo,
+    InheritanceStrategy,
     Model,
     Outcome,
     RegionId,
@@ -295,11 +298,12 @@ mod generic_model_tests {
 mod inheritance_tests {
     use super::*;
     use serde::{Deserialize, Serialize};
-    use sqlmodel_core::InheritanceStrategy;
+    // InheritanceStrategy is re-exported from crate root
+    use crate::InheritanceStrategy;
 
-    // Single table inheritance base model
+    // Single table inheritance base model with discriminator column
     #[derive(Model, Debug, Clone, Serialize, Deserialize)]
-    #[sqlmodel(table, inheritance = "single")]
+    #[sqlmodel(table, inheritance = "single", discriminator = "type_")]
     struct Employee {
         #[sqlmodel(primary_key)]
         id: i64,
@@ -357,6 +361,7 @@ mod inheritance_tests {
         let info = <Employee as Model>::inheritance();
         assert_eq!(info.strategy, InheritanceStrategy::Single);
         assert!(info.parent.is_none());
+        assert_eq!(info.discriminator_column, Some("type_"));
         assert!(info.discriminator_value.is_none());
         assert!(info.is_base());
         assert!(!info.is_child());

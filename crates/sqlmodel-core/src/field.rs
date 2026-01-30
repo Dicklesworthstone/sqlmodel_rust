@@ -842,7 +842,12 @@ pub struct InheritanceInfo {
     ///
     /// When set, this model inherits from the specified parent model.
     pub parent: Option<&'static str>,
-    /// The discriminator value for this model (single table inheritance).
+    /// The discriminator column name (for single table inheritance base models).
+    ///
+    /// For single table inheritance, this specifies which column contains the
+    /// type discriminator values that distinguish between different model types.
+    pub discriminator_column: Option<&'static str>,
+    /// The discriminator value for this model (single table inheritance child).
     ///
     /// For single table inheritance, this value is stored in the discriminator
     /// column to identify rows belonging to this specific model type.
@@ -855,6 +860,7 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::None,
             parent: None,
+            discriminator_column: None,
             discriminator_value: None,
         }
     }
@@ -864,6 +870,7 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::Single,
             parent: None,
+            discriminator_column: None,
             discriminator_value: None,
         }
     }
@@ -873,6 +880,7 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::Joined,
             parent: None,
+            discriminator_column: None,
             discriminator_value: None,
         }
     }
@@ -882,6 +890,7 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::Concrete,
             parent: None,
+            discriminator_column: None,
             discriminator_value: None,
         }
     }
@@ -891,12 +900,19 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::None, // Inherits from parent's strategy
             parent: Some(parent),
+            discriminator_column: None,
             discriminator_value: None,
         }
     }
 
-    /// Set the discriminator value (builder pattern).
-    pub const fn with_discriminator(mut self, value: &'static str) -> Self {
+    /// Set the discriminator column name (builder pattern, for base models).
+    pub const fn with_discriminator_column(mut self, column: &'static str) -> Self {
+        self.discriminator_column = Some(column);
+        self
+    }
+
+    /// Set the discriminator value (builder pattern, for child models).
+    pub const fn with_discriminator_value(mut self, value: &'static str) -> Self {
         self.discriminator_value = Some(value);
         self
     }
@@ -1455,10 +1471,18 @@ mod tests {
     }
 
     #[test]
-    fn test_inheritance_info_child_with_discriminator() {
-        let info = InheritanceInfo::child("Employee").with_discriminator("manager");
+    fn test_inheritance_info_child_with_discriminator_value() {
+        let info = InheritanceInfo::child("Employee").with_discriminator_value("manager");
         assert_eq!(info.parent, Some("Employee"));
         assert_eq!(info.discriminator_value, Some("manager"));
         assert!(info.is_child());
+    }
+
+    #[test]
+    fn test_inheritance_info_single_table_with_discriminator_column() {
+        let info = InheritanceInfo::single_table().with_discriminator_column("type");
+        assert_eq!(info.strategy, InheritanceStrategy::Single);
+        assert_eq!(info.discriminator_column, Some("type"));
+        assert!(info.is_base());
     }
 }

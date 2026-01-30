@@ -53,7 +53,9 @@ pub struct ModelConfigParsed {
     pub inheritance: InheritanceStrategy,
     /// Parent model name this model inherits from.
     pub inherits: Option<String>,
-    /// Discriminator value for single table inheritance.
+    /// Discriminator column name for single table inheritance (on base model).
+    pub discriminator_column: Option<String>,
+    /// Discriminator value for single table inheritance (on child model).
     pub discriminator_value: Option<String>,
 }
 
@@ -617,6 +619,18 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
                         "expected string literal for inherits",
                     ))
                 }
+            } else if meta.path.is_ident("discriminator") {
+                // Struct-level discriminator specifies the column name for STI base models
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    config.discriminator_column = Some(lit_str.value());
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal for discriminator",
+                    ))
+                }
             } else if meta.path.is_ident("discriminator_value") {
                 let value: Lit = meta.value()?.parse()?;
                 if let Lit::Str(lit_str) = value {
@@ -634,7 +648,7 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
                     "unknown sqlmodel struct attribute (supported: table, table_alias, from_attributes, \
                      validate_assignment, extra, strict, populate_by_name, use_enum_values, \
                      arbitrary_types_allowed, defer_build, revalidate_instances, json_schema_extra, title, \
-                     inheritance, inherits, discriminator_value)",
+                     inheritance, inherits, discriminator, discriminator_value)",
                 ))
             }
         })?;
@@ -4204,6 +4218,25 @@ mod tests {
         let def = parse_model(&input).unwrap();
         assert_eq!(def.config.inheritance, InheritanceStrategy::None);
         assert!(def.config.inherits.is_none());
+        assert!(def.config.discriminator_column.is_none());
+        assert!(def.config.discriminator_value.is_none());
+    }
+
+    #[test]
+    fn test_single_inheritance_with_discriminator_column() {
+        let input: DeriveInput = parse_quote! {
+            #[sqlmodel(table, inheritance = "single", discriminator = "type")]
+            struct Employee {
+                #[sqlmodel(primary_key)]
+                id: i64,
+                type_: String,
+            }
+        };
+
+        let def = parse_model(&input).unwrap();
+        assert!(def.config.table);
+        assert_eq!(def.config.inheritance, InheritanceStrategy::Single);
+        assert_eq!(def.config.discriminator_column.as_deref(), Some("type"));
         assert!(def.config.discriminator_value.is_none());
     }
 }
