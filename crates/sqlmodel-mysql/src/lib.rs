@@ -1,5 +1,15 @@
 //! MySQL driver for SQLModel Rust.
 //!
+//! `sqlmodel-mysql` is the **MySQL driver** for the SQLModel ecosystem. It
+//! implements the MySQL wire protocol from scratch using asupersync's TCP
+//! primitives and exposes a `Connection` implementation for query execution.
+//!
+//! # Role In The Architecture
+//!
+//! - Implements `sqlmodel-core::Connection` for MySQL
+//! - Provides authentication, protocol framing, and type conversions
+//! - Powers `sqlmodel-query` execution and `sqlmodel-session` persistence
+//!
 //! This crate implements the MySQL wire protocol from scratch using
 //! asupersync's TCP primitives. It provides:
 //!

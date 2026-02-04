@@ -1,13 +1,17 @@
 //! Schema definition and migration support for SQLModel Rust.
 //!
-//! This crate provides:
-//! - Schema definition from Model types
-//! - Expected schema extraction from Model definitions
-//! - Schema diff engine for comparing schemas
-//! - DDL generation for SQLite, MySQL, PostgreSQL
-//! - Table creation/alteration SQL generation
-//! - Migration tracking and execution
-//! - Database introspection
+//! `sqlmodel-schema` is the **DDL and migrations layer**. It inspects `Model` metadata
+//! to generate CREATE/ALTER SQL and provides tooling for schema diffs and migrations.
+//!
+//! # Role In The Architecture
+//!
+//! - **Schema extraction**: derive expected tables/columns from `Model` definitions.
+//! - **Diff engine**: compare desired vs. actual schema for migration planning.
+//! - **DDL generation**: emit dialect-specific SQL for SQLite, MySQL, and Postgres.
+//! - **Migration runner**: track, apply, and validate migrations.
+//!
+//! Applications typically use this via `sqlmodel::SchemaBuilder`, but it can also be
+//! embedded in custom tooling or CI migration checks.
 
 pub mod create;
 pub mod ddl;
@@ -194,7 +198,7 @@ mod tests {
         );
         // Verify the whole thing is treated as a single identifier
         assert!(sql.starts_with("DROP TABLE IF EXISTS \""));
-        assert!(sql.ends_with("\""));
+        assert!(sql.ends_with('"'));
         // Count quotes: 1 opening + 2 for doubled embedded quote + 1 closing = 4
         let quote_count = sql.matches('"').count();
         assert_eq!(quote_count, 4);

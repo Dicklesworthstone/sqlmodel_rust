@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Session and Unit of Work for SQLModel Rust"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-session"
+readme = "README.md"
+keywords = ["sql", "session", "unit-of-work", "database", "sqlmodel"]
+categories = ["database", "database-implementations", "asynchronous"]
 
 [lints]
 workspace = true

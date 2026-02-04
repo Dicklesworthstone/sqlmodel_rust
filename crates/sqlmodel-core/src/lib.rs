@@ -1,12 +1,28 @@
 //! Core types and traits for SQLModel Rust.
 //!
-//! This crate provides the foundational abstractions for type-safe SQL operations:
+//! `sqlmodel-core` is the **foundation layer** for the entire ecosystem. It defines the
+//! traits and core data types that all other crates build on.
 //!
-//! - `Model` trait for ORM-style struct mapping
-//! - `Field` types for column definitions
-//! - `Connection` trait for database connections
-//! - `Outcome` re-export from asupersync for cancel-correct operations
-//! - `Cx` context for structured concurrency
+//! # Role In The Architecture
+//!
+//! - **Contract layer**: `Model` and `Connection` are the primary traits implemented by
+//!   user models and database drivers.
+//! - **Data model**: `Row`, `Value`, and `SqlType` represent query inputs/outputs and
+//!   are shared across query, schema, and driver crates.
+//! - **Structured concurrency**: re-exports `Cx` and `Outcome` from asupersync so every
+//!   async database operation is cancel-correct and budget-aware.
+//!
+//! # Who Uses This Crate
+//!
+//! - `sqlmodel-macros` generates `Model` implementations defined here.
+//! - `sqlmodel-query` consumes `Model` metadata and `Value` to build SQL.
+//! - `sqlmodel-schema` inspects `Model` metadata to generate DDL.
+//! - `sqlmodel-session` depends on `Connection`, `Row`, and `Value` for unit-of-work flows.
+//! - Driver crates (`sqlmodel-postgres`, `sqlmodel-mysql`, `sqlmodel-sqlite`) implement
+//!   `Connection` and operate on `Row`/`Value`.
+//!
+//! Most applications should use the `sqlmodel` facade; reach for `sqlmodel-core` directly
+//! when writing drivers or advanced integrations.
 
 // Re-export asupersync primitives for structured concurrency
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};

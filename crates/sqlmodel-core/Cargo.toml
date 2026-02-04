@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Core types and traits for SQLModel Rust"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-core"
+readme = "README.md"
+keywords = ["sql", "orm", "database", "sqlmodel", "core"]
+categories = ["database", "database-implementations"]
 
 [lints]
 workspace = true

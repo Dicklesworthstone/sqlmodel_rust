@@ -1,7 +1,15 @@
 //! Connection pooling for SQLModel Rust using asupersync.
 //!
-//! This crate provides a connection pool that integrates with
-//! asupersync's structured concurrency model.
+//! `sqlmodel-pool` is the **connection lifecycle layer**. It provides a generic,
+//! budget-aware pool that integrates with structured concurrency and can wrap any
+//! `Connection` implementation.
+//!
+//! # Role In The Architecture
+//!
+//! - **Shared connection management**: reuse connections across tasks safely.
+//! - **Budget-aware acquisition**: respects `Cx` timeouts and cancellation.
+//! - **Health checks**: validates connections before handing them out.
+//! - **Metrics**: exposes stats for pool sizing and tuning.
 //!
 //! # Features
 //!

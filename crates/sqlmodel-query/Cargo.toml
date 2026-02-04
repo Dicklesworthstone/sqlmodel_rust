@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Type-safe SQL query builder for SQLModel Rust"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-query"
+readme = "README.md"
+keywords = ["sql", "query-builder", "database", "sqlmodel", "dsl"]
+categories = ["database", "database-implementations"]
 
 [lints]
 workspace = true

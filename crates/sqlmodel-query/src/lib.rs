@@ -1,7 +1,16 @@
 //! Type-safe SQL query builder for SQLModel Rust.
 //!
-//! This crate provides a fluent API for building SQL queries
-//! with compile-time type safety.
+//! `sqlmodel-query` is the **query construction layer**. It provides the fluent builder
+//! API and expression DSL that turn `Model` metadata into executable SQL plus parameters.
+//!
+//! # Role In The Architecture
+//!
+//! - **Query macros**: `select!`, `insert!`, `update!`, `delete!` build typed queries.
+//! - **Expression DSL**: `Expr` and operators build WHERE/HAVING clauses safely.
+//! - **Dialect support**: generates SQL for Postgres, MySQL, and SQLite.
+//!
+//! The resulting queries execute through the `Connection` trait from `sqlmodel-core`.
+//! Most users access these builders via the `sqlmodel` facade crate.
 
 pub mod builder;
 pub mod cache;

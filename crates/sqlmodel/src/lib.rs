@@ -1,12 +1,21 @@
 //! SQLModel Rust - SQL databases in Rust, designed to be intuitive and type-safe.
 //!
-//! SQLModel Rust is a Rust port of Python's SQLModel library, providing:
+//! `sqlmodel` is the **facade crate** for the entire SQLModel Rust ecosystem. It re-exports
+//! the core traits, macros, query builders, schema/migration tooling, session layer, pooling,
+//! and optional console integration so most applications only need a single dependency.
 //!
-//! - Type-safe database operations with compile-time checks
-//! - ORM-style struct mapping with derive macros
-//! - Fluent query builder API
-//! - Connection pooling with structured concurrency
-//! - Migration support
+//! # Role In The Architecture
+//!
+//! - **One-stop import**: `use sqlmodel::prelude::*;` gives you `Model`, `Connection`,
+//!   `Expr`, and the query macros.
+//! - **Facade over sub-crates**: wraps `sqlmodel-core`, `sqlmodel-macros`, `sqlmodel-query`,
+//!   `sqlmodel-schema`, `sqlmodel-session`, and `sqlmodel-pool`.
+//! - **Optional console**: feature-gated integration with `sqlmodel-console` for rich output.
+//!
+//! # When To Use This Crate
+//!
+//! Use `sqlmodel` for nearly all application code. Reach for the sub-crates directly only
+//! if you're extending internals or building an alternative facade.
 //!
 //! # Quick Start
 //!
@@ -24,7 +33,6 @@
 //! }
 //!
 //! async fn main_example(cx: &Cx, conn: &impl Connection) {
-//!     // Create a hero
 //!     let hero = Hero {
 //!         id: None,
 //!         name: "Spider-Man".to_string(),
@@ -32,22 +40,15 @@
 //!         age: Some(25),
 //!     };
 //!
-//!     // Insert
 //!     let id = insert!(hero).execute(cx, conn).await.unwrap();
-//!
-//!     // Query
 //!     let heroes = select!(Hero)
 //!         .filter(Expr::col("age").gt(18))
 //!         .all(cx, conn)
 //!         .await
 //!         .unwrap();
-//!
-//!     // Update
 //!     let mut hero = heroes.into_iter().next().unwrap();
 //!     hero.age = Some(26);
 //!     update!(hero).execute(cx, conn).await.unwrap();
-//!
-//!     // Delete
 //!     delete!(Hero)
 //!         .filter(Expr::col("name").eq("Spider-Man"))
 //!         .execute(cx, conn)
@@ -64,6 +65,7 @@
 //! - **Fluent API**: Chainable query builder methods
 //! - **Connection pooling**: Efficient connection reuse
 //! - **Migrations**: Version-controlled schema changes
+//! - **`console` feature**: Enable rich terminal output via `sqlmodel-console`
 
 // Re-export all public types from sub-crates
 pub use sqlmodel_core::connection::{ConnectionConfig, SslMode, Transaction};

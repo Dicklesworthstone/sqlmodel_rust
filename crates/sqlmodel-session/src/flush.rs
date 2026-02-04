@@ -1683,10 +1683,10 @@ mod tests {
     fn test_link_table_op_empty_strings() {
         // Edge case: empty identifiers (unusual but should still be quoted)
         let op = LinkTableOp::link(
-            "".to_string(),
-            "".to_string(),
+            String::new(),
+            String::new(),
             Value::BigInt(1),
-            "".to_string(),
+            String::new(),
             Value::BigInt(2),
         );
         let sql = op.to_sql();

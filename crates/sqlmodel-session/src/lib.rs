@@ -1,14 +1,21 @@
 //! Session and Unit of Work for SQLModel Rust.
 //!
-//! The Session is the central unit-of-work manager. It holds a database connection,
-//! tracks objects, and coordinates flushing changes to the database.
+//! `sqlmodel-session` is the **unit-of-work layer**. It coordinates object identity,
+//! change tracking, and transactional persistence in a way that mirrors Python SQLModel
+//! while staying explicit and Rust-idiomatic.
+//!
+//! # Role In The Architecture
+//!
+//! - **Identity map**: ensures a single in-memory instance per primary key.
+//! - **Change tracking**: records inserts, updates, and deletes before flush.
+//! - **Transactional safety**: wraps flush/commit/rollback around a `Connection`.
 //!
 //! # Design Philosophy
 //!
-//! - **Explicit over implicit**: No autoflush by default
-//! - **Ownership clarity**: Session owns the connection
-//! - **Type erasure**: Identity map stores `Box<dyn Any>` for heterogeneous objects
-//! - **Transaction safety**: Atomic commit/rollback semantics
+//! - **Explicit over implicit**: No autoflush by default.
+//! - **Ownership clarity**: Session owns the connection or pooled connection.
+//! - **Type erasure**: Identity map stores `Box<dyn Any>` for heterogeneous models.
+//! - **Cancel-correct**: All async operations use `Cx` + `Outcome` via `sqlmodel-core`.
 //!
 //! # Example
 //!

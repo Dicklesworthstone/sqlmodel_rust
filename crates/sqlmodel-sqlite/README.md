@@ -1,10 +1,10 @@
-# sqlmodel-mysql
+# sqlmodel-sqlite
 
-MySQL driver implementing the SQLModel Connection trait.
+SQLite driver implementing the SQLModel Connection trait.
 
 ## Role in the SQLModel Rust System
-- Implements the MySQL wire protocol with asupersync I/O.
-- Provides authentication, query, and type conversion support.
+- FFI-backed SQLite execution and type conversion.
+- Lightweight backend for local/dev/test usage.
 - Used by sqlmodel-query and sqlmodel-session at runtime.
 
 ## Usage
@@ -13,4 +13,4 @@ Use this crate directly if you are extending internals or building tooling aroun
 
 ## Links
 - Repository: https://github.com/sqlmodel/sqlmodel-rust
-- Documentation: https://docs.rs/sqlmodel-mysql
+- Documentation: https://docs.rs/sqlmodel-sqlite

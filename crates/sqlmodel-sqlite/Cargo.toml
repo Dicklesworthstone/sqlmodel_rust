@@ -7,6 +7,11 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "SQLite driver for SQLModel Rust"
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-sqlite"
+readme = "README.md"
+keywords = ["sqlite", "sql", "database", "driver", "sqlmodel"]
+categories = ["database", "database-implementations"]
 
 [lints]
 workspace = true
@@ -22,7 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Optional console support
-sqlmodel-console = { path = "../sqlmodel-console", optional = true }
+sqlmodel-console = { workspace = true, optional = true }
 
 [build-dependencies]
 

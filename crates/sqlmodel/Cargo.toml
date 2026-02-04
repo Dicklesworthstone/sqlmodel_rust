@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "SQL databases in Rust, designed to be intuitive and type-safe"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel"
+readme = "README.md"
+keywords = ["sql", "orm", "database", "sqlmodel", "async"]
+categories = ["database", "database-implementations", "asynchronous"]
 
 [lints]
 workspace = true
@@ -24,4 +30,4 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Optional console support for rich output
-sqlmodel-console = { path = "../sqlmodel-console", optional = true }
+sqlmodel-console = { workspace = true, optional = true }

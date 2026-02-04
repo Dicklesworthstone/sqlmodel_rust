@@ -1,4 +1,15 @@
-//! SQLModel Console - Beautiful terminal output for sqlmodel_rust
+//! SQLModel Console - Beautiful terminal output for SQLModel Rust.
+//!
+//! `sqlmodel-console` is the **optional UX layer** for SQLModel Rust. It renders
+//! errors, query results, schema trees, and progress in a way that adapts to
+//! humans (rich formatting) or agents/CI (plain or JSON).
+//!
+//! # Role In The Architecture
+//!
+//! - **Optional integration**: enabled via the `console` feature in `sqlmodel` or
+//!   in driver crates.
+//! - **Agent-safe output**: auto-detects AI coding tools and switches to plain text.
+//! - **Diagnostics**: provides structured renderables for tables, errors, and status.
 //!
 //! This crate provides styled console output that automatically adapts to
 //! the terminal environment. When running under an AI coding agent, output

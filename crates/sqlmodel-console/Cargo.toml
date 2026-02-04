@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Beautiful terminal output for SQLModel Rust - automatically adapts to agents vs humans"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-console"
+readme = "README.md"
+keywords = ["sql", "console", "terminal", "formatting", "sqlmodel"]
+categories = ["value-formatting"]
 
 [lints]
 workspace = true
@@ -24,7 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Optional: rich terminal output library
-rich_rust = { path = "../../../rich_rust", optional = true }
+rich_rust = { workspace = true, optional = true }
 
 [dev-dependencies]
 sqlmodel-schema = { workspace = true }

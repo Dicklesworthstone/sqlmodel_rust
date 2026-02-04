@@ -9,7 +9,7 @@
 **SQL databases in Rust, designed to be intuitive and type-safe.**
 
 [![CI](https://github.com/Dicklesworthstone/sqlmodel_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/sqlmodel_rust/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: Nightly](https://img.shields.io/badge/Rust-nightly-orange.svg)](https://www.rust-lang.org/)
 
 *A Rust port of [tiangolo/sqlmodel](https://github.com/tiangolo/sqlmodel) (Python), extended with [asupersync](https://github.com/Dicklesworthstone/asupersync) for structured concurrency and cancel-correct async database operations.*
@@ -132,7 +132,26 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 
 ## Installation
 
-### From Source (Currently the only option)
+### From crates.io (recommended)
+
+```toml
+# Cargo.toml
+[dependencies]
+sqlmodel = "0.1.0"
+
+# Choose a driver (pick one or more)
+sqlmodel-postgres = "0.1.0"
+# sqlmodel-mysql = "0.1.0"
+# sqlmodel-sqlite = "0.1.0"
+
+# Optional rich console output
+sqlmodel-console = { version = "0.1.0", features = ["rich"] }
+```
+
+You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
+re-exported from `sqlmodel` and `sqlmodel-core`.
+
+### From Source
 
 ```bash
 git clone https://github.com/sqlmodel/sqlmodel-rust.git
@@ -143,17 +162,6 @@ cargo build --workspace
 
 # Run tests
 cargo test --workspace
-```
-
-### Add to Your Project
-
-```toml
-# Cargo.toml
-[dependencies]
-sqlmodel = { git = "https://github.com/sqlmodel/sqlmodel-rust.git" }
-
-# You'll also need asupersync
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git" }
 ```
 
 ---
@@ -252,7 +260,7 @@ Add the console feature to your dependency:
 
 ```toml
 [dependencies]
-sqlmodel-console = { path = "crates/sqlmodel-console" }
+sqlmodel-console = { version = "0.1.0", features = ["rich"] }
 ```
 
 Create and use a console:
@@ -317,36 +325,23 @@ cargo run -p sqlmodel-console --example schema_visualization
 │            Re-exports all crates for easy import                 │
 └─────────────────────────────────────────────────────────────────┘
                                │
-       ┌───────────────────────┼───────────────────────┐
-       │                       │                       │
-       ▼                       ▼                       ▼
-┌─────────────┐    ┌───────────────────┐    ┌─────────────────┐
-│sqlmodel-core│    │ sqlmodel-macros   │    │ sqlmodel-query  │
-│             │    │                   │    │                 │
-│ Model trait │◄───│ #[derive(Model)]  │    │ Type-safe SQL   │
-│ Value/Row   │    │ Attribute parsing │    │ SELECT/INSERT   │
-│ Error types │    │ SQL type infer    │    │ UPDATE/DELETE   │
-│ Connection  │    │ Code generation   │    │ Expr builder    │
-└─────────────┘    └───────────────────┘    └─────────────────┘
-       │                                            │
-       │           ┌───────────────────┐           │
-       │           │  sqlmodel-schema  │           │
-       └──────────►│                   │◄──────────┘
-                   │ CREATE TABLE gen  │
-                   │ Migration runner  │
-                   │ Schema builder    │
-                   └───────────────────┘
-                            │
-       ┌────────────────────┼────────────────────┐
-       │                    │                    │
-       ▼                    ▼                    ▼
-┌─────────────┐    ┌─────────────┐    ┌─────────────────┐
-│sqlmodel-pool│    │sqlmodel-    │    │ Future drivers  │
-│             │    │postgres     │    │                 │
-│ Conn pooling│    │             │    │ SQLite, MySQL   │
-│ Health check│    │ Wire proto  │    │                 │
-│ Budget-aware│    │ SCRAM auth  │    │                 │
-└─────────────┘    └─────────────┘    └─────────────────┘
+       ┌───────────────┬───────────────┬───────────────┬───────────────┬───────────────┐
+       ▼               ▼               ▼               ▼               ▼
+┌─────────────┐  ┌───────────────────┐  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│sqlmodel-core│  │ sqlmodel-macros   │  │ sqlmodel-query  │  │ sqlmodel-schema │  │ sqlmodel-session│
+│ Model trait │  │ #[derive(Model)]  │  │ Query builder  │  │ DDL + migration │  │ Unit of work    │
+└─────────────┘  └───────────────────┘  └─────────────────┘  └─────────────────┘  └─────────────────┘
+                               │
+                 ┌─────────────┴─────────────┐
+                 ▼                           ▼
+          ┌─────────────┐           ┌─────────────────┐
+          │sqlmodel-pool│           │sqlmodel-console │ (optional)
+          │Conn pooling │           │Rich output      │
+          └─────────────┘           └─────────────────┘
+                 │
+       ┌─────────┼─────────┬─────────┐
+       ▼         ▼         ▼         ▼
+sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite (drivers)
 ```
 
 ### Crate Responsibilities
@@ -358,8 +353,12 @@ cargo run -p sqlmodel-console --example schema_visualization
 | `sqlmodel-macros` | `#[derive(Model)]` proc macro with attribute parsing and code gen |
 | `sqlmodel-query` | Type-safe query builder with multi-dialect support |
 | `sqlmodel-schema` | DDL generation, schema builder, migration support |
+| `sqlmodel-session` | Unit of work + identity map |
 | `sqlmodel-pool` | Connection pooling with asupersync channels |
 | `sqlmodel-postgres` | PostgreSQL wire protocol implementation |
+| `sqlmodel-mysql` | MySQL wire protocol implementation |
+| `sqlmodel-sqlite` | SQLite driver (FFI) |
+| `sqlmodel-console` | Optional rich console output for humans and agents |
 
 ---
 
@@ -475,19 +474,18 @@ Expr::case()
 - **Nightly Rust required**: We use Edition 2024 features
 - **No stable release yet**: API may change
 - **Limited documentation**: We're working on it
-- **asupersync dependency**: Must be cloned as sibling directory
+- **asupersync dependency**: Pulled via git for now (requires git access during builds)
 
 ---
 
 ## Troubleshooting
 
-### "Can't find crate `asupersync`"
+### "Failed to fetch git dependency `asupersync`"
 
 ```bash
-# Clone asupersync as a sibling directory
-cd ..
-git clone https://github.com/Dicklesworthstone/asupersync.git asupersync
-cd sqlmodel_rust
+# Ensure git can reach GitHub and retry
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+cargo update -p asupersync
 cargo build
 ```
 
@@ -546,9 +544,4 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+MIT License. See [LICENSE](LICENSE).

@@ -7,6 +7,11 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "MySQL driver for SQLModel Rust"
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-mysql"
+readme = "README.md"
+keywords = ["mysql", "sql", "database", "driver", "sqlmodel"]
+categories = ["database", "database-implementations"]
 
 [lints]
 workspace = true
@@ -27,7 +32,7 @@ sha2 = "0.10"
 rand = "0.8"
 
 # Optional console support
-sqlmodel-console = { path = "../sqlmodel-console", optional = true }
+sqlmodel-console = { workspace = true, optional = true }
 
 # Optional TLS support
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }

@@ -1,5 +1,15 @@
 //! SQLite driver for SQLModel Rust.
 //!
+//! `sqlmodel-sqlite` is the **SQLite driver** for the SQLModel ecosystem. It implements
+//! the `Connection` trait from `sqlmodel-core`, providing a lightweight backend that is
+//! ideal for local development, embedded use, and testing.
+//!
+//! # Role In The Architecture
+//!
+//! - Implements `sqlmodel-core::Connection` for SQLite
+//! - Supplies FFI-backed execution and type conversion
+//! - Enables `sqlmodel-query` and `sqlmodel-session` to run against SQLite
+//!
 // FFI bindings require unsafe code - this is expected for database drivers
 #![allow(unsafe_code)]
 //!

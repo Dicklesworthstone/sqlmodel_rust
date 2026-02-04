@@ -1,9 +1,17 @@
 //! Procedural macros for SQLModel Rust.
 //!
-//! This crate provides derive macros for:
-//! - `Model` - ORM-style struct mapping
-//! - `Validate` - Field validation
-//! - `JsonSchema` - JSON Schema generation (for OpenAPI)
+//! `sqlmodel-macros` is the **compile-time codegen layer**. It turns Rust structs into
+//! fully described SQL models by generating static metadata and trait implementations.
+//!
+//! # Role In The Architecture
+//!
+//! - **Model metadata**: `#[derive(Model)]` produces a `Model` implementation with
+//!   table/column metadata consumed by query, schema, and session layers.
+//! - **Validation**: `#[derive(Validate)]` generates field validation glue.
+//! - **Schema export**: `#[derive(JsonSchema)]` enables JSON schema generation for
+//!   API documentation or tooling.
+//!
+//! These macros are used by application crates via the `sqlmodel` facade.
 
 use proc_macro::TokenStream;
 use syn::ext::IdentExt;

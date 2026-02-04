@@ -17,10 +17,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 rust-version = "1.85"
 authors = ["SQLModel Rust Contributors"]
 repository = "https://github.com/sqlmodel/sqlmodel-rust"
+homepage = "https://github.com/sqlmodel/sqlmodel-rust"
 description = "SQL databases in Rust, designed to be intuitive and type-safe"
 
 [workspace.lints.rust]
@@ -53,7 +54,7 @@ format_push_string = "allow"
 
 [workspace.dependencies]
 # Core async runtime - our custom cancel-correct runtime
-asupersync = { path = "../asupersync" }
+asupersync = { version = "0.1.0", git = "https://github.com/Dicklesworthstone/asupersync", rev = "393d13e134ba5908f03fde1e5cbc24e62de8f807" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -65,6 +66,9 @@ regex = "1"
 # Logging
 tracing = "0.1"
 
+# Rich console output (optional, used by sqlmodel-console)
+rich_rust = "0.1.1"
+
 # Internal crates
 sqlmodel = { path = "crates/sqlmodel" }
 sqlmodel-core = { path = "crates/sqlmodel-core" }
@@ -73,6 +77,7 @@ sqlmodel-query = { path = "crates/sqlmodel-query" }
 sqlmodel-schema = { path = "crates/sqlmodel-schema" }
 sqlmodel-session = { path = "crates/sqlmodel-session" }
 sqlmodel-pool = { path = "crates/sqlmodel-pool" }
+sqlmodel-console = { path = "crates/sqlmodel-console" }
 
 [profile.release]
 opt-level = "z"
