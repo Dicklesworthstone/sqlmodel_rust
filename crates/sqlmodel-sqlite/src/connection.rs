@@ -40,6 +40,7 @@ use std::ffi::{CStr, CString, c_int};
 use std::future::Future;
 use std::ptr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[cfg(feature = "console")]
 use sqlmodel_console::{ConsoleAware, SqlModelConsole};
@@ -315,6 +316,102 @@ impl SqliteConnection {
                 detail: None,
                 hint: None,
                 position: None,
+                source: None,
+            }));
+        }
+
+        Ok(())
+    }
+
+    /// Backup the current database to a destination path using the SQLite backup API.
+    ///
+    /// This opens (or creates) the destination database and performs an online backup
+    /// from this connection's `main` database into the destination's `main` database.
+    pub fn backup_to_path(&self, dest_path: impl AsRef<str>) -> Result<(), Error> {
+        let dest = SqliteConnection::open(
+            &SqliteConfig::file(dest_path.as_ref()).flags(OpenFlags::create_read_write()),
+        )?;
+        self.backup_to_connection(&dest)
+    }
+
+    /// Backup the current database to another open SQLite connection.
+    pub fn backup_to_connection(&self, dest: &SqliteConnection) -> Result<(), Error> {
+        let self_first = (self as *const _ as usize) <= (dest as *const _ as usize);
+        let (source_guard, dest_guard) = if self_first {
+            let source_guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let dest_guard = dest.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (source_guard, dest_guard)
+        } else {
+            let dest_guard = dest.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let source_guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (source_guard, dest_guard)
+        };
+
+        let source_db = source_guard.db;
+        let dest_db = dest_guard.db;
+
+        let main = CString::new("main").expect("static sqlite db name");
+
+        // SAFETY: We hold locks on both connections; db pointers are valid.
+        let backup = unsafe {
+            ffi::sqlite3_backup_init(dest_db, main.as_ptr(), source_db, main.as_ptr())
+        };
+        if backup.is_null() {
+            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Connection(ConnectionError {
+                kind: ConnectionErrorKind::Connect,
+                message: format!("SQLite backup init failed: {msg}"),
+                source: None,
+            }));
+        }
+
+        let mut rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
+        loop {
+            if rc == ffi::SQLITE_DONE {
+                break;
+            }
+            if rc == ffi::SQLITE_OK {
+                rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
+                continue;
+            }
+            if rc == ffi::SQLITE_BUSY || rc == ffi::SQLITE_LOCKED {
+                std::thread::sleep(Duration::from_millis(50));
+                rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
+                continue;
+            }
+            break;
+        }
+
+        let finish_rc = unsafe { ffi::sqlite3_backup_finish(backup) };
+
+        if rc != ffi::SQLITE_DONE && rc != ffi::SQLITE_OK {
+            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Connection(ConnectionError {
+                kind: ConnectionErrorKind::Connect,
+                message: format!(
+                    "SQLite backup failed: {} ({})",
+                    msg,
+                    ffi::error_string(rc)
+                ),
+                source: None,
+            }));
+        }
+
+        if finish_rc != ffi::SQLITE_OK {
+            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Connection(ConnectionError {
+                kind: ConnectionErrorKind::Connect,
+                message: format!(
+                    "SQLite backup finish failed: {} ({})",
+                    msg,
+                    ffi::error_string(finish_rc)
+                ),
                 source: None,
             }));
         }

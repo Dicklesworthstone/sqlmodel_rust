@@ -21,6 +21,12 @@ pub struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
+/// Opaque sqlite3_backup handle.
+#[repr(C)]
+pub struct sqlite3_backup {
+    _private: [u8; 0],
+}
+
 // SQLite result codes
 pub const SQLITE_OK: c_int = 0;
 pub const SQLITE_ERROR: c_int = 1;
@@ -104,6 +110,18 @@ unsafe extern "C" {
 
     pub fn sqlite3_close(db: *mut sqlite3) -> c_int;
     pub fn sqlite3_close_v2(db: *mut sqlite3) -> c_int;
+
+    // Backup API
+    pub fn sqlite3_backup_init(
+        pDest: *mut sqlite3,
+        zDestName: *const c_char,
+        pSource: *mut sqlite3,
+        zSourceName: *const c_char,
+    ) -> *mut sqlite3_backup;
+    pub fn sqlite3_backup_step(p: *mut sqlite3_backup, nPage: c_int) -> c_int;
+    pub fn sqlite3_backup_finish(p: *mut sqlite3_backup) -> c_int;
+    pub fn sqlite3_backup_remaining(p: *mut sqlite3_backup) -> c_int;
+    pub fn sqlite3_backup_pagecount(p: *mut sqlite3_backup) -> c_int;
 
     // Error handling
     pub fn sqlite3_errmsg(db: *mut sqlite3) -> *const c_char;
