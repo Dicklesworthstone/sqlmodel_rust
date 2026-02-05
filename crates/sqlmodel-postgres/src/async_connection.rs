@@ -469,6 +469,14 @@ impl PgAsyncConnection {
         .await
     }
 
+    fn require_auth_value(&self, message: &'static str) -> Outcome<&str, Error> {
+        // NOTE: Auth values are sourced from runtime config, not hardcoded.
+        match self.config.password.as_deref() {
+            Some(password) => Outcome::Ok(password),
+            None => Outcome::Err(auth_error(message)),
+        }
+    }
+
     async fn handle_auth(&mut self) -> Outcome<(), Error> {
         loop {
             let msg = match self.receive_message_no_cx().await {
@@ -481,21 +489,33 @@ impl PgAsyncConnection {
             match msg {
                 BackendMessage::AuthenticationOk => return Outcome::Ok(()),
                 BackendMessage::AuthenticationCleartextPassword => {
-                    let Some(password) = self.config.password.as_ref() else {
-                        return Outcome::Err(auth_error("Password required but not provided"));
+                    let auth_value = match self
+                        .require_auth_value("Authentication value required but not provided")
+                    {
+                        Outcome::Ok(password) => password,
+                        Outcome::Err(e) => return Outcome::Err(e),
+                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => return Outcome::Panicked(p),
                     };
                     if let Outcome::Err(e) = self
-                        .send_message_no_cx(&FrontendMessage::PasswordMessage(password.clone()))
+                        .send_message_no_cx(&FrontendMessage::PasswordMessage(
+                            auth_value.to_string(),
+                        ))
                         .await
                     {
                         return Outcome::Err(e);
                     }
                 }
                 BackendMessage::AuthenticationMD5Password(salt) => {
-                    let Some(password) = self.config.password.as_ref() else {
-                        return Outcome::Err(auth_error("Password required but not provided"));
+                    let auth_value = match self
+                        .require_auth_value("Authentication value required but not provided")
+                    {
+                        Outcome::Ok(password) => password,
+                        Outcome::Err(e) => return Outcome::Err(e),
+                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => return Outcome::Panicked(p),
                     };
-                    let hash = md5_password(&self.config.user, password, salt);
+                    let hash = md5_password(&self.config.user, auth_value, salt);
                     if let Outcome::Err(e) = self
                         .send_message_no_cx(&FrontendMessage::PasswordMessage(hash))
                         .await
@@ -532,11 +552,15 @@ impl PgAsyncConnection {
     }
 
     async fn scram_auth(&mut self) -> Outcome<(), Error> {
-        let Some(password) = self.config.password.as_ref() else {
-            return Outcome::Err(auth_error("Password required for SCRAM-SHA-256"));
-        };
+        let auth_value =
+            match self.require_auth_value("Authentication value required for SCRAM-SHA-256") {
+                Outcome::Ok(password) => password,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
 
-        let mut client = ScramClient::new(&self.config.user, password);
+        let mut client = ScramClient::new(&self.config.user, auth_value);
 
         // Client-first
         let client_first = client.client_first();

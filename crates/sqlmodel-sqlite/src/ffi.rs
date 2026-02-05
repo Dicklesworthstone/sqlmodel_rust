@@ -84,10 +84,10 @@ pub type sqlite3_destructor_type = Option<unsafe extern "C" fn(*mut c_void)>;
 /// It is the safest option when the source data's lifetime is uncertain.
 #[inline]
 pub fn sqlite_transient() -> sqlite3_destructor_type {
-    // SAFETY: This is how SQLite defines SQLITE_TRANSIENT in its C API.
-    // The address 0xFFFF...FFFF is never a valid function pointer, and
-    // SQLite specifically checks for this sentinel value.
-    unsafe { std::mem::transmute(!0usize) }
+    // SAFETY: SQLite defines SQLITE_TRANSIENT as a sentinel function pointer
+    // with the value -1. SQLite checks for this sentinel and does not invoke it.
+    const SQLITE_TRANSIENT_SENTINEL: isize = -1;
+    unsafe { std::mem::transmute::<isize, sqlite3_destructor_type>(SQLITE_TRANSIENT_SENTINEL) }
 }
 
 #[link(name = "sqlite3")]

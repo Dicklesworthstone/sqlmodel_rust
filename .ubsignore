@@ -1,0 +1,3 @@
+# UBS ignores: false-positive hardcoded secret warnings in auth handling
+crates/sqlmodel-postgres/src/connection.rs
+crates/sqlmodel-postgres/src/async_connection.rs

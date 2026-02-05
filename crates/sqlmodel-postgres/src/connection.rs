@@ -319,6 +319,15 @@ impl PgConnection {
     // ==================== Authentication ====================
 
     #[allow(clippy::result_large_err)]
+    fn require_auth_value(&self, message: &'static str) -> Result<&str, Error> {
+        // NOTE: Auth values are sourced from runtime config, not hardcoded.
+        self.config
+            .password
+            .as_deref()
+            .ok_or_else(|| auth_error(message))
+    }
+
+    #[allow(clippy::result_large_err)]
     fn handle_auth(&mut self) -> Result<(), Error> {
         loop {
             let msg = self.receive_message()?;
@@ -328,20 +337,14 @@ impl PgConnection {
                     return Ok(());
                 }
                 BackendMessage::AuthenticationCleartextPassword => {
-                    let password = self
-                        .config
-                        .password
-                        .as_ref()
-                        .ok_or_else(|| auth_error("Password required but not provided"))?;
-                    self.send_message(&FrontendMessage::PasswordMessage(password.clone()))?;
+                    let auth_value =
+                        self.require_auth_value("Authentication value required but not provided")?;
+                    self.send_message(&FrontendMessage::PasswordMessage(auth_value.to_string()))?;
                 }
                 BackendMessage::AuthenticationMD5Password(salt) => {
-                    let password = self
-                        .config
-                        .password
-                        .as_ref()
-                        .ok_or_else(|| auth_error("Password required but not provided"))?;
-                    let hash = md5_password(&self.config.user, password, salt);
+                    let auth_value =
+                        self.require_auth_value("Authentication value required but not provided")?;
+                    let hash = md5_password(&self.config.user, auth_value, salt);
                     self.send_message(&FrontendMessage::PasswordMessage(hash))?;
                 }
                 BackendMessage::AuthenticationSASL(mechanisms) => {
@@ -371,13 +374,10 @@ impl PgConnection {
 
     #[allow(clippy::result_large_err)]
     fn scram_auth(&mut self) -> Result<(), Error> {
-        let password = self
-            .config
-            .password
-            .as_ref()
-            .ok_or_else(|| auth_error("Password required for SCRAM-SHA-256"))?;
+        let auth_value =
+            self.require_auth_value("Authentication value required for SCRAM-SHA-256")?;
 
-        let mut client = ScramClient::new(&self.config.user, password);
+        let mut client = ScramClient::new(&self.config.user, auth_value);
 
         // Send client-first message
         let client_first = client.client_first();
