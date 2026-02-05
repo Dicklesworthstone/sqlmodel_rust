@@ -49,6 +49,56 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
 
+  publish:
+    name: Publish to crates.io
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && !contains(github.ref, '-') && !contains(github.event.inputs.tag, '-') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set. Skipping publish."
+            exit 0
+          fi
+
+          crates=(sqlmodel-core sqlmodel-macros sqlmodel-query sqlmodel-schema sqlmodel-session sqlmodel-pool sqlmodel-console sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite sqlmodel)
+          for crate in "${crates[@]}"; do
+            echo "=== Publishing ${crate} ==="
+            while true; do
+              out=$(cargo publish -p "${crate}" 2>&1)
+              status=$?
+              echo "${out}"
+              if [ ${status} -eq 0 ]; then
+                echo "=== Published ${crate} ==="
+                break
+              fi
+              retry=$(echo "${out}" | sed -n "s/.*Please try again after \\(.*\\) GMT.*/\\1/p" | head -n1)
+              if [ -n "${retry}" ]; then
+                target=$(date -u -d "${retry} GMT" +%s)
+                now=$(date -u +%s)
+                wait=$((target-now+5))
+                if [ ${wait} -lt 5 ]; then wait=5; fi
+                echo "Rate limited. Sleeping ${wait}s until $(date -u -d "@$((${now}+${wait}))" +"%Y-%m-%dT%H:%M:%SZ")"
+                sleep ${wait}
+                continue
+              fi
+              echo "Publish failed without rate-limit. Aborting."
+              exit ${status}
+            done
+          done
+
   build:
     name: Build (${{ matrix.target }})
     needs: validate
