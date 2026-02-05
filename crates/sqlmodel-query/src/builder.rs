@@ -361,7 +361,12 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
             let mut placeholders = Vec::new();
             for v in &values {
                 if matches!(v, Value::Default) {
-                    placeholders.push("DEFAULT".to_string());
+                    if dialect == Dialect::Sqlite {
+                        all_values.push(Value::Null);
+                        placeholders.push(dialect.placeholder(all_values.len()));
+                    } else {
+                        placeholders.push("DEFAULT".to_string());
+                    }
                 } else {
                     all_values.push(v.clone());
                     placeholders.push(dialect.placeholder(all_values.len()));

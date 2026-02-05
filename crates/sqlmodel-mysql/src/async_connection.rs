@@ -1552,6 +1552,10 @@ impl MySqlAsyncConnection {
 impl Connection for MySqlAsyncConnection {
     type Tx<'conn> = MySqlTransaction<'conn>;
 
+    fn dialect(&self) -> sqlmodel_core::Dialect {
+        sqlmodel_core::Dialect::Mysql
+    }
+
     fn query(
         &self,
         _cx: &Cx,
@@ -2000,6 +2004,10 @@ impl Connection for SharedMySqlConnection {
         = SharedMySqlTransaction<'conn>
     where
         Self: 'conn;
+
+    fn dialect(&self) -> sqlmodel_core::Dialect {
+        sqlmodel_core::Dialect::Mysql
+    }
 
     fn query(
         &self,

@@ -880,6 +880,10 @@ impl Connection for SharedPgConnection {
     where
         Self: 'conn;
 
+    fn dialect(&self) -> sqlmodel_core::Dialect {
+        sqlmodel_core::Dialect::Postgres
+    }
+
     fn query(
         &self,
         cx: &Cx,
