@@ -70,14 +70,14 @@ tracing = "0.1"
 rich_rust = "0.1.1"
 
 # Internal crates
-sqlmodel = { path = "crates/sqlmodel" }
-sqlmodel-core = { path = "crates/sqlmodel-core" }
-sqlmodel-macros = { path = "crates/sqlmodel-macros" }
-sqlmodel-query = { path = "crates/sqlmodel-query" }
-sqlmodel-schema = { path = "crates/sqlmodel-schema" }
-sqlmodel-session = { path = "crates/sqlmodel-session" }
-sqlmodel-pool = { path = "crates/sqlmodel-pool" }
-sqlmodel-console = { path = "crates/sqlmodel-console" }
+sqlmodel = { path = "crates/sqlmodel", version = "0.1.0" }
+sqlmodel-core = { path = "crates/sqlmodel-core", version = "0.1.0" }
+sqlmodel-macros = { path = "crates/sqlmodel-macros", version = "0.1.0" }
+sqlmodel-query = { path = "crates/sqlmodel-query", version = "0.1.0" }
+sqlmodel-schema = { path = "crates/sqlmodel-schema", version = "0.1.0" }
+sqlmodel-session = { path = "crates/sqlmodel-session", version = "0.1.0" }
+sqlmodel-pool = { path = "crates/sqlmodel-pool", version = "0.1.0" }
+sqlmodel-console = { path = "crates/sqlmodel-console", version = "0.1.0" }
 
 [profile.release]
 opt-level = "z"
