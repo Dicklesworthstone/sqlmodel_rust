@@ -137,33 +137,36 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             })
             .collect();
 
-        let columns: Vec<_> = insert_fields.iter().map(|(name, _)| *name).collect();
-
+        let mut columns = Vec::new();
         let mut placeholders = Vec::new();
         let mut params = Vec::new();
 
-        for (_, value) in insert_fields {
+        for (name, value) in insert_fields {
+            if matches!(value, Value::Default) && dialect == Dialect::Sqlite {
+                // SQLite doesn't allow DEFAULT in VALUES; omit the column to trigger defaults.
+                continue;
+            }
+
+            columns.push(name);
+
             if matches!(value, Value::Default) {
-                // SQLite doesn't support DEFAULT as a value in VALUES clause.
-                // Use NULL instead, which works the same for auto-increment columns.
-                if dialect == Dialect::Sqlite {
-                    params.push(Value::Null);
-                    placeholders.push(dialect.placeholder(params.len()));
-                } else {
-                    placeholders.push("DEFAULT".to_string());
-                }
+                placeholders.push("DEFAULT".to_string());
             } else {
                 params.push(value);
                 placeholders.push(dialect.placeholder(params.len()));
             }
         }
 
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            M::TABLE_NAME,
-            columns.join(", "),
-            placeholders.join(", ")
-        );
+        let mut sql = if columns.is_empty() {
+            format!("INSERT INTO {} DEFAULT VALUES", M::TABLE_NAME)
+        } else {
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                M::TABLE_NAME,
+                columns.join(", "),
+                placeholders.join(", ")
+            )
+        };
 
         // Add ON CONFLICT clause if specified
         if let Some(on_conflict) = &self.on_conflict {
@@ -203,8 +206,6 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
 
                     // Only add DO UPDATE SET if we have a valid conflict target
                     if has_target {
-                        sql.push_str(" DO UPDATE SET ");
-
                         // If columns is empty, update all non-PK columns
                         let update_set: Vec<String> = if update_cols.is_empty() {
                             columns // Use full column list from explicit insert
@@ -218,7 +219,17 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                                 .map(|c| format!("{} = EXCLUDED.{}", c, c))
                                 .collect()
                         };
-                        sql.push_str(&update_set.join(", "));
+
+                        if update_set.is_empty() {
+                            tracing::warn!(
+                                table = M::TABLE_NAME,
+                                "ON CONFLICT DO UPDATE has no updatable columns. Falling back to DO NOTHING."
+                            );
+                            sql.push_str(" DO NOTHING");
+                        } else {
+                            sql.push_str(" DO UPDATE SET ");
+                            sql.push_str(&update_set.join(", "));
+                        }
                     }
                 }
             }
@@ -415,8 +426,6 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
 
                     // Only add DO UPDATE SET if we have a valid conflict target
                     if has_target {
-                        sql.push_str(" DO UPDATE SET ");
-
                         let update_cols: Vec<String> = if columns.is_empty() {
                             insert_columns
                                 .iter()
@@ -429,7 +438,17 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
                                 .map(|c| format!("{} = EXCLUDED.{}", c, c))
                                 .collect()
                         };
-                        sql.push_str(&update_cols.join(", "));
+
+                        if update_cols.is_empty() {
+                            tracing::warn!(
+                                table = M::TABLE_NAME,
+                                "ON CONFLICT DO UPDATE has no updatable columns. Falling back to DO NOTHING."
+                            );
+                            sql.push_str(" DO NOTHING");
+                        } else {
+                            sql.push_str(" DO UPDATE SET ");
+                            sql.push_str(&update_cols.join(", "));
+                        }
                     }
                 }
             }
