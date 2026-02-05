@@ -41,7 +41,8 @@ pub mod validate;
 pub mod value;
 
 pub use connection::{
-    Connection, IsolationLevel, PreparedStatement, Transaction, TransactionInternal, TransactionOps,
+    Connection, Dialect, IsolationLevel, PreparedStatement, Transaction, TransactionInternal,
+    TransactionOps,
 };
 pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
 pub use field::{

@@ -586,6 +586,10 @@ impl Connection for SqliteConnection {
     where
         Self: 'conn;
 
+    fn dialect(&self) -> sqlmodel_core::Dialect {
+        sqlmodel_core::Dialect::Sqlite
+    }
+
     fn query(
         &self,
         _cx: &Cx,

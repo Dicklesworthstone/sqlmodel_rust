@@ -150,11 +150,73 @@ impl PreparedStatement {
 /// tx.execute(&cx, "INSERT INTO logs (msg) VALUES ($1)", &[Value::Text("action".into())]).await?;
 /// tx.commit(&cx).await?;
 /// ```
+/// SQL dialect enumeration for cross-database compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// PostgreSQL dialect (uses $1, $2 placeholders)
+    #[default]
+    Postgres,
+    /// SQLite dialect (uses ?1, ?2 placeholders)
+    Sqlite,
+    /// MySQL dialect (uses ? placeholders)
+    Mysql,
+}
+
+impl Dialect {
+    /// Generate a placeholder for the given parameter index (1-based).
+    pub fn placeholder(self, index: usize) -> String {
+        match self {
+            Dialect::Postgres => format!("${index}"),
+            Dialect::Sqlite => format!("?{index}"),
+            Dialect::Mysql => "?".to_string(),
+        }
+    }
+
+    /// Get the string concatenation operator for this dialect.
+    pub const fn concat_op(self) -> &'static str {
+        match self {
+            Dialect::Postgres | Dialect::Sqlite => "||",
+            Dialect::Mysql => "", // MySQL uses CONCAT() function
+        }
+    }
+
+    /// Check if this dialect supports ILIKE.
+    pub const fn supports_ilike(self) -> bool {
+        matches!(self, Dialect::Postgres)
+    }
+
+    /// Quote an identifier for this dialect.
+    ///
+    /// Properly escapes embedded quote characters by doubling them:
+    /// - For Postgres/SQLite: `"` becomes `""`
+    /// - For MySQL: `` ` `` becomes ``` `` ```
+    pub fn quote_identifier(self, name: &str) -> String {
+        match self {
+            Dialect::Postgres | Dialect::Sqlite => {
+                let escaped = name.replace('"', "\"\"");
+                format!("\"{escaped}\"")
+            }
+            Dialect::Mysql => {
+                let escaped = name.replace('`', "``");
+                format!("`{escaped}`")
+            }
+        }
+    }
+}
+
 pub trait Connection: Send + Sync {
     /// The transaction type returned by this connection.
     type Tx<'conn>: TransactionOps
     where
         Self: 'conn;
+
+    /// Get the SQL dialect for this connection.
+    ///
+    /// This is used by query builders to generate dialect-specific SQL.
+    /// Defaults to Postgres for backwards compatibility.
+    fn dialect(&self) -> Dialect {
+        Dialect::Postgres
+    }
 
     /// Execute a query and return all rows.
     fn query(

@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/sqlmodel-macros"
 readme = "README.md"
 keywords = ["sql", "orm", "database", "proc-macro", "sqlmodel"]
-categories = ["database", "development-tools::procedural-macro"]
+categories = ["database", "development-tools"]
 
 [lib]
 proc-macro = true

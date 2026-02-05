@@ -144,7 +144,14 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
 
         for (_, value) in insert_fields {
             if matches!(value, Value::Default) {
-                placeholders.push("DEFAULT".to_string());
+                // SQLite doesn't support DEFAULT as a value in VALUES clause.
+                // Use NULL instead, which works the same for auto-increment columns.
+                if dialect == Dialect::Sqlite {
+                    params.push(Value::Null);
+                    placeholders.push(dialect.placeholder(params.len()));
+                } else {
+                    placeholders.push("DEFAULT".to_string());
+                }
             } else {
                 params.push(value);
                 placeholders.push(dialect.placeholder(params.len()));
@@ -231,7 +238,7 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
         cx: &Cx,
         conn: &C,
     ) -> Outcome<i64, sqlmodel_core::Error> {
-        let (sql, params) = self.build();
+        let (sql, params) = self.build_with_dialect(conn.dialect());
         conn.insert(cx, &sql, &params).await
     }
 
@@ -244,7 +251,7 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
         conn: &C,
     ) -> Outcome<Option<Row>, sqlmodel_core::Error> {
         self.returning = true;
-        let (sql, params) = self.build();
+        let (sql, params) = self.build_with_dialect(conn.dialect());
         conn.query_one(cx, &sql, &params).await
     }
 }
