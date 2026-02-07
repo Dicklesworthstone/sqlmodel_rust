@@ -353,9 +353,8 @@ impl SqliteConnection {
         let main = CString::new("main").expect("static sqlite db name");
 
         // SAFETY: We hold locks on both connections; db pointers are valid.
-        let backup = unsafe {
-            ffi::sqlite3_backup_init(dest_db, main.as_ptr(), source_db, main.as_ptr())
-        };
+        let backup =
+            unsafe { ffi::sqlite3_backup_init(dest_db, main.as_ptr(), source_db, main.as_ptr()) };
         if backup.is_null() {
             let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
                 .to_string_lossy()
@@ -392,11 +391,7 @@ impl SqliteConnection {
                 .into_owned();
             return Err(Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Connect,
-                message: format!(
-                    "SQLite backup failed: {} ({})",
-                    msg,
-                    ffi::error_string(rc)
-                ),
+                message: format!("SQLite backup failed: {} ({})", msg, ffi::error_string(rc)),
                 source: None,
             }));
         }
