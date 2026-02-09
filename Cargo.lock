@@ -25,9 +25,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "asupersync"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45551c816d1bb377e94e2633e48e6ab3cedfba821fa1d0eee52f1f2164b17db8"
+checksum = "88eafdfdd913f7464e5329597771f95bb6fa6b0edb6e75ac8542de43c806f822"
 dependencies = [
  "base64",
  "bincode",
@@ -43,6 +43,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "slab",
+ "smallvec",
  "socket2",
  "tempfile",
  "thiserror",
