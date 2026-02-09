@@ -29,8 +29,8 @@ sha2 = "0.10"
 hmac = "0.12"
 pbkdf2 = "0.12"
 base64 = "0.22"
-rand = "0.8"
-md5 = "0.7"
+rand = "0.10"
+md5 = "0.8"
 subtle = "2.5"
 
 # Optional console support
