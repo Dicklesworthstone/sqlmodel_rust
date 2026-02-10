@@ -21,12 +21,13 @@ fn is_joined_inheritance_child<M: Model>() -> bool {
     inh.strategy == InheritanceStrategy::Joined && inh.parent.is_some()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinedTableTarget {
     Parent,
     Child,
 }
+
+type JoinedSetPairs = Vec<(&'static str, Value)>;
 
 #[allow(clippy::result_large_err)]
 fn joined_parent_meta<M: Model>()
@@ -45,12 +46,7 @@ fn joined_parent_meta<M: Model>()
     Ok((parent_table, parent_fields_fn()))
 }
 
-#[allow(dead_code)]
-fn field_names(fields: &[FieldInfo]) -> HashSet<&'static str> {
-    fields.iter().map(|f| f.column_name).collect()
-}
-
-#[allow(dead_code, clippy::result_large_err)]
+#[allow(clippy::result_large_err)]
 fn classify_joined_column<M: Model>(
     column: &str,
     parent_table: &'static str,
@@ -112,7 +108,7 @@ fn classify_joined_column<M: Model>(
     }
 }
 
-#[allow(dead_code, clippy::result_large_err)]
+#[allow(clippy::result_large_err)]
 fn build_joined_pk_select_sql<M: Model>(
     dialect: Dialect,
     where_clause: Option<&Where>,
@@ -160,6 +156,81 @@ fn build_joined_pk_select_sql<M: Model>(
     Ok((sql, params))
 }
 
+#[allow(clippy::result_large_err)]
+fn extract_pk_values_from_rows(
+    rows: Vec<Row>,
+    pk_col_count: usize,
+) -> Result<Vec<Vec<Value>>, sqlmodel_core::Error> {
+    let mut pk_values = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.len() < pk_col_count {
+            return Err(sqlmodel_core::Error::Custom(format!(
+                "joined-table inheritance PK lookup returned {} columns; expected at least {}",
+                row.len(),
+                pk_col_count
+            )));
+        }
+        let mut vals = Vec::with_capacity(pk_col_count);
+        for i in 0..pk_col_count {
+            let Some(v) = row.get(i) else {
+                return Err(sqlmodel_core::Error::Custom(format!(
+                    "joined-table inheritance PK lookup missing column index {i}"
+                )));
+            };
+            vals.push(v.clone());
+        }
+        pk_values.push(vals);
+    }
+    Ok(pk_values)
+}
+
+async fn select_joined_pk_values_in_tx<Tx: TransactionOps, M: Model>(
+    tx: &Tx,
+    cx: &Cx,
+    dialect: Dialect,
+    where_clause: Option<&Where>,
+) -> Outcome<Vec<Vec<Value>>, sqlmodel_core::Error> {
+    let pk_cols = M::PRIMARY_KEY;
+    let (pk_sql, pk_params) = match build_joined_pk_select_sql::<M>(dialect, where_clause, 0) {
+        Ok(v) => v,
+        Err(e) => return Outcome::Err(e),
+    };
+    match tx.query(cx, &pk_sql, &pk_params).await {
+        Outcome::Ok(rows) => match extract_pk_values_from_rows(rows, pk_cols.len()) {
+            Ok(vals) => Outcome::Ok(vals),
+            Err(e) => Outcome::Err(e),
+        },
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn split_explicit_joined_sets<M: Model>(
+    explicit_sets: &[SetClause],
+    parent_table: &'static str,
+    parent_fields: &'static [FieldInfo],
+) -> Result<(JoinedSetPairs, JoinedSetPairs), sqlmodel_core::Error> {
+    let mut parent_sets = Vec::new();
+    let mut child_sets = Vec::new();
+
+    for set in explicit_sets {
+        let (target, col) = classify_joined_column::<M>(&set.column, parent_table, parent_fields)?;
+        if M::PRIMARY_KEY.contains(&col) {
+            return Err(sqlmodel_core::Error::Custom(format!(
+                "joined-table inheritance update does not support setting primary key column '{col}'"
+            )));
+        }
+        match target {
+            JoinedTableTarget::Parent => parent_sets.push((col, set.value.clone())),
+            JoinedTableTarget::Child => child_sets.push((col, set.value.clone())),
+        }
+    }
+
+    Ok((parent_sets, child_sets))
+}
+
 fn build_pk_in_where(
     dialect: Dialect,
     pk_cols: &[&'static str],
@@ -203,7 +274,50 @@ fn build_pk_in_where(
     (format!("{cols_tuple} IN ({})", groups.join(", ")), params)
 }
 
-#[allow(dead_code)]
+fn build_pk_in_where_qualified(
+    dialect: Dialect,
+    table: &str,
+    pk_cols: &[&'static str],
+    pk_values: &[Vec<Value>],
+    param_offset: usize,
+) -> (String, Vec<Value>) {
+    let qualified_cols: Vec<String> = pk_cols.iter().map(|c| format!("{table}.{c}")).collect();
+
+    let mut params: Vec<Value> = Vec::new();
+    if qualified_cols.is_empty() || pk_values.is_empty() {
+        return (String::new(), params);
+    }
+
+    if qualified_cols.len() == 1 {
+        let col = &qualified_cols[0];
+        let mut placeholders = Vec::new();
+        for vals in pk_values {
+            if vals.len() != 1 {
+                continue;
+            }
+            params.push(vals[0].clone());
+            placeholders.push(dialect.placeholder(param_offset + params.len()));
+        }
+        return (format!("{col} IN ({})", placeholders.join(", ")), params);
+    }
+
+    let cols_tuple = format!("({})", qualified_cols.join(", "));
+    let mut groups = Vec::new();
+    for vals in pk_values {
+        if vals.len() != qualified_cols.len() {
+            continue;
+        }
+        let mut ph = Vec::new();
+        for v in vals {
+            params.push(v.clone());
+            ph.push(dialect.placeholder(param_offset + params.len()));
+        }
+        groups.push(format!("({})", ph.join(", ")));
+    }
+
+    (format!("{cols_tuple} IN ({})", groups.join(", ")), params)
+}
+
 fn build_update_sql_for_table_pk_in(
     dialect: Dialect,
     table: &str,
@@ -240,7 +354,6 @@ fn build_update_sql_for_table_pk_in(
     (sql, params)
 }
 
-#[allow(dead_code)]
 fn build_delete_sql_for_table_pk_in(
     dialect: Dialect,
     table: &str,
@@ -303,7 +416,8 @@ fn build_joined_child_select_sql_by_pk_in<M: Model>(
             .join(" AND "),
     );
 
-    let (pk_where, pk_params) = build_pk_in_where(dialect, pk_cols, pk_values, 0);
+    let (pk_where, pk_params) =
+        build_pk_in_where_qualified(dialect, M::TABLE_NAME, pk_cols, pk_values, 0);
     if pk_where.is_empty() {
         return Ok((String::new(), Vec::new()));
     }
@@ -484,27 +598,6 @@ fn build_update_sql_for_table(
         params.extend_from_slice(pk_vals);
     }
 
-    (sql, params)
-}
-
-fn build_delete_sql_for_table(
-    dialect: Dialect,
-    table: &str,
-    pk_cols: &[&'static str],
-    pk_vals: &[Value],
-) -> (String, Vec<Value>) {
-    let mut sql = format!("DELETE FROM {}", table);
-    let mut params = Vec::new();
-    if !pk_cols.is_empty() && pk_cols.len() == pk_vals.len() {
-        let where_parts: Vec<String> = pk_cols
-            .iter()
-            .enumerate()
-            .map(|(i, col)| format!("{} = {}", col, dialect.placeholder(i + 1)))
-            .collect();
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_parts.join(" AND "));
-        params.extend_from_slice(pk_vals);
-    }
     (sql, params)
 }
 
@@ -1216,7 +1309,7 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
         if is_joined_inheritance_child::<M>() {
             if self.on_conflict.is_some() {
                 return Outcome::Err(sqlmodel_core::Error::Custom(
-                    "joined-table inheritance insert does not support ON CONFLICT yet (bd-2bht follow-ups may extend this)"
+                    "joined-table inheritance insert_returning does not support ON CONFLICT; use execute() for ON CONFLICT semantics"
                         .to_string(),
                 ));
             }
@@ -2191,15 +2284,146 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
     }
 
     /// Execute the UPDATE and return rows affected.
+    ///
+    /// Joined-table inheritance semantics:
+    /// - `UpdateBuilder::empty().set(...).filter(...)` routes each `SET` column to parent or child table.
+    /// - Unqualified ambiguous columns (e.g. shared PK names) are rejected with a clear error.
+    /// - A single update operation may execute one UPDATE per table inside one transaction.
     pub async fn execute<C: Connection>(
         self,
         cx: &Cx,
         conn: &C,
     ) -> Outcome<u64, sqlmodel_core::Error> {
-        if self.model.is_some() && is_joined_inheritance_child::<M>() {
+        if is_joined_inheritance_child::<M>() {
+            if self.model.is_none() {
+                if self.explicit_sets.is_empty() {
+                    return Outcome::Err(sqlmodel_core::Error::Custom(
+                        "joined-table inheritance explicit update requires at least one SET clause"
+                            .to_string(),
+                    ));
+                }
+
+                let dialect = conn.dialect();
+                let (parent_table, parent_fields) = match joined_parent_meta::<M>() {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(e),
+                };
+                let (parent_sets, child_sets) = match split_explicit_joined_sets::<M>(
+                    &self.explicit_sets,
+                    parent_table,
+                    parent_fields,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(e),
+                };
+
+                let tx_out = conn.begin(cx).await;
+                let tx = match tx_out {
+                    Outcome::Ok(t) => t,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+
+                let pk_values = match select_joined_pk_values_in_tx::<_, M>(
+                    &tx,
+                    cx,
+                    dialect,
+                    self.where_clause.as_ref(),
+                )
+                .await
+                {
+                    Outcome::Ok(v) => v,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                };
+
+                if pk_values.is_empty() {
+                    return match tx.commit(cx).await {
+                        Outcome::Ok(()) => Outcome::Ok(0),
+                        Outcome::Err(e) => Outcome::Err(e),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
+                    };
+                }
+
+                let mut total = 0_u64;
+
+                if !parent_sets.is_empty() {
+                    let (parent_sql, parent_params) = build_update_sql_for_table_pk_in(
+                        dialect,
+                        parent_table,
+                        M::PRIMARY_KEY,
+                        &pk_values,
+                        &parent_sets,
+                    );
+                    if !parent_sql.is_empty() {
+                        match tx.execute(cx, &parent_sql, &parent_params).await {
+                            Outcome::Ok(n) => total = total.saturating_add(n),
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                }
+
+                if !child_sets.is_empty() {
+                    let (child_sql, child_params) = build_update_sql_for_table_pk_in(
+                        dialect,
+                        M::TABLE_NAME,
+                        M::PRIMARY_KEY,
+                        &pk_values,
+                        &child_sets,
+                    );
+                    if !child_sql.is_empty() {
+                        match tx.execute(cx, &child_sql, &child_params).await {
+                            Outcome::Ok(n) => total = total.saturating_add(n),
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                }
+
+                return match tx.commit(cx).await {
+                    Outcome::Ok(()) => Outcome::Ok(total),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                };
+            }
+
             if self.where_clause.is_some() || !self.explicit_sets.is_empty() {
                 return Outcome::Err(sqlmodel_core::Error::Custom(
-                    "joined-table inheritance update currently supports only model-based updates (no explicit WHERE/SET yet)"
+                    "joined-table inheritance update with a model supports model-based updates only; use UpdateBuilder::empty().set(...).filter(...) for explicit WHERE/SET"
                         .to_string(),
                 ));
             }
@@ -2328,10 +2552,165 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
         conn: &C,
     ) -> Outcome<Vec<Row>, sqlmodel_core::Error> {
         self.returning = true;
-        if self.model.is_some() && is_joined_inheritance_child::<M>() {
+        if is_joined_inheritance_child::<M>() {
+            if self.model.is_none() {
+                if self.explicit_sets.is_empty() {
+                    return Outcome::Err(sqlmodel_core::Error::Custom(
+                        "joined-table inheritance explicit update_returning requires at least one SET clause"
+                            .to_string(),
+                    ));
+                }
+
+                let dialect = conn.dialect();
+                let (parent_table, parent_fields) = match joined_parent_meta::<M>() {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(e),
+                };
+                let (parent_sets, child_sets) = match split_explicit_joined_sets::<M>(
+                    &self.explicit_sets,
+                    parent_table,
+                    parent_fields,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(e),
+                };
+
+                let tx_out = conn.begin(cx).await;
+                let tx = match tx_out {
+                    Outcome::Ok(t) => t,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+
+                let pk_values = match select_joined_pk_values_in_tx::<_, M>(
+                    &tx,
+                    cx,
+                    dialect,
+                    self.where_clause.as_ref(),
+                )
+                .await
+                {
+                    Outcome::Ok(v) => v,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                };
+
+                if pk_values.is_empty() {
+                    return match tx.commit(cx).await {
+                        Outcome::Ok(()) => Outcome::Ok(Vec::new()),
+                        Outcome::Err(e) => Outcome::Err(e),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
+                    };
+                }
+
+                if !parent_sets.is_empty() {
+                    let (parent_sql, parent_params) = build_update_sql_for_table_pk_in(
+                        dialect,
+                        parent_table,
+                        M::PRIMARY_KEY,
+                        &pk_values,
+                        &parent_sets,
+                    );
+                    if !parent_sql.is_empty() {
+                        match tx.execute(cx, &parent_sql, &parent_params).await {
+                            Outcome::Ok(_) => {}
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                }
+
+                if !child_sets.is_empty() {
+                    let (child_sql, child_params) = build_update_sql_for_table_pk_in(
+                        dialect,
+                        M::TABLE_NAME,
+                        M::PRIMARY_KEY,
+                        &pk_values,
+                        &child_sets,
+                    );
+                    if !child_sql.is_empty() {
+                        match tx.execute(cx, &child_sql, &child_params).await {
+                            Outcome::Ok(_) => {}
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                }
+
+                let (select_sql, select_params) = match build_joined_child_select_sql_by_pk_in::<M>(
+                    dialect,
+                    M::PRIMARY_KEY,
+                    &pk_values,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                };
+                let rows = if select_sql.is_empty() {
+                    Vec::new()
+                } else {
+                    match tx.query(cx, &select_sql, &select_params).await {
+                        Outcome::Ok(rows) => rows,
+                        Outcome::Err(e) => {
+                            tx_rollback_best_effort(tx, cx).await;
+                            return Outcome::Err(e);
+                        }
+                        Outcome::Cancelled(r) => {
+                            tx_rollback_best_effort(tx, cx).await;
+                            return Outcome::Cancelled(r);
+                        }
+                        Outcome::Panicked(p) => {
+                            tx_rollback_best_effort(tx, cx).await;
+                            return Outcome::Panicked(p);
+                        }
+                    }
+                };
+
+                return match tx.commit(cx).await {
+                    Outcome::Ok(()) => Outcome::Ok(rows),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                };
+            }
+
             if self.where_clause.is_some() || !self.explicit_sets.is_empty() {
                 return Outcome::Err(sqlmodel_core::Error::Custom(
-                    "joined-table inheritance update_returning currently supports only model-based updates (no explicit WHERE/SET yet)"
+                    "joined-table inheritance update_returning with a model supports model-based updates only; use UpdateBuilder::empty().set(...).filter(...) for explicit WHERE/SET"
                         .to_string(),
                 ));
             }
@@ -2564,34 +2943,21 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
     }
 
     /// Execute the DELETE and return rows affected.
+    ///
+    /// Joined-table inheritance semantics:
+    /// - Filters select target child primary keys from a base+child join.
+    /// - Deletion always removes matching child rows and their parent rows in one transaction.
     pub async fn execute<C: Connection>(
         self,
         cx: &Cx,
         conn: &C,
     ) -> Outcome<u64, sqlmodel_core::Error> {
-        if self.model.is_some() && is_joined_inheritance_child::<M>() {
-            if self.where_clause.is_some() {
-                return Outcome::Err(sqlmodel_core::Error::Custom(
-                    "joined-table inheritance delete currently supports only DeleteBuilder::from_model (no explicit WHERE yet)"
-                        .to_string(),
-                ));
-            }
-
+        if is_joined_inheritance_child::<M>() {
             let dialect = conn.dialect();
-            let Some(model) = self.model else {
-                return Outcome::Err(sqlmodel_core::Error::Custom(
-                    "delete called without model".to_string(),
-                ));
+            let (parent_table, _parent_fields) = match joined_parent_meta::<M>() {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(e),
             };
-            let inh = M::inheritance();
-            let Some(parent_table) = inh.parent else {
-                return Outcome::Err(sqlmodel_core::Error::Custom(
-                    "joined-table inheritance child missing parent table metadata".to_string(),
-                ));
-            };
-
-            let pk_cols = M::PRIMARY_KEY;
-            let pk_vals = model.primary_key_value();
 
             let tx_out = conn.begin(cx).await;
             let tx = match tx_out {
@@ -2601,42 +2967,98 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             };
 
-            let (child_sql, child_params) =
-                build_delete_sql_for_table(dialect, M::TABLE_NAME, pk_cols, &pk_vals);
+            let pk_values = if let Some(where_clause) = self.where_clause.as_ref() {
+                match select_joined_pk_values_in_tx::<_, M>(&tx, cx, dialect, Some(where_clause))
+                    .await
+                {
+                    Outcome::Ok(v) => v,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            } else if let Some(model) = self.model {
+                vec![model.primary_key_value()]
+            } else {
+                // Explicit WHERE omitted: delete all joined-child rows (child + matching parent rows).
+                match select_joined_pk_values_in_tx::<_, M>(&tx, cx, dialect, None).await {
+                    Outcome::Ok(v) => v,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            };
+
+            if pk_values.is_empty() {
+                return match tx.commit(cx).await {
+                    Outcome::Ok(()) => Outcome::Ok(0),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                };
+            }
+
+            let (child_sql, child_params) = build_delete_sql_for_table_pk_in(
+                dialect,
+                M::TABLE_NAME,
+                M::PRIMARY_KEY,
+                &pk_values,
+            );
             let (parent_sql, parent_params) =
-                build_delete_sql_for_table(dialect, parent_table, pk_cols, &pk_vals);
+                build_delete_sql_for_table_pk_in(dialect, parent_table, M::PRIMARY_KEY, &pk_values);
 
             let mut total = 0_u64;
 
-            match tx.execute(cx, &child_sql, &child_params).await {
-                Outcome::Ok(n) => total = total.saturating_add(n),
-                Outcome::Err(e) => {
-                    tx_rollback_best_effort(tx, cx).await;
-                    return Outcome::Err(e);
-                }
-                Outcome::Cancelled(r) => {
-                    tx_rollback_best_effort(tx, cx).await;
-                    return Outcome::Cancelled(r);
-                }
-                Outcome::Panicked(p) => {
-                    tx_rollback_best_effort(tx, cx).await;
-                    return Outcome::Panicked(p);
+            if !child_sql.is_empty() {
+                match tx.execute(cx, &child_sql, &child_params).await {
+                    Outcome::Ok(n) => total = total.saturating_add(n),
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
                 }
             }
 
-            match tx.execute(cx, &parent_sql, &parent_params).await {
-                Outcome::Ok(n) => total = total.saturating_add(n),
-                Outcome::Err(e) => {
-                    tx_rollback_best_effort(tx, cx).await;
-                    return Outcome::Err(e);
-                }
-                Outcome::Cancelled(r) => {
-                    tx_rollback_best_effort(tx, cx).await;
-                    return Outcome::Cancelled(r);
-                }
-                Outcome::Panicked(p) => {
-                    tx_rollback_best_effort(tx, cx).await;
-                    return Outcome::Panicked(p);
+            if !parent_sql.is_empty() {
+                match tx.execute(cx, &parent_sql, &parent_params).await {
+                    Outcome::Ok(n) => total = total.saturating_add(n),
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
                 }
             }
 
@@ -2653,12 +3075,160 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
     }
 
     /// Execute the DELETE with RETURNING and get the deleted rows.
+    ///
+    /// For joined-table inheritance child models, returned rows are projected with both
+    /// child and parent prefixes (`table__column`) before the delete is applied.
     pub async fn execute_returning<C: Connection>(
         mut self,
         cx: &Cx,
         conn: &C,
     ) -> Outcome<Vec<Row>, sqlmodel_core::Error> {
         self.returning = true;
+        if is_joined_inheritance_child::<M>() {
+            let dialect = conn.dialect();
+            let (parent_table, _parent_fields) = match joined_parent_meta::<M>() {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(e),
+            };
+
+            let tx_out = conn.begin(cx).await;
+            let tx = match tx_out {
+                Outcome::Ok(t) => t,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+
+            let pk_values = if let Some(where_clause) = self.where_clause.as_ref() {
+                match select_joined_pk_values_in_tx::<_, M>(&tx, cx, dialect, Some(where_clause))
+                    .await
+                {
+                    Outcome::Ok(v) => v,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            } else if let Some(model) = self.model {
+                vec![model.primary_key_value()]
+            } else {
+                match select_joined_pk_values_in_tx::<_, M>(&tx, cx, dialect, None).await {
+                    Outcome::Ok(v) => v,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            };
+
+            if pk_values.is_empty() {
+                return match tx.commit(cx).await {
+                    Outcome::Ok(()) => Outcome::Ok(Vec::new()),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                };
+            }
+
+            let (select_sql, select_params) = match build_joined_child_select_sql_by_pk_in::<M>(
+                dialect,
+                M::PRIMARY_KEY,
+                &pk_values,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(e);
+                }
+            };
+            let rows = if select_sql.is_empty() {
+                Vec::new()
+            } else {
+                match tx.query(cx, &select_sql, &select_params).await {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            };
+
+            let (child_sql, child_params) = build_delete_sql_for_table_pk_in(
+                dialect,
+                M::TABLE_NAME,
+                M::PRIMARY_KEY,
+                &pk_values,
+            );
+            let (parent_sql, parent_params) =
+                build_delete_sql_for_table_pk_in(dialect, parent_table, M::PRIMARY_KEY, &pk_values);
+
+            if !child_sql.is_empty() {
+                match tx.execute(cx, &child_sql, &child_params).await {
+                    Outcome::Ok(_) => {}
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            }
+
+            if !parent_sql.is_empty() {
+                match tx.execute(cx, &parent_sql, &parent_params).await {
+                    Outcome::Ok(_) => {}
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            }
+
+            return match tx.commit(cx).await {
+                Outcome::Ok(()) => Outcome::Ok(rows),
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            };
+        }
         let (sql, params) = self.build_with_dialect(conn.dialect());
         conn.query(cx, &sql, &params).await
     }
