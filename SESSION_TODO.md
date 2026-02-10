@@ -27,6 +27,33 @@ Purpose: keep a granular, lossless checklist for parity work (docs, schema, sess
 - [x] `cargo test -p sqlmodel-session`
 - [x] `ubs --diff --only=rust,toml .` (exit 0)
 
+## 0. Current Focus (2026-02-10): bd-3g6y (composite relationship keys)
+
+### 0.1 Metadata Shape
+- [x] Extend `sqlmodel_core::RelationshipInfo` to support composite local/remote keys (slice-based) while preserving single-column API
+- [x] Add `RelationshipInfo::{local_key_cols,remote_key_cols}` helpers to normalize single vs composite key access
+
+### 0.2 Session Cascade + Orphan Tracking
+- [x] Update `Session::flush` cascade planner to handle composite FK tuples for one-to-many/one-to-one child deletes
+- [x] Update passive-deletes orphan detachment to handle composite FK tuples
+- [x] Decide what to do for many-to-many cascades with composite keys
+- [ ] Implement composite link-table support (tracked as `bd-ywnj`)
+
+### 0.3 Tests
+- [x] Add unit test covering composite-key cascade delete ordering (child delete first)
+- [x] Add unit test covering composite-key PassiveDeletes::Passive behavior (no child delete SQL; identity map detached)
+- [x] Audit the new tests to ensure they don't rely on incorrect hardcoded values (IDs, pk values)
+
+### 0.4 Docs
+- [x] Update `FEATURE_PARITY.md` cascade delete row: composite FK tuples supported for 1-to-many/1-to-1; many-to-many composite still pending
+
+### 0.5 Quality Gates (re-run after all edits)
+- [x] `cargo fmt --check`
+- [x] `cargo check --all-targets`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test -p sqlmodel-session`
+- [x] `ubs --diff --only=rust,toml .` (exit 0)
+
 ## 0. Current Focus (2026-02-10): bd-2lpn (one-to-many batch loader)
 
 ### 0.1 Implementation

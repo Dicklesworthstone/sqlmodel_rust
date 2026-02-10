@@ -114,9 +114,19 @@ pub struct RelationshipInfo {
     /// e.g., `"team_id"` on `Hero`.
     pub local_key: Option<&'static str>,
 
+    /// Composite local foreign key columns (for ManyToOne).
+    ///
+    /// If set, this takes precedence over `local_key`.
+    pub local_keys: Option<&'static [&'static str]>,
+
     /// Remote foreign key column (for OneToMany).
     /// e.g., `"team_id"` on `Hero` when accessed from `Team`.
     pub remote_key: Option<&'static str>,
+
+    /// Composite remote foreign key columns (for OneToMany / OneToOne).
+    ///
+    /// If set, this takes precedence over `remote_key`.
+    pub remote_keys: Option<&'static [&'static str]>,
 
     /// Link table for ManyToMany relationships.
     pub link_table: Option<LinkTableInfo>,
@@ -163,8 +173,8 @@ impl PartialEq for RelationshipInfo {
         self.name == other.name
             && self.related_table == other.related_table
             && self.kind == other.kind
-            && self.local_key == other.local_key
-            && self.remote_key == other.remote_key
+            && self.local_key_cols() == other.local_key_cols()
+            && self.remote_key_cols() == other.remote_key_cols()
             && self.link_table == other.link_table
             && self.back_populates == other.back_populates
             && self.lazy == other.lazy
@@ -196,7 +206,9 @@ impl RelationshipInfo {
             related_table,
             kind,
             local_key: None,
+            local_keys: None,
             remote_key: None,
+            remote_keys: None,
             link_table: None,
             back_populates: None,
             lazy: false,
@@ -207,6 +219,34 @@ impl RelationshipInfo {
             cascade: None,
             uselist: None,
             related_fields_fn: Self::empty_related_fields,
+        }
+    }
+
+    /// Return the local key columns for this relationship (empty slice if unset).
+    ///
+    /// For single-column relationships, this returns a 1-element slice backed by `self.local_key`.
+    #[must_use]
+    pub fn local_key_cols(&self) -> &[&'static str] {
+        if let Some(keys) = self.local_keys {
+            return keys;
+        }
+        match &self.local_key {
+            Some(key) => std::slice::from_ref(key),
+            None => &[],
+        }
+    }
+
+    /// Return the remote key columns for this relationship (empty slice if unset).
+    ///
+    /// For single-column relationships, this returns a 1-element slice backed by `self.remote_key`.
+    #[must_use]
+    pub fn remote_key_cols(&self) -> &[&'static str] {
+        if let Some(keys) = self.remote_keys {
+            return keys;
+        }
+        match &self.remote_key {
+            Some(key) => std::slice::from_ref(key),
+            None => &[],
         }
     }
 
@@ -224,6 +264,17 @@ impl RelationshipInfo {
     #[must_use]
     pub const fn local_key(mut self, key: &'static str) -> Self {
         self.local_key = Some(key);
+        self.local_keys = None;
+        self
+    }
+
+    /// Set composite local foreign key columns (ManyToOne).
+    ///
+    /// The column order must match the parent primary key value ordering.
+    #[must_use]
+    pub const fn local_keys(mut self, keys: &'static [&'static str]) -> Self {
+        self.local_keys = Some(keys);
+        self.local_key = None;
         self
     }
 
@@ -231,6 +282,17 @@ impl RelationshipInfo {
     #[must_use]
     pub const fn remote_key(mut self, key: &'static str) -> Self {
         self.remote_key = Some(key);
+        self.remote_keys = None;
+        self
+    }
+
+    /// Set composite remote foreign key columns (OneToMany / OneToOne).
+    ///
+    /// The column order must match the parent primary key value ordering.
+    #[must_use]
+    pub const fn remote_keys(mut self, keys: &'static [&'static str]) -> Self {
+        self.remote_keys = Some(keys);
+        self.remote_key = None;
         self
     }
 
@@ -1975,7 +2037,9 @@ mod tests {
             related_table: "teams",
             kind: RelationshipKind::ManyToOne,
             local_key: Some("team_id"),
+            local_keys: None,
             remote_key: None,
+            remote_keys: None,
             link_table: None,
             back_populates: Some("heroes"),
             lazy: false,
@@ -2030,7 +2094,9 @@ mod tests {
             related_table: "heroes",
             kind: RelationshipKind::OneToMany,
             local_key: None,
+            local_keys: None,
             remote_key: Some("team_id"),
+            remote_keys: None,
             link_table: None,
             back_populates: Some("team"),
             lazy: false,

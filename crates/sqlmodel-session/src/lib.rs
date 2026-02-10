@@ -445,6 +445,12 @@ struct TrackedObject {
     expired_attributes: Option<std::collections::HashSet<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CascadeChildDeleteKey {
+    table: &'static str,
+    fk_cols: Vec<&'static str>,
+}
+
 // ============================================================================
 // Session
 // ============================================================================
@@ -1330,7 +1336,9 @@ impl<C: Connection> Session<C> {
         // delete dependent rows (and clean up link tables) when `passive_deletes` is not set.
         //
         // This is intentionally explicit (no hidden queries): we emit concrete DELETE statements.
-        let mut cascade_child_deletes: HashMap<(&'static str, &'static str), Vec<Value>> =
+        let mut cascade_child_deletes_single: HashMap<(&'static str, &'static str), Vec<Value>> =
+            HashMap::new();
+        let mut cascade_child_deletes_composite: HashMap<CascadeChildDeleteKey, Vec<Vec<Value>>> =
             HashMap::new();
         let mut cascade_link_deletes: HashMap<(&'static str, &'static str), Vec<Value>> =
             HashMap::new();
@@ -1342,11 +1350,7 @@ impl<C: Connection> Session<C> {
             if tracked.state != ObjectState::Deleted {
                 continue;
             }
-            // Composite PK cascades need richer metadata; skip rather than guessing.
-            if tracked.pk_values.len() != 1 {
-                continue;
-            }
-            let parent_pk = tracked.pk_values[0].clone();
+            let parent_pk_values = tracked.pk_values.clone();
 
             for rel in tracked.relationships {
                 if !rel.cascade_delete || rel.is_passive_deletes_all() {
@@ -1361,13 +1365,28 @@ impl<C: Connection> Session<C> {
                         if matches!(rel.passive_deletes, sqlmodel_core::PassiveDeletes::Passive) {
                             continue;
                         }
-                        let Some(remote_key) = rel.remote_key else {
+                        let fk_cols = rel.remote_key_cols();
+                        if fk_cols.is_empty() {
                             continue;
-                        };
-                        cascade_child_deletes
-                            .entry((rel.related_table, remote_key))
-                            .or_default()
-                            .push(parent_pk.clone());
+                        }
+                        if fk_cols.len() == 1 && parent_pk_values.len() == 1 {
+                            cascade_child_deletes_single
+                                .entry((rel.related_table, fk_cols[0]))
+                                .or_default()
+                                .push(parent_pk_values[0].clone());
+                        } else {
+                            // Composite FK: column order must match parent PK value ordering.
+                            if fk_cols.len() != parent_pk_values.len() {
+                                continue;
+                            }
+                            cascade_child_deletes_composite
+                                .entry(CascadeChildDeleteKey {
+                                    table: rel.related_table,
+                                    fk_cols: fk_cols.to_vec(),
+                                })
+                                .or_default()
+                                .push(parent_pk_values.clone());
+                        }
                     }
                     sqlmodel_core::RelationshipKind::ManyToMany => {
                         if matches!(rel.passive_deletes, sqlmodel_core::PassiveDeletes::Passive) {
@@ -1376,10 +1395,14 @@ impl<C: Connection> Session<C> {
                         let Some(link) = rel.link_table else {
                             continue;
                         };
+                        // Link-table cascades only support single-column parent keys today.
+                        if parent_pk_values.len() != 1 {
+                            continue;
+                        }
                         cascade_link_deletes
                             .entry((link.table_name, link.local_column))
                             .or_default()
-                            .push(parent_pk.clone());
+                            .push(parent_pk_values[0].clone());
                     }
                     sqlmodel_core::RelationshipKind::ManyToOne => {}
                 }
@@ -1392,7 +1415,7 @@ impl<C: Connection> Session<C> {
         };
 
         // (a) Delete children first (one-to-many / one-to-one).
-        for ((child_table, fk_col), mut pks) in cascade_child_deletes {
+        for ((child_table, fk_col), mut pks) in cascade_child_deletes_single {
             dedup_by_hash(&mut pks);
             if pks.is_empty() {
                 continue;
@@ -1438,6 +1461,102 @@ impl<C: Connection> Session<C> {
                 };
                 let fk_val = &t.values[idx];
                 if pk_hashes.contains(&hash_values(std::slice::from_ref(fk_val))) {
+                    to_remove.push(*k);
+                }
+            }
+            for k in &to_remove {
+                self.identity_map.remove(k);
+            }
+            self.pending_new.retain(|k| !to_remove.contains(k));
+            self.pending_dirty.retain(|k| !to_remove.contains(k));
+            self.pending_delete.retain(|k| !to_remove.contains(k));
+        }
+
+        // (a2) Delete children for composite foreign keys using row-value IN.
+        for (key, mut tuples) in cascade_child_deletes_composite {
+            if tuples.is_empty() {
+                continue;
+            }
+
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            tuples.retain(|t| seen.insert(hash_values(t)));
+
+            if tuples.is_empty() {
+                continue;
+            }
+
+            let col_list = key
+                .fk_cols
+                .iter()
+                .map(|c| dialect.quote_identifier(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let mut params: Vec<Value> = Vec::with_capacity(tuples.len() * key.fk_cols.len());
+            let mut idx = 1;
+            let tuple_sql: Vec<String> = tuples
+                .iter()
+                .map(|t| {
+                    for v in t {
+                        params.push(v.clone());
+                    }
+                    let inner = (0..key.fk_cols.len())
+                        .map(|_| {
+                            let ph = dialect.placeholder(idx);
+                            idx += 1;
+                            ph
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({})", inner)
+                })
+                .collect();
+
+            let sql = format!(
+                "DELETE FROM {} WHERE ({}) IN ({})",
+                dialect.quote_identifier(key.table),
+                col_list,
+                tuple_sql.join(", ")
+            );
+
+            match self.connection.execute(cx, &sql, &params).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Panicked(p);
+                }
+            }
+
+            // Remove now-deleted children from the identity map to prevent stale reads.
+            let tuple_hashes: std::collections::HashSet<u64> =
+                tuples.iter().map(|t| hash_values(t)).collect();
+            let mut to_remove: Vec<ObjectKey> = Vec::new();
+            for (k, t) in &self.identity_map {
+                if t.table_name != key.table {
+                    continue;
+                }
+
+                let mut child_fk: Vec<Value> = Vec::with_capacity(key.fk_cols.len());
+                let mut missing = false;
+                for fk_col in &key.fk_cols {
+                    let Some(idx) = t.column_names.iter().position(|col| col == fk_col) else {
+                        missing = true;
+                        break;
+                    };
+                    child_fk.push(t.values[idx].clone());
+                }
+                if missing {
+                    continue;
+                }
+                if tuple_hashes.contains(&hash_values(&child_fk)) {
                     to_remove.push(*k);
                 }
             }
@@ -1530,10 +1649,7 @@ impl<C: Connection> Session<C> {
 
                         // PassiveDeletes::Passive orphan tracking: the DB will delete children,
                         // so eagerly detach them from the identity map after the parent delete succeeds.
-                        if pk_values.len() == 1 {
-                            let parent_pk = &pk_values[0];
-                            let parent_pk_hash = hash_values(std::slice::from_ref(parent_pk));
-
+                        if !pk_values.is_empty() {
                             let mut to_remove: Vec<ObjectKey> = Vec::new();
                             for rel in relationships {
                                 if !rel.cascade_delete
@@ -1551,21 +1667,30 @@ impl<C: Connection> Session<C> {
                                 ) {
                                     continue;
                                 }
-                                let Some(remote_key) = rel.remote_key else {
+
+                                let fk_cols = rel.remote_key_cols();
+                                if fk_cols.is_empty() || fk_cols.len() != pk_values.len() {
                                     continue;
-                                };
+                                }
 
                                 for (k, t) in &self.identity_map {
                                     if t.table_name != rel.related_table {
                                         continue;
                                     }
-                                    let Some(idx) =
-                                        t.column_names.iter().position(|col| *col == remote_key)
-                                    else {
-                                        continue;
-                                    };
-                                    let fk_val = &t.values[idx];
-                                    if hash_values(std::slice::from_ref(fk_val)) == parent_pk_hash {
+                                    let mut matches_parent = true;
+                                    for (fk_col, parent_val) in fk_cols.iter().zip(&pk_values) {
+                                        let Some(idx) =
+                                            t.column_names.iter().position(|col| col == fk_col)
+                                        else {
+                                            matches_parent = false;
+                                            break;
+                                        };
+                                        if &t.values[idx] != parent_val {
+                                            matches_parent = false;
+                                            break;
+                                        }
+                                    }
+                                    if matches_parent {
                                         to_remove.push(*k);
                                     }
                                 }
@@ -3589,6 +3714,151 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct HeroCompositeChild {
+        id: Option<i64>,
+        team_id1: i64,
+        team_id2: i64,
+    }
+
+    impl Model for HeroCompositeChild {
+        const TABLE_NAME: &'static str = "heroes_composite";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
+                ("team_id1", Value::BigInt(self.team_id1)),
+                ("team_id2", Value::BigInt(self.team_id2)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            let team_id1: i64 = row.get_named("team_id1")?;
+            let team_id2: i64 = row.get_named("team_id2")?;
+            Ok(Self {
+                id: Some(id),
+                team_id1,
+                team_id2,
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TeamComposite {
+        id1: Option<i64>,
+        id2: Option<i64>,
+    }
+
+    impl Model for TeamComposite {
+        const TABLE_NAME: &'static str = "teams_composite";
+        const PRIMARY_KEY: &'static [&'static str] = &["id1", "id2"];
+        const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] =
+            &[sqlmodel_core::RelationshipInfo::new(
+                "heroes",
+                "heroes_composite",
+                sqlmodel_core::RelationshipKind::OneToMany,
+            )
+            .remote_keys(&["team_id1", "team_id2"])
+            .cascade_delete(true)];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id1", self.id1.map_or(Value::Null, Value::BigInt)),
+                ("id2", self.id2.map_or(Value::Null, Value::BigInt)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id1: i64 = row.get_named("id1")?;
+            let id2: i64 = row.get_named("id2")?;
+            Ok(Self {
+                id1: Some(id1),
+                id2: Some(id2),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            match (self.id1, self.id2) {
+                (Some(a), Some(b)) => vec![Value::BigInt(a), Value::BigInt(b)],
+                _ => vec![Value::Null, Value::Null],
+            }
+        }
+
+        fn is_new(&self) -> bool {
+            self.id1.is_none() || self.id2.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TeamCompositePassive {
+        id1: Option<i64>,
+        id2: Option<i64>,
+    }
+
+    impl Model for TeamCompositePassive {
+        const TABLE_NAME: &'static str = "teams_composite_passive";
+        const PRIMARY_KEY: &'static [&'static str] = &["id1", "id2"];
+        const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] =
+            &[sqlmodel_core::RelationshipInfo::new(
+                "heroes",
+                "heroes_composite",
+                sqlmodel_core::RelationshipKind::OneToMany,
+            )
+            .remote_keys(&["team_id1", "team_id2"])
+            .cascade_delete(true)
+            .passive_deletes(sqlmodel_core::PassiveDeletes::Passive)];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id1", self.id1.map_or(Value::Null, Value::BigInt)),
+                ("id2", self.id2.map_or(Value::Null, Value::BigInt)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id1: i64 = row.get_named("id1")?;
+            let id2: i64 = row.get_named("id2")?;
+            Ok(Self {
+                id1: Some(id1),
+                id2: Some(id2),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            match (self.id1, self.id2) {
+                (Some(a), Some(b)) => vec![Value::BigInt(a), Value::BigInt(b)],
+                _ => vec![Value::Null, Value::Null],
+            }
+        }
+
+        fn is_new(&self) -> bool {
+            self.id1.is_none() || self.id2.is_none()
+        }
+    }
+
     #[test]
     fn test_load_one_to_many_single_query_and_populates_related_many() {
         let rt = RuntimeBuilder::current_thread()
@@ -3776,6 +4046,183 @@ mod tests {
         );
         assert!(
             !sql0.contains("heroes"),
+            "did not expect a child-table delete for passive_deletes"
+        );
+    }
+
+    #[test]
+    fn test_flush_cascade_delete_composite_keys_deletes_children_first() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        let team = TeamComposite {
+            id1: Some(1),
+            id2: Some(2),
+        };
+        let team_key = ObjectKey::from_model(&team);
+
+        // Track parent as persistent.
+        session.identity_map.insert(
+            team_key,
+            TrackedObject {
+                object: Box::new(team.clone()),
+                original_state: None,
+                state: ObjectState::Persistent,
+                table_name: TeamComposite::TABLE_NAME,
+                column_names: vec!["id1", "id2"],
+                values: vec![Value::BigInt(1), Value::BigInt(2)],
+                pk_columns: vec!["id1", "id2"],
+                pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+                relationships: TeamComposite::RELATIONSHIPS,
+                expired_attributes: None,
+            },
+        );
+
+        // Track two children that reference the parent via a composite FK.
+        let child1 = HeroCompositeChild {
+            id: Some(10),
+            team_id1: 1,
+            team_id2: 2,
+        };
+        let child2 = HeroCompositeChild {
+            id: Some(11),
+            team_id1: 1,
+            team_id2: 2,
+        };
+        for child in [child1, child2] {
+            let child_id = child.id.expect("child id");
+            let key = ObjectKey::from_model(&child);
+            session.identity_map.insert(
+                key,
+                TrackedObject {
+                    object: Box::new(child),
+                    original_state: None,
+                    state: ObjectState::Persistent,
+                    table_name: HeroCompositeChild::TABLE_NAME,
+                    column_names: vec!["id", "team_id1", "team_id2"],
+                    values: vec![Value::BigInt(child_id), Value::BigInt(1), Value::BigInt(2)],
+                    pk_columns: vec!["id"],
+                    pk_values: vec![Value::BigInt(child_id)],
+                    relationships: HeroCompositeChild::RELATIONSHIPS,
+                    expired_attributes: None,
+                },
+            );
+        }
+
+        rt.block_on(async {
+            session.delete(&team);
+            unwrap_outcome(session.flush(&cx).await);
+            assert_eq!(session.tracked_count(), 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert!(
+            guard.execute_calls >= 2,
+            "expected at least composite cascade + parent delete"
+        );
+        let (sql0, _params0) = &guard.executed[0];
+        assert!(sql0.contains("DELETE"), "expected DELETE SQL");
+        assert!(
+            sql0.contains("heroes_composite"),
+            "expected composite cascade to target child table"
+        );
+        assert!(sql0.contains("team_id1"), "expected fk col team_id1");
+        assert!(sql0.contains("team_id2"), "expected fk col team_id2");
+        assert!(
+            sql0.contains("$1") && sql0.contains("$2"),
+            "expected Postgres-style placeholders for composite tuple"
+        );
+    }
+
+    #[test]
+    fn test_flush_passive_deletes_composite_keys_detaches_children_no_child_delete_sql() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        let team = TeamCompositePassive {
+            id1: Some(1),
+            id2: Some(2),
+        };
+        let team_key = ObjectKey::from_model(&team);
+
+        session.identity_map.insert(
+            team_key,
+            TrackedObject {
+                object: Box::new(team.clone()),
+                original_state: None,
+                state: ObjectState::Persistent,
+                table_name: TeamCompositePassive::TABLE_NAME,
+                column_names: vec!["id1", "id2"],
+                values: vec![Value::BigInt(1), Value::BigInt(2)],
+                pk_columns: vec!["id1", "id2"],
+                pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+                relationships: TeamCompositePassive::RELATIONSHIPS,
+                expired_attributes: None,
+            },
+        );
+
+        let child = HeroCompositeChild {
+            id: Some(10),
+            team_id1: 1,
+            team_id2: 2,
+        };
+        session.identity_map.insert(
+            ObjectKey::from_model(&child),
+            TrackedObject {
+                object: Box::new(child),
+                original_state: None,
+                state: ObjectState::Persistent,
+                table_name: HeroCompositeChild::TABLE_NAME,
+                column_names: vec!["id", "team_id1", "team_id2"],
+                values: vec![Value::BigInt(10), Value::BigInt(1), Value::BigInt(2)],
+                pk_columns: vec!["id"],
+                pk_values: vec![Value::BigInt(10)],
+                relationships: HeroCompositeChild::RELATIONSHIPS,
+                expired_attributes: None,
+            },
+        );
+
+        rt.block_on(async {
+            session.delete(&team);
+            unwrap_outcome(session.flush(&cx).await);
+            assert_eq!(session.tracked_count(), 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert_eq!(guard.execute_calls, 1, "expected only the parent delete");
+        let (sql0, _params0) = &guard.executed[0];
+        assert!(
+            sql0.contains("teams_composite_passive"),
+            "expected delete to target composite parent table"
+        );
+        assert!(
+            !sql0.contains("heroes_composite"),
             "did not expect a child-table delete for passive_deletes"
         );
     }
