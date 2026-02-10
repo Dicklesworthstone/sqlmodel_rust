@@ -668,7 +668,22 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
         })?;
     }
 
+    // Derive table name from struct name unless explicitly overridden.
     let table_name = table_name.unwrap_or_else(|| derive_table_name(&struct_name.to_string()));
+
+    // Inference: `#[sqlmodel(table, inherits = "...")]` without explicit `inheritance = "..."`
+    // is treated as *joined-table inheritance child*.
+    //
+    // Rationale: This matches the ergonomics shown in our docs/tests and avoids requiring
+    // repeating `inheritance = "joined"` on every child model.
+    if config.table
+        && config.inherits.is_some()
+        && config.discriminator_value.is_none()
+        && config.inheritance == InheritanceStrategy::None
+    {
+        config.inheritance = InheritanceStrategy::Joined;
+    }
+
     Ok(StructAttrs {
         table_name,
         table_alias,
@@ -4204,6 +4219,11 @@ mod tests {
         assert!(def.config.table);
         assert_eq!(def.config.inherits.as_deref(), Some("Person"));
         assert!(def.config.discriminator_value.is_none());
+        assert_eq!(
+            def.config.inheritance,
+            InheritanceStrategy::Joined,
+            "joined inheritance child should be inferred for #[sqlmodel(table, inherits = \"...\")]"
+        );
     }
 
     #[test]

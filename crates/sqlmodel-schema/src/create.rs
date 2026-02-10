@@ -42,7 +42,7 @@ impl<M: Model> CreateTable<M> {
             && inheritance.discriminator_value.is_some()
         {
             // This is a single table inheritance child - no table to create
-            // The parent table already exists with all columns
+            // Child-specific columns are handled by higher-level schema planning (e.g. SchemaBuilder)
             return String::new();
         }
 
@@ -105,19 +105,20 @@ impl<M: Model> CreateTable<M> {
         // For joined table inheritance child models, add FK to parent table
         if inheritance.strategy == InheritanceStrategy::Joined {
             if let Some(parent_table) = inheritance.parent {
-                // Get the primary key column(s) - these become the FK to parent
+                // In joined inheritance, the child's primary key columns are also a foreign key
+                // to the parent table's primary key columns (same column names).
                 let pk_cols = M::PRIMARY_KEY;
                 if !pk_cols.is_empty() {
-                    // Assume first PK column references parent's PK
-                    // In joined inheritance, child's PK is also FK to parent
-                    let pk_col = pk_cols[0];
+                    let quoted_child_cols: Vec<String> =
+                        pk_cols.iter().map(|c| quote_ident(c)).collect();
+                    let quoted_parent_cols = quoted_child_cols.clone();
                     let constraint_name = format!("fk_{}_parent", M::TABLE_NAME);
                     let fk_sql = format!(
                         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE CASCADE",
                         quote_ident(&constraint_name),
-                        quote_ident(pk_col),
+                        quoted_child_cols.join(", "),
                         quote_ident(parent_table),
-                        quote_ident(pk_col)
+                        quoted_parent_cols.join(", ")
                     );
                     constraints.push(fk_sql);
                 }
@@ -966,6 +967,7 @@ mod tests {
             InheritanceInfo {
                 strategy: sqlmodel_core::InheritanceStrategy::Single,
                 parent: None,
+                parent_fields_fn: None,
                 discriminator_column: Some("type_"),
                 discriminator_value: None,
             }
@@ -976,7 +978,8 @@ mod tests {
     struct SingleTableChild;
 
     impl Model for SingleTableChild {
-        const TABLE_NAME: &'static str = "managers"; // Would be this if it had own table
+        // Single-table inheritance child shares the parent's physical table.
+        const TABLE_NAME: &'static str = "employees";
         const PRIMARY_KEY: &'static [&'static str] = &["id"];
 
         fn fields() -> &'static [FieldInfo] {
@@ -1008,8 +1011,9 @@ mod tests {
             // (inherits from parent's strategy implicitly)
             InheritanceInfo {
                 strategy: sqlmodel_core::InheritanceStrategy::None,
-                parent: Some("Employee"),
-                discriminator_column: None,
+                parent: Some("employees"),
+                parent_fields_fn: None,
+                discriminator_column: Some("type_"),
                 discriminator_value: Some("manager"),
             }
         }
@@ -1050,6 +1054,7 @@ mod tests {
             InheritanceInfo {
                 strategy: sqlmodel_core::InheritanceStrategy::Joined,
                 parent: None,
+                parent_fields_fn: None,
                 discriminator_column: None,
                 discriminator_value: None,
             }
@@ -1091,6 +1096,7 @@ mod tests {
             InheritanceInfo {
                 strategy: sqlmodel_core::InheritanceStrategy::Joined,
                 parent: Some("persons"),
+                parent_fields_fn: None,
                 discriminator_column: None,
                 discriminator_value: None,
             }
@@ -1149,19 +1155,20 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_builder_skips_sti_child() {
+    fn test_schema_builder_applies_sti_child_columns() {
         let statements = SchemaBuilder::new()
             .create_table::<SingleTableBase>()
-            .create_table::<SingleTableChild>() // Should be skipped
+            .create_table::<SingleTableChild>() // Adds child-specific columns via ALTER TABLE
             .build();
 
-        // Only one table should be created (the base)
+        // Base creates the table, child adds the extra column(s).
         assert_eq!(
             statements.len(),
-            1,
-            "STI child should be skipped by SchemaBuilder"
+            2,
+            "STI child should contribute ALTER TABLE statements"
         );
         assert!(statements[0].contains("CREATE TABLE IF NOT EXISTS \"employees\""));
+        assert!(statements[1].contains("ALTER TABLE \"employees\" ADD COLUMN \"department\""));
     }
 
     #[test]
@@ -1197,13 +1204,28 @@ impl SchemaBuilder {
 
     /// Add a CREATE TABLE statement.
     ///
-    /// For single table inheritance child models, this is a no-op since
-    /// they share their parent's table.
+    /// For single table inheritance child models, this emits `ALTER TABLE .. ADD COLUMN ..`
+    /// statements for the child-specific fields, since the child's logical table is the
+    /// parent's physical table.
     pub fn create_table<M: Model>(mut self) -> Self {
-        // Skip single table inheritance child models - they don't have their own table
         if CreateTable::<M>::should_skip_table_creation() {
+            let inheritance = M::inheritance();
+            let Some(parent_table) = inheritance.parent else {
+                return self;
+            };
+
+            let pk_cols = M::PRIMARY_KEY;
+            for field in M::fields() {
+                // Avoid trying to re-add PK columns that are expected to be on the base table.
+                if field.primary_key || pk_cols.contains(&field.column_name) {
+                    continue;
+                }
+                self.statements
+                    .push(alter_table_add_column(parent_table, field));
+            }
             return self;
         }
+
         self.statements
             .push(CreateTable::<M>::new().if_not_exists().build());
         self
@@ -1234,4 +1256,25 @@ impl SchemaBuilder {
     pub fn build(self) -> Vec<String> {
         self.statements
     }
+}
+
+fn alter_table_add_column(table: &str, field: &FieldInfo) -> String {
+    let sql_type = field.effective_sql_type();
+    let mut stmt = format!(
+        "ALTER TABLE {} ADD COLUMN {} {}",
+        quote_ident(table),
+        quote_ident(field.column_name),
+        sql_type
+    );
+
+    if !field.nullable && !field.auto_increment {
+        stmt.push_str(" NOT NULL");
+    }
+
+    if let Some(default) = field.default {
+        stmt.push_str(" DEFAULT ");
+        stmt.push_str(default);
+    }
+
+    stmt
 }
