@@ -90,6 +90,38 @@ Purpose: keep a granular, lossless checklist for parity work (docs, schema, sess
 - [x] `cargo test -p sqlmodel --test joined_inheritance_polymorphic2_sqlite`
 - [x] `ubs --diff --only=rust,toml .` (exit 0)
 
+## 0. Current Focus (2026-02-10): bd-3bmd (joined-table inheritance DML: explicit WHERE/SET + ON CONFLICT)
+
+### 0.1 UPDATE: Explicit WHERE/SET
+- [ ] Support `UpdateBuilder::empty().set(...).filter(...)` for joined children by splitting SET columns across parent/child tables
+- [ ] Support `UpdateBuilder::new(&model).set(...).filter(...)` (explicit SET overrides model values)
+- [ ] When `.filter(...)` is present, apply it via `WHERE (pk...) IN (SELECT pk... FROM child JOIN parent WHERE <filter>)` so the predicate can reference either table
+- [ ] Define/implement behavior for `.set_only(...)` to apply to parent columns as well (when names match parent fields)
+
+### 0.2 DELETE: Explicit WHERE (+ RETURNING)
+- [ ] Support `DeleteBuilder::new().filter(...)` for joined children: select PKs first, then delete child rows, then parent rows (same tx)
+- [ ] Support `DeleteBuilder::...returning().execute_returning(...)` for joined children by selecting joined rows before delete (tx)
+
+### 0.3 INSERT: ON CONFLICT (+ RETURNING)
+- [ ] Support `InsertBuilder::on_conflict_*` for joined children with conservative rules:
+- [ ] Require explicit PK values (no auto-increment PK + upsert yet)
+- [ ] Apply ON CONFLICT for both parent insert and child insert inside a single tx
+- [ ] Make `execute_returning` return a joined row shape (base + child columns, `table__col` aliases) using a follow-up SELECT in-tx
+
+### 0.4 Tests (SQLite, end-to-end)
+- [ ] Add integration test `crates/sqlmodel/tests/joined_inheritance_dml_advanced_sqlite.rs`:
+- [ ] UPDATE with explicit SET + filter updates both parent and child tables
+- [ ] DELETE with explicit filter deletes from both tables
+- [ ] INSERT with ON CONFLICT DO UPDATE updates both tables (explicit PK models)
+- [ ] RETURNING for joined child includes both `child__*` and `parent__*` columns
+
+### 0.5 Quality Gates
+- [ ] `cargo fmt --check`
+- [ ] `cargo check --all-targets`
+- [ ] `cargo clippy --all-targets -- -D warnings`
+- [ ] `cargo test -p sqlmodel --test joined_inheritance_dml_advanced_sqlite`
+- [ ] `ubs --diff --only=rust,toml .` (exit 0)
+
 ## 0. Current Focus (2026-02-10): bd-3j44 (cascade delete/orphan tracking)
 
 ### 0.1 Implementation
