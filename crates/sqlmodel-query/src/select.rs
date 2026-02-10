@@ -1,7 +1,9 @@
 //! SELECT query builder.
 
 use crate::clause::{Limit, Offset, OrderBy, Where};
-use crate::eager::{EagerLoader, IncludePath, build_join_clause, find_relationship};
+use crate::eager::{
+    EagerLoader, IncludePath, build_aliased_column_parts, build_join_clause, find_relationship,
+};
 use crate::expr::{Dialect, Expr};
 use crate::join::Join;
 use crate::subquery::SelectQuery;
@@ -204,8 +206,6 @@ impl<M: Model> Select<M> {
         if let Some(loader) = &self.eager_loader {
             for include in loader.includes() {
                 if let Some(rel) = find_relationship::<M>(include.relationship) {
-                    // For now, we assume related model has same column structure
-                    // In practice, we'd need to look up the related Model's fields
                     join_info.push(EagerJoinInfo {
                         relationship_name: include.relationship,
                         related_table: rel.related_table,
@@ -213,9 +213,11 @@ impl<M: Model> Select<M> {
                         nested: include.nested.clone(),
                     });
 
-                    // Add aliased columns for related table
-                    // We select all columns and alias them
-                    col_parts.push(format!("{}.*", rel.related_table));
+                    // Add aliased columns for related table so callers can use
+                    // `row.subset_by_prefix(rel.related_table)` deterministically.
+                    let related_cols: Vec<&str> =
+                        (rel.related_fields_fn)().iter().map(|f| f.name).collect();
+                    col_parts.extend(build_aliased_column_parts(rel.related_table, &related_cols));
                 }
             }
         }
@@ -1090,6 +1092,39 @@ mod tests {
 
     use sqlmodel_core::RelationshipInfo;
 
+    /// A test team model for eager loading column projection.
+    #[derive(Debug, Clone)]
+    struct EagerTeam;
+
+    impl Model for EagerTeam {
+        const TABLE_NAME: &'static str = "teams";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", sqlmodel_core::SqlType::BigInt),
+                FieldInfo::new("name", "name", sqlmodel_core::SqlType::Text),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            Vec::new()
+        }
+
+        fn from_row(_row: &Row) -> Result<Self> {
+            Err(Error::Custom("not used in tests".to_string()))
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            Vec::new()
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
     /// A test hero model with relationships defined.
     #[derive(Debug, Clone)]
     struct EagerHero;
@@ -1100,6 +1135,7 @@ mod tests {
         const RELATIONSHIPS: &'static [RelationshipInfo] =
             &[
                 RelationshipInfo::new("team", "teams", RelationshipKind::ManyToOne)
+                    .related_fields(EagerTeam::fields)
                     .local_key("team_id"),
             ];
 
@@ -1154,6 +1190,10 @@ mod tests {
         assert!(sql.contains("heroes.id AS heroes__id"));
         assert!(sql.contains("heroes.name AS heroes__name"));
         assert!(sql.contains("heroes.team_id AS heroes__team_id"));
+
+        // Should have aliased columns for related table (so subset_by_prefix works)
+        assert!(sql.contains("teams.id AS teams__id"));
+        assert!(sql.contains("teams.name AS teams__name"));
 
         // Should have join info
         assert_eq!(join_info.len(), 1);
@@ -1324,17 +1364,14 @@ mod tests {
             .filter(Expr::raw("heroes.team_id = teams.id"))
             .into_exists();
 
-        // Note: We'd need a Team model to properly test this,
-        // but we can test the expr combination manually
-        let outer_expr = Expr::col("active").eq(true).and(has_heroes);
-
-        let mut params = Vec::new();
-        let sql = outer_expr.build(&mut params, 0);
+        let query = Select::<EagerTeam>::new().filter(Expr::col("active").eq(true).and(has_heroes));
+        let (sql, params) = query.build_with_dialect(Dialect::default());
 
         assert_eq!(
             sql,
-            "\"active\" = $1 AND EXISTS (SELECT 1 FROM heroes WHERE heroes.team_id = teams.id)"
+            "SELECT * FROM teams WHERE \"active\" = $1 AND EXISTS (SELECT 1 FROM heroes WHERE heroes.team_id = teams.id)"
         );
+        assert_eq!(params, vec![Value::Bool(true)]);
     }
 
     #[test]

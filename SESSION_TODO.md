@@ -88,3 +88,24 @@ Purpose: eliminate "comment-only" SQLite DDL behavior and fix doc/spec drift wit
 ### D3. Naming: deterministic, collision-safe constraint names
 - [x] Update expected schema extraction to name uniques as `uk_<table>_<columns...>` (not `uk_<col>`)
 - [x] Align CreateTable builder (`crates/sqlmodel-schema/src/create.rs`) to use same naming
+
+## E. "Would" / Stub Cleanup (bd-162)
+
+Goal: eliminate real behavior gaps hidden behind "we'd need ..." comments and ensure the code matches the stated parity goals.
+
+### E1. Eager SELECT must alias related columns (no `table.*`)
+- [x] Add `RelationshipInfo.related_fields_fn` so query builders can project related model columns deterministically
+- [x] Derive macro wires `.related_fields(<RelatedModel as Model>::fields)`
+- [x] Update `Select::build_eager_with_dialect()` to project `related_table.col AS related_table__col` (not `related_table.*`)
+- [x] Add tests asserting `teams.id AS teams__id` etc are present for eager join queries
+
+### E2. MySQL binary protocol temporal decoding must be structured (no "keep as text")
+- [x] Decode MySQL binary DATE into `Value::Date(days_since_epoch)` where possible
+- [x] Decode MySQL binary TIME into `Value::Time(microseconds)` (supports days + sign)
+- [x] Decode MySQL binary DATETIME/TIMESTAMP into `Value::Timestamp(microseconds_since_epoch)` where possible
+- [x] Add unit tests for DATE/TIME/DATETIME binary result decoding
+- [ ] Consider parsing text-protocol temporal strings in `decode_text_value` into structured `Value::*` (optional, but improves API consistency)
+
+### E3. Doc/Parity Drift: "Excluded" sections must become real tracked work
+- [ ] Audit `FEATURE_PARITY.md` for "Explicitly Excluded" content and reconcile with bd-162 (no exclusions)
+- [ ] Create/adjust beads for each formerly-excluded feature and link them to bd-162

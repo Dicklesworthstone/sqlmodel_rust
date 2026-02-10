@@ -240,7 +240,7 @@ fn generate_hybrid_methods(model: &ModelDef) -> proc_macro2::TokenStream {
 }
 
 /// Convert a referential action string to the corresponding token.
-fn referential_action_token(action: &str) -> proc_macro2::TokenStream {
+fn referential_action_ts(action: &str) -> proc_macro2::TokenStream {
     match action.to_uppercase().as_str() {
         "NO ACTION" | "NOACTION" | "NO_ACTION" => {
             quote::quote! { sqlmodel_core::ReferentialAction::NoAction }
@@ -259,7 +259,7 @@ fn referential_action_token(action: &str) -> proc_macro2::TokenStream {
 
 /// Generate the static FieldInfo array contents.
 fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
-    let mut field_tokens = Vec::new();
+    let mut field_ts = Vec::new();
 
     // Use data_fields() to include computed fields in metadata (needed for serialization)
     for field in model.data_fields() {
@@ -281,7 +281,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         let effective_sql_type = sa_col
             .and_then(|sc| sc.sql_type.as_ref())
             .or(field.sql_type.as_ref());
-        let sql_type_token = if let Some(sql_type_str) = effective_sql_type {
+        let sql_type_ts = if let Some(sql_type_str) = effective_sql_type {
             // Parse the explicit SQL type attribute string
             infer::parse_sql_type_attr(sql_type_str)
         } else {
@@ -290,7 +290,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         };
 
         // If sql_type attribute was provided, also store the raw string as an override for DDL.
-        let sql_type_override_token = if let Some(sql_type_str) = effective_sql_type {
+        let sql_type_override_ts = if let Some(sql_type_str) = effective_sql_type {
             quote::quote! { Some(#sql_type_str) }
         } else {
             quote::quote! { None }
@@ -300,14 +300,14 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         let effective_default = sa_col
             .and_then(|sc| sc.server_default.as_ref())
             .or(field.default.as_ref());
-        let default_token = if let Some(d) = effective_default {
+        let default_ts = if let Some(d) = effective_default {
             quote::quote! { Some(#d) }
         } else {
             quote::quote! { None }
         };
 
         // Foreign key (validation prevents use with sa_column, so field value is always used)
-        let fk_token = if let Some(fk) = &field.foreign_key {
+        let fk_ts = if let Some(fk) = &field.foreign_key {
             quote::quote! { Some(#fk) }
         } else {
             quote::quote! { None }
@@ -317,42 +317,42 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         let effective_index = sa_col
             .and_then(|sc| sc.index.as_ref())
             .or(field.index.as_ref());
-        let index_token = if let Some(idx) = effective_index {
+        let index_ts = if let Some(idx) = effective_index {
             quote::quote! { Some(#idx) }
         } else {
             quote::quote! { None }
         };
 
         // ON DELETE action
-        let on_delete_token = if let Some(ref action) = field.on_delete {
-            let action_token = referential_action_token(action);
-            quote::quote! { Some(#action_token) }
+        let on_delete_ts = if let Some(ref action) = field.on_delete {
+            let action_ts = referential_action_ts(action);
+            quote::quote! { Some(#action_ts) }
         } else {
             quote::quote! { None }
         };
 
         // ON UPDATE action
-        let on_update_token = if let Some(ref action) = field.on_update {
-            let action_token = referential_action_token(action);
-            quote::quote! { Some(#action_token) }
+        let on_update_ts = if let Some(ref action) = field.on_update {
+            let action_ts = referential_action_ts(action);
+            quote::quote! { Some(#action_ts) }
         } else {
             quote::quote! { None }
         };
 
         // Alias tokens
-        let alias_token = if let Some(ref alias) = field.alias {
+        let alias_ts = if let Some(ref alias) = field.alias {
             quote::quote! { Some(#alias) }
         } else {
             quote::quote! { None }
         };
 
-        let validation_alias_token = if let Some(ref val_alias) = field.validation_alias {
+        let validation_alias_ts = if let Some(ref val_alias) = field.validation_alias {
             quote::quote! { Some(#val_alias) }
         } else {
             quote::quote! { None }
         };
 
-        let serialization_alias_token = if let Some(ref ser_alias) = field.serialization_alias {
+        let serialization_alias_ts = if let Some(ref ser_alias) = field.serialization_alias {
             quote::quote! { Some(#ser_alias) }
         } else {
             quote::quote! { None }
@@ -362,26 +362,26 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         let exclude = field.exclude;
 
         // Schema metadata tokens
-        let title_token = if let Some(ref title) = field.title {
+        let title_ts = if let Some(ref title) = field.title {
             quote::quote! { Some(#title) }
         } else {
             quote::quote! { None }
         };
 
-        let description_token = if let Some(ref desc) = field.description {
+        let description_ts = if let Some(ref desc) = field.description {
             quote::quote! { Some(#desc) }
         } else {
             quote::quote! { None }
         };
 
-        let schema_extra_token = if let Some(ref extra) = field.schema_extra {
+        let schema_extra_ts = if let Some(ref extra) = field.schema_extra {
             quote::quote! { Some(#extra) }
         } else {
             quote::quote! { None }
         };
 
         // Default JSON for exclude_defaults support
-        let default_json_token = if let Some(ref dj) = field.default_json {
+        let default_json_ts = if let Some(ref dj) = field.default_json {
             quote::quote! { Some(#dj) }
         } else {
             quote::quote! { None }
@@ -397,7 +397,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         } else {
             field.column_constraints.iter().collect()
         };
-        let column_constraints_token = if effective_constraints.is_empty() {
+        let column_constraints_ts = if effective_constraints.is_empty() {
             quote::quote! { &[] }
         } else {
             quote::quote! { &[#(#effective_constraints),*] }
@@ -408,79 +408,79 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         let effective_comment = sa_col
             .and_then(|sc| sc.comment.as_ref())
             .or(field.column_comment.as_ref());
-        let column_comment_token = if let Some(comment) = effective_comment {
+        let column_comment_ts = if let Some(comment) = effective_comment {
             quote::quote! { Some(#comment) }
         } else {
             quote::quote! { None }
         };
 
         // Column info
-        let column_info_token = if let Some(ref info) = field.column_info {
+        let column_info_ts = if let Some(ref info) = field.column_info {
             quote::quote! { Some(#info) }
         } else {
             quote::quote! { None }
         };
 
         // Hybrid SQL expression
-        let hybrid_sql_token = if let Some(ref sql) = field.hybrid_sql {
+        let hybrid_sql_ts = if let Some(ref sql) = field.hybrid_sql {
             quote::quote! { Some(#sql) }
         } else {
             quote::quote! { None }
         };
 
         // Discriminator for union types
-        let discriminator_token = if let Some(ref disc) = field.discriminator {
+        let discriminator_ts = if let Some(ref disc) = field.discriminator {
             quote::quote! { Some(#disc) }
         } else {
             quote::quote! { None }
         };
 
         // Decimal precision (max_digits -> precision, decimal_places -> scale)
-        let precision_token = if let Some(p) = field.max_digits {
+        let precision_ts = if let Some(p) = field.max_digits {
             quote::quote! { Some(#p) }
         } else {
             quote::quote! { None }
         };
 
-        let scale_token = if let Some(s) = field.decimal_places {
+        let scale_ts = if let Some(s) = field.decimal_places {
             quote::quote! { Some(#s) }
         } else {
             quote::quote! { None }
         };
 
-        field_tokens.push(quote::quote! {
-            sqlmodel_core::FieldInfo::new(stringify!(#field_ident), #column_name, #sql_type_token)
-                .sql_type_override_opt(#sql_type_override_token)
-                .precision_opt(#precision_token)
-                .scale_opt(#scale_token)
+        field_ts.push(quote::quote! {
+            sqlmodel_core::FieldInfo::new(stringify!(#field_ident), #column_name, #sql_type_ts)
+                .sql_type_override_opt(#sql_type_override_ts)
+                .precision_opt(#precision_ts)
+                .scale_opt(#scale_ts)
                 .nullable(#nullable)
                 .primary_key(#primary_key)
                 .auto_increment(#auto_increment)
                 .unique(#unique)
-                .default_opt(#default_token)
-                .foreign_key_opt(#fk_token)
-                .on_delete_opt(#on_delete_token)
-                .on_update_opt(#on_update_token)
-                .index_opt(#index_token)
-                .alias_opt(#alias_token)
-                .validation_alias_opt(#validation_alias_token)
-                .serialization_alias_opt(#serialization_alias_token)
+                .default_opt(#default_ts)
+                .foreign_key_opt(#fk_ts)
+                .on_delete_opt(#on_delete_ts)
+                .on_update_opt(#on_update_ts)
+                .index_opt(#index_ts)
+                .alias_opt(#alias_ts)
+                .validation_alias_opt(#validation_alias_ts)
+                .serialization_alias_opt(#serialization_alias_ts)
                 .computed(#computed)
                 .exclude(#exclude)
-                .title_opt(#title_token)
-                .description_opt(#description_token)
-                .schema_extra_opt(#schema_extra_token)
-                .default_json_opt(#default_json_token)
+                .title_opt(#title_ts)
+                .description_opt(#description_ts)
+                .schema_extra_opt(#schema_extra_ts)
+                .default_json_opt(#default_json_ts)
                 .const_field(#const_field)
-                .column_constraints(#column_constraints_token)
-                .column_comment_opt(#column_comment_token)
-                .column_info_opt(#column_info_token)
-                .hybrid_sql_opt(#hybrid_sql_token)
-                .discriminator_opt(#discriminator_token)
+                .column_constraints(#column_constraints_ts)
+                .column_comment_opt(#column_comment_ts)
+                .column_info_opt(#column_info_ts)
+                .hybrid_sql_opt(#hybrid_sql_ts)
+                .discriminator_opt(#discriminator_ts)
         });
     }
 
-    quote::quote! { #(#field_tokens),* }
+    quote::quote! { #(#field_ts),* }
 }
 
 /// Generate the to_row method body.
@@ -664,20 +664,20 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
     let revalidate_instances = config.revalidate_instances;
 
     // Handle extra field behavior
-    let extra_token = match config.extra.as_str() {
+    let extra_ts = match config.extra.as_str() {
         "forbid" => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Forbid },
         "allow" => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Allow },
         _ => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Ignore },
     };
 
     // Handle optional string fields
-    let json_schema_extra_token = if let Some(ref extra) = config.json_schema_extra {
+    let json_schema_extra_ts = if let Some(ref extra) = config.json_schema_extra {
         quote::quote! { Some(#extra) }
     } else {
         quote::quote! { None }
     };
 
-    let title_token = if let Some(ref title) = config.title {
+    let title_ts = if let Some(ref title) = config.title {
         quote::quote! { Some(#title) }
     } else {
         quote::quote! { None }
@@ -688,15 +688,15 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
             table: #table,
             from_attributes: #from_attributes,
             validate_assignment: #validate_assignment,
-            extra: #extra_token,
+            extra: #extra_ts,
             strict: #strict,
             populate_by_name: #populate_by_name,
             use_enum_values: #use_enum_values,
             arbitrary_types_allowed: #arbitrary_types_allowed,
             defer_build: #defer_build,
             revalidate_instances: #revalidate_instances,
-            json_schema_extra: #json_schema_extra_token,
-            title: #title_token,
+            json_schema_extra: #json_schema_extra_ts,
+            title: #title_ts,
         }
     }
 }
@@ -708,7 +708,7 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
     let config = &model.config;
 
     // Determine the inheritance strategy token
-    let strategy_token = match config.inheritance {
+    let strategy_ts = match config.inheritance {
         InheritanceStrategy::None => {
             quote::quote! { sqlmodel_core::InheritanceStrategy::None }
         }
@@ -724,21 +724,21 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
     };
 
     // Handle parent model name
-    let parent_token = if let Some(ref parent) = config.inherits {
+    let parent_ts = if let Some(ref parent) = config.inherits {
         quote::quote! { Some(#parent) }
     } else {
         quote::quote! { None }
     };
 
     // Handle discriminator column (for base models)
-    let discriminator_column_token = if let Some(ref column) = config.discriminator_column {
+    let discriminator_column_ts = if let Some(ref column) = config.discriminator_column {
         quote::quote! { Some(#column) }
     } else {
         quote::quote! { None }
     };
 
     // Handle discriminator value (for child models)
-    let discriminator_value_token = if let Some(ref value) = config.discriminator_value {
+    let discriminator_value_ts = if let Some(ref value) = config.discriminator_value {
         quote::quote! { Some(#value) }
     } else {
         quote::quote! { None }
@@ -746,10 +746,10 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
 
     quote::quote! {
         sqlmodel_core::InheritanceInfo {
-            strategy: #strategy_token,
-            parent: #parent_token,
-            discriminator_column: #discriminator_column_token,
-            discriminator_value: #discriminator_value_token,
+            strategy: #strategy_ts,
+            parent: #parent_ts,
+            discriminator_column: #discriminator_column_ts,
+            discriminator_value: #discriminator_value_ts,
         }
     }
 }
@@ -766,7 +766,7 @@ fn generate_shard_key(model: &ModelDef) -> (proc_macro2::TokenStream, proc_macro
         // Find the shard key field to get its type info
         let shard_field = model.fields.iter().find(|f| f.name == shard_key_name);
 
-        let const_token = quote::quote! { Some(#shard_key_name) };
+        let const_ts = quote::quote! { Some(#shard_key_name) };
 
         // Generate the method body based on whether the field exists and its type
         let value_body = if let Some(field) = shard_field {
@@ -791,12 +791,12 @@ fn generate_shard_key(model: &ModelDef) -> (proc_macro2::TokenStream, proc_macro
             quote::quote! { None }
         };
 
-        (const_token, value_body)
+        (const_ts, value_body)
     } else {
         // No shard key configured
-        let const_token = quote::quote! { None };
+        let const_ts = quote::quote! { None };
         let value_body = quote::quote! { None };
-        (const_token, value_body)
+        (const_ts, value_body)
     }
 }
 
@@ -845,21 +845,51 @@ fn generate_debug_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
 /// Generate the RELATIONSHIPS constant from relationship fields.
 fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
+    fn relationship_inner_model_ty(ty: &syn::Type) -> Option<syn::Type> {
+        let syn::Type::Path(tp) = ty else {
+            return None;
+        };
+
+        let last = tp.path.segments.last()?;
+        let ident = last.ident.to_string();
+        if ident != "Related" && ident != "RelatedMany" && ident != "Lazy" {
+            return None;
+        }
+
+        let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+            return None;
+        };
+
+        args.args.iter().find_map(|arg| match arg {
+            syn::GenericArgument::Type(t) => Some(t.clone()),
+            _ => None,
+        })
+    }
+
     let relationship_fields = model.relationship_fields();
 
     if relationship_fields.is_empty() {
         return quote::quote! { &[] };
     }
 
-    let mut relationship_tokens = Vec::new();
+    let mut relationship_ts = Vec::new();
 
     for field in relationship_fields {
         let rel = field.relationship.as_ref().unwrap();
         let field_name = &field.name;
         let related_table = &rel.model;
 
+        let Some(related_ty) = relationship_inner_model_ty(&field.ty) else {
+            relationship_ts.push(quote::quote! {
+                ::core::compile_error!(
+                    "sqlmodel: relationship field type must be Related<T>, RelatedMany<T>, or Lazy<T>"
+                )
+            });
+            continue;
+        };
+
         // Determine RelationshipKind token
-        let kind_token = match rel.kind {
+        let kind_ts = match rel.kind {
             RelationshipKindAttr::OneToOne => {
                 quote::quote! { sqlmodel_core::RelationshipKind::OneToOne }
             }
@@ -906,7 +936,7 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
 
         let lazy_val = rel.lazy;
         let cascade_val = rel.cascade_delete;
-        let passive_deletes_token = match rel.passive_deletes {
+        let passive_deletes_ts = match rel.passive_deletes {
             crate::parse::PassiveDeletesAttr::Active => {
                 quote::quote! { sqlmodel_core::PassiveDeletes::Active }
             }
@@ -926,7 +956,7 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
         };
 
         let lazy_strategy_call = if let Some(ref strategy) = rel.lazy_strategy {
-            let strategy_token = match strategy {
+            let strategy_ts = match strategy {
                 crate::parse::LazyLoadStrategyAttr::Select => {
                     quote::quote! { sqlmodel_core::LazyLoadStrategy::Select }
                 }
@@ -952,7 +982,7 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
                     quote::quote! { sqlmodel_core::LazyLoadStrategy::WriteOnly }
                 }
             };
-            quote::quote! { .lazy_strategy(#strategy_token) }
+            quote::quote! { .lazy_strategy(#strategy_ts) }
         } else {
             quote::quote! {}
         };
@@ -969,19 +999,20 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
             quote::quote! {}
         };
 
-        relationship_tokens.push(quote::quote! {
+        relationship_ts.push(quote::quote! {
             sqlmodel_core::RelationshipInfo::new(
                 stringify!(#field_name),
                 #related_table,
-                #kind_token
+                #kind_ts
             )
+            .related_fields(<#related_ty as sqlmodel_core::Model>::fields)
             #local_key_call
             #remote_key_call
             #back_populates_call
             #link_table_call
             .lazy(#lazy_val)
             .cascade_delete(#cascade_val)
-            .passive_deletes(#passive_deletes_token)
+            .passive_deletes(#passive_deletes_ts)
             #order_by_call
             #lazy_strategy_call
             #cascade_call
@@ -990,7 +1021,7 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
     }
 
     quote::quote! {
-        &[#(#relationship_tokens),*]
+        &[#(#relationship_ts),*]
     }
 }
 

@@ -5,6 +5,7 @@
 //! builder, session/UoW, eager/lazy loaders) to generate correct SQL and load
 //! related objects without runtime reflection.
 
+use crate::field::FieldInfo;
 use crate::{Error, Model, Value};
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -98,7 +99,7 @@ impl LinkTableInfo {
 }
 
 /// Metadata about a relationship between models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct RelationshipInfo {
     /// Name of the relationship field.
     pub name: &'static str,
@@ -146,9 +147,43 @@ pub struct RelationshipInfo {
     /// - `Some(false)`: Always return a single item
     /// - `None`: Infer from field type
     pub uselist: Option<bool>,
+
+    /// Function pointer returning the related model's fields metadata.
+    ///
+    /// This keeps relationship metadata "zero-cost" (static + no allocation) while still
+    /// letting higher layers (query builder, eager loaders) build stable projections for
+    /// related models without runtime reflection.
+    pub related_fields_fn: fn() -> &'static [FieldInfo],
 }
 
+impl PartialEq for RelationshipInfo {
+    fn eq(&self, other: &Self) -> bool {
+        // Intentionally ignore `related_fields_fn`: function-pointer equality is not stable
+        // across codegen units and is not part of the semantic identity of a relationship.
+        self.name == other.name
+            && self.related_table == other.related_table
+            && self.kind == other.kind
+            && self.local_key == other.local_key
+            && self.remote_key == other.remote_key
+            && self.link_table == other.link_table
+            && self.back_populates == other.back_populates
+            && self.lazy == other.lazy
+            && self.cascade_delete == other.cascade_delete
+            && self.passive_deletes == other.passive_deletes
+            && self.order_by == other.order_by
+            && self.lazy_strategy == other.lazy_strategy
+            && self.cascade == other.cascade
+            && self.uselist == other.uselist
+    }
+}
+
+impl Eq for RelationshipInfo {}
+
 impl RelationshipInfo {
+    fn empty_related_fields() -> &'static [FieldInfo] {
+        &[]
+    }
+
     /// Create a new relationship with required fields.
     #[must_use]
     pub const fn new(
@@ -171,7 +206,18 @@ impl RelationshipInfo {
             lazy_strategy: None,
             cascade: None,
             uselist: None,
+            related_fields_fn: Self::empty_related_fields,
         }
+    }
+
+    /// Provide the related model's `Model::fields()` function pointer.
+    ///
+    /// Derive macros should set this for relationship fields so query builders can
+    /// project and alias the related columns deterministically.
+    #[must_use]
+    pub const fn related_fields(mut self, f: fn() -> &'static [FieldInfo]) -> Self {
+        self.related_fields_fn = f;
+        self
     }
 
     /// Set the local foreign key column (ManyToOne).
@@ -1939,6 +1985,7 @@ mod tests {
             lazy_strategy: None,
             cascade: None,
             uselist: None,
+            related_fields_fn: TeamWithRelationships::fields,
         }];
 
         fn fields() -> &'static [FieldInfo] {
@@ -1993,6 +2040,7 @@ mod tests {
             lazy_strategy: None,
             cascade: None,
             uselist: None,
+            related_fields_fn: Hero::fields,
         }];
 
         fn fields() -> &'static [FieldInfo] {

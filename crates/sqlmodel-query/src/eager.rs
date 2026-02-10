@@ -208,12 +208,19 @@ pub fn build_join_clause(
 ///
 /// Prefixes each column with the table name to avoid conflicts.
 #[must_use]
-pub fn build_aliased_columns(table_name: &str, columns: &[&str]) -> String {
+pub fn build_aliased_column_parts(table_name: &str, columns: &[&str]) -> Vec<String> {
     columns
         .iter()
         .map(|col| format!("{}.{} AS {}__{}", table_name, col, table_name, col))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
+}
+
+/// Generate aliased column list for eager loading.
+///
+/// Prefixes each column with the table name to avoid conflicts.
+#[must_use]
+pub fn build_aliased_columns(table_name: &str, columns: &[&str]) -> String {
+    build_aliased_column_parts(table_name, columns).join(", ")
 }
 
 #[cfg(test)]

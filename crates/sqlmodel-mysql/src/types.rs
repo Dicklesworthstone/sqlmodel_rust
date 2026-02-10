@@ -499,11 +499,7 @@ pub fn decode_binary_value(field_type: FieldType, data: &[u8], is_unsigned: bool
         | FieldType::Timestamp
         | FieldType::Time2
         | FieldType::DateTime2
-        | FieldType::Timestamp2 => {
-            // For now, keep as text (we'd need more complex parsing for binary date/time)
-            // The text representation is more portable
-            Value::Text(decode_binary_datetime(field_type, data))
-        }
+        | FieldType::Timestamp2 => decode_binary_temporal_value(field_type, data),
 
         // Decimal types - keep as text for precision
         FieldType::Decimal | FieldType::NewDecimal => {
@@ -515,68 +511,152 @@ pub fn decode_binary_value(field_type: FieldType, data: &[u8], is_unsigned: bool
     }
 }
 
-/// Decode binary date/time values to ISO format strings.
-fn decode_binary_datetime(field_type: FieldType, data: &[u8]) -> String {
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Convert (year, month, day) to days since Unix epoch (1970-01-01), if valid.
+///
+/// Inverse of `days_to_ymd()` in `protocol/prepared.rs` (Howard Hinnant algorithm).
+fn ymd_to_days_since_unix_epoch(year: i32, month: u32, day: u32) -> Option<i32> {
+    if year <= 0 || !(1..=12).contains(&month) {
+        return None;
+    }
+    let dim = days_in_month(year, month);
+    if day == 0 || day > dim {
+        return None;
+    }
+
+    let mut y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+
+    // Shift Jan/Feb to previous year.
+    y -= if m <= 2 { 1 } else { 0 };
+
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = m + if m > 2 { -3 } else { 9 }; // March=0..Feb=11
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let z = era * 146_097 + doe - 719_468; // 1970-01-01 -> 0
+
+    i32::try_from(z).ok()
+}
+
+fn decode_binary_temporal_value(field_type: FieldType, data: &[u8]) -> Value {
     match field_type {
         FieldType::Date | FieldType::NewDate => {
-            if data.len() >= 4 {
-                let year = u16::from_le_bytes([data[0], data[1]]);
-                let month = data[2];
-                let day = data[3];
-                format!("{year:04}-{month:02}-{day:02}")
-            } else {
-                // Empty or insufficient data returns zero date
-                "0000-00-00".to_string()
+            if data.len() < 4 {
+                return Value::Text("0000-00-00".to_string());
+            }
+            let year = i32::from(u16::from_le_bytes([data[0], data[1]]));
+            let month = u32::from(data[2]);
+            let day = u32::from(data[3]);
+
+            match ymd_to_days_since_unix_epoch(year, month, day) {
+                Some(days) => Value::Date(days),
+                None => Value::Text(format!("{year:04}-{month:02}-{day:02}")),
             }
         }
 
         FieldType::Time | FieldType::Time2 => {
-            if data.len() >= 8 {
-                let is_negative = data[0] != 0;
-                let days = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                let hours = data[5];
-                let minutes = data[6];
-                let seconds = data[7];
-                let total_hours = days * 24 + u32::from(hours);
-                let sign = if is_negative { "-" } else { "" };
-                format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}")
-            } else {
-                // Empty or insufficient data returns zero time
-                "00:00:00".to_string()
+            if data.len() < 8 {
+                return Value::Text("00:00:00".to_string());
             }
+            let is_negative = data[0] != 0;
+            let days = i64::from(u32::from_le_bytes([data[1], data[2], data[3], data[4]]));
+            let hours = i64::from(data[5]);
+            let minutes = i64::from(data[6]);
+            let seconds = i64::from(data[7]);
+            let micros = if data.len() >= 12 {
+                i64::from(u32::from_le_bytes([data[8], data[9], data[10], data[11]]))
+            } else {
+                0
+            };
+
+            let total_seconds = days
+                .saturating_mul(24)
+                .saturating_add(hours) // hours is 0..23 in MySQL binary format
+                .saturating_mul(3600)
+                .saturating_add(minutes.saturating_mul(60))
+                .saturating_add(seconds);
+            let total_micros = total_seconds
+                .saturating_mul(1_000_000)
+                .saturating_add(micros);
+
+            let signed = if is_negative {
+                -total_micros
+            } else {
+                total_micros
+            };
+            Value::Time(signed)
         }
 
         FieldType::DateTime
         | FieldType::Timestamp
         | FieldType::DateTime2
         | FieldType::Timestamp2 => {
-            if data.len() >= 7 {
-                let year = u16::from_le_bytes([data[0], data[1]]);
-                let month = data[2];
-                let day = data[3];
-                let hour = data[4];
-                let minute = data[5];
-                let second = data[6];
-
-                if data.len() >= 11 {
-                    let microseconds = u32::from_le_bytes([data[7], data[8], data[9], data[10]]);
-                    format!(
-                        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microseconds:06}"
-                    )
-                } else {
-                    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
-                }
-            } else if data.len() >= 4 {
-                let year = u16::from_le_bytes([data[0], data[1]]);
-                let month = data[2];
-                let day = data[3];
-                format!("{year:04}-{month:02}-{day:02} 00:00:00")
-            } else {
-                "0000-00-00 00:00:00".to_string()
+            if data.len() < 4 {
+                return Value::Text("0000-00-00 00:00:00".to_string());
             }
+
+            let year = i32::from(u16::from_le_bytes([data[0], data[1]]));
+            let month = u32::from(data[2]);
+            let day = u32::from(data[3]);
+
+            let (hour, minute, second, micros) = if data.len() >= 7 {
+                let hour = u32::from(data[4]);
+                let minute = u32::from(data[5]);
+                let second = u32::from(data[6]);
+                let micros = if data.len() >= 11 {
+                    u32::from_le_bytes([data[7], data[8], data[9], data[10]])
+                } else {
+                    0
+                };
+                (hour, minute, second, micros)
+            } else {
+                (0, 0, 0, 0)
+            };
+
+            let Some(days) = ymd_to_days_since_unix_epoch(year, month, day) else {
+                // Preserve zero/invalid date semantics without inventing a bogus epoch value.
+                return Value::Text(format!(
+                    "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+                ));
+            };
+
+            let day_us = i128::from(days) * 86_400_i128 * 1_000_000_i128;
+            let tod_us =
+                (i128::from(hour) * 3_600_i128 + i128::from(minute) * 60_i128 + i128::from(second))
+                    * 1_000_000_i128
+                    + i128::from(micros);
+            let total = day_us + tod_us;
+            let Ok(total_i64) = i64::try_from(total) else {
+                return Value::Text(format!(
+                    "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+                ));
+            };
+
+            Value::Timestamp(total_i64)
         }
 
-        _ => String::from_utf8_lossy(data).into_owned(),
+        _ => Value::Text(String::from_utf8_lossy(data).into_owned()),
     }
 }
 
@@ -722,13 +802,8 @@ pub fn decode_binary_value_with_len(
             if data.len() < 1 + len || len < 4 {
                 return (Value::Null, 1);
             }
-            let year = u16::from_le_bytes([data[1], data[2]]);
-            let month = data[3];
-            let day = data[4];
-            (
-                Value::Text(format!("{year:04}-{month:02}-{day:02}")),
-                1 + len,
-            )
+            let value = decode_binary_temporal_value(field_type, &data[1..=len]);
+            (value, 1 + len)
         }
 
         FieldType::Time | FieldType::Time2 => {
@@ -742,17 +817,8 @@ pub fn decode_binary_value_with_len(
             if data.len() < 1 + len || len < 8 {
                 return (Value::Text("00:00:00".to_string()), 1);
             }
-            let is_negative = data[1] != 0;
-            let days = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
-            let hours = data[6];
-            let minutes = data[7];
-            let seconds = data[8];
-            let total_hours = days * 24 + u32::from(hours);
-            let sign = if is_negative { "-" } else { "" };
-            (
-                Value::Text(format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}")),
-                1 + len,
-            )
+            let value = decode_binary_temporal_value(field_type, &data[1..=len]);
+            (value, 1 + len)
         }
 
         FieldType::DateTime
@@ -769,37 +835,8 @@ pub fn decode_binary_value_with_len(
             if data.len() < 1 + len {
                 return (Value::Null, 1);
             }
-            if len >= 4 {
-                let year = u16::from_le_bytes([data[1], data[2]]);
-                let month = data[3];
-                let day = data[4];
-                if len >= 7 {
-                    let hour = data[5];
-                    let minute = data[6];
-                    let second = data[7];
-                    if len >= 11 {
-                        let microseconds =
-                            u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                        return (
-                            Value::Text(format!(
-                                "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microseconds:06}"
-                            )),
-                            1 + len,
-                        );
-                    }
-                    return (
-                        Value::Text(format!(
-                            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
-                        )),
-                        1 + len,
-                    );
-                }
-                return (
-                    Value::Text(format!("{year:04}-{month:02}-{day:02} 00:00:00")),
-                    1 + len,
-                );
-            }
-            (Value::Text("0000-00-00 00:00:00".to_string()), 1 + len)
+            let value = decode_binary_temporal_value(field_type, &data[1..=len]);
+            (value, 1 + len)
         }
 
         // Variable-length types with length-encoded prefix
@@ -1191,11 +1228,7 @@ mod tests {
     #[allow(clippy::approx_constant)]
     fn test_decode_text_float() {
         let val = decode_text_value(FieldType::Double, b"3.14", false);
-        if let Value::Double(f) = val {
-            assert!((f - 3.14).abs() < 0.001);
-        } else {
-            panic!("Expected double");
-        }
+        assert!(matches!(val, Value::Double(f) if (f - 3.14).abs() < 0.001));
     }
 
     #[test]
@@ -1227,11 +1260,65 @@ mod tests {
     fn test_decode_binary_double() {
         let pi_bytes = 3.14159_f64.to_le_bytes();
         let val = decode_binary_value(FieldType::Double, &pi_bytes, false);
-        if let Value::Double(f) = val {
-            assert!((f - 3.14159).abs() < 0.00001);
-        } else {
-            panic!("Expected double");
-        }
+        assert!(matches!(val, Value::Double(f) if (f - 3.14159).abs() < 0.00001));
+    }
+
+    #[test]
+    fn test_decode_binary_date_with_len_to_value_date() {
+        // 2024-02-29
+        let mut buf = Vec::new();
+        buf.push(4);
+        buf.extend_from_slice(&2024_u16.to_le_bytes());
+        buf.push(2);
+        buf.push(29);
+
+        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::Date, false);
+        assert_eq!(consumed, 5);
+
+        let expected_days = ymd_to_days_since_unix_epoch(2024, 2, 29).unwrap();
+        assert_eq!(val, Value::Date(expected_days));
+    }
+
+    #[test]
+    fn test_decode_binary_time_with_len_to_value_time() {
+        // +1 day 02:03:04.000005
+        let mut buf = Vec::new();
+        buf.push(12);
+        buf.push(0); // positive
+        buf.extend_from_slice(&1_u32.to_le_bytes());
+        buf.push(2);
+        buf.push(3);
+        buf.push(4);
+        buf.extend_from_slice(&5_u32.to_le_bytes());
+
+        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::Time, false);
+        assert_eq!(consumed, 13);
+
+        let total_seconds = (24_i64 + 2) * 3600 + 3 * 60 + 4;
+        let expected = total_seconds * 1_000_000 + 5;
+        assert_eq!(val, Value::Time(expected));
+    }
+
+    #[test]
+    fn test_decode_binary_datetime_with_len_to_value_timestamp() {
+        // 2020-01-02 03:04:05.000006
+        let mut buf = Vec::new();
+        buf.push(11);
+        buf.extend_from_slice(&2020_u16.to_le_bytes());
+        buf.push(1);
+        buf.push(2);
+        buf.push(3);
+        buf.push(4);
+        buf.push(5);
+        buf.extend_from_slice(&6_u32.to_le_bytes());
+
+        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::DateTime, false);
+        assert_eq!(consumed, 12);
+
+        let days = i64::from(ymd_to_days_since_unix_epoch(2020, 1, 2).unwrap());
+        let tod_us = ((3_i64 * 3600 + 4 * 60 + 5) * 1_000_000) + 6;
+        let expected = days * 86_400 * 1_000_000 + tod_us;
+        assert_eq!(val, Value::Timestamp(expected));
     }
 
     #[test]
