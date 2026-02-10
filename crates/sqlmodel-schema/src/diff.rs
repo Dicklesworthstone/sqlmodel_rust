@@ -15,11 +15,11 @@ fn fk_effective_name(table: &str, fk: &ForeignKeyInfo) -> String {
         .unwrap_or_else(|| format!("fk_{}_{}", table, fk.column))
 }
 
-fn unique_effective_name(constraint: &UniqueConstraintInfo) -> String {
+fn unique_effective_name(table: &str, constraint: &UniqueConstraintInfo) -> String {
     constraint
         .name
         .clone()
-        .unwrap_or_else(|| format!("uk_{}", constraint.columns.join("_")))
+        .unwrap_or_else(|| format!("uk_{}_{}", table, constraint.columns.join("_")))
 }
 
 // ============================================================================
@@ -83,24 +83,44 @@ pub enum SchemaOperation {
 
     // Primary Keys
     /// Add a primary key constraint.
-    AddPrimaryKey { table: String, columns: Vec<String> },
+    AddPrimaryKey {
+        table: String,
+        columns: Vec<String>,
+        table_info: Option<TableInfo>,
+    },
     /// Drop a primary key constraint.
-    DropPrimaryKey { table: String },
+    DropPrimaryKey {
+        table: String,
+        table_info: Option<TableInfo>,
+    },
 
     // Foreign Keys
     /// Add a foreign key constraint.
-    AddForeignKey { table: String, fk: ForeignKeyInfo },
+    AddForeignKey {
+        table: String,
+        fk: ForeignKeyInfo,
+        table_info: Option<TableInfo>,
+    },
     /// Drop a foreign key constraint.
-    DropForeignKey { table: String, name: String },
+    DropForeignKey {
+        table: String,
+        name: String,
+        table_info: Option<TableInfo>,
+    },
 
     // Unique Constraints
     /// Add a unique constraint.
     AddUnique {
         table: String,
         constraint: UniqueConstraintInfo,
+        table_info: Option<TableInfo>,
     },
     /// Drop a unique constraint.
-    DropUnique { table: String, name: String },
+    DropUnique {
+        table: String,
+        name: String,
+        table_info: Option<TableInfo>,
+    },
 
     // Indexes
     /// Create an index.
@@ -192,16 +212,23 @@ impl SchemaOperation {
             }
             SchemaOperation::AddPrimaryKey { table, .. } => Some(SchemaOperation::DropPrimaryKey {
                 table: table.clone(),
+                table_info: None,
             }),
             SchemaOperation::DropPrimaryKey { .. } => None,
-            SchemaOperation::AddForeignKey { table, fk } => Some(SchemaOperation::DropForeignKey {
-                table: table.clone(),
-                name: fk_effective_name(table, fk),
-            }),
+            SchemaOperation::AddForeignKey { table, fk, .. } => {
+                Some(SchemaOperation::DropForeignKey {
+                    table: table.clone(),
+                    name: fk_effective_name(table, fk),
+                    table_info: None,
+                })
+            }
             SchemaOperation::DropForeignKey { .. } => None,
-            SchemaOperation::AddUnique { table, constraint } => Some(SchemaOperation::DropUnique {
+            SchemaOperation::AddUnique {
+                table, constraint, ..
+            } => Some(SchemaOperation::DropUnique {
                 table: table.clone(),
-                name: unique_effective_name(constraint),
+                name: unique_effective_name(table, constraint),
+                table_info: None,
             }),
             SchemaOperation::DropUnique { .. } => None,
             SchemaOperation::CreateIndex { table, index } => Some(SchemaOperation::DropIndex {
@@ -225,7 +252,7 @@ impl SchemaOperation {
             | SchemaOperation::AlterColumnDefault { table, .. }
             | SchemaOperation::RenameColumn { table, .. }
             | SchemaOperation::AddPrimaryKey { table, .. }
-            | SchemaOperation::DropPrimaryKey { table }
+            | SchemaOperation::DropPrimaryKey { table, .. }
             | SchemaOperation::AddForeignKey { table, .. }
             | SchemaOperation::DropForeignKey { table, .. }
             | SchemaOperation::AddUnique { table, .. }
@@ -524,18 +551,13 @@ fn diff_table(current: &TableInfo, expected: &TableInfo, dialect: Dialect, diff:
     diff_columns(current, expected, dialect, diff);
 
     // Diff primary key
-    diff_primary_key(table, &current.primary_key, &expected.primary_key, diff);
+    diff_primary_key(current, &expected.primary_key, diff);
 
     // Diff foreign keys
-    diff_foreign_keys(table, &current.foreign_keys, &expected.foreign_keys, diff);
+    diff_foreign_keys(current, &expected.foreign_keys, diff);
 
     // Diff unique constraints
-    diff_unique_constraints(
-        table,
-        &current.unique_constraints,
-        &expected.unique_constraints,
-        diff,
-    );
+    diff_unique_constraints(current, &expected.unique_constraints, diff);
 
     // Diff indexes
     diff_indexes(table, &current.indexes, &expected.indexes, diff);
@@ -685,7 +707,10 @@ fn diff_column_details(
 }
 
 /// Compare primary keys.
-fn diff_primary_key(table: &str, current: &[String], expected: &[String], diff: &mut SchemaDiff) {
+fn diff_primary_key(current_table: &TableInfo, expected_pk: &[String], diff: &mut SchemaDiff) {
+    let table = current_table.name.as_str();
+    let current = current_table.primary_key.as_slice();
+    let expected = expected_pk;
     let current_set: HashSet<&str> = current.iter().map(|s| s.as_str()).collect();
     let expected_set: HashSet<&str> = expected.iter().map(|s| s.as_str()).collect();
 
@@ -694,6 +719,7 @@ fn diff_primary_key(table: &str, current: &[String], expected: &[String], diff: 
         if !current.is_empty() {
             diff.add_op(SchemaOperation::DropPrimaryKey {
                 table: table.to_string(),
+                table_info: Some(current_table.clone()),
             });
         }
 
@@ -702,6 +728,7 @@ fn diff_primary_key(table: &str, current: &[String], expected: &[String], diff: 
             diff.add_op(SchemaOperation::AddPrimaryKey {
                 table: table.to_string(),
                 columns: expected.to_vec(),
+                table_info: Some(current_table.clone()),
             });
         }
     }
@@ -709,11 +736,12 @@ fn diff_primary_key(table: &str, current: &[String], expected: &[String], diff: 
 
 /// Compare foreign keys.
 fn diff_foreign_keys(
-    table: &str,
-    current: &[ForeignKeyInfo],
+    current_table: &TableInfo,
     expected: &[ForeignKeyInfo],
     diff: &mut SchemaDiff,
 ) {
+    let table = current_table.name.as_str();
+    let current = current_table.foreign_keys.as_slice();
     // Build maps by column (since names may differ or be auto-generated)
     let current_map: HashMap<&str, &ForeignKeyInfo> =
         current.iter().map(|fk| (fk.column.as_str(), fk)).collect();
@@ -726,6 +754,7 @@ fn diff_foreign_keys(
             diff.add_op(SchemaOperation::AddForeignKey {
                 table: table.to_string(),
                 fk: (*fk).clone(),
+                table_info: Some(current_table.clone()),
             });
         }
     }
@@ -737,6 +766,7 @@ fn diff_foreign_keys(
             diff.add_op(SchemaOperation::DropForeignKey {
                 table: table.to_string(),
                 name,
+                table_info: Some(current_table.clone()),
             });
         }
     }
@@ -750,10 +780,12 @@ fn diff_foreign_keys(
                 diff.add_op(SchemaOperation::DropForeignKey {
                     table: table.to_string(),
                     name,
+                    table_info: Some(current_table.clone()),
                 });
                 diff.add_op(SchemaOperation::AddForeignKey {
                     table: table.to_string(),
                     fk: (*expected_fk).clone(),
+                    table_info: Some(current_table.clone()),
                 });
             }
         }
@@ -770,11 +802,12 @@ fn fk_matches(current: &ForeignKeyInfo, expected: &ForeignKeyInfo) -> bool {
 
 /// Compare unique constraints.
 fn diff_unique_constraints(
-    table: &str,
-    current: &[UniqueConstraintInfo],
+    current_table: &TableInfo,
     expected: &[UniqueConstraintInfo],
     diff: &mut SchemaDiff,
 ) {
+    let table = current_table.name.as_str();
+    let current = current_table.unique_constraints.as_slice();
     // Build sets of column combinations
     let current_set: HashSet<Vec<&str>> = current
         .iter()
@@ -792,6 +825,7 @@ fn diff_unique_constraints(
             diff.add_op(SchemaOperation::AddUnique {
                 table: table.to_string(),
                 constraint: constraint.clone(),
+                table_info: Some(current_table.clone()),
             });
         }
     }
@@ -800,10 +834,11 @@ fn diff_unique_constraints(
     for constraint in current {
         let cols: Vec<&str> = constraint.columns.iter().map(|s| s.as_str()).collect();
         if !expected_set.contains(&cols) {
-            let name = unique_effective_name(constraint);
+            let name = unique_effective_name(table, constraint);
             diff.add_op(SchemaOperation::DropUnique {
                 table: table.to_string(),
                 name,
+                table_info: Some(current_table.clone()),
             });
         }
     }
@@ -1370,10 +1405,80 @@ mod tests {
         expected.tables.insert("heroes".to_string(), heroes);
 
         let diff = schema_diff(&current, &expected);
-        assert!(diff
-            .operations
-            .iter()
-            .any(|op| matches!(op, SchemaOperation::AddForeignKey { table, fk } if table == "heroes" && fk.column == "team_id")));
+        let op = diff.operations.iter().find_map(|op| match op {
+            SchemaOperation::AddForeignKey {
+                table,
+                fk,
+                table_info,
+            } if table == "heroes" && fk.column == "team_id" => Some(table_info),
+            _ => None,
+        });
+        assert!(op.is_some(), "Expected AddForeignKey op for heroes.team_id");
+        assert!(
+            op.unwrap().is_some(),
+            "Expected table_info on AddForeignKey op"
+        );
+    }
+
+    #[test]
+    fn test_schema_diff_primary_key_add_attaches_table_info() {
+        let mut current = DatabaseSchema::new(Dialect::Sqlite);
+        let mut current_table = make_table("heroes", vec![make_column("id", "INTEGER", false)]);
+        current_table.primary_key.clear();
+        current.tables.insert("heroes".to_string(), current_table);
+
+        let mut expected = DatabaseSchema::new(Dialect::Sqlite);
+        let mut expected_table = make_table("heroes", vec![make_column("id", "INTEGER", false)]);
+        expected_table.primary_key = vec!["id".to_string()];
+        expected.tables.insert("heroes".to_string(), expected_table);
+
+        let diff = schema_diff(&current, &expected);
+        let op = diff.operations.iter().find_map(|op| match op {
+            SchemaOperation::AddPrimaryKey {
+                table,
+                columns,
+                table_info,
+            } if table == "heroes" && columns == &vec!["id".to_string()] => Some(table_info),
+            _ => None,
+        });
+        assert!(op.is_some(), "Expected AddPrimaryKey op for heroes(id)");
+        assert!(
+            op.unwrap().is_some(),
+            "Expected table_info on AddPrimaryKey op"
+        );
+    }
+
+    #[test]
+    fn test_schema_diff_unique_add_attaches_table_info() {
+        let mut current = DatabaseSchema::new(Dialect::Sqlite);
+        current.tables.insert(
+            "heroes".to_string(),
+            make_table("heroes", vec![make_column("name", "TEXT", false)]),
+        );
+
+        let mut expected = DatabaseSchema::new(Dialect::Sqlite);
+        let mut expected_table = make_table("heroes", vec![make_column("name", "TEXT", false)]);
+        expected_table
+            .unique_constraints
+            .push(UniqueConstraintInfo {
+                name: Some("uk_heroes_name".to_string()),
+                columns: vec!["name".to_string()],
+            });
+        expected.tables.insert("heroes".to_string(), expected_table);
+
+        let diff = schema_diff(&current, &expected);
+        let op = diff.operations.iter().find_map(|op| match op {
+            SchemaOperation::AddUnique {
+                table,
+                constraint,
+                table_info,
+            } if table == "heroes" && constraint.columns == vec!["name".to_string()] => {
+                Some(table_info)
+            }
+            _ => None,
+        });
+        assert!(op.is_some(), "Expected AddUnique op for heroes(name)");
+        assert!(op.unwrap().is_some(), "Expected table_info on AddUnique op");
     }
 
     #[test]
@@ -1416,10 +1521,12 @@ mod tests {
                 on_delete: None,
                 on_update: None,
             },
+            table_info: None,
         });
         diff.add_op(SchemaOperation::DropForeignKey {
             table: "old".to_string(),
             name: "fk_old".to_string(),
+            table_info: None,
         });
         diff.add_op(SchemaOperation::AddColumn {
             table: "heroes".to_string(),

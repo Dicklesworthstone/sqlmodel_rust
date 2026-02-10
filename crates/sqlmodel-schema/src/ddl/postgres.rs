@@ -24,7 +24,14 @@ impl DdlGenerator for PostgresDdlGenerator {
         let statements = match op {
             // Tables
             SchemaOperation::CreateTable(table) => {
-                vec![generate_create_table(table, Dialect::Postgres)]
+                let mut stmts = vec![generate_create_table(table, Dialect::Postgres)];
+                for idx in &table.indexes {
+                    if idx.primary {
+                        continue;
+                    }
+                    stmts.push(generate_create_index(&table.name, idx, Dialect::Postgres));
+                }
+                stmts
             }
             SchemaOperation::DropTable(name) => {
                 vec![generate_drop_table(name, Dialect::Postgres)]
@@ -105,7 +112,7 @@ impl DdlGenerator for PostgresDdlGenerator {
             }
 
             // Primary Keys
-            SchemaOperation::AddPrimaryKey { table, columns } => {
+            SchemaOperation::AddPrimaryKey { table, columns, .. } => {
                 let cols: Vec<String> = columns
                     .iter()
                     .map(|c| quote_identifier(c, Dialect::Postgres))
@@ -117,7 +124,7 @@ impl DdlGenerator for PostgresDdlGenerator {
                     cols.join(", ")
                 )]
             }
-            SchemaOperation::DropPrimaryKey { table } => {
+            SchemaOperation::DropPrimaryKey { table, .. } => {
                 // PostgreSQL requires the constraint name, which is typically {table}_pkey
                 let constraint_name = format!("{}_pkey", table);
                 vec![format!(
@@ -128,7 +135,7 @@ impl DdlGenerator for PostgresDdlGenerator {
             }
 
             // Foreign Keys
-            SchemaOperation::AddForeignKey { table, fk } => {
+            SchemaOperation::AddForeignKey { table, fk, .. } => {
                 let constraint_name = fk
                     .name
                     .clone()
@@ -140,7 +147,7 @@ impl DdlGenerator for PostgresDdlGenerator {
                     format_fk_constraint(fk, Dialect::Postgres)
                 )]
             }
-            SchemaOperation::DropForeignKey { table, name } => {
+            SchemaOperation::DropForeignKey { table, name, .. } => {
                 vec![format!(
                     "ALTER TABLE {} DROP CONSTRAINT {}",
                     quote_identifier(table, Dialect::Postgres),
@@ -149,7 +156,9 @@ impl DdlGenerator for PostgresDdlGenerator {
             }
 
             // Unique Constraints
-            SchemaOperation::AddUnique { table, constraint } => {
+            SchemaOperation::AddUnique {
+                table, constraint, ..
+            } => {
                 let cols: Vec<String> = constraint
                     .columns
                     .iter()
@@ -166,7 +175,7 @@ impl DdlGenerator for PostgresDdlGenerator {
                     cols.join(", ")
                 )]
             }
-            SchemaOperation::DropUnique { table, name } => {
+            SchemaOperation::DropUnique { table, name, .. } => {
                 vec![format!(
                     "ALTER TABLE {} DROP CONSTRAINT {}",
                     quote_identifier(table, Dialect::Postgres),
@@ -246,6 +255,34 @@ mod tests {
         assert_eq!(stmts.len(), 1);
         assert!(stmts[0].contains("CREATE TABLE IF NOT EXISTS"));
         assert!(stmts[0].contains("\"heroes\""));
+    }
+
+    #[test]
+    fn test_create_table_emits_indexes() {
+        let ddl = PostgresDdlGenerator;
+        let mut table = make_table(
+            "heroes",
+            vec![
+                make_column("id", "SERIAL", false),
+                make_column("name", "VARCHAR(100)", false),
+            ],
+            vec!["id"],
+        );
+        table.indexes.push(IndexInfo {
+            name: "idx_heroes_name".to_string(),
+            columns: vec!["name".to_string()],
+            unique: false,
+            index_type: Some("btree".to_string()),
+            primary: false,
+        });
+
+        let op = SchemaOperation::CreateTable(table);
+        let stmts = ddl.generate(&op);
+
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(stmts[1].contains("CREATE INDEX"));
+        assert!(stmts[1].contains("\"idx_heroes_name\""));
     }
 
     #[test]
@@ -403,6 +440,7 @@ mod tests {
         let op = SchemaOperation::AddPrimaryKey {
             table: "heroes".to_string(),
             columns: vec!["id".to_string()],
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
@@ -415,6 +453,7 @@ mod tests {
         let ddl = PostgresDdlGenerator;
         let op = SchemaOperation::DropPrimaryKey {
             table: "heroes".to_string(),
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
@@ -436,6 +475,7 @@ mod tests {
                 on_delete: Some("CASCADE".to_string()),
                 on_update: None,
             },
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
@@ -451,6 +491,7 @@ mod tests {
         let op = SchemaOperation::DropForeignKey {
             table: "heroes".to_string(),
             name: "fk_heroes_team".to_string(),
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
@@ -468,6 +509,7 @@ mod tests {
                 name: Some("uk_heroes_name".to_string()),
                 columns: vec!["name".to_string()],
             },
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
@@ -482,6 +524,7 @@ mod tests {
         let op = SchemaOperation::DropUnique {
             table: "heroes".to_string(),
             name: "uk_heroes_name".to_string(),
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
@@ -553,6 +596,7 @@ mod tests {
         let op = SchemaOperation::AddPrimaryKey {
             table: "hero_team".to_string(),
             columns: vec!["hero_id".to_string(), "team_id".to_string()],
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 

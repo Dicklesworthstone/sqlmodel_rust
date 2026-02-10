@@ -2,7 +2,7 @@
 
 This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
-**Last Updated:** 2026-01-27 (Full verification pass - sql_type, on_delete/on_update, Validate macro confirmed)
+**Last Updated:** 2026-02-10 (Relationships + SQLite schema diff/DDL correctness pass)
 
 ---
 
@@ -18,11 +18,11 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Transactions | 6 | 6 | 100% |
 | Schema/DDL | 7 | 8 | 88% |
 | Validation | 5 | 6 | 83% |
-| Relationships | 0 | 6 | 0% (Excluded) |
+| Relationships | 4 | 6 | 67% (Partial) |
 | Serialization | 4 | 4 | 100% |
 | Database Drivers | 3 | 3 | 100% |
 | Connection Pooling | 8 | 8 | 100% |
-| **TOTAL** | **109** | **119** | **92%** |
+| **TOTAL** | **113** | **119** | **95%** |
 
 ---
 
@@ -160,7 +160,7 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Feature | Python | Rust | Status |
 |---------|--------|------|--------|
 | Field validator | `@field_validator` | `#[derive(Validate)]` | ✅ Complete |
-| Model validator | `@model_validator` | N/A (use field validators) | ❌ Not planned |
+| Model validator | `@model_validator` | `#[validate(model = \"fn_name\")]` | ✅ Complete (explicit, compile-time wired) |
 | Numeric range | `Field(gt=, ge=, lt=, le=)` | `#[validate(min=, max=)]` | ✅ Complete |
 | String length | `Field(min_length=, max_length=)` | `#[validate(min_length=, max_length=)]` | ✅ Complete |
 | Regex pattern | `Field(regex=)` | `#[validate(pattern=)]` (simplified) | ⚠️ Partial |
@@ -172,14 +172,14 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
 | Feature | Python | Rust | Status |
 |---------|--------|------|--------|
-| One-to-many | `Relationship()` | Explicit JOINs | ❌ Different |
-| Many-to-one | `Relationship()` | Explicit JOINs | ❌ Different |
-| Many-to-many | `Relationship(link_model=)` | Explicit JOINs | ❌ Different |
-| Back populates | `back_populates=` | N/A | ❌ Excluded |
-| Cascade delete | `cascade_delete=True` | N/A (use FK ON DELETE) | ❌ Excluded |
-| Lazy loading | Automatic | N/A | ❌ Excluded |
+| One-to-many | `Relationship()` | `RelatedMany<T>` (type + metadata) | ⚠️ Partial (no built-in batch loader yet) |
+| Many-to-one | `Relationship()` | `Lazy<T>` / `Related<T>` + `Session::{load_lazy,load_many}` | ✅ Implemented (explicit load/batch-load) |
+| Many-to-many | `Relationship(link_model=)` | `RelatedMany<T>` + `Session::load_many_to_many` + `flush_related_many` | ✅ Implemented |
+| Back populates | `back_populates=` | `Session::{relate_to_one,unrelate_from_one}` helpers + metadata | ✅ Implemented (explicit sync helper) |
+| Cascade delete | `cascade_delete=True` | Metadata only today | ⚠️ Partial (prefer FK `ON DELETE`, no automatic cascade planner yet) |
+| Lazy loading | Automatic | `Lazy<T>` | ✅ Implemented (explicit, cancel-correct) |
 
-**Note:** Relationships are handled differently in Rust. Instead of magic lazy-loading, use explicit JOIN queries.
+**Note:** Relationships are handled differently in Rust: prefer explicit load/batch-load (`Lazy<T>`, `Session::load_many_to_many`) or explicit JOIN queries rather than implicit N+1 behavior.
 
 ---
 

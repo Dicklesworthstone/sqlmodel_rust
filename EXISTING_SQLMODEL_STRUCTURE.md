@@ -637,7 +637,7 @@ The following Python SQLModel features are **intentionally NOT ported** to Rust:
 | `Field(index=True)` | ✅ `#[sqlmodel(index)]` | Complete |
 | `Field(nullable=True)` | ✅ `#[sqlmodel(nullable)]` | Via Option<T> |
 | `Field(default=...)` | ✅ `#[sqlmodel(default = "...")]` | Complete |
-| `Relationship()` | ❌ Not implemented | Explicit JOINs |
+| `Relationship()` | ✅ Implemented (different API) | `Related<T>`, `RelatedMany<T>`, `Lazy<T>` + `#[sqlmodel(relationship(...))]` metadata + `Session::{load_lazy,load_many,load_many_to_many,flush_related_many}` |
 | `select(Model)` | ✅ `select!(Model)` | Complete |
 | `.where()` | ✅ `.filter()` | Complete |
 | `.order_by()` | ✅ `.order_by()` | Complete |
@@ -683,6 +683,8 @@ The following Python SQLModel features are **intentionally NOT ported** to Rust:
 | Query builder | `crates/sqlmodel-query/src/builder.rs` |
 | Expressions | `crates/sqlmodel-query/src/expr.rs` |
 | Schema DDL | `crates/sqlmodel-schema/src/create.rs` |
+| Relationships | `crates/sqlmodel-core/src/relationship.rs` |
+| Session (UoW) | `crates/sqlmodel-session/src/lib.rs` |
 | MySQL driver | `crates/sqlmodel-mysql/src/async_connection.rs` |
 | SQLite driver | `crates/sqlmodel-sqlite/src/lib.rs` |
 | Pool | `crates/sqlmodel-pool/src/lib.rs` |

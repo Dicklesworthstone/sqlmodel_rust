@@ -355,16 +355,115 @@ impl Introspector {
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
+        let unique_constraints = match self.dialect {
+            Dialect::Postgres => match self.postgres_unique_constraints(cx, conn, table_name).await
+            {
+                Outcome::Ok(uks) => uks,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            },
+            Dialect::Sqlite | Dialect::Mysql => {
+                // For SQLite/MySQL, UNIQUE constraints are represented by UNIQUE indexes.
+                // We normalize them into `unique_constraints` and remove them from `indexes`
+                // so the diff engine does not try to DROP/CREATE constraint-backed indexes.
+                Vec::new()
+            }
+        };
+
+        // SQLite/MySQL: derive unique_constraints from indexes (unique && !primary).
+        // PostgreSQL: unique_constraints already queried from pg_constraint; indexes already
+        // exclude constraint-backed indexes (see postgres_indexes()).
+        let (unique_constraints, indexes) = match self.dialect {
+            Dialect::Sqlite | Dialect::Mysql => {
+                let mut uks = Vec::new();
+                let mut idxs = Vec::new();
+                for idx in indexes {
+                    if idx.unique && !idx.primary {
+                        uks.push(UniqueConstraintInfo {
+                            name: Some(idx.name.clone()),
+                            columns: idx.columns.clone(),
+                        });
+                    } else {
+                        idxs.push(idx);
+                    }
+                }
+                (uks, idxs)
+            }
+            Dialect::Postgres => (unique_constraints, indexes),
+        };
+
         Outcome::Ok(TableInfo {
             name: table_name.to_string(),
             columns,
             primary_key,
             foreign_keys,
-            unique_constraints: Vec::new(), // Extracted from indexes with unique=true
-            check_constraints: Vec::new(),  // Requires additional queries per dialect
+            unique_constraints,
+            check_constraints: Vec::new(), // Requires additional queries per dialect
             indexes,
             comment: None, // Requires additional queries per dialect
         })
+    }
+
+    async fn postgres_unique_constraints<C: Connection>(
+        &self,
+        cx: &Cx,
+        conn: &C,
+        table_name: &str,
+    ) -> Outcome<Vec<UniqueConstraintInfo>, Error> {
+        debug_assert!(self.dialect == Dialect::Postgres);
+
+        let sql = "SELECT
+                       c.conname AS constraint_name,
+                       a.attname AS column_name,
+                       u.ord AS ordinal
+                   FROM pg_constraint c
+                   JOIN pg_class t ON t.oid = c.conrelid
+                   JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord) ON true
+                   JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = u.attnum
+                   WHERE t.relname = $1
+                     AND c.contype = 'u'
+                   ORDER BY c.conname, u.ord";
+
+        let rows = match conn
+            .query(
+                cx,
+                sql,
+                &[sqlmodel_core::Value::Text(table_name.to_string())],
+            )
+            .await
+        {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let mut map: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        for row in &rows {
+            let Ok(name) = row.get_named::<String>("constraint_name") else {
+                continue;
+            };
+            let Ok(col) = row.get_named::<String>("column_name") else {
+                continue;
+            };
+            let ord = row.get_named::<i64>("ordinal").ok().unwrap_or(0);
+            map.entry(name.clone())
+                .and_modify(|cols| cols.push((ord, col.clone())))
+                .or_insert_with(|| vec![(ord, col)]);
+        }
+
+        let mut out = Vec::new();
+        for (name, mut cols) in map {
+            cols.sort_by_key(|(ord, _)| *ord);
+            out.push(UniqueConstraintInfo {
+                name: Some(name),
+                columns: cols.into_iter().map(|(_, c)| c).collect(),
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Outcome::Ok(out)
     }
 
     /// Introspect the entire database schema.
@@ -827,6 +926,9 @@ impl Introspector {
         conn: &C,
         table_name: &str,
     ) -> Outcome<Vec<IndexInfo>, Error> {
+        // Exclude indexes backing PRIMARY KEY / UNIQUE constraints; those are represented
+        // via TableInfo.primary_key and TableInfo.unique_constraints so the diff engine
+        // doesn't try to DROP/CREATE constraint-backed indexes.
         let sql = "SELECT
                        i.relname AS index_name,
                        a.attname AS column_name,
@@ -840,6 +942,13 @@ impl Introspector {
                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
                    WHERE t.relname = $1
                        AND t.relkind = 'r'
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM pg_constraint c
+                           WHERE c.conrelid = t.oid
+                             AND c.conindid = i.oid
+                             AND c.contype IN ('p', 'u')
+                       )
                    ORDER BY i.relname, a.attnum";
 
         let rows = match conn

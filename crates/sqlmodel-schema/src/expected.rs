@@ -103,7 +103,7 @@ pub fn table_schema_from_fields(
         // Extract unique constraint if present (and not part of PK)
         if field.unique && !field.primary_key {
             unique_constraints.push(UniqueConstraintInfo {
-                name: Some(format!("uk_{}", field.column_name)),
+                name: Some(format!("uk_{}_{}", table_name, field.column_name)),
                 columns: vec![field.column_name.to_string()],
             });
         }

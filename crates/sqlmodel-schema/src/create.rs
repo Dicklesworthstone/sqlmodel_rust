@@ -64,7 +64,7 @@ impl<M: Model> CreateTable<M> {
 
             // Collect constraints
             if field.unique && !field.primary_key {
-                let constraint_name = format!("uk_{}", field.column_name);
+                let constraint_name = format!("uk_{}_{}", M::TABLE_NAME, field.column_name);
                 let constraint = format!(
                     "CONSTRAINT {} UNIQUE ({})",
                     quote_ident(&constraint_name),
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn test_create_table_unique_constraint() {
         let sql = CreateTable::<TestHero>::new().build();
-        assert!(sql.contains("CONSTRAINT \"uk_name\" UNIQUE (\"name\")"));
+        assert!(sql.contains("CONSTRAINT \"uk_heroes_name\" UNIQUE (\"name\")"));
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tests {
     fn test_unique_constraint_with_keyword_column() {
         let sql = CreateTable::<TestUniqueKeyword>::new().build();
         // Unique constraint with keyword column name
-        assert!(sql.contains("CONSTRAINT \"uk_index\" UNIQUE (\"index\")"));
+        assert!(sql.contains("CONSTRAINT \"uk_items_index\" UNIQUE (\"index\")"));
         assert!(sql.contains("\"index\" INTEGER NOT NULL"));
     }
 

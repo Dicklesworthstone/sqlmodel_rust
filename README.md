@@ -128,7 +128,7 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 **When SQLModel Rust might not fit:**
 - You need an established ecosystem with extensive documentation
 - You require immediate production readiness (we're in active development)
-- You need advanced ORM features like lazy loading or complex relationship traversal
+- You need implicit relationship traversal/lazy loading without explicit load calls (we provide `Lazy<T>` + `Session::load_lazy/load_many`, but we avoid hidden N+1 behavior)
 
 ---
 
@@ -469,7 +469,7 @@ Expr::case()
 | MySQL driver | ✅ Complete | Wire protocol + SharedMySqlConnection |
 | PostgreSQL driver | ✅ Complete | Wire protocol + SharedPgConnection with SCRAM auth |
 | Runtime migrations | ✅ Complete | Schema diffing, migration runner, version tracking |
-| Lazy loading | ❌ Not Planned | Explicit joins only—by design |
+| Lazy loading | ✅ Explicit | `Lazy<T>` + `Session::load_lazy/load_many` (batch-friendly; no implicit N+1) |
 
 ### Known Limitations
 

@@ -8,7 +8,7 @@ use super::{
     quote_identifier,
 };
 use crate::diff::SchemaOperation;
-use crate::introspect::{Dialect, TableInfo};
+use crate::introspect::{Dialect, ForeignKeyInfo, TableInfo, UniqueConstraintInfo};
 
 /// DDL generator for SQLite.
 pub struct SqliteDdlGenerator;
@@ -24,7 +24,39 @@ impl DdlGenerator for SqliteDdlGenerator {
         let statements = match op {
             // Tables
             SchemaOperation::CreateTable(table) => {
-                vec![generate_create_table(table, Dialect::Sqlite)]
+                // For SQLite, implement UNIQUE constraints via named UNIQUE indexes so they can
+                // be dropped later without requiring table recreation.
+                let mut base = table.clone();
+                base.unique_constraints.clear();
+
+                let mut stmts = vec![generate_create_table(&base, Dialect::Sqlite)];
+
+                for uk in &table.unique_constraints {
+                    let cols: Vec<String> = uk
+                        .columns
+                        .iter()
+                        .map(|c| quote_identifier(c, Dialect::Sqlite))
+                        .collect();
+                    let name = uk
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("uk_{}_{}", table.name, uk.columns.join("_")));
+                    stmts.push(format!(
+                        "CREATE UNIQUE INDEX {} ON {}({})",
+                        quote_identifier(&name, Dialect::Sqlite),
+                        quote_identifier(&table.name, Dialect::Sqlite),
+                        cols.join(", ")
+                    ));
+                }
+
+                for idx in &table.indexes {
+                    if idx.primary {
+                        continue;
+                    }
+                    stmts.push(generate_create_index(&table.name, idx, Dialect::Sqlite));
+                }
+
+                stmts
             }
             SchemaOperation::DropTable(name) => {
                 vec![generate_drop_table(name, Dialect::Sqlite)]
@@ -112,61 +144,67 @@ impl DdlGenerator for SqliteDdlGenerator {
             }
 
             // Primary Keys
-            SchemaOperation::AddPrimaryKey { table, columns } => {
-                // SQLite doesn't support adding PK to existing table
-                tracing::warn!(
-                    table = %table,
-                    columns = ?columns,
-                    "SQLite does not support adding PRIMARY KEY to existing table"
-                );
-                vec![format!(
-                    "-- SQLite: Cannot add PRIMARY KEY to existing table. Requires table recreation.\n\
-                     -- Table: {}, Columns: {}",
-                    table,
-                    columns.join(", ")
-                )]
+            SchemaOperation::AddPrimaryKey {
+                table,
+                columns,
+                table_info,
+            } => {
+                if let Some(table_info) = table_info {
+                    sqlite_add_primary_key_recreate(table_info, columns)
+                } else {
+                    vec![format!(
+                        "SELECT __sqlmodel_error__('SQLite ADD PRIMARY KEY requires table_info: {}')",
+                        sanitize_temp_ident(table)
+                    )]
+                }
             }
-            SchemaOperation::DropPrimaryKey { table } => {
-                tracing::warn!(
-                    table = %table,
-                    "SQLite does not support dropping PRIMARY KEY"
-                );
-                vec![format!(
-                    "-- SQLite: Cannot drop PRIMARY KEY. Requires table recreation.\n\
-                     -- Table: {}",
-                    table
-                )]
+            SchemaOperation::DropPrimaryKey { table, table_info } => {
+                if let Some(table_info) = table_info {
+                    sqlite_drop_primary_key_recreate(table_info)
+                } else {
+                    vec![format!(
+                        "SELECT __sqlmodel_error__('SQLite DROP PRIMARY KEY requires table_info: {}')",
+                        sanitize_temp_ident(table)
+                    )]
+                }
             }
 
             // Foreign Keys
-            SchemaOperation::AddForeignKey { table, fk } => {
-                // SQLite doesn't support adding FK to existing table
-                tracing::warn!(
-                    table = %table,
-                    column = %fk.column,
-                    "SQLite does not support adding FOREIGN KEY to existing table"
-                );
-                vec![format!(
-                    "-- SQLite: Cannot add FOREIGN KEY to existing table. Requires table recreation.\n\
-                     -- Table: {}, Column: {} -> {}.{}",
-                    table, fk.column, fk.foreign_table, fk.foreign_column
-                )]
+            SchemaOperation::AddForeignKey {
+                table,
+                fk,
+                table_info,
+            } => {
+                if let Some(table_info) = table_info {
+                    sqlite_add_foreign_key_recreate(table_info, fk)
+                } else {
+                    vec![format!(
+                        "SELECT __sqlmodel_error__('SQLite ADD FOREIGN KEY requires table_info: {}.{}')",
+                        sanitize_temp_ident(table),
+                        sanitize_temp_ident(&fk.column)
+                    )]
+                }
             }
-            SchemaOperation::DropForeignKey { table, name } => {
-                tracing::warn!(
-                    table = %table,
-                    name = %name,
-                    "SQLite does not support dropping FOREIGN KEY"
-                );
-                vec![format!(
-                    "-- SQLite: Cannot drop FOREIGN KEY. Requires table recreation.\n\
-                     -- Table: {}, Constraint: {}",
-                    table, name
-                )]
+            SchemaOperation::DropForeignKey {
+                table,
+                name,
+                table_info,
+            } => {
+                if let Some(table_info) = table_info {
+                    sqlite_drop_foreign_key_recreate(table_info, name)
+                } else {
+                    vec![format!(
+                        "SELECT __sqlmodel_error__('SQLite DROP FOREIGN KEY requires table_info: {}.{}')",
+                        sanitize_temp_ident(table),
+                        sanitize_temp_ident(name)
+                    )]
+                }
             }
 
             // Unique Constraints
-            SchemaOperation::AddUnique { table, constraint } => {
+            SchemaOperation::AddUnique {
+                table, constraint, ..
+            } => {
                 // SQLite: Create a unique index instead
                 let cols: Vec<String> = constraint
                     .columns
@@ -184,9 +222,26 @@ impl DdlGenerator for SqliteDdlGenerator {
                     cols.join(", ")
                 )]
             }
-            SchemaOperation::DropUnique { table, name } => {
-                // Drop the unique index
-                vec![generate_drop_index(table, name, Dialect::Sqlite)]
+            SchemaOperation::DropUnique {
+                table,
+                name,
+                table_info,
+            } => {
+                // If this is a SQLite autoindex (constraint-backed), DROP INDEX will fail.
+                // In that case we must recreate the table without the unique constraint.
+                if name.starts_with("sqlite_autoindex_") {
+                    if let Some(table_info) = table_info {
+                        sqlite_drop_unique_recreate(table_info, name)
+                    } else {
+                        vec![format!(
+                            "SELECT __sqlmodel_error__('SQLite DROP UNIQUE autoindex requires table_info: {}.{}')",
+                            sanitize_temp_ident(table),
+                            sanitize_temp_ident(name)
+                        )]
+                    }
+                } else {
+                    vec![generate_drop_index(table, name, Dialect::Sqlite)]
+                }
             }
 
             // Indexes
@@ -229,11 +284,16 @@ fn sqlite_recreate_table(
 ) -> Vec<String> {
     let table_name = new_table.name.as_str();
 
+    // For SQLite we intentionally implement unique constraints via named unique indexes
+    // (not table-level UNIQUE constraints) so we can DROP them later without table recreation.
+    let mut create_table = new_table.clone();
+    create_table.unique_constraints.clear();
+
     let mut stmts = vec![
         "PRAGMA foreign_keys=OFF".to_string(),
         "BEGIN".to_string(),
         generate_rename_table(table_name, tmp_old, Dialect::Sqlite),
-        super::generate_create_table_with_if_not_exists(new_table, Dialect::Sqlite, false),
+        super::generate_create_table_with_if_not_exists(&create_table, Dialect::Sqlite, false),
     ];
 
     stmts.push(format!(
@@ -246,6 +306,24 @@ fn sqlite_recreate_table(
 
     stmts.push(generate_drop_table(tmp_old, Dialect::Sqlite));
 
+    for uk in &new_table.unique_constraints {
+        let cols: Vec<String> = uk
+            .columns
+            .iter()
+            .map(|c| quote_identifier(c, Dialect::Sqlite))
+            .collect();
+        let name = uk
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("uk_{}_{}", table_name, uk.columns.join("_")));
+        stmts.push(format!(
+            "CREATE UNIQUE INDEX {} ON {}({})",
+            quote_identifier(&name, Dialect::Sqlite),
+            quote_identifier(table_name, Dialect::Sqlite),
+            cols.join(", ")
+        ));
+    }
+
     for idx in &new_table.indexes {
         if idx.primary {
             continue;
@@ -256,6 +334,122 @@ fn sqlite_recreate_table(
     stmts.push("COMMIT".to_string());
     stmts.push("PRAGMA foreign_keys=ON".to_string());
     stmts
+}
+
+fn sqlite_fk_effective_name(table: &str, fk: &ForeignKeyInfo) -> String {
+    fk.name
+        .clone()
+        .unwrap_or_else(|| format!("fk_{}_{}", table, fk.column))
+}
+
+fn sqlite_unique_effective_name(table: &str, uk: &UniqueConstraintInfo) -> String {
+    uk.name
+        .clone()
+        .unwrap_or_else(|| format!("uk_{}_{}", table, uk.columns.join("_")))
+}
+
+fn sqlite_add_primary_key_recreate(table: &TableInfo, pk_columns: &[String]) -> Vec<String> {
+    let table_name = table.name.as_str();
+    let tmp_old = format!("__sqlmodel_old_{}_add_pk", sanitize_temp_ident(table_name));
+
+    let mut new_table = table.clone();
+    new_table.primary_key = pk_columns.to_vec();
+    for col in &mut new_table.columns {
+        col.primary_key = pk_columns.iter().any(|c| c == &col.name);
+    }
+
+    let cols: Vec<String> = new_table
+        .columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, Dialect::Sqlite))
+        .collect();
+
+    sqlite_recreate_table(&new_table, &tmp_old, &cols, &cols)
+}
+
+fn sqlite_drop_primary_key_recreate(table: &TableInfo) -> Vec<String> {
+    let table_name = table.name.as_str();
+    let tmp_old = format!("__sqlmodel_old_{}_drop_pk", sanitize_temp_ident(table_name));
+
+    let mut new_table = table.clone();
+    new_table.primary_key.clear();
+    for col in &mut new_table.columns {
+        col.primary_key = false;
+    }
+
+    let cols: Vec<String> = new_table
+        .columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, Dialect::Sqlite))
+        .collect();
+
+    sqlite_recreate_table(&new_table, &tmp_old, &cols, &cols)
+}
+
+fn sqlite_add_foreign_key_recreate(table: &TableInfo, fk: &ForeignKeyInfo) -> Vec<String> {
+    let table_name = table.name.as_str();
+    let tmp_old = format!(
+        "__sqlmodel_old_{}_add_fk_{}",
+        sanitize_temp_ident(table_name),
+        sanitize_temp_ident(&fk.column)
+    );
+
+    let mut new_table = table.clone();
+    // Keep one FK per local column (SQLite/SQLModel model metadata assumes this).
+    new_table.foreign_keys.retain(|x| x.column != fk.column);
+    new_table.foreign_keys.push(fk.clone());
+
+    let cols: Vec<String> = new_table
+        .columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, Dialect::Sqlite))
+        .collect();
+
+    sqlite_recreate_table(&new_table, &tmp_old, &cols, &cols)
+}
+
+fn sqlite_drop_foreign_key_recreate(table: &TableInfo, name: &str) -> Vec<String> {
+    let table_name = table.name.as_str();
+    let tmp_old = format!(
+        "__sqlmodel_old_{}_drop_fk_{}",
+        sanitize_temp_ident(table_name),
+        sanitize_temp_ident(name)
+    );
+
+    let mut new_table = table.clone();
+    new_table
+        .foreign_keys
+        .retain(|fk| sqlite_fk_effective_name(table_name, fk) != name);
+
+    let cols: Vec<String> = new_table
+        .columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, Dialect::Sqlite))
+        .collect();
+
+    sqlite_recreate_table(&new_table, &tmp_old, &cols, &cols)
+}
+
+fn sqlite_drop_unique_recreate(table: &TableInfo, name: &str) -> Vec<String> {
+    let table_name = table.name.as_str();
+    let tmp_old = format!(
+        "__sqlmodel_old_{}_drop_uk_{}",
+        sanitize_temp_ident(table_name),
+        sanitize_temp_ident(name)
+    );
+
+    let mut new_table = table.clone();
+    new_table
+        .unique_constraints
+        .retain(|uk| sqlite_unique_effective_name(table_name, uk) != name);
+
+    let cols: Vec<String> = new_table
+        .columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, Dialect::Sqlite))
+        .collect();
+
+    sqlite_recreate_table(&new_table, &tmp_old, &cols, &cols)
 }
 
 fn sqlite_drop_column_recreate(table: &TableInfo, drop_column: &str) -> Vec<String> {
@@ -455,6 +649,33 @@ mod tests {
         assert_eq!(stmts.len(), 1);
         assert!(stmts[0].contains("CREATE TABLE IF NOT EXISTS"));
         assert!(stmts[0].contains("\"heroes\""));
+    }
+
+    #[test]
+    fn test_create_table_emits_indexes() {
+        let ddl = SqliteDdlGenerator;
+        let mut table = make_table(
+            "heroes",
+            vec![
+                make_column("id", "INTEGER", false),
+                make_column("name", "TEXT", false),
+            ],
+            vec!["id"],
+        );
+        table.indexes.push(IndexInfo {
+            name: "idx_heroes_name".to_string(),
+            columns: vec!["name".to_string()],
+            unique: false,
+            index_type: None,
+            primary: false,
+        });
+        let op = SchemaOperation::CreateTable(table);
+        let stmts = ddl.generate(&op);
+
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(stmts[1].contains("CREATE INDEX"));
+        assert!(stmts[1].contains("\"idx_heroes_name\""));
     }
 
     #[test]
@@ -665,6 +886,7 @@ mod tests {
                 name: Some("uk_heroes_name".to_string()),
                 columns: vec!["name".to_string()],
             },
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
@@ -673,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_fk_unsupported() {
+    fn test_add_fk_requires_table_info() {
         let ddl = SqliteDdlGenerator;
         let op = SchemaOperation::AddForeignKey {
             table: "heroes".to_string(),
@@ -685,12 +907,13 @@ mod tests {
                 on_delete: None,
                 on_update: None,
             },
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 
         assert_eq!(stmts.len(), 1);
-        assert!(stmts[0].contains("--")); // Comment
-        assert!(stmts[0].contains("table recreation"));
+        assert!(stmts[0].contains("__sqlmodel_error__"));
+        assert!(stmts[0].contains("requires table_info"));
     }
 
     #[test]
