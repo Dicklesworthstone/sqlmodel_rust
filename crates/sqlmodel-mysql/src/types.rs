@@ -402,9 +402,299 @@ pub fn decode_text_value(field_type: FieldType, data: &[u8], is_unsigned: bool) 
         // NULL type
         FieldType::Null => Value::Null,
 
+        // Temporal types (text protocol transmits them as strings).
+        FieldType::Date | FieldType::NewDate => decode_text_date(text.as_ref()),
+        FieldType::Time | FieldType::Time2 => decode_text_time(text.as_ref()),
+        FieldType::DateTime
+        | FieldType::Timestamp
+        | FieldType::DateTime2
+        | FieldType::Timestamp2 => decode_text_datetime_or_timestamp(text.as_ref()),
+
         // All other types (strings, dates, times) as text
         _ => Value::Text(text.into_owned()),
     }
+}
+
+fn decode_text_date(original: &str) -> Value {
+    let trimmed = original.trim();
+    if trimmed.is_empty() {
+        return Value::Text(original.to_string());
+    }
+    // MySQL "zero date" sentinel.
+    if trimmed == "0000-00-00" {
+        return Value::Text("0000-00-00".to_string());
+    }
+
+    let bytes = trimmed.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return Value::Text(original.to_string());
+    }
+
+    let year_i32 = parse_4_digits(bytes, 0).and_then(|v| i32::try_from(v).ok());
+    let month_u32 = parse_2_digits(bytes, 5);
+    let day_u32 = parse_2_digits(bytes, 8);
+
+    match (year_i32, month_u32, day_u32) {
+        (Some(year), Some(month), Some(day)) => ymd_to_days_since_unix_epoch(year, month, day)
+            .map_or_else(|| Value::Text(original.to_string()), Value::Date),
+        _ => Value::Text(original.to_string()),
+    }
+}
+
+fn decode_text_time(original: &str) -> Value {
+    let trimmed = original.trim();
+    if trimmed.is_empty() {
+        return Value::Text(original.to_string());
+    }
+    // Preserve the common "zero time" sentinel as text (parity with binary len=0 behavior).
+    if trimmed == "00:00:00" || trimmed == "-00:00:00" {
+        return Value::Text(trimmed.to_string());
+    }
+
+    let mut bytes = trimmed.as_bytes();
+    let mut negative = false;
+    if let Some((&first, rest)) = bytes.split_first() {
+        if first == b'-' {
+            negative = true;
+            bytes = rest;
+        }
+    }
+
+    // Support both "HH:MM:SS[.ffffff]" and "D HH:MM:SS[.ffffff]".
+    let (days_part, time_part) = match bytes.iter().position(|&c| c == b' ') {
+        Some(sp) => (&bytes[..sp], &bytes[sp + 1..]),
+        None => (&[][..], bytes),
+    };
+
+    let days: i64 = if days_part.is_empty() {
+        0
+    } else {
+        let Ok(ds) = std::str::from_utf8(days_part) else {
+            return Value::Text(original.to_string());
+        };
+        let Ok(d) = ds.parse::<i64>() else {
+            return Value::Text(original.to_string());
+        };
+        d
+    };
+
+    // Split off fractional seconds.
+    let (hms, frac) = match time_part.iter().position(|&c| c == b'.') {
+        Some(dot) => (&time_part[..dot], Some(&time_part[dot + 1..])),
+        None => (time_part, None),
+    };
+
+    let mut it = hms.split(|&c| c == b':');
+    let Some(hh) = it.next() else {
+        return Value::Text(original.to_string());
+    };
+    let Some(mm) = it.next() else {
+        return Value::Text(original.to_string());
+    };
+    let Some(ss) = it.next() else {
+        return Value::Text(original.to_string());
+    };
+    if it.next().is_some() {
+        return Value::Text(original.to_string());
+    }
+
+    let Ok(hh_s) = std::str::from_utf8(hh) else {
+        return Value::Text(original.to_string());
+    };
+    let Ok(mm_s) = std::str::from_utf8(mm) else {
+        return Value::Text(original.to_string());
+    };
+    let Ok(ss_s) = std::str::from_utf8(ss) else {
+        return Value::Text(original.to_string());
+    };
+
+    let Ok(hours) = hh_s.parse::<i64>() else {
+        return Value::Text(original.to_string());
+    };
+    let Ok(minutes) = mm_s.parse::<i64>() else {
+        return Value::Text(original.to_string());
+    };
+    let Ok(seconds) = ss_s.parse::<i64>() else {
+        return Value::Text(original.to_string());
+    };
+
+    if !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+        return Value::Text(original.to_string());
+    }
+
+    let micros: i64 = match frac {
+        None => 0,
+        Some(fr) => {
+            // MySQL emits up to 6 digits. Pad right with zeros.
+            let mut us: i64 = 0;
+            let mut n = 0usize;
+            for &c in fr {
+                if n == 6 {
+                    break;
+                }
+                if !c.is_ascii_digit() {
+                    return Value::Text(original.to_string());
+                }
+                us = us.saturating_mul(10).saturating_add(i64::from(c - b'0'));
+                n += 1;
+            }
+            for _ in n..6 {
+                us = us.saturating_mul(10);
+            }
+            us
+        }
+    };
+
+    let total_seconds = days
+        .saturating_mul(24)
+        .saturating_add(hours)
+        .saturating_mul(3600)
+        .saturating_add(minutes.saturating_mul(60))
+        .saturating_add(seconds);
+    let total_micros = total_seconds
+        .saturating_mul(1_000_000)
+        .saturating_add(micros);
+
+    let signed = if negative {
+        -total_micros
+    } else {
+        total_micros
+    };
+    Value::Time(signed)
+}
+
+fn decode_text_datetime_or_timestamp(original: &str) -> Value {
+    let trimmed = original.trim();
+    if trimmed.is_empty() {
+        return Value::Text(original.to_string());
+    }
+    // MySQL "zero datetime" sentinel.
+    if trimmed.starts_with("0000-00-00") {
+        return Value::Text(trimmed.to_string());
+    }
+
+    // Accept "YYYY-MM-DD", "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DDTHH:MM:SS" with optional ".ffffff".
+    let (date_part, rest) = if trimmed.len() >= 10 {
+        (&trimmed[..10], &trimmed[10..])
+    } else {
+        return Value::Text(original.to_string());
+    };
+    let date_b = date_part.as_bytes();
+    if date_b.len() != 10 || date_b[4] != b'-' || date_b[7] != b'-' {
+        return Value::Text(original.to_string());
+    }
+
+    let year = parse_4_digits(date_b, 0).and_then(|v| i32::try_from(v).ok());
+    let month = parse_2_digits(date_b, 5);
+    let day = parse_2_digits(date_b, 8);
+    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
+        return Value::Text(original.to_string());
+    };
+
+    let Some(days) = ymd_to_days_since_unix_epoch(year, month, day) else {
+        return Value::Text(original.to_string());
+    };
+
+    // Default midnight if no time part.
+    let mut hour: u32 = 0;
+    let mut minute: u32 = 0;
+    let mut second: u32 = 0;
+    let mut micros: u32 = 0;
+
+    let rest = rest.trim_start();
+    if !rest.is_empty() {
+        let rest = rest.strip_prefix('T').unwrap_or(rest);
+        let rest = rest.trim_start();
+
+        // Split off fractional seconds.
+        let (hms_part, frac) = match rest.find('.') {
+            Some(dot) => (&rest[..dot], Some(&rest[dot + 1..])),
+            None => (rest, None),
+        };
+
+        if hms_part.len() < 8 {
+            return Value::Text(original.to_string());
+        }
+        let hms_b = hms_part.as_bytes();
+        if hms_b.len() != 8 || hms_b[2] != b':' || hms_b[5] != b':' {
+            return Value::Text(original.to_string());
+        }
+        let Some(hh) = parse_2_digits(hms_b, 0) else {
+            return Value::Text(original.to_string());
+        };
+        let Some(mm) = parse_2_digits(hms_b, 3) else {
+            return Value::Text(original.to_string());
+        };
+        let Some(ss) = parse_2_digits(hms_b, 6) else {
+            return Value::Text(original.to_string());
+        };
+        if hh > 23 || mm > 59 || ss > 59 {
+            return Value::Text(original.to_string());
+        }
+        hour = hh;
+        minute = mm;
+        second = ss;
+
+        if let Some(frac) = frac {
+            let frac = frac.trim();
+            let fb = frac.as_bytes();
+            let mut us: u32 = 0;
+            let mut n = 0usize;
+            for &c in fb {
+                if n == 6 {
+                    break;
+                }
+                if !c.is_ascii_digit() {
+                    return Value::Text(original.to_string());
+                }
+                us = us.saturating_mul(10).saturating_add(u32::from(c - b'0'));
+                n += 1;
+            }
+            for _ in n..6 {
+                us = us.saturating_mul(10);
+            }
+            micros = us;
+        }
+    }
+
+    let day_us = i128::from(days) * 86_400_i128 * 1_000_000_i128;
+    let tod_us =
+        (i128::from(hour) * 3_600_i128 + i128::from(minute) * 60_i128 + i128::from(second))
+            * 1_000_000_i128
+            + i128::from(micros);
+    let total = day_us + tod_us;
+    let Ok(total_i64) = i64::try_from(total) else {
+        return Value::Text(original.to_string());
+    };
+
+    Value::Timestamp(total_i64)
+}
+
+fn parse_2_digits(bytes: &[u8], offset: usize) -> Option<u32> {
+    if bytes.len() < offset + 2 {
+        return None;
+    }
+    let d0 = bytes[offset];
+    let d1 = bytes[offset + 1];
+    if !d0.is_ascii_digit() || !d1.is_ascii_digit() {
+        return None;
+    }
+    Some(u32::from(d0 - b'0') * 10 + u32::from(d1 - b'0'))
+}
+
+fn parse_4_digits(bytes: &[u8], offset: usize) -> Option<u32> {
+    if bytes.len() < offset + 4 {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for i in 0..4 {
+        let d = bytes[offset + i];
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + u32::from(d - b'0');
+    }
+    Some(v)
 }
 
 /// Decode a binary protocol value to a sqlmodel Value.
@@ -1235,6 +1525,57 @@ mod tests {
     fn test_decode_text_string() {
         let val = decode_text_value(FieldType::VarChar, b"hello", false);
         assert!(matches!(val, Value::Text(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_decode_text_date_to_value_date() {
+        let val = decode_text_value(FieldType::Date, b"2024-02-29", false);
+        let expected_days = ymd_to_days_since_unix_epoch(2024, 2, 29).unwrap();
+        assert_eq!(val, Value::Date(expected_days));
+    }
+
+    #[test]
+    fn test_decode_text_date_zero_preserved_as_text() {
+        let val = decode_text_value(FieldType::Date, b"0000-00-00", false);
+        assert_eq!(val, Value::Text("0000-00-00".to_string()));
+    }
+
+    #[test]
+    fn test_decode_text_time_to_value_time() {
+        // 25:00:00.000001 (text protocol can emit hours > 23)
+        let val = decode_text_value(FieldType::Time, b"25:00:00.000001", false);
+        let expected = (25_i64 * 3600_i64) * 1_000_000_i64 + 1;
+        assert_eq!(val, Value::Time(expected));
+    }
+
+    #[test]
+    fn test_decode_text_time_negative_to_value_time() {
+        let val = decode_text_value(FieldType::Time, b"-01:02:03.4", false);
+        // Fractional seconds are right-padded to 6 digits: ".4" -> 400_000 us.
+        let expected = -(((3600_i64 + 2 * 60 + 3) * 1_000_000_i64) + 400_000_i64);
+        assert_eq!(val, Value::Time(expected));
+    }
+
+    #[test]
+    fn test_decode_text_time_zero_preserved_as_text() {
+        let val = decode_text_value(FieldType::Time, b"00:00:00", false);
+        assert_eq!(val, Value::Text("00:00:00".to_string()));
+    }
+
+    #[test]
+    fn test_decode_text_datetime_to_value_timestamp() {
+        let val = decode_text_value(FieldType::DateTime, b"2020-01-02 03:04:05.000006", false);
+
+        let days = i64::from(ymd_to_days_since_unix_epoch(2020, 1, 2).unwrap());
+        let tod_us = ((3_i64 * 3600 + 4 * 60 + 5) * 1_000_000) + 6;
+        let expected = days * 86_400 * 1_000_000 + tod_us;
+        assert_eq!(val, Value::Timestamp(expected));
+    }
+
+    #[test]
+    fn test_decode_text_timestamp_zero_preserved_as_text() {
+        let val = decode_text_value(FieldType::Timestamp, b"0000-00-00 00:00:00", false);
+        assert_eq!(val, Value::Text("0000-00-00 00:00:00".to_string()));
     }
 
     #[test]

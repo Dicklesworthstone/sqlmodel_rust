@@ -26,6 +26,25 @@ Purpose: keep a granular, lossless checklist for parity work (docs, schema, sess
 - [x] `cargo test -p sqlmodel-session`
 - [x] `ubs --diff --only=rust,toml .` (exit 0)
 
+## 1. Current Focus (2026-02-10): bd-22u8 (MySQL text-protocol temporal parsing)
+
+### 1.1 Implementation
+- [x] Parse MySQL text-protocol DATE into `Value::Date(days_since_epoch)` in `crates/sqlmodel-mysql/src/types.rs`
+- [x] Parse MySQL text-protocol TIME into `Value::Time(microseconds)` (supports sign, hours > 23, fractional seconds)
+- [x] Parse MySQL text-protocol DATETIME/TIMESTAMP into `Value::Timestamp(microseconds_since_epoch)` (supports fractional seconds)
+- [x] Preserve MySQL zero-date sentinels as `Value::Text` (do not invent epoch values)
+
+### 1.2 Tests
+- [x] Add unit tests for DATE/TIME/DATETIME parsing
+- [x] Add unit tests that zero sentinels remain `Value::Text`
+
+### 1.3 Quality Gates
+- [x] `cargo fmt --check`
+- [x] `cargo check --all-targets`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test -p sqlmodel-mysql`
+- [x] `ubs --diff --only=rust,toml .` (exit 0)
+
 ## A. SQLite DDL: Remove Comment-Only Paths (Constraint Ops)
 
 ### A1. Audit current SQLite DDL generator
