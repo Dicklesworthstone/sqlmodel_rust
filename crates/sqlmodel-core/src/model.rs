@@ -188,6 +188,18 @@ pub trait Model: Sized + Send + Sync {
     #[allow(clippy::result_large_err)]
     fn from_row(row: &Row) -> Result<Self>;
 
+    /// If this is a joined-table inheritance *child* model, return the base (parent) table row.
+    ///
+    /// This enables query builders to implement joined inheritance DML (base+child insert/update/delete)
+    /// without runtime reflection.
+    ///
+    /// The derive macro implements this automatically when a joined child declares exactly one
+    /// `#[sqlmodel(parent)]` embedded parent field. Non-joined models (and joined bases) return `None`.
+    #[must_use]
+    fn joined_parent_row(&self) -> Option<Vec<(&'static str, Value)>> {
+        None
+    }
+
     /// Get the value of the primary key field(s).
     fn primary_key_value(&self) -> Vec<Value>;
 

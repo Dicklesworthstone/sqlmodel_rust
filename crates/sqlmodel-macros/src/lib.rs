@@ -21,7 +21,7 @@ mod parse;
 mod validate;
 mod validate_derive;
 
-use parse::{ModelDef, RelationshipKindAttr, parse_model};
+use parse::{InheritanceStrategy, ModelDef, RelationshipKindAttr, parse_model};
 
 /// Derive macro for the `Model` trait.
 ///
@@ -161,6 +161,9 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     // Generate shard_key implementation
     let (shard_key_const, shard_key_value_body) = generate_shard_key(model);
 
+    // Generate joined-parent extraction for joined-table inheritance child models.
+    let joined_parent_row_body = generate_joined_parent_row(model);
+
     // Generate Debug impl only if any field has repr=false
     let debug_impl = generate_debug_impl(model);
 
@@ -208,6 +211,8 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
             fn shard_key_value(&self) -> Option<sqlmodel_core::Value> {
                 #shard_key_value_body
             }
+
+            #joined_parent_row_body
         }
 
         #debug_impl
@@ -261,6 +266,25 @@ fn generate_hybrid_methods(model: &ModelDef) -> proc_macro2::TokenStream {
     quote::quote! {
         impl #impl_generics #name #ty_generics #where_clause {
             #(#methods)*
+        }
+    }
+}
+
+fn generate_joined_parent_row(model: &ModelDef) -> proc_macro2::TokenStream {
+    let is_joined_child =
+        model.config.inheritance == InheritanceStrategy::Joined && model.config.inherits.is_some();
+    if !is_joined_child {
+        return quote::quote! {};
+    }
+
+    let Some(parent_field) = model.fields.iter().find(|f| f.parent) else {
+        return quote::quote! {};
+    };
+    let parent_ident = &parent_field.name;
+
+    quote::quote! {
+        fn joined_parent_row(&self) -> Option<Vec<(&'static str, sqlmodel_core::Value)>> {
+            Some(self.#parent_ident.to_row())
         }
     }
 }

@@ -33,6 +33,32 @@ Purpose: keep a granular, lossless checklist for parity work (docs, schema, sess
 - [x] `cargo test -p sqlmodel --test joined_inheritance_sqlite`
 - [x] `ubs --diff --only=rust,toml .` (exit 0)
 
+## 0. Current Focus (2026-02-10): bd-2bht (joined-table inheritance DML across base+child)
+
+### 0.1 Core Trait Hook (Model)
+- [x] Add `Model::joined_parent_row()` default method for joined-child parent extraction
+- [x] Derive macro implements `joined_parent_row()` for joined children with exactly one `#[sqlmodel(parent)]` field
+
+### 0.2 Query Builders (insert/update/delete)
+- [x] `InsertBuilder::execute`: for joined child, begin tx, insert base then child, commit
+- [x] Auto-increment PK propagation (single-column PK): fetch generated id (sqlite/mysql last-id; postgres RETURNING pk) and patch child insert
+- [x] `UpdateBuilder::execute`: for joined child, begin tx, update base then child, commit (model-based only)
+- [x] `DeleteBuilder::execute`: for joined child, begin tx, delete child then base, commit (from_model only)
+- [ ] Decide/implement semantics for: explicit WHERE, explicit SET, ON CONFLICT, multi-column PKs (likely new beads)
+
+### 0.3 Tests (SQLite, end-to-end)
+- [x] Add integration test `crates/sqlmodel/tests/joined_inheritance_dml_sqlite.rs`:
+- [x] Insert joined child via `insert!(&child)` and verify both tables populated
+- [x] Update joined child via `update!(&child)` and verify both tables updated
+- [x] Delete joined child via `DeleteBuilder::from_model(&child)` and verify both tables deleted
+
+### 0.4 Quality Gates (re-run after all edits)
+- [x] `cargo fmt --check`
+- [x] `cargo check --all-targets`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test -p sqlmodel --test joined_inheritance_dml_sqlite`
+- [x] `ubs --diff --only=rust,toml .` (exit 0)
+
 ## 0. Current Focus (2026-02-10): bd-3j44 (cascade delete/orphan tracking)
 
 ### 0.1 Implementation

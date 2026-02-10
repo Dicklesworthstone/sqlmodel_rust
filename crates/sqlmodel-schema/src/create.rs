@@ -59,8 +59,27 @@ impl<M: Model> CreateTable<M> {
         let mut column_defs = Vec::new();
         let mut constraints = Vec::new();
 
+        // SQLite auto-increment requires `INTEGER PRIMARY KEY` on the column itself.
+        // When we detect a single-column PK marked `auto_increment`, we embed the PK
+        // constraint in the column definition and skip the table-level PK clause.
+        let embedded_autoinc_pk: Option<&str> = {
+            let pk_cols = M::PRIMARY_KEY;
+            if pk_cols.len() == 1 {
+                let pk = pk_cols[0];
+                let has_autoinc_pk = fields
+                    .iter()
+                    .any(|f| f.column_name == pk && f.primary_key && f.auto_increment);
+                if has_autoinc_pk { Some(pk) } else { None }
+            } else {
+                None
+            }
+        };
+
         for field in fields {
-            column_defs.push(self.column_definition(field));
+            let embed_pk = embedded_autoinc_pk.is_some_and(|col| {
+                col == field.column_name && field.primary_key && field.auto_increment
+            });
+            column_defs.push(self.column_definition(field, embed_pk));
 
             // Collect constraints
             if field.unique && !field.primary_key {
@@ -125,15 +144,18 @@ impl<M: Model> CreateTable<M> {
             }
         }
 
-        // Add primary key constraint
+        // Add primary key constraint (unless embedded for SQLite-style auto-increment single PK).
         let pk_cols = M::PRIMARY_KEY;
         if !pk_cols.is_empty() {
-            let quoted_pk: Vec<String> = pk_cols.iter().map(|c| quote_ident(c)).collect();
-            let mut constraint = String::new();
-            constraint.push_str("PRIMARY KEY (");
-            constraint.push_str(&quoted_pk.join(", "));
-            constraint.push(')');
-            constraints.insert(0, constraint);
+            let embedded = embedded_autoinc_pk.is_some_and(|pk| pk_cols == [pk]);
+            if !embedded {
+                let quoted_pk: Vec<String> = pk_cols.iter().map(|c| quote_ident(c)).collect();
+                let mut constraint = String::new();
+                constraint.push_str("PRIMARY KEY (");
+                constraint.push_str(&quoted_pk.join(", "));
+                constraint.push(')');
+                constraints.insert(0, constraint);
+            }
         }
 
         // Combine column definitions and constraints
@@ -157,21 +179,22 @@ impl<M: Model> CreateTable<M> {
             && inheritance.discriminator_value.is_some()
     }
 
-    fn column_definition(&self, field: &FieldInfo) -> String {
-        let sql_type = field.effective_sql_type();
+    fn column_definition(&self, field: &FieldInfo, embed_primary_key: bool) -> String {
+        let sql_type = if embed_primary_key {
+            // Required by SQLite for rowid-backed autoincrement behavior.
+            "INTEGER".to_string()
+        } else {
+            field.effective_sql_type()
+        };
         let mut def = String::from("  ");
         def.push_str(&quote_ident(field.column_name));
         def.push(' ');
         def.push_str(&sql_type);
 
-        if !field.nullable && !field.auto_increment {
+        if embed_primary_key {
+            def.push_str(" PRIMARY KEY");
+        } else if !field.nullable && !field.auto_increment {
             def.push_str(" NOT NULL");
-        }
-
-        if field.auto_increment {
-            // Use AUTOINCREMENT for SQLite, SERIAL/GENERATED for PostgreSQL
-            // For now, use a simple approach
-            def.push_str(" AUTOINCREMENT");
         }
 
         if let Some(default) = field.default {
@@ -237,7 +260,7 @@ mod tests {
     fn test_create_table_basic() {
         let sql = CreateTable::<TestHero>::new().build();
         assert!(sql.starts_with("CREATE TABLE \"heroes\""));
-        assert!(sql.contains("\"id\" BIGINT"));
+        assert!(sql.contains("\"id\" INTEGER PRIMARY KEY"));
         assert!(sql.contains("\"name\" TEXT NOT NULL"));
         assert!(sql.contains("\"age\" INTEGER"));
         assert!(sql.contains("\"team_id\" BIGINT"));
@@ -252,7 +275,7 @@ mod tests {
     #[test]
     fn test_create_table_primary_key() {
         let sql = CreateTable::<TestHero>::new().build();
-        assert!(sql.contains("PRIMARY KEY (\"id\")"));
+        assert!(sql.contains("\"id\" INTEGER PRIMARY KEY"));
     }
 
     #[test]
@@ -270,7 +293,7 @@ mod tests {
     #[test]
     fn test_create_table_auto_increment() {
         let sql = CreateTable::<TestHero>::new().build();
-        assert!(sql.contains("AUTOINCREMENT"));
+        assert!(sql.contains("\"id\" INTEGER PRIMARY KEY"));
     }
 
     #[test]
