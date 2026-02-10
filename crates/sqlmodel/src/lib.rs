@@ -415,7 +415,7 @@ mod inheritance_tests {
         #[sqlmodel(parent)]
         person: Person,
         #[sqlmodel(primary_key)]
-        student_id: i64,
+        id: i64,
         grade: String,
     }
 

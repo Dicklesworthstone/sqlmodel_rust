@@ -66,7 +66,6 @@ fn validate_joined_inheritance_parent_field(model: &ModelDef, errors: &mut Vec<E
             model.name.span(),
             "joined-table inheritance child models must include exactly one `#[sqlmodel(parent)]` field to embed the parent model",
         ));
-        return;
     }
 }
 

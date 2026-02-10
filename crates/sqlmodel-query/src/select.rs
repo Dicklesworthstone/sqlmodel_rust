@@ -11,6 +11,8 @@ use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection, Model, RelationshipKind, Value};
 use std::marker::PhantomData;
 
+type ParentFieldsFn = fn() -> &'static [sqlmodel_core::FieldInfo];
+
 fn sti_discriminator_filter<M: Model>() -> Option<Expr> {
     let inh = M::inheritance();
     match (inh.discriminator_column, inh.discriminator_value) {
@@ -19,8 +21,7 @@ fn sti_discriminator_filter<M: Model>() -> Option<Expr> {
     }
 }
 
-fn joined_inheritance_parent<M: Model>()
--> Option<(&'static str, fn() -> &'static [sqlmodel_core::FieldInfo])> {
+fn joined_inheritance_parent<M: Model>() -> Option<(&'static str, ParentFieldsFn)> {
     let inh = M::inheritance();
     if inh.strategy != sqlmodel_core::InheritanceStrategy::Joined {
         return None;
