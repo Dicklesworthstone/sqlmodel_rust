@@ -35,7 +35,10 @@ pub use expr::{
     BinaryOp, Dialect, Expr, UnaryOp, WindowBuilder, WindowFrame, WindowFrameBound, WindowFrameType,
 };
 pub use join::{Join, JoinType};
-pub use select::{PolymorphicJoined, PolymorphicJoinedSelect, Select};
+pub use select::{
+    PolymorphicJoined, PolymorphicJoined2, PolymorphicJoinedSelect, PolymorphicJoinedSelect2,
+    Select,
+};
 pub use set_ops::{
     SetOpType, SetOperation, except, except_all, intersect, intersect_all, union, union_all,
 };

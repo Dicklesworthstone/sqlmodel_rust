@@ -59,6 +59,37 @@ Purpose: keep a granular, lossless checklist for parity work (docs, schema, sess
 - [x] `cargo test -p sqlmodel --test joined_inheritance_dml_sqlite`
 - [x] `ubs --diff --only=rust,toml .` (exit 0)
 
+## 0. Current Focus (2026-02-10): bd-4bhg (joined inheritance polymorphic base queries: multiple child types)
+
+### 0.1 API + Types
+- [x] Define `PolymorphicJoined2<Base, C1, C2>` enum
+- [x] Define `PolymorphicJoinedSelect2<Base, C1, C2>` query wrapper
+- [x] Add `Select::<Base>::polymorphic_joined2::<C1, C2>()`
+- [x] Re-export new types in `crates/sqlmodel-query/src/lib.rs` and `crates/sqlmodel/src/lib.rs`
+- [ ] Extend to N children beyond 2 (macro-generated family)
+
+### 0.2 SQL Generation
+- [x] Build a single SELECT that:
+- [x] Projects base + each child columns aliased as `table__col`
+- [x] LEFT JOINs each child table by PK columns
+- [x] Preserves existing `.filter/.order_by/.limit/.offset` behavior
+
+### 0.3 Hydration Semantics
+- [x] Hydrate `Child` if child prefix has any non-NULL values, else Base
+- [x] If multiple child prefixes are non-null for the same row, return a clear error (ambiguous)
+
+### 0.4 Tests (SQLite, end-to-end)
+- [x] Add SQLite integration test with base + two joined children
+- [x] Insert base-only row + base+child1 row + base+child2 row
+- [x] Assert polymorphic query returns correct variants in a deterministic order
+
+### 0.5 Quality Gates
+- [x] `cargo fmt --check`
+- [x] `cargo check --all-targets`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test -p sqlmodel --test joined_inheritance_polymorphic2_sqlite`
+- [x] `ubs --diff --only=rust,toml .` (exit 0)
+
 ## 0. Current Focus (2026-02-10): bd-3j44 (cascade delete/orphan tracking)
 
 ### 0.1 Implementation
