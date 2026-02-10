@@ -153,8 +153,15 @@ fn format_unique_constraint(unique: &UniqueConstraintInfo, dialect: Dialect) -> 
     }
 }
 
-/// Generate CREATE TABLE SQL.
-fn generate_create_table(table: &TableInfo, dialect: Dialect) -> String {
+/// Generate CREATE TABLE SQL with configurable `IF NOT EXISTS`.
+///
+/// Kept private to `ddl` and its submodules (SQLite drop-column needs a
+/// strict create without IF NOT EXISTS for table recreation).
+fn generate_create_table_with_if_not_exists(
+    table: &TableInfo,
+    dialect: Dialect,
+    if_not_exists: bool,
+) -> String {
     tracing::debug!(
         dialect = %match dialect {
             Dialect::Sqlite => "sqlite",
@@ -194,14 +201,21 @@ fn generate_create_table(table: &TableInfo, dialect: Dialect) -> String {
     }
 
     let table_name = quote_identifier(&table.name, dialect);
+    let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} (\n{}\n)",
+        "CREATE TABLE{} {} (\n{}\n)",
+        ine,
         table_name,
         parts.join(",\n")
     );
 
     tracing::trace!(sql = %sql, "Generated CREATE TABLE statement");
     sql
+}
+
+/// Generate CREATE TABLE SQL (defaulting to `IF NOT EXISTS`).
+fn generate_create_table(table: &TableInfo, dialect: Dialect) -> String {
+    generate_create_table_with_if_not_exists(table, dialect, true)
 }
 
 /// Generate DROP TABLE SQL.

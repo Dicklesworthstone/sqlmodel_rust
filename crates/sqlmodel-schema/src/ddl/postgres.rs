@@ -37,7 +37,7 @@ impl DdlGenerator for PostgresDdlGenerator {
             SchemaOperation::AddColumn { table, column } => {
                 vec![generate_add_column(table, column, Dialect::Postgres)]
             }
-            SchemaOperation::DropColumn { table, column } => {
+            SchemaOperation::DropColumn { table, column, .. } => {
                 vec![format!(
                     "ALTER TABLE {} DROP COLUMN {}",
                     quote_identifier(table, Dialect::Postgres),
@@ -292,6 +292,7 @@ mod tests {
         let op = SchemaOperation::DropColumn {
             table: "heroes".to_string(),
             column: "old_field".to_string(),
+            table_info: None,
         };
         let stmts = ddl.generate(&op);
 

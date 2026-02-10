@@ -41,7 +41,15 @@ pub enum SchemaOperation {
     /// Add a column to a table.
     AddColumn { table: String, column: ColumnInfo },
     /// Drop a column from a table.
-    DropColumn { table: String, column: String },
+    ///
+    /// For SQLite, safely dropping a column on versions < 3.35 requires table
+    /// recreation. When `table_info` is present, the SQLite DDL generator can
+    /// emit a correct recreate-copy-drop sequence (preserving indexes we track).
+    DropColumn {
+        table: String,
+        column: String,
+        table_info: Option<TableInfo>,
+    },
     /// Change a column's type.
     AlterColumnType {
         table: String,
@@ -126,6 +134,7 @@ impl SchemaOperation {
             SchemaOperation::AddColumn { table, column } => Some(SchemaOperation::DropColumn {
                 table: table.clone(),
                 column: column.name.clone(),
+                table_info: None,
             }),
             SchemaOperation::DropColumn { .. } => None,
             SchemaOperation::AlterColumnType {
@@ -503,7 +512,7 @@ fn diff_table(current: &TableInfo, expected: &TableInfo, dialect: Dialect, diff:
     let table = &current.name;
 
     // Diff columns
-    diff_columns(table, &current.columns, &expected.columns, dialect, diff);
+    diff_columns(current, expected, dialect, diff);
 
     // Diff primary key
     diff_primary_key(table, &current.primary_key, &expected.primary_key, diff);
@@ -525,12 +534,14 @@ fn diff_table(current: &TableInfo, expected: &TableInfo, dialect: Dialect, diff:
 
 /// Compare columns between tables.
 fn diff_columns(
-    table: &str,
-    current: &[ColumnInfo],
-    expected: &[ColumnInfo],
+    current_table: &TableInfo,
+    expected_table: &TableInfo,
     dialect: Dialect,
     diff: &mut SchemaDiff,
 ) {
+    let table = current_table.name.as_str();
+    let current = current_table.columns.as_slice();
+    let expected = expected_table.columns.as_slice();
     let current_map: HashMap<&str, &ColumnInfo> =
         current.iter().map(|c| (c.name.as_str(), c)).collect();
     let expected_map: HashMap<&str, &ColumnInfo> =
@@ -582,6 +593,7 @@ fn diff_columns(
                 SchemaOperation::DropColumn {
                     table: table.to_string(),
                     column: (*name).to_string(),
+                    table_info: Some(current_table.clone()),
                 },
                 WarningSeverity::DataLoss,
                 format!("Dropping column '{}.{}' will delete data", table, name),
@@ -1241,7 +1253,7 @@ mod tests {
         let diff = schema_diff(&current, &expected);
         assert!(diff.has_destructive());
         assert!(diff.operations.iter().any(
-            |op| matches!(op, SchemaOperation::DropColumn { table, column } if table == "heroes" && column == "old_field")
+            |op| matches!(op, SchemaOperation::DropColumn { table, column, table_info: Some(_), .. } if table == "heroes" && column == "old_field")
         ));
     }
 
@@ -1448,6 +1460,7 @@ mod tests {
             SchemaOperation::DropColumn {
                 table: "heroes".to_string(),
                 column: "age".to_string(),
+                table_info: None,
             }
             .is_destructive()
         );

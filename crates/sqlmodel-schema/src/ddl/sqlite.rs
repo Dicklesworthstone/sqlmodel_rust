@@ -8,7 +8,7 @@ use super::{
     quote_identifier,
 };
 use crate::diff::SchemaOperation;
-use crate::introspect::Dialect;
+use crate::introspect::{Dialect, TableInfo};
 
 /// DDL generator for SQLite.
 pub struct SqliteDdlGenerator;
@@ -37,14 +37,23 @@ impl DdlGenerator for SqliteDdlGenerator {
             SchemaOperation::AddColumn { table, column } => {
                 vec![generate_add_column(table, column, Dialect::Sqlite)]
             }
-            SchemaOperation::DropColumn { table, column } => {
-                // SQLite 3.35.0+ supports DROP COLUMN directly
-                // For older versions, table recreation would be needed
-                vec![format!(
-                    "ALTER TABLE {} DROP COLUMN {}",
-                    quote_identifier(table, Dialect::Sqlite),
-                    quote_identifier(column, Dialect::Sqlite)
-                )]
+            SchemaOperation::DropColumn {
+                table,
+                column,
+                table_info,
+            } => {
+                if let Some(table_info) = table_info {
+                    sqlite_drop_column_recreate(table_info, column)
+                } else {
+                    vec![
+                        "-- SQLite: DROP COLUMN without table_info; using ALTER TABLE DROP COLUMN (requires SQLite >= 3.35.0)".to_string(),
+                        format!(
+                            "ALTER TABLE {} DROP COLUMN {}",
+                            quote_identifier(table, Dialect::Sqlite),
+                            quote_identifier(column, Dialect::Sqlite)
+                        ),
+                    ]
+                }
             }
             SchemaOperation::AlterColumnType {
                 table,
@@ -208,6 +217,96 @@ impl DdlGenerator for SqliteDdlGenerator {
     }
 }
 
+fn sanitize_temp_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("tmp");
+    }
+    out
+}
+
+fn sqlite_drop_column_recreate(table: &TableInfo, drop_column: &str) -> Vec<String> {
+    let table_name = table.name.as_str();
+    let drop_column = drop_column.to_string();
+
+    if !table.columns.iter().any(|c| c.name == drop_column) {
+        return vec![format!(
+            "-- SQLite: column '{}' not found on table '{}' (noop)",
+            drop_column, table_name
+        )];
+    }
+
+    let mut new_table = table.clone();
+    new_table.columns.retain(|c| c.name != drop_column);
+    new_table.primary_key.retain(|c| c != &drop_column);
+    new_table.foreign_keys.retain(|fk| fk.column != drop_column);
+    new_table
+        .unique_constraints
+        .retain(|u| !u.columns.iter().any(|c| c == &drop_column));
+    new_table
+        .indexes
+        .retain(|idx| !idx.columns.iter().any(|c| c == &drop_column));
+
+    if new_table.columns.is_empty() {
+        return vec![format!(
+            "SELECT __sqlmodel_error__('cannot drop last column {}.{}')",
+            sanitize_temp_ident(table_name),
+            sanitize_temp_ident(&drop_column)
+        )];
+    }
+
+    let tmp_old = format!(
+        "__sqlmodel_old_{}_drop_{}",
+        sanitize_temp_ident(table_name),
+        sanitize_temp_ident(&drop_column)
+    );
+
+    let mut stmts = Vec::new();
+    stmts.push("PRAGMA foreign_keys=OFF".to_string());
+    stmts.push("BEGIN".to_string());
+    stmts.push(generate_rename_table(table_name, &tmp_old, Dialect::Sqlite));
+    stmts.push(super::generate_create_table_with_if_not_exists(
+        &new_table,
+        Dialect::Sqlite,
+        false,
+    ));
+
+    let cols: Vec<String> = new_table
+        .columns
+        .iter()
+        .map(|c| quote_identifier(&c.name, Dialect::Sqlite))
+        .collect();
+    let cols_joined = cols.join(", ");
+
+    stmts.push(format!(
+        "INSERT INTO {} ({}) SELECT {} FROM {}",
+        quote_identifier(table_name, Dialect::Sqlite),
+        cols_joined,
+        cols_joined,
+        quote_identifier(&tmp_old, Dialect::Sqlite)
+    ));
+
+    stmts.push(generate_drop_table(&tmp_old, Dialect::Sqlite));
+
+    for idx in &new_table.indexes {
+        if idx.primary {
+            continue;
+        }
+        stmts.push(generate_create_index(table_name, idx, Dialect::Sqlite));
+    }
+
+    stmts.push("COMMIT".to_string());
+    stmts.push("PRAGMA foreign_keys=ON".to_string());
+    stmts
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -307,15 +406,48 @@ mod tests {
     #[test]
     fn test_drop_column() {
         let ddl = SqliteDdlGenerator;
+        let mut table = make_table(
+            "heroes",
+            vec![
+                make_column("id", "INTEGER", false),
+                make_column("name", "TEXT", false),
+                make_column("old_field", "TEXT", true),
+            ],
+            vec!["id"],
+        );
+        table.indexes = vec![
+            IndexInfo {
+                name: "idx_name".to_string(),
+                columns: vec!["name".to_string()],
+                unique: false,
+                index_type: None,
+                primary: false,
+            },
+            IndexInfo {
+                name: "idx_old_field".to_string(),
+                columns: vec!["old_field".to_string()],
+                unique: false,
+                index_type: None,
+                primary: false,
+            },
+        ];
         let op = SchemaOperation::DropColumn {
             table: "heroes".to_string(),
             column: "old_field".to_string(),
+            table_info: Some(table),
         };
         let stmts = ddl.generate(&op);
 
-        assert_eq!(stmts.len(), 1);
-        assert!(stmts[0].contains("ALTER TABLE"));
-        assert!(stmts[0].contains("DROP COLUMN"));
+        // Table recreation path emits multiple statements.
+        assert!(stmts.len() >= 6);
+        assert!(stmts.iter().any(|s| s.contains("ALTER TABLE") && s.contains("RENAME TO")));
+        assert!(stmts.iter().any(|s| s.contains("CREATE TABLE") && s.contains("\"heroes\"")));
+        assert!(stmts.iter().any(|s| s.contains("INSERT INTO") && s.contains("SELECT")));
+        // Index on dropped column should be omitted; remaining index should be recreated.
+        assert!(stmts.iter().any(|s| s.contains("CREATE INDEX") && s.contains("idx_name")));
+        assert!(!stmts
+            .iter()
+            .any(|s| s.contains("CREATE INDEX") && s.contains("idx_old_field")));
     }
 
     #[test]
