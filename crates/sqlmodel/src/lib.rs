@@ -136,8 +136,9 @@ pub use sqlmodel_macros::{Model, SqlEnum, Validate};
 
 pub use sqlmodel_query::{
     BinaryOp, Expr, Join, JoinType, Limit, Offset, OrderBy, PolymorphicJoined, PolymorphicJoined2,
-    PolymorphicJoinedSelect, PolymorphicJoinedSelect2, QueryBuilder, Select, UnaryOp, Where,
-    delete, insert, raw_execute, raw_query, select, update,
+    PolymorphicJoined3, PolymorphicJoinedSelect, PolymorphicJoinedSelect2,
+    PolymorphicJoinedSelect3, QueryBuilder, Select, UnaryOp, Where, delete, insert, raw_execute,
+    raw_query, select, update,
 };
 
 pub use sqlmodel_schema::{
@@ -656,8 +657,10 @@ pub mod prelude {
         Outcome,
         PolymorphicJoined,
         PolymorphicJoined2,
+        PolymorphicJoined3,
         PolymorphicJoinedSelect,
         PolymorphicJoinedSelect2,
+        PolymorphicJoinedSelect3,
         // Pool
         Pool,
         PoolConfig,
