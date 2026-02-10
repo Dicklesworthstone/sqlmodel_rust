@@ -219,6 +219,20 @@ Purpose: keep a granular, lossless checklist for parity work (docs, schema, sess
 
 Goal: eliminate real behavior gaps hidden behind "we'd need ..." comments and ensure the code matches the stated parity goals.
 
+### E0. Repo-wide "would" audit
+- [x] `rg -n "\\bwould\\b" -S .` and classify each match
+- [x] Confirmed: all current `would` instances are either correct semantics or test/doc phrasing (no hidden stubs):
+- [x] `crates/sqlmodel-core/src/row.rs`: "precision would be lost" (correct semantics)
+- [x] `crates/sqlmodel-core/src/value.rs`: "precision would be lost" (correct semantics)
+- [x] `crates/sqlmodel-pool/src/sharding.rs`: "would cause division by zero" (correct semantics)
+- [x] `crates/sqlmodel-core/src/validate.rs`: "it would be excluded" / "description would be None" (doc comment)
+- [x] `crates/sqlmodel-schema/src/lib.rs`: "SQL that drop_table would execute" (doc comment)
+- [x] `crates/sqlmodel-query/src/builder.rs`: "would violate" (doc comment)
+- [x] `crates/sqlmodel-session/src/flush.rs`: "SQL that would be executed" / "would cause parameter mismatch" (doc comment + correctness note)
+- [x] `crates/sqlmodel-console/tests/e2e/*`: "would be captured/generated" (tests)
+- [x] `crates/sqlmodel-schema/src/create.rs`: "Would be this if it had own table" (test comment only)
+- [x] No `would` instances implied missing implementation; nothing needed to bead/patch from this scan
+
 ### E1. Eager SELECT must alias related columns (no `table.*`)
 - [x] Add `RelationshipInfo.related_fields_fn` so query builders can project related model columns deterministically
 - [x] Derive macro wires `.related_fields(<RelatedModel as Model>::fields)`
@@ -235,6 +249,36 @@ Goal: eliminate real behavior gaps hidden behind "we'd need ..." comments and en
 ### E3. Doc/Parity Drift: "Excluded" sections must become real tracked work
 - [ ] Audit `FEATURE_PARITY.md` for "Explicitly Excluded" content and reconcile with bd-162 (no exclusions)
 - [ ] Create/adjust beads for each formerly-excluded feature and link them to bd-162
+
+## H. Table Inheritance (bd-kzp1)
+
+Goal: make inheritance metadata and schema generation correct and usable (STI/JTI/CTI), and remove misleading behavior.
+
+### H1. Macro metadata correctness
+- [x] Infer `inheritance="joined"` for `#[sqlmodel(table, inherits = \"...\")]` children
+- [x] Store parent *table name* in `InheritanceInfo.parent` (not parent model name string)
+- [x] STI children inherit `discriminator_column` from parent automatically
+- [x] STI children use parent `TABLE_NAME` (physical table) for `Model::TABLE_NAME`
+
+### H2. Schema correctness
+- [x] Joined-table child DDL: FK to parent uses *all* PK columns (composite-safe)
+- [x] SchemaBuilder STI child: emit `ALTER TABLE parent ADD COLUMN ...` for child-only fields (skip PK columns)
+
+### H3. Tests
+- [x] Update macro parse tests for joined-child inference
+- [x] Update core inheritance tests to treat `parent` as table name
+- [x] Update schema inheritance tests to reflect new semantics and ALTER TABLE behavior
+- [x] Update facade tests (`crates/sqlmodel/src/lib.rs`) for new `InheritanceInfo` outputs
+
+### H4. Polymorphic Query Basics (STI)
+- [x] `to_row()` for STI child always emits discriminator column/value (even if the struct has no discriminator field)
+- [x] `Select::<Child>` implicitly ANDs discriminator filter into WHERE/EXISTS/subquery builds
+- [x] Add unit tests covering discriminator filter SQL + params
+
+### H5. Follow-up (Joined Polymorphism)
+- [ ] Define the Rust-facing API for joined-table inheritance that preserves parent fields (composition/flattening vs separate load)
+- [ ] Implement joined-child query building/hydration semantics + tests
+- [ ] Track as its own bead under `bd-162` (bd-kzp1 follow-up)
 
 ## F. ORM Patterns Wiring + API Reality (bd-3lz)
 
