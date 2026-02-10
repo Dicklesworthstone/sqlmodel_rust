@@ -2,6 +2,37 @@
 
 Purpose: keep a granular, lossless checklist for parity work (docs, schema, session/relationships) without losing track of sub-tasks.
 
+## 0. Current Focus (2026-02-10): bd-ukkg (joined-table inheritance polymorphic queries + hydration)
+
+### 0.1 Joined Inheritance Child Hydration (`select!(Child)`)
+- [x] Ensure joined child queries project parent columns with `parent__col` aliases and JOIN parent table
+- [x] Ensure joined child `from_row()` can hydrate embedded parent model via `#[sqlmodel(parent)]`
+
+### 0.2 Joined Inheritance Base Polymorphic Query (`select!(Base) -> Base|Child`)
+- [x] Add `Select::<Base>::polymorphic_joined::<Child>()` (LEFT JOIN + prefixed projections)
+- [x] Add `PolymorphicJoined<Base, Child>` enum and `PolymorphicJoinedSelect<Base, Child>` execution wrapper
+- [ ] Extend polymorphic support beyond a single child type (macro-generated enum or type-list story)
+- [ ] Track/decide joined-inheritance DML semantics (insert/update/delete across base+child tables) and create beads
+
+### 0.3 Tests (SQLite, end-to-end)
+- [x] Add integration test `crates/sqlmodel/tests/joined_inheritance_sqlite.rs`:
+- [x] Create tables for base+child via `SchemaBuilder`
+- [x] Insert base row + joined child row
+- [x] Assert `select!(Child).all()` hydrates embedded parent correctly
+- [x] Assert `select!(Base).polymorphic_joined::<Child>().all()` returns both `Base` and `Child` variants
+
+### 0.4 API Surface (Facade)
+- [x] Re-export polymorphic types from `sqlmodel-query`
+- [x] Re-export polymorphic types from `sqlmodel` facade
+- [x] Add polymorphic types to `sqlmodel::prelude::*`
+
+### 0.5 Quality Gates (re-run after all edits)
+- [x] `cargo fmt --check`
+- [x] `cargo check --all-targets`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test -p sqlmodel --test joined_inheritance_sqlite`
+- [x] `ubs --diff --only=rust,toml .` (exit 0)
+
 ## 0. Current Focus (2026-02-10): bd-3j44 (cascade delete/orphan tracking)
 
 ### 0.1 Implementation

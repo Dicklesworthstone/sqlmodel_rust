@@ -78,6 +78,9 @@ sqlmodel-schema = { path = "crates/sqlmodel-schema", version = "0.1.1" }
 sqlmodel-session = { path = "crates/sqlmodel-session", version = "0.1.1" }
 sqlmodel-pool = { path = "crates/sqlmodel-pool", version = "0.1.1" }
 sqlmodel-console = { path = "crates/sqlmodel-console", version = "0.1.1" }
+sqlmodel-postgres = { path = "crates/sqlmodel-postgres", version = "0.1.1" }
+sqlmodel-sqlite = { path = "crates/sqlmodel-sqlite", version = "0.1.1" }
+sqlmodel-mysql = { path = "crates/sqlmodel-mysql", version = "0.1.1" }
 
 [profile.release]
 opt-level = "z"

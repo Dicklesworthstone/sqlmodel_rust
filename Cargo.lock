@@ -1266,6 +1266,7 @@ dependencies = [
  "sqlmodel-query",
  "sqlmodel-schema",
  "sqlmodel-session",
+ "sqlmodel-sqlite",
 ]
 
 [[package]]
