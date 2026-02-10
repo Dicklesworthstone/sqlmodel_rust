@@ -292,10 +292,10 @@ impl FieldInfo {
         match self.sql_type {
             SqlType::Decimal { .. } | SqlType::Numeric { .. } => {
                 if let (Some(p), Some(s)) = (self.precision, self.scale) {
-                    let type_name = match self.sql_type {
-                        SqlType::Decimal { .. } => "DECIMAL",
-                        SqlType::Numeric { .. } => "NUMERIC",
-                        _ => unreachable!(),
+                    let type_name = if matches!(self.sql_type, SqlType::Decimal { .. }) {
+                        "DECIMAL"
+                    } else {
+                        "NUMERIC"
                     };
                     return format!("{}({}, {})", type_name, p, s);
                 }
@@ -838,10 +838,15 @@ impl InheritanceStrategy {
 pub struct InheritanceInfo {
     /// The inheritance strategy for this model.
     pub strategy: InheritanceStrategy,
-    /// The parent model name (for child models).
+    /// The parent table name (for child models).
     ///
-    /// When set, this model inherits from the specified parent model.
+    /// When set, this model inherits from the specified parent table.
     pub parent: Option<&'static str>,
+    /// Function returning the parent's field metadata (for joined inheritance).
+    ///
+    /// This is used by query builders to project and alias parent columns when selecting
+    /// a joined-table inheritance child.
+    pub parent_fields_fn: Option<fn() -> &'static [FieldInfo]>,
     /// The discriminator column name (for single table inheritance base models).
     ///
     /// For single table inheritance, this specifies which column contains the
@@ -860,6 +865,7 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::None,
             parent: None,
+            parent_fields_fn: None,
             discriminator_column: None,
             discriminator_value: None,
         }
@@ -870,6 +876,7 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::Single,
             parent: None,
+            parent_fields_fn: None,
             discriminator_column: None,
             discriminator_value: None,
         }
@@ -880,6 +887,7 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::Joined,
             parent: None,
+            parent_fields_fn: None,
             discriminator_column: None,
             discriminator_value: None,
         }
@@ -890,16 +898,18 @@ impl InheritanceInfo {
         Self {
             strategy: InheritanceStrategy::Concrete,
             parent: None,
+            parent_fields_fn: None,
             discriminator_column: None,
             discriminator_value: None,
         }
     }
 
     /// Create inheritance info for a child model.
-    pub const fn child(parent: &'static str) -> Self {
+    pub const fn child(parent_table: &'static str) -> Self {
         Self {
             strategy: InheritanceStrategy::None, // Inherits from parent's strategy
-            parent: Some(parent),
+            parent: Some(parent_table),
+            parent_fields_fn: None,
             discriminator_column: None,
             discriminator_value: None,
         }
@@ -1464,16 +1474,16 @@ mod tests {
 
     #[test]
     fn test_inheritance_info_child() {
-        let info = InheritanceInfo::child("Employee");
-        assert_eq!(info.parent, Some("Employee"));
+        let info = InheritanceInfo::child("employees");
+        assert_eq!(info.parent, Some("employees"));
         assert!(info.is_child());
         assert!(!info.is_base());
     }
 
     #[test]
     fn test_inheritance_info_child_with_discriminator_value() {
-        let info = InheritanceInfo::child("Employee").with_discriminator_value("manager");
-        assert_eq!(info.parent, Some("Employee"));
+        let info = InheritanceInfo::child("employees").with_discriminator_value("manager");
+        assert_eq!(info.parent, Some("employees"));
         assert_eq!(info.discriminator_value, Some("manager"));
         assert!(info.is_child());
     }

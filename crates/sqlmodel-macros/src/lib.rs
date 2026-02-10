@@ -89,8 +89,29 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 /// Generate the Model trait implementation from parsed model definition.
 fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     let name = &model.name;
-    let table_name = &model.table_name;
+    let table_name_lit = &model.table_name;
     let (impl_generics, ty_generics, where_clause) = model.generics.split_for_impl();
+
+    // If this is a single-table-inheritance child (inherits + discriminator_value),
+    // its effective table is the parent table.
+    let table_name_ts =
+        if model.config.inherits.is_some() && model.config.discriminator_value.is_some() {
+            let parent = model
+                .config
+                .inherits
+                .as_deref()
+                .expect("inherits checked above");
+            let parent_ty_ts: proc_macro2::TokenStream =
+                if let Ok(path) = syn::parse_str::<syn::Path>(parent) {
+                    quote::quote! { #path }
+                } else {
+                    let ident = syn::Ident::new(parent, proc_macro2::Span::call_site());
+                    quote::quote! { #ident }
+                };
+            quote::quote! { <#parent_ty_ts as sqlmodel_core::Model>::TABLE_NAME }
+        } else {
+            quote::quote! { #table_name_lit }
+        };
 
     // Collect primary key field names
     let pk_fields: Vec<&str> = model
@@ -148,7 +169,7 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
     quote::quote! {
         impl #impl_generics sqlmodel_core::Model for #name #ty_generics #where_clause {
-            const TABLE_NAME: &'static str = #table_name;
+            const TABLE_NAME: &'static str = #table_name_ts;
             const PRIMARY_KEY: &'static [&'static str] = #pk_slice;
             const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] = #relationships;
             const SHARD_KEY: Option<&'static str> = #shard_key_const;
@@ -512,7 +533,19 @@ fn generate_to_row(model: &ModelDef) -> proc_macro2::TokenStream {
     }
 
     quote::quote! {
-        vec![#(#conversions),*]
+        let mut out = vec![#(#conversions),*];
+
+        // Single-table inheritance child models should always emit their discriminator
+        // so inserts/updates can round-trip correctly even if the struct doesn't have a
+        // dedicated discriminator field.
+        let inh = <Self as sqlmodel_core::Model>::inheritance();
+        if let (Some(col), Some(val)) = (inh.discriminator_column, inh.discriminator_value) {
+            if !out.iter().any(|(c, _)| *c == col) {
+                out.push((col, sqlmodel_core::Value::from(val)));
+            }
+        }
+
+        out
     }
 }
 
@@ -728,16 +761,44 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
         }
     };
 
-    // Handle parent model name
-    let parent_ts = if let Some(ref parent) = config.inherits {
-        quote::quote! { Some(#parent) }
+    // Helper: interpret `inherits = "..."` as a Rust type path in the current scope.
+    // We keep it as a string in parsing so attribute syntax stays simple; here we
+    // translate it into type tokens for codegen.
+    let parent_ty_ts: Option<proc_macro2::TokenStream> = config.inherits.as_deref().map(|p| {
+        if let Ok(path) = syn::parse_str::<syn::Path>(p) {
+            quote::quote! { #path }
+        } else {
+            let ident = syn::Ident::new(p, proc_macro2::Span::call_site());
+            quote::quote! { #ident }
+        }
+    });
+
+    // Store parent table name (not parent Rust type name) in metadata so schema/DDL can be correct.
+    let parent_table_ts = if let Some(ref parent_ty) = parent_ty_ts {
+        quote::quote! { Some(<#parent_ty as sqlmodel_core::Model>::TABLE_NAME) }
     } else {
         quote::quote! { None }
     };
 
-    // Handle discriminator column (for base models)
+    let parent_fields_fn_ts = if let Some(ref parent_ty) = parent_ty_ts {
+        quote::quote! { Some(<#parent_ty as sqlmodel_core::Model>::fields) }
+    } else {
+        quote::quote! { None }
+    };
+
+    // Handle discriminator column.
+    //
+    // - Base STI models specify it explicitly: `#[sqlmodel(inheritance="single", discriminator="...")]`
+    // - Child STI models inherit it from the parent so query/schema tooling has the column name
+    //   available without requiring duplicate annotation.
     let discriminator_column_ts = if let Some(ref column) = config.discriminator_column {
         quote::quote! { Some(#column) }
+    } else if config.discriminator_value.is_some() {
+        if let Some(parent_ty) = parent_ty_ts.as_ref() {
+            quote::quote! { <#parent_ty as sqlmodel_core::Model>::inheritance().discriminator_column }
+        } else {
+            quote::quote! { None }
+        }
     } else {
         quote::quote! { None }
     };
@@ -752,7 +813,8 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
     quote::quote! {
         sqlmodel_core::InheritanceInfo {
             strategy: #strategy_ts,
-            parent: #parent_ts,
+            parent: #parent_table_ts,
+            parent_fields_fn: #parent_fields_fn_ts,
             discriminator_column: #discriminator_column_ts,
             discriminator_value: #discriminator_value_ts,
         }
