@@ -304,6 +304,9 @@ Environment variables for control:
 
 - [Console User Guide](docs/console/user-guide.md) - Complete feature guide
 - [Agent Compatibility Guide](docs/console/agent-compatibility.md) - For agent authors
+- [Proposed Rust Architecture](PROPOSED_RUST_ARCHITECTURE.md) - Crate boundaries, invariants, and inheritance/query design
+- [Existing SQLModel Structure](EXISTING_SQLMODEL_STRUCTURE.md) - Behavior specification extracted from legacy Python projects
+- [Feature Parity Tracker](FEATURE_PARITY.md) - Status of parity work against Python SQLModel
 
 ### Visual Examples
 
