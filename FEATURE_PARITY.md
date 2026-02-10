@@ -2,7 +2,7 @@
 
 This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
-**Last Updated:** 2026-02-10 (Relationships + SQLite schema diff/DDL correctness pass)
+**Last Updated:** 2026-02-10 (Relationships: one-to-many batch loader + SQLite schema diff/DDL correctness pass)
 
 ---
 
@@ -18,11 +18,11 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Transactions | 6 | 6 | 100% |
 | Schema/DDL | 7 | 8 | 88% |
 | Validation | 5 | 6 | 83% |
-| Relationships | 4 | 6 | 67% (Partial) |
+| Relationships | 5 | 6 | 83% (Partial) |
 | Serialization | 4 | 4 | 100% |
 | Database Drivers | 3 | 3 | 100% |
 | Connection Pooling | 8 | 8 | 100% |
-| **TOTAL** | **113** | **119** | **95%** |
+| **TOTAL** | **114** | **119** | **96%** |
 
 ---
 
@@ -172,7 +172,7 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
 | Feature | Python | Rust | Status |
 |---------|--------|------|--------|
-| One-to-many | `Relationship()` | `RelatedMany<T>` (type + metadata) | ⚠️ Partial (no built-in batch loader yet) |
+| One-to-many | `Relationship()` | `RelatedMany<T>` + `Session::load_one_to_many` | ✅ Implemented (explicit batch load) |
 | Many-to-one | `Relationship()` | `Lazy<T>` / `Related<T>` + `Session::{load_lazy,load_many}` | ✅ Implemented (explicit load/batch-load) |
 | Many-to-many | `Relationship(link_model=)` | `RelatedMany<T>` + `Session::load_many_to_many` + `flush_related_many` | ✅ Implemented |
 | Back populates | `back_populates=` | `Session::{relate_to_one,unrelate_from_one}` helpers + metadata | ✅ Implemented (explicit sync helper) |

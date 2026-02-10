@@ -1,6 +1,30 @@
 # Session TODO (Codex)
 
-Purpose: eliminate "comment-only" SQLite DDL behavior and fix doc/spec drift without losing track of sub-tasks.
+Purpose: keep a granular, lossless checklist for parity work (docs, schema, session/relationships) without losing track of sub-tasks.
+
+## 0. Current Focus (2026-02-10): bd-2lpn (one-to-many batch loader)
+
+### 0.1 Implementation
+- [x] Implement `Session::load_one_to_many` for `RelatedMany<T>` (one-to-many) in `crates/sqlmodel-session/src/lib.rs`
+- [x] Make SQL dialect-correct (identifier quoting + placeholders)
+- [x] Fix correctness: duplicate parents in input slice must not drop relationship results (no `HashMap::remove` consumption)
+- [x] Apply same duplicate-parent fix to `Session::load_many_to_many`
+- [x] Insert loaded children into Session identity map (best-effort caching)
+
+### 0.2 Tests
+- [x] Add unit test `test_load_one_to_many_single_query_and_populates_related_many`
+- [x] Fix compile break in existing tests by introducing `MockConnection::new()` (dialect field)
+- [x] Assert SQL contains expected table + Postgres placeholder shape (`$1`, `$2`)
+
+### 0.3 Docs
+- [x] Update `FEATURE_PARITY.md` relationships section: one-to-many now implemented
+
+### 0.4 Quality Gates
+- [x] `cargo fmt --check`
+- [x] `cargo check --all-targets`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test -p sqlmodel-session`
+- [x] `ubs --diff --only=rust,toml .` (exit 0)
 
 ## A. SQLite DDL: Remove Comment-Only Paths (Constraint Ops)
 

@@ -1761,13 +1761,16 @@ impl<C: Connection> Session<C> {
             return Outcome::Ok(0);
         }
 
-        // Build query with IN clause
+        // Build query with IN clause (dialect-correct placeholders/quoting).
+        let dialect = self.connection.dialect();
         let pk_col = T::PRIMARY_KEY.first().unwrap_or(&"id");
-        let placeholders: Vec<String> = (1..=fk_values.len()).map(|i| format!("${}", i)).collect();
+        let placeholders: Vec<String> = (1..=fk_values.len())
+            .map(|i| dialect.placeholder(i))
+            .collect();
         let sql = format!(
-            "SELECT * FROM \"{}\" WHERE \"{}\" IN ({})",
-            T::TABLE_NAME,
-            pk_col,
+            "SELECT * FROM {} WHERE {} IN ({})",
+            dialect.quote_identifier(T::TABLE_NAME),
+            dialect.quote_identifier(pk_col),
             placeholders.join(", ")
         );
 
@@ -1899,28 +1902,23 @@ impl<C: Connection> Session<C> {
             return Outcome::Ok(0);
         }
 
-        // Build query with JOIN through link table:
+        // Build query with JOIN through link table (dialect-correct placeholders/quoting):
         // SELECT child.*, link.local_column as __parent_pk
         // FROM child
         // JOIN link ON child.pk = link.remote_column
         // WHERE link.local_column IN (...)
+        let dialect = self.connection.dialect();
         let child_pk_col = Child::PRIMARY_KEY.first().unwrap_or(&"id");
-        let placeholders: Vec<String> = (1..=pks.len()).map(|i| format!("${}", i)).collect();
+        let placeholders: Vec<String> = (1..=pks.len()).map(|i| dialect.placeholder(i)).collect();
+        let child_table = dialect.quote_identifier(Child::TABLE_NAME);
+        let link_table_q = dialect.quote_identifier(link_table.table_name);
+        let link_local_col = dialect.quote_identifier(link_table.local_column);
+        let link_remote_col = dialect.quote_identifier(link_table.remote_column);
+        let child_pk_q = dialect.quote_identifier(child_pk_col);
         let sql = format!(
-            "SELECT \"{}\".*, \"{}\".\"{}\" AS __parent_pk FROM \"{}\" \
-             JOIN \"{}\" ON \"{}\".\"{}\" = \"{}\".\"{}\" \
-             WHERE \"{}\".\"{}\" IN ({})",
-            Child::TABLE_NAME,
-            link_table.table_name,
-            link_table.local_column,
-            Child::TABLE_NAME,
-            link_table.table_name,
-            Child::TABLE_NAME,
-            child_pk_col,
-            link_table.table_name,
-            link_table.remote_column,
-            link_table.table_name,
-            link_table.local_column,
+            "SELECT {child_table}.*, {link_table_q}.{link_local_col} AS __parent_pk FROM {child_table} \
+             JOIN {link_table_q} ON {child_table}.{child_pk_q} = {link_table_q}.{link_remote_col} \
+             WHERE {link_table_q}.{link_local_col} IN ({})",
             placeholders.join(", ")
         );
 
@@ -1957,7 +1955,8 @@ impl<C: Connection> Session<C> {
         for obj in objects {
             let pk = parent_pk(obj);
             let pk_hash = hash_values(std::slice::from_ref(&pk));
-            let children = by_parent.remove(&pk_hash).unwrap_or_default();
+            // Don't `remove()` here: callers might pass the same parent more than once.
+            let children = by_parent.get(&pk_hash).cloned().unwrap_or_default();
             let child_count = children.len();
 
             let related = accessor(obj);
@@ -1971,6 +1970,140 @@ impl<C: Connection> Session<C> {
             total_children = loaded_count,
             "Many-to-many batch load complete"
         );
+
+        Outcome::Ok(loaded_count)
+    }
+
+    /// Batch load one-to-many relationships for multiple parent objects.
+    ///
+    /// This populates `RelatedMany<Child>` where the child table has a foreign key column pointing
+    /// back to the parent. It runs a single query:
+    ///
+    /// `SELECT *, <fk_col> AS __parent_pk FROM <child_table> WHERE <fk_col> IN (...)`
+    ///
+    /// and then groups results per parent PK to populate each `RelatedMany`.
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor, parent_pk))]
+    pub async fn load_one_to_many<P, Child, FA, FP>(
+        &mut self,
+        cx: &Cx,
+        objects: &mut [P],
+        accessor: FA,
+        parent_pk: FP,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        Child: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+        FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FP: Fn(&P) -> Value,
+    {
+        // Collect parent PKs for objects that still need loading.
+        let mut pks: Vec<Value> = Vec::new();
+        let mut pk_by_index: Vec<(usize, Value)> = Vec::new();
+        for (idx, obj) in objects.iter_mut().enumerate() {
+            let pk = parent_pk(&*obj);
+            let related = accessor(obj);
+            if related.is_loaded() {
+                continue;
+            }
+
+            related.set_parent_pk(pk.clone());
+
+            if matches!(pk, Value::Null) {
+                // Unsaved parent: empty collection, mark loaded.
+                let _ = related.set_loaded(Vec::new());
+                continue;
+            }
+
+            pks.push(pk.clone());
+            pk_by_index.push((idx, pk));
+        }
+
+        tracing::info!(
+            parent_model = std::any::type_name::<P>(),
+            related_model = std::any::type_name::<Child>(),
+            parent_count = objects.len(),
+            query_parent_count = pks.len(),
+            "Batch loading one-to-many relationships"
+        );
+
+        if pks.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        // Use the FK column from the RelatedMany field on the first object.
+        let fk_column = accessor(&mut objects[pk_by_index[0].0]).fk_column();
+        let dialect = self.connection.dialect();
+        let placeholders: Vec<String> = (1..=pks.len()).map(|i| dialect.placeholder(i)).collect();
+        let child_table = dialect.quote_identifier(Child::TABLE_NAME);
+        let fk_q = dialect.quote_identifier(fk_column);
+        let sql = format!(
+            "SELECT *, {fk_q} AS __parent_pk FROM {child_table} WHERE {fk_q} IN ({})",
+            placeholders.join(", ")
+        );
+
+        tracing::trace!(sql = %sql, "One-to-many batch SQL");
+
+        let rows = match self.connection.query(cx, &sql, &pks).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Group by parent PK
+        let mut by_parent: HashMap<u64, Vec<Child>> = HashMap::new();
+        for row in &rows {
+            let parent_pk_value: Value = match row.get_by_name("__parent_pk") {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let parent_pk_hash = hash_values(std::slice::from_ref(&parent_pk_value));
+            match Child::from_row(row) {
+                Ok(child) => {
+                    // Add to session identity map so later `get()` calls can reuse loaded instances.
+                    let pk_values = child.primary_key_value();
+                    let key = ObjectKey::from_pk::<Child>(&pk_values);
+
+                    self.identity_map.entry(key).or_insert_with(|| {
+                        // Extract column data from the model while we have the concrete type
+                        let row_data = child.to_row();
+                        let column_names: Vec<&'static str> =
+                            row_data.iter().map(|(name, _)| *name).collect();
+                        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
+
+                        // Serialize values for dirty checking (must match format used in flush)
+                        let serialized = serde_json::to_vec(&values).ok();
+
+                        TrackedObject {
+                            object: Box::new(child.clone()),
+                            original_state: serialized,
+                            state: ObjectState::Persistent,
+                            table_name: Child::TABLE_NAME,
+                            column_names,
+                            values,
+                            pk_columns: Child::PRIMARY_KEY.to_vec(),
+                            pk_values: pk_values.clone(),
+                            expired_attributes: None,
+                        }
+                    });
+
+                    by_parent.entry(parent_pk_hash).or_default().push(child);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Populate each RelatedMany.
+        let mut loaded_count = 0;
+        for (idx, pk) in pk_by_index {
+            let pk_hash = hash_values(std::slice::from_ref(&pk));
+            // Don't `remove()` here: callers might pass the same parent more than once.
+            let children = by_parent.get(&pk_hash).cloned().unwrap_or_default();
+            loaded_count += children.len();
+
+            let related = accessor(&mut objects[idx]);
+            let _ = related.set_loaded(children);
+        }
 
         Outcome::Ok(loaded_count)
     }
@@ -2771,11 +2904,22 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockState {
         query_calls: usize,
+        last_sql: Option<String>,
     }
 
     #[derive(Debug, Clone)]
     struct MockConnection {
         state: Arc<Mutex<MockState>>,
+        dialect: sqlmodel_core::Dialect,
+    }
+
+    impl MockConnection {
+        fn new(state: Arc<Mutex<MockState>>) -> Self {
+            Self {
+                state,
+                dialect: sqlmodel_core::Dialect::Postgres,
+            }
+        }
     }
 
     impl sqlmodel_core::Connection for MockConnection {
@@ -2784,29 +2928,62 @@ mod tests {
         where
             Self: 'conn;
 
+        fn dialect(&self) -> sqlmodel_core::Dialect {
+            self.dialect
+        }
+
         fn query(
             &self,
             _cx: &Cx,
-            _sql: &str,
+            sql: &str,
             params: &[Value],
         ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
             let params = params.to_vec();
             let state = Arc::clone(&self.state);
+            let sql = sql.to_string();
             async move {
-                state.lock().expect("lock poisoned").query_calls += 1;
+                {
+                    let mut guard = state.lock().expect("lock poisoned");
+                    guard.query_calls += 1;
+                    guard.last_sql = Some(sql.clone());
+                }
 
                 let mut rows = Vec::new();
+                let is_teams = sql.contains("teams");
+                let is_heroes = sql.contains("heroes");
+
                 for v in params {
-                    match v {
-                        Value::BigInt(1) => rows.push(Row::new(
-                            vec!["id".into(), "name".into()],
-                            vec![Value::BigInt(1), Value::Text("Avengers".into())],
-                        )),
-                        Value::BigInt(2) => rows.push(Row::new(
-                            vec!["id".into(), "name".into()],
-                            vec![Value::BigInt(2), Value::Text("X-Men".into())],
-                        )),
-                        _ => {}
+                    if is_teams {
+                        match v {
+                            Value::BigInt(1) => rows.push(Row::new(
+                                vec!["id".into(), "name".into()],
+                                vec![Value::BigInt(1), Value::Text("Avengers".into())],
+                            )),
+                            Value::BigInt(2) => rows.push(Row::new(
+                                vec!["id".into(), "name".into()],
+                                vec![Value::BigInt(2), Value::Text("X-Men".into())],
+                            )),
+                            _ => {}
+                        }
+                    } else if is_heroes {
+                        // One-to-many child rows keyed by team_id (the query parameter).
+                        match v {
+                            Value::BigInt(1) => {
+                                rows.push(Row::new(
+                                    vec!["id".into(), "team_id".into(), "__parent_pk".into()],
+                                    vec![Value::BigInt(101), Value::BigInt(1), Value::BigInt(1)],
+                                ));
+                                rows.push(Row::new(
+                                    vec!["id".into(), "team_id".into(), "__parent_pk".into()],
+                                    vec![Value::BigInt(102), Value::BigInt(1), Value::BigInt(1)],
+                                ));
+                            }
+                            Value::BigInt(2) => rows.push(Row::new(
+                                vec!["id".into(), "team_id".into(), "__parent_pk".into()],
+                                vec![Value::BigInt(201), Value::BigInt(2), Value::BigInt(2)],
+                            )),
+                            _ => {}
+                        }
                     }
                 }
 
@@ -2974,9 +3151,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         let heroes = vec![
@@ -3038,12 +3213,161 @@ mod tests {
         assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct HeroChild {
+        id: Option<i64>,
+        team_id: i64,
+    }
+
+    impl Model for HeroChild {
+        const TABLE_NAME: &'static str = "heroes";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
+                ("team_id", Value::BigInt(self.team_id)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            let team_id: i64 = row.get_named("team_id")?;
+            Ok(Self {
+                id: Some(id),
+                team_id,
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TeamWithHeroes {
+        id: Option<i64>,
+        heroes: sqlmodel_core::RelatedMany<HeroChild>,
+    }
+
+    impl Model for TeamWithHeroes {
+        const TABLE_NAME: &'static str = "teams";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![("id", self.id.map_or(Value::Null, Value::BigInt))]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            Ok(Self {
+                id: Some(id),
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[test]
+    fn test_load_one_to_many_single_query_and_populates_related_many() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let mut teams = vec![
+            TeamWithHeroes {
+                id: Some(1),
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            },
+            TeamWithHeroes {
+                id: Some(2),
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            },
+            TeamWithHeroes {
+                id: None,
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            },
+        ];
+
+        rt.block_on(async {
+            let loaded = unwrap_outcome(
+                session
+                    .load_one_to_many::<TeamWithHeroes, HeroChild, _, _>(
+                        &cx,
+                        &mut teams,
+                        |t| &mut t.heroes,
+                        |t| t.id.map_or(Value::Null, Value::BigInt),
+                    )
+                    .await,
+            );
+            assert_eq!(loaded, 3);
+
+            assert!(teams[0].heroes.is_loaded());
+            assert_eq!(teams[0].heroes.len(), 2);
+            assert_eq!(teams[0].heroes.parent_pk(), Some(&Value::BigInt(1)));
+
+            assert!(teams[1].heroes.is_loaded());
+            assert_eq!(teams[1].heroes.len(), 1);
+            assert_eq!(teams[1].heroes.parent_pk(), Some(&Value::BigInt(2)));
+
+            // Unsaved parent gets an empty, loaded collection without querying.
+            assert!(teams[2].heroes.is_loaded());
+            assert_eq!(teams[2].heroes.len(), 0);
+            assert_eq!(teams[2].heroes.parent_pk(), Some(&Value::Null));
+        });
+
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
+        let sql = state
+            .lock()
+            .expect("lock poisoned")
+            .last_sql
+            .clone()
+            .expect("sql captured");
+        assert!(sql.contains("FROM"), "expected SQL to contain FROM");
+        assert!(
+            sql.contains("heroes"),
+            "expected SQL to target heroes table"
+        );
+        assert!(
+            sql.contains("$1"),
+            "expected Postgres-style placeholders ($1, $2, ...)"
+        );
+        assert!(
+            sql.contains("$2"),
+            "expected Postgres-style placeholders ($1, $2, ...)"
+        );
+    }
+
     #[test]
     fn test_add_all_with_vec() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         // Each object needs a unique PK for identity tracking
@@ -3073,9 +3397,7 @@ mod tests {
     #[test]
     fn test_add_all_with_empty_collection() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         let teams: Vec<Team> = vec![];
@@ -3089,9 +3411,7 @@ mod tests {
     #[test]
     fn test_add_all_with_iterator() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         let teams = [
@@ -3116,9 +3436,7 @@ mod tests {
     #[test]
     fn test_add_all_with_slice() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         let teams = [
@@ -3149,9 +3467,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3185,9 +3501,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3224,9 +3538,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3260,9 +3572,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3296,9 +3606,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3329,9 +3637,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3361,9 +3667,7 @@ mod tests {
     #[test]
     fn test_is_modified_new_object_returns_true() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         let team = Team {
@@ -3379,9 +3683,7 @@ mod tests {
     #[test]
     fn test_is_modified_untracked_returns_false() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let session = Session::<MockConnection>::new(conn);
 
         let team = Team {
@@ -3401,9 +3703,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3423,9 +3723,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3451,9 +3749,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3477,9 +3773,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3502,9 +3796,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         // Untracked object
@@ -3547,9 +3839,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3574,9 +3864,7 @@ mod tests {
     #[test]
     fn test_modified_attributes_untracked_returns_empty() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let session = Session::<MockConnection>::new(conn);
 
         let team = Team {
@@ -3591,9 +3879,7 @@ mod tests {
     #[test]
     fn test_modified_attributes_new_returns_empty() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         let team = Team {
@@ -3617,9 +3903,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3649,9 +3933,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3681,9 +3963,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3707,9 +3987,7 @@ mod tests {
     #[test]
     fn test_expire_does_not_affect_new_objects() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         // Add a new object
@@ -3735,9 +4013,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
@@ -3777,9 +4053,7 @@ mod tests {
     #[test]
     fn test_is_expired_returns_false_for_untracked() {
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let session = Session::<MockConnection>::new(conn);
 
         let team = Team {
@@ -3799,9 +4073,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let state = Arc::new(Mutex::new(MockState::default()));
-        let conn = MockConnection {
-            state: Arc::clone(&state),
-        };
+        let conn = MockConnection::new(Arc::clone(&state));
         let mut session = Session::new(conn);
 
         rt.block_on(async {
