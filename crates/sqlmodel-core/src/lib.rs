@@ -31,11 +31,13 @@ pub mod connection;
 pub mod dynamic;
 pub mod error;
 pub mod field;
+pub mod fields_set;
 pub mod hybrid;
 pub mod identifiers;
 pub mod model;
 pub mod relationship;
 pub mod row;
+pub mod tracked;
 pub mod types;
 pub mod validate;
 pub mod value;
@@ -48,6 +50,7 @@ pub use error::{Error, FieldValidationError, Result, ValidationError, Validation
 pub use field::{
     Column, Field, FieldInfo, InheritanceInfo, InheritanceStrategy, ReferentialAction,
 };
+pub use fields_set::FieldsSet;
 pub use hybrid::Hybrid;
 pub use identifiers::{quote_ident, quote_ident_mysql, sanitize_identifier};
 pub use model::{
@@ -59,6 +62,7 @@ pub use relationship::{
     RelationshipKind, find_back_relationship, find_relationship, validate_back_populates,
 };
 pub use row::Row;
+pub use tracked::TrackedModel;
 pub use types::{SqlEnum, SqlType, TypeInfo};
 pub use validate::{
     DumpMode, DumpOptions, DumpResult, ModelDump, ModelValidate, SqlModelDump, SqlModelValidate,

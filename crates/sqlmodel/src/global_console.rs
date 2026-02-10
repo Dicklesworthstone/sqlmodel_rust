@@ -176,6 +176,6 @@ mod tests {
         set_global_shared_console(console);
     }
 
-    // Integration tests for global console behavior would need to be
-    // in separate test binaries to ensure clean global state.
+    // Integration tests for OnceLock "set only once" behavior live in
+    // crates/sqlmodel/tests/global_console_once.rs (separate test binary).
 }

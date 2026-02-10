@@ -524,7 +524,7 @@ impl DumpOptions {
 /// Result type for model_dump operations.
 pub type DumpResult = std::result::Result<serde_json::Value, serde_json::Error>;
 
-fn dump_options_unsupported(msg: impl Into<String>) -> serde_json::Error {
+pub(crate) fn dump_options_unsupported(msg: impl Into<String>) -> serde_json::Error {
     serde_json::Error::io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         msg.into(),
@@ -626,7 +626,7 @@ impl<T: serde::Serialize> ModelDump for T {
         }
         if options.exclude_unset {
             return Err(dump_options_unsupported(
-                "DumpOptions.exclude_unset is not supported (requires fields_set tracking)",
+                "DumpOptions.exclude_unset requires fields_set tracking; use SqlModelValidate::sql_model_validate_tracked(...) or the tracked!(Type { .. }) macro",
             ));
         }
         if options.round_trip {
@@ -882,6 +882,68 @@ pub trait SqlModelValidate: Model + DeserializeOwned + Sized {
         })
     }
 
+    /// Create and validate a model from input, also tracking which fields were explicitly set.
+    ///
+    /// This enables Pydantic-compatible `exclude_unset` behavior when dumping via `TrackedModel`.
+    fn sql_model_validate_tracked(
+        input: impl Into<ValidateInput>,
+        options: ValidateOptions,
+    ) -> ValidateResult<crate::TrackedModel<Self>> {
+        let input = input.into();
+
+        let mut json_value = match input {
+            ValidateInput::Dict(dict) => {
+                let map: serde_json::Map<String, serde_json::Value> = dict
+                    .into_iter()
+                    .map(|(k, v)| (k, value_to_json(v)))
+                    .collect();
+                serde_json::Value::Object(map)
+            }
+            ValidateInput::Json(json_str) => serde_json::from_str(&json_str).map_err(|e| {
+                let mut err = ValidationError::new();
+                err.add(
+                    "_json",
+                    ValidationErrorKind::Custom,
+                    format!("Invalid JSON: {e}"),
+                );
+                err
+            })?,
+            ValidateInput::JsonValue(value) => value,
+        };
+
+        apply_validation_aliases(&mut json_value, Self::fields());
+
+        if let Some(update) = options.update {
+            if let serde_json::Value::Object(ref mut map) = json_value {
+                for (key, value) in update {
+                    map.insert(key, value);
+                }
+            }
+        }
+
+        // Compute fields_set from the (post-alias) object keys.
+        let mut fields_set = crate::FieldsSet::empty(Self::fields().len());
+        if let serde_json::Value::Object(ref map) = json_value {
+            for (idx, field) in Self::fields().iter().enumerate() {
+                if map.contains_key(field.name) {
+                    fields_set.set(idx);
+                }
+            }
+        }
+
+        let model = serde_json::from_value(json_value).map_err(|e| {
+            let mut err = ValidationError::new();
+            err.add(
+                "_model",
+                ValidationErrorKind::Custom,
+                format!("Validation failed: {e}"),
+            );
+            err
+        })?;
+
+        Ok(crate::TrackedModel::new(model, fields_set))
+    }
+
     /// Create and validate a model from JSON string with default options.
     fn sql_model_validate_json(json: &str) -> ValidateResult<Self> {
         Self::sql_model_validate(json, ValidateOptions::default())
@@ -931,7 +993,7 @@ pub trait SqlModelDump: Model + serde::Serialize {
         }
         if options.exclude_unset {
             return Err(dump_options_unsupported(
-                "DumpOptions.exclude_unset is not supported (requires fields_set tracking)",
+                "DumpOptions.exclude_unset requires fields_set tracking; use SqlModelValidate::sql_model_validate_tracked(...) or the tracked!(Type { .. }) macro",
             ));
         }
         if options.round_trip {
@@ -945,6 +1007,13 @@ pub trait SqlModelDump: Model + serde::Serialize {
 
         // Apply options that work on original field names BEFORE alias renaming
         if let serde_json::Value::Object(ref mut map) = value {
+            // Always honor per-field exclude flag (Pydantic Field(exclude=True) semantics).
+            for field in Self::fields() {
+                if field.exclude {
+                    map.remove(field.name);
+                }
+            }
+
             // Exclude computed fields if requested (must happen before alias renaming)
             if options.exclude_computed_fields {
                 let computed_field_names: std::collections::HashSet<&str> = Self::fields()

@@ -405,7 +405,7 @@ class Hero(SQLModel, table=True):
 
 ### 8.3 Rust Equivalent
 
-The `#[derive(Validate)]` macro (TODO) will generate validation methods:
+The `#[derive(Validate)]` macro generates validation methods:
 
 ```rust
 #[derive(Model, Validate)]
@@ -485,6 +485,33 @@ let json = serde_json::to_string(&hero)?;
 
 // Deserialize
 let hero: Hero = serde_json::from_str(&json)?;
+```
+
+SQLModel Rust also provides model-aware helpers that mirror Pydantic:
+
+```rust
+use sqlmodel::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Model, Serialize, Deserialize)]
+struct Hero {
+    name: String,
+    #[serde(default)]
+    age: i32,
+}
+
+// Alias-aware validation (accepts validation_alias/alias keys)
+let hero = Hero::sql_model_validate(r#"{"name": "Spider-Man"}"#, ValidateOptions::default())?;
+
+// Model-aware dump (aliases/computed/defaults)
+let dumped = hero.sql_model_dump(DumpOptions::default())?;
+
+// Pydantic-compatible exclude_unset requires fields-set tracking
+let tracked = Hero::sql_model_validate_tracked(
+    r#"{"name": "Spider-Man"}"#,
+    ValidateOptions::default(),
+)?;
+let dumped = tracked.sql_model_dump(DumpOptions::default().exclude_unset())?;
 ```
 
 ---
@@ -623,10 +650,10 @@ The following Python SQLModel features are **intentionally NOT ported** to Rust:
 | `session.begin()` | ✅ `conn.begin()` | Complete |
 | `session.rollback()` | ✅ `conn.rollback()` | Complete |
 | Nested transactions | ✅ Savepoints | Complete |
-| `@field_validator` | ❌ `#[derive(Validate)]` | TODO |
-| `@model_validator` | ❌ `#[derive(Validate)]` | TODO |
-| `model_dump()` | ✅ `serde_json::to_string()` | Via serde |
-| `model_validate()` | ✅ `serde_json::from_str()` | Via serde |
+| `@field_validator` | ✅ `#[derive(Validate)]` | Implemented |
+| `@model_validator` | ✅ `#[derive(Validate)]` | Implemented |
+| `model_dump()` | ✅ `ModelDump` / `SqlModelDump` | `DumpOptions` support (including tracked `exclude_unset`) |
+| `model_validate()` | ✅ `ModelValidate` / `SqlModelValidate` | Alias-aware validation helpers |
 | Connection pooling | ✅ `sqlmodel-pool` | Complete |
 | CREATE TABLE | ✅ `create_table::<M>()` | Complete |
 | Migrations | ⚠️ Basic support | No auto-generation |

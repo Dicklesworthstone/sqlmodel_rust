@@ -75,22 +75,33 @@ pub use sqlmodel_core::{
     // Core types
     Connection,
     Cx,
+    DumpMode,
+    DumpOptions,
+    DumpResult,
     Error,
     Field,
     FieldInfo,
+    FieldsSet,
     Hybrid,
     // Inheritance types
     InheritanceInfo,
     InheritanceStrategy,
     Model,
+    ModelDump,
     Outcome,
     RegionId,
     Result,
     Row,
     SqlEnum,
+    SqlModelDump,
+    SqlModelValidate,
     SqlType,
     TaskId,
+    TrackedModel,
     TypeInfo,
+    ValidateInput,
+    ValidateOptions,
+    ValidateResult,
     Value,
 };
 
@@ -109,6 +120,36 @@ pub use sqlmodel_schema::{
 pub use sqlmodel_pool::{
     Pool, PoolConfig, PoolStats, PooledConnection, ReplicaPool, ReplicaStrategy,
 };
+
+/// Wrap a model struct literal and track which fields were explicitly provided.
+///
+/// This is the Rust equivalent of Pydantic's "fields_set" tracking and enables
+/// correct `exclude_unset` behavior for dumps via `TrackedModel::sql_model_dump()`.
+///
+/// Examples:
+/// ```ignore
+/// use sqlmodel::tracked;
+///
+/// let user = tracked!(User {
+///     id: 1,
+///     name: "Alice".to_string(),
+///     ..Default::default()
+/// });
+///
+/// // Omits fields that came from defaults, keeps explicitly provided fields.
+/// let json = user.sql_model_dump(DumpOptions::default().exclude_unset())?;
+/// ```
+#[macro_export]
+macro_rules! tracked {
+    ($ty:ident { $($field:ident : $value:expr),* $(,)? }) => {{
+        let inner = $ty { $($field: $value),* };
+        $crate::TrackedModel::from_explicit_field_names(inner, &[$(stringify!($field)),*])
+    }};
+    ($ty:ident { $($field:ident : $value:expr),* , .. $rest:expr $(,)? }) => {{
+        let inner = $ty { $($field: $value),*, .. $rest };
+        $crate::TrackedModel::from_explicit_field_names(inner, &[$(stringify!($field)),*])
+    }};
+}
 
 // Session management
 pub mod session;
@@ -539,15 +580,19 @@ pub mod prelude {
         // Core traits and types (Model is the trait)
         Connection,
         Cx,
+        DumpMode,
+        DumpOptions,
         Error,
         // Query building
         Expr,
+        FieldsSet,
         Hybrid,
         Join,
         JoinType,
         Migration,
         MigrationRunner,
         Model,
+        ModelDump,
         OrderBy,
         Outcome,
         // Pool
@@ -560,7 +605,13 @@ pub mod prelude {
         // Session
         Session,
         SessionBuilder,
+        SqlModelDump,
+        SqlModelValidate,
         TaskId,
+        TrackedModel,
+        ValidateInput,
+        ValidateOptions,
+        ValidateResult,
         Value,
         // Schema
         create_table,
