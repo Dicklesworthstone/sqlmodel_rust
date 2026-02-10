@@ -412,6 +412,8 @@ mod inheritance_tests {
     #[derive(Model, Debug, Clone, Serialize, Deserialize)]
     #[sqlmodel(table, inherits = "Person")]
     struct Student {
+        #[sqlmodel(parent)]
+        person: Person,
         #[sqlmodel(primary_key)]
         student_id: i64,
         grade: String,
