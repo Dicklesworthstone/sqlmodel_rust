@@ -1200,6 +1200,7 @@ dependencies = [
  "sqlmodel-pool",
  "sqlmodel-query",
  "sqlmodel-schema",
+ "sqlmodel-session",
 ]
 
 [[package]]

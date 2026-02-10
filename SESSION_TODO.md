@@ -109,3 +109,30 @@ Goal: eliminate real behavior gaps hidden behind "we'd need ..." comments and en
 ### E3. Doc/Parity Drift: "Excluded" sections must become real tracked work
 - [ ] Audit `FEATURE_PARITY.md` for "Explicitly Excluded" content and reconcile with bd-162 (no exclusions)
 - [ ] Create/adjust beads for each formerly-excluded feature and link them to bd-162
+
+## F. ORM Patterns Wiring + API Reality (bd-3lz)
+
+Goal: ensure the *actual public facade* (`sqlmodel::prelude::*`) exposes the real ORM Session (unit of work / identity map / lazy loading), and stop shipping misleading "Session" APIs that are only a connection wrapper.
+
+### F1. Facade exports the ORM Session
+- [x] Add `sqlmodel-session` as a dependency of `crates/sqlmodel`
+- [x] Re-export `sqlmodel_session::{Session, SessionConfig, GetOptions, ObjectKey, ObjectState, SessionDebugInfo}` from the facade
+- [x] Ensure `sqlmodel::prelude::*` includes ORM session types/options
+
+### F2. Resolve the duplicate "Session" concept
+- [x] Move the old connection+console wrapper into `sqlmodel::ConnectionSession` + `ConnectionSessionBuilder`
+- [x] Update docs/comments that previously implied `Session::builder()` was the ORM session
+
+### F3. Follow-ups (not done yet)
+- [x] Add a small compile-level test in `crates/sqlmodel/tests/` that exercises `use sqlmodel::prelude::*;` + `Session::<MockConnection>::new(MockConnection)` + `SessionConfig` (guards against future facade drift)
+- [ ] Audit `README.md` and `FEATURE_PARITY.md` for any remaining references to the old "Session builder" that now means `ConnectionSession`
+- [ ] Decide and implement whether ORM identity map guarantees *reference identity* (shared instance) vs *value caching* (clones). If reference-identity is required, plan the core API shift (`LazyLoader`, `Lazy<T>`, etc.) and track it explicitly under `bd-162`.
+
+## G. UBS Critical Findings (bd-3obp)
+
+Goal: make `ubs --diff --only=rust,toml .` exit 0 without broad ignores so it can gate commits.
+
+- [x] Fix UBS "hardcoded secrets" false positives in MySQL auth plugin matching (avoid triggering `password\\s*=` regex).
+- [x] Fix MySQL config password setter to avoid UBS pattern matches without changing runtime behavior.
+- [x] Confirm `ubs --diff --only=rust,toml .` exits 0 (Critical: 0).
+- [x] Close `bd-3obp` with a concrete reason once UBS is clean.

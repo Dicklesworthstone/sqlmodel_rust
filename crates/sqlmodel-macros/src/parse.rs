@@ -3932,7 +3932,8 @@ mod tests {
                 id: i64,
                 name: String,
                 #[sqlmodel(discriminator = "pet_type")]
-                pet: String, // Would normally be a union type
+                // In Python, discriminator is commonly used with unions; here we only validate parsing.
+                pet: String,
             }
         };
 

@@ -204,7 +204,13 @@ fn generate_hybrid_methods(model: &ModelDef) -> proc_macro2::TokenStream {
     let hybrid_fields: Vec<_> = model
         .fields
         .iter()
-        .filter(|f| f.hybrid && f.hybrid_sql.is_some())
+        .filter_map(|f| {
+            if !f.hybrid {
+                return None;
+            }
+            let sql = f.hybrid_sql.as_deref()?;
+            Some((f, sql))
+        })
         .collect();
 
     if hybrid_fields.is_empty() {
@@ -216,8 +222,7 @@ fn generate_hybrid_methods(model: &ModelDef) -> proc_macro2::TokenStream {
 
     let methods: Vec<_> = hybrid_fields
         .iter()
-        .map(|field| {
-            let sql = field.hybrid_sql.as_ref().unwrap();
+        .map(|(field, sql)| {
             let method_name = quote::format_ident!("{}_expr", field.name);
             let doc = format!(
                 "SQL expression for the `{}` hybrid property.\n\nGenerates: `{}`",
@@ -875,7 +880,14 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
     let mut relationship_ts = Vec::new();
 
     for field in relationship_fields {
-        let rel = field.relationship.as_ref().unwrap();
+        let Some(rel) = field.relationship.as_ref() else {
+            relationship_ts.push(quote::quote! {
+                ::core::compile_error!(
+                    "sqlmodel: internal error: relationship field missing parsed relationship metadata"
+                )
+            });
+            continue;
+        };
         let field_name = &field.name;
         let related_table = &rel.model;
 

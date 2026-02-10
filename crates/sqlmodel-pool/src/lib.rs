@@ -1691,8 +1691,8 @@ mod tests {
                 inner.active_count = 1;
             }
 
-            // Now panic while "using" the connection
-            // (In real code, this would be while holding a PooledConnection)
+            // Panic while holding the pool's internal mutex to simulate a poisoned lock.
+            // This models an internal panic in pool bookkeeping, not user code.
             let _guard = pool_clone.shared.inner.lock().unwrap();
             panic!("simulated panic during database operation");
         });

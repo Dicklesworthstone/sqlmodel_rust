@@ -12,8 +12,7 @@
 //! sqlmodel::init_auto_console();
 //!
 //! // All sessions now have console output automatically
-//! let session = Session::builder()
-//!     .build_with(connection);
+//! let session = ConnectionSession::builder().build_with(connection);
 //! ```
 //!
 //! # Precedence Rules

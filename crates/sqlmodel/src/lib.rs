@@ -32,7 +32,7 @@
 //!     age: Option<i32>,
 //! }
 //!
-//! async fn main_example(cx: &Cx, conn: &impl Connection) {
+//! async fn main_example(cx: &Cx, conn: &impl Connection) -> Outcome<(), Error> {
 //!     let hero = Hero {
 //!         id: None,
 //!         name: "Spider-Man".to_string(),
@@ -40,20 +40,47 @@
 //!         age: Some(25),
 //!     };
 //!
-//!     let id = insert!(hero).execute(cx, conn).await.unwrap();
-//!     let heroes = select!(Hero)
+//!     let _id = match insert!(hero).execute(cx, conn).await {
+//!         Outcome::Ok(v) => v,
+//!         Outcome::Err(e) => return Outcome::Err(e),
+//!         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+//!         Outcome::Panicked(p) => return Outcome::Panicked(p),
+//!     };
+//!
+//!     let heroes = match select!(Hero)
 //!         .filter(Expr::col("age").gt(18))
 //!         .all(cx, conn)
 //!         .await
-//!         .unwrap();
-//!     let mut hero = heroes.into_iter().next().unwrap();
+//!     {
+//!         Outcome::Ok(v) => v,
+//!         Outcome::Err(e) => return Outcome::Err(e),
+//!         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+//!         Outcome::Panicked(p) => return Outcome::Panicked(p),
+//!     };
+//!
+//!     let Some(mut hero) = heroes.into_iter().next() else {
+//!         return Outcome::Ok(());
+//!     };
 //!     hero.age = Some(26);
-//!     update!(hero).execute(cx, conn).await.unwrap();
-//!     delete!(Hero)
+//!
+//!     match update!(hero).execute(cx, conn).await {
+//!         Outcome::Ok(_) => {}
+//!         Outcome::Err(e) => return Outcome::Err(e),
+//!         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+//!         Outcome::Panicked(p) => return Outcome::Panicked(p),
+//!     };
+//!
+//!     match delete!(Hero)
 //!         .filter(Expr::col("name").eq("Spider-Man"))
 //!         .execute(cx, conn)
 //!         .await
-//!         .unwrap();
+//!
+//!     {
+//!         Outcome::Ok(_) => Outcome::Ok(()),
+//!         Outcome::Err(e) => Outcome::Err(e),
+//!         Outcome::Cancelled(r) => Outcome::Cancelled(r),
+//!         Outcome::Panicked(p) => Outcome::Panicked(p),
+//!     }
 //! }
 //! ```
 //!
@@ -121,6 +148,10 @@ pub use sqlmodel_pool::{
     Pool, PoolConfig, PoolStats, PooledConnection, ReplicaPool, ReplicaStrategy,
 };
 
+pub use sqlmodel_session::{
+    GetOptions, ObjectKey, ObjectState, Session, SessionConfig, SessionDebugInfo,
+};
+
 /// Wrap a model struct literal and track which fields were explicitly provided.
 ///
 /// This is the Rust equivalent of Pydantic's "fields_set" tracking and enables
@@ -152,12 +183,13 @@ macro_rules! tracked {
 }
 
 // Session management
+pub mod connection_session;
 pub mod session;
-pub use session::{Session, SessionBuilder};
+pub use connection_session::{ConnectionSession, ConnectionSessionBuilder};
 
 // Console-enabled session extension trait
 #[cfg(feature = "console")]
-pub use session::ConnectionBuilderExt;
+pub use connection_session::ConnectionBuilderExt;
 
 // Global console support (feature-gated)
 #[cfg(feature = "console")]
@@ -579,6 +611,9 @@ pub mod prelude {
         Budget,
         // Core traits and types (Model is the trait)
         Connection,
+        // Connection session (connection + optional console)
+        ConnectionSession,
+        ConnectionSessionBuilder,
         Cx,
         DumpMode,
         DumpOptions,
@@ -586,6 +621,7 @@ pub mod prelude {
         // Query building
         Expr,
         FieldsSet,
+        GetOptions,
         Hybrid,
         Join,
         JoinType,
@@ -593,6 +629,8 @@ pub mod prelude {
         MigrationRunner,
         Model,
         ModelDump,
+        ObjectKey,
+        ObjectState,
         OrderBy,
         Outcome,
         // Pool
@@ -602,9 +640,9 @@ pub mod prelude {
         Result,
         Row,
         Select,
-        // Session
+        // ORM Session (unit of work / identity map)
         Session,
-        SessionBuilder,
+        SessionConfig,
         SqlModelDump,
         SqlModelValidate,
         TaskId,
