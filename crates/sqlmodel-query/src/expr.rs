@@ -2378,56 +2378,154 @@ pub(crate) fn adjust_placeholder_indices(sql: &str, offset: usize, dialect: Dial
         Dialect::Postgres => {
             // Rewrite $N to $(N+offset)
             let mut result = String::with_capacity(sql.len() + 20);
-            let mut chars = sql.chars().peekable();
+            let chars: Vec<char> = sql.chars().collect();
+            let mut i = 0;
+            let mut in_single_quote = false;
+            let mut in_double_quote = false;
 
-            while let Some(c) = chars.next() {
-                if c == '$' {
-                    // Collect digits after $
-                    let mut num_str = String::new();
-                    while let Some(&d) = chars.peek() {
-                        if d.is_ascii_digit() {
-                            num_str.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Ok(n) = num_str.parse::<usize>() {
-                        result.push_str(&format!("${}", n + offset));
-                    } else {
-                        result.push('$');
-                        result.push_str(&num_str);
-                    }
-                } else {
+            while i < chars.len() {
+                let c = chars[i];
+
+                if in_single_quote {
                     result.push(c);
+                    if c == '\'' {
+                        if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                            // SQL escaped quote ('')
+                            result.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        in_single_quote = false;
+                    }
+                    i += 1;
+                    continue;
                 }
+
+                if in_double_quote {
+                    result.push(c);
+                    if c == '"' {
+                        if i + 1 < chars.len() && chars[i + 1] == '"' {
+                            // SQL escaped quote ("")
+                            result.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        in_double_quote = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                if c == '\'' {
+                    in_single_quote = true;
+                    result.push(c);
+                    i += 1;
+                    continue;
+                }
+                if c == '"' {
+                    in_double_quote = true;
+                    result.push(c);
+                    i += 1;
+                    continue;
+                }
+
+                if c == '$' {
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+
+                    if j > i + 1 {
+                        let num_str: String = chars[i + 1..j].iter().collect();
+                        if let Ok(n) = num_str.parse::<usize>() {
+                            result.push_str(&format!("${}", n + offset));
+                        } else {
+                            result.push('$');
+                            result.push_str(&num_str);
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+
+                result.push(c);
+                i += 1;
             }
             result
         }
         Dialect::Sqlite => {
             // Rewrite ?N to ?(N+offset)
             let mut result = String::with_capacity(sql.len() + 20);
-            let mut chars = sql.chars().peekable();
+            let chars: Vec<char> = sql.chars().collect();
+            let mut i = 0;
+            let mut in_single_quote = false;
+            let mut in_double_quote = false;
 
-            while let Some(c) = chars.next() {
-                if c == '?' {
-                    // Collect digits after ?
-                    let mut num_str = String::new();
-                    while let Some(&d) = chars.peek() {
-                        if d.is_ascii_digit() {
-                            num_str.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Ok(n) = num_str.parse::<usize>() {
-                        result.push_str(&format!("?{}", n + offset));
-                    } else {
-                        result.push('?');
-                        result.push_str(&num_str);
-                    }
-                } else {
+            while i < chars.len() {
+                let c = chars[i];
+
+                if in_single_quote {
                     result.push(c);
+                    if c == '\'' {
+                        if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                            result.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        in_single_quote = false;
+                    }
+                    i += 1;
+                    continue;
                 }
+
+                if in_double_quote {
+                    result.push(c);
+                    if c == '"' {
+                        if i + 1 < chars.len() && chars[i + 1] == '"' {
+                            result.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        in_double_quote = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                if c == '\'' {
+                    in_single_quote = true;
+                    result.push(c);
+                    i += 1;
+                    continue;
+                }
+                if c == '"' {
+                    in_double_quote = true;
+                    result.push(c);
+                    i += 1;
+                    continue;
+                }
+
+                if c == '?' {
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+
+                    if j > i + 1 {
+                        let num_str: String = chars[i + 1..j].iter().collect();
+                        if let Ok(n) = num_str.parse::<usize>() {
+                            result.push_str(&format!("?{}", n + offset));
+                        } else {
+                            result.push('?');
+                            result.push_str(&num_str);
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+
+                result.push(c);
+                i += 1;
             }
             result
         }
@@ -3433,6 +3531,26 @@ mod tests {
         let sql = "SELECT * FROM t WHERE a = ? AND b = ?";
         let adjusted = super::adjust_placeholder_indices(sql, 3, Dialect::Mysql);
         assert_eq!(adjusted, sql);
+    }
+
+    #[test]
+    fn test_adjust_placeholder_indices_postgres_ignores_quoted_literals() {
+        let sql = "SELECT '$1' AS s, col FROM t WHERE a = $1 AND note = 'it''s $2'";
+        let adjusted = super::adjust_placeholder_indices(sql, 3, Dialect::Postgres);
+        assert_eq!(
+            adjusted,
+            "SELECT '$1' AS s, col FROM t WHERE a = $4 AND note = 'it''s $2'"
+        );
+    }
+
+    #[test]
+    fn test_adjust_placeholder_indices_sqlite_ignores_quoted_literals() {
+        let sql = "SELECT '?1' AS s, col FROM t WHERE a = ?1 AND note = 'keep ?2'";
+        let adjusted = super::adjust_placeholder_indices(sql, 3, Dialect::Sqlite);
+        assert_eq!(
+            adjusted,
+            "SELECT '?1' AS s, col FROM t WHERE a = ?4 AND note = 'keep ?2'"
+        );
     }
 
     // ==================== JSON Expression Tests ====================
