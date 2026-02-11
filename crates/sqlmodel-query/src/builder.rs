@@ -427,24 +427,57 @@ fn build_joined_child_select_sql_by_pk_in<M: Model>(
     Ok((sql, pk_params))
 }
 
-#[allow(clippy::result_large_err)]
+fn rewrite_insert_as_ignore(sql: &mut String) {
+    if let Some(rest) = sql.strip_prefix("INSERT INTO ") {
+        *sql = format!("INSERT IGNORE INTO {rest}");
+    }
+}
+
 fn append_on_conflict_clause(
     dialect: Dialect,
     sql: &mut String,
     pk_cols: &[&'static str],
     insert_columns: &[&'static str],
     on_conflict: &OnConflict,
-) -> Result<(), sqlmodel_core::Error> {
+) {
     if dialect == Dialect::Mysql {
-        return Err(sqlmodel_core::Error::Custom(
-            "ON CONFLICT is not supported for MySQL yet".to_string(),
-        ));
+        match on_conflict {
+            OnConflict::DoNothing => {
+                rewrite_insert_as_ignore(sql);
+                return;
+            }
+            OnConflict::DoUpdate { columns, .. } => {
+                let update_cols: Vec<String> = if columns.is_empty() {
+                    insert_columns
+                        .iter()
+                        .filter(|c| !pk_cols.contains(c))
+                        .map(|c| (*c).to_string())
+                        .collect()
+                } else {
+                    columns.clone()
+                };
+
+                if update_cols.is_empty() {
+                    rewrite_insert_as_ignore(sql);
+                    return;
+                }
+
+                sql.push_str(" ON DUPLICATE KEY UPDATE ");
+                sql.push_str(
+                    &update_cols
+                        .iter()
+                        .map(|c| format!("{c} = VALUES({c})"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                return;
+            }
+        }
     }
 
     match on_conflict {
         OnConflict::DoNothing => {
             sql.push_str(" ON CONFLICT DO NOTHING");
-            Ok(())
         }
         OnConflict::DoUpdate { columns, target } => {
             sql.push_str(" ON CONFLICT");
@@ -457,7 +490,7 @@ fn append_on_conflict_clause(
 
             if effective_target.is_empty() {
                 sql.push_str(" DO NOTHING");
-                return Ok(());
+                return;
             }
 
             sql.push_str(" (");
@@ -476,7 +509,7 @@ fn append_on_conflict_clause(
 
             if update_cols.is_empty() {
                 sql.push_str(" DO NOTHING");
-                return Ok(());
+                return;
             }
 
             sql.push_str(" DO UPDATE SET ");
@@ -487,8 +520,6 @@ fn append_on_conflict_clause(
                     .collect::<Vec<_>>()
                     .join(", "),
             );
-
-            Ok(())
         }
     }
 }
@@ -900,71 +931,9 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             )
         };
 
-        // Add ON CONFLICT clause if specified
+        // Add ON CONFLICT/UPSERT clause if specified
         if let Some(on_conflict) = &self.on_conflict {
-            match on_conflict {
-                OnConflict::DoNothing => {
-                    sql.push_str(" ON CONFLICT DO NOTHING");
-                }
-                OnConflict::DoUpdate {
-                    columns: update_cols,
-                    target,
-                } => {
-                    sql.push_str(" ON CONFLICT");
-
-                    // Add target if specified, otherwise use primary key
-                    // PostgreSQL requires a conflict target for DO UPDATE
-                    let has_target = if !target.is_empty() {
-                        sql.push_str(" (");
-                        sql.push_str(&target.join(", "));
-                        sql.push(')');
-                        true
-                    } else if !M::PRIMARY_KEY.is_empty() {
-                        sql.push_str(" (");
-                        sql.push_str(&M::PRIMARY_KEY.join(", "));
-                        sql.push(')');
-                        true
-                    } else {
-                        // No conflict target available - fall back to DO NOTHING
-                        // since PostgreSQL requires a target for DO UPDATE
-                        tracing::warn!(
-                            table = M::TABLE_NAME,
-                            "ON CONFLICT DO UPDATE requires a conflict target (primary key or explicit target). \
-                             Falling back to DO NOTHING since no target is available."
-                        );
-                        sql.push_str(" DO NOTHING");
-                        false
-                    };
-
-                    // Only add DO UPDATE SET if we have a valid conflict target
-                    if has_target {
-                        // If columns is empty, update all non-PK columns
-                        let update_set: Vec<String> = if update_cols.is_empty() {
-                            columns // Use full column list from explicit insert
-                                .iter()
-                                .filter(|name| !M::PRIMARY_KEY.contains(name)) // Don't update PK
-                                .map(|name| format!("{} = EXCLUDED.{}", name, name))
-                                .collect()
-                        } else {
-                            update_cols
-                                .iter()
-                                .map(|c| format!("{} = EXCLUDED.{}", c, c))
-                                .collect()
-                        };
-
-                        if update_set.is_empty() {
-                            tracing::warn!(
-                                table = M::TABLE_NAME,
-                                "ON CONFLICT DO UPDATE has no updatable columns. Falling back to DO NOTHING."
-                            );
-                            sql.push_str(" DO NOTHING");
-                        } else {
-                            sql.push_str(" DO UPDATE SET ");
-                            sql.push_str(&update_set.join(", "));
-                        }
-                    }
-                }
-            }
+            append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &columns, on_conflict);
         }
 
         // Add RETURNING clause if requested
@@ -1135,12 +1104,7 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                         None,
                     );
                     if let Some(oc) = &parent_on_conflict {
-                        if let Err(e) =
-                            append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc)
-                        {
-                            tx_rollback_best_effort(tx, cx).await;
-                            return Outcome::Err(e);
-                        }
+                        append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
                     }
                     match tx.execute(cx, &sql, &params).await {
                         Outcome::Ok(_) => {}
@@ -1167,12 +1131,7 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     None,
                 );
                 if let Some(oc) = &parent_on_conflict {
-                    if let Err(e) =
-                        append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc)
-                    {
-                        tx_rollback_best_effort(tx, cx).await;
-                        return Outcome::Err(e);
-                    }
+                    append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
                 }
                 match tx.execute(cx, &sql, &params).await {
                     Outcome::Ok(_) => {}
@@ -1252,16 +1211,7 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                 None,
             );
             if let Some(oc) = &child_on_conflict {
-                if let Err(e) = append_on_conflict_clause(
-                    dialect,
-                    &mut child_sql,
-                    M::PRIMARY_KEY,
-                    &child_cols,
-                    oc,
-                ) {
-                    tx_rollback_best_effort(tx, cx).await;
-                    return Outcome::Err(e);
-                }
+                append_on_conflict_clause(dialect, &mut child_sql, M::PRIMARY_KEY, &child_cols, oc);
             }
 
             match tx.execute(cx, &child_sql, &child_params).await {
@@ -1682,7 +1632,7 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
             match batch {
                 Batch::DefaultValues => {
                     let mut sql = format!("INSERT INTO {} DEFAULT VALUES", M::TABLE_NAME);
-                    self.append_on_conflict(&mut sql, &[]);
+                    self.append_on_conflict(dialect, &mut sql, &[]);
                     self.append_returning(&mut sql);
                     statements.push((sql, Vec::new()));
                 }
@@ -1765,7 +1715,7 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
             value_groups.join(", ")
         );
 
-        self.append_on_conflict(&mut sql, &insert_columns);
+        self.append_on_conflict(dialect, &mut sql, &insert_columns);
         self.append_returning(&mut sql);
 
         (sql, all_values)
@@ -1804,71 +1754,20 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
             )
         };
 
-        self.append_on_conflict(&mut sql, columns);
+        self.append_on_conflict(dialect, &mut sql, columns);
         self.append_returning(&mut sql);
 
         (sql, params)
     }
 
-    fn append_on_conflict(&self, sql: &mut String, insert_columns: &[&'static str]) {
+    fn append_on_conflict(
+        &self,
+        dialect: Dialect,
+        sql: &mut String,
+        insert_columns: &[&'static str],
+    ) {
         if let Some(on_conflict) = &self.on_conflict {
-            match on_conflict {
-                OnConflict::DoNothing => {
-                    sql.push_str(" ON CONFLICT DO NOTHING");
-                }
-                OnConflict::DoUpdate { columns, target } => {
-                    sql.push_str(" ON CONFLICT");
-
-                    // PostgreSQL requires a conflict target for DO UPDATE
-                    let has_target = if !target.is_empty() {
-                        sql.push_str(" (");
-                        sql.push_str(&target.join(", "));
-                        sql.push(')');
-                        true
-                    } else if !M::PRIMARY_KEY.is_empty() {
-                        sql.push_str(" (");
-                        sql.push_str(&M::PRIMARY_KEY.join(", "));
-                        sql.push(')');
-                        true
-                    } else {
-                        // No conflict target available - fall back to DO NOTHING
-                        tracing::warn!(
-                            table = M::TABLE_NAME,
-                            "ON CONFLICT DO UPDATE requires a conflict target (primary key or explicit target). \
-                             Falling back to DO NOTHING since no target is available."
-                        );
-                        sql.push_str(" DO NOTHING");
-                        false
-                    };
-
-                    // Only add DO UPDATE SET if we have a valid conflict target
-                    if has_target {
-                        let update_cols: Vec<String> = if columns.is_empty() {
-                            insert_columns
-                                .iter()
-                                .filter(|name| !M::PRIMARY_KEY.contains(name))
-                                .map(|name| format!("{} = EXCLUDED.{}", name, name))
-                                .collect()
-                        } else {
-                            columns
-                                .iter()
-                                .map(|c| format!("{} = EXCLUDED.{}", c, c))
-                                .collect()
-                        };
-
-                        if update_cols.is_empty() {
-                            tracing::warn!(
-                                table = M::TABLE_NAME,
-                                "ON CONFLICT DO UPDATE has no updatable columns. Falling back to DO NOTHING."
-                            );
-                            sql.push_str(" DO NOTHING");
-                        } else {
-                            sql.push_str(" DO UPDATE SET ");
-                            sql.push_str(&update_cols.join(", "));
-                        }
-                    }
-                }
-            }
+            append_on_conflict_clause(dialect, sql, M::PRIMARY_KEY, insert_columns, on_conflict);
         }
     }
 
@@ -3417,6 +3316,62 @@ mod tests {
         assert!(sql.contains("ON CONFLICT (id) DO UPDATE SET"));
         assert!(sql.contains("name = EXCLUDED.name"));
         assert!(sql.contains("age = EXCLUDED.age"));
+    }
+
+    #[test]
+    fn test_insert_mysql_on_conflict_do_nothing() {
+        let hero = TestHero {
+            id: None,
+            name: "Spider-Man".to_string(),
+            age: 25,
+        };
+        let (sql, _) = InsertBuilder::new(&hero)
+            .on_conflict_do_nothing()
+            .build_with_dialect(Dialect::Mysql);
+
+        assert!(sql.starts_with("INSERT IGNORE INTO heroes"));
+        assert!(!sql.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn test_insert_mysql_on_conflict_do_update() {
+        let hero = TestHero {
+            id: None,
+            name: "Spider-Man".to_string(),
+            age: 25,
+        };
+        let (sql, _) = InsertBuilder::new(&hero)
+            .on_conflict_do_update(&["name", "age"])
+            .build_with_dialect(Dialect::Mysql);
+
+        assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
+        assert!(sql.contains("name = VALUES(name)"));
+        assert!(sql.contains("age = VALUES(age)"));
+        assert!(!sql.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn test_insert_many_mysql_on_conflict_do_update() {
+        let heroes = vec![
+            TestHero {
+                id: None,
+                name: "Spider-Man".to_string(),
+                age: 25,
+            },
+            TestHero {
+                id: None,
+                name: "Iron Man".to_string(),
+                age: 45,
+            },
+        ];
+        let (sql, params) = InsertManyBuilder::new(&heroes)
+            .on_conflict_do_update(&["name"])
+            .build_with_dialect(Dialect::Mysql);
+
+        assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
+        assert!(sql.contains("name = VALUES(name)"));
+        assert!(!sql.contains("ON CONFLICT"));
+        assert_eq!(params.len(), 4);
     }
 
     #[test]
