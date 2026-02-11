@@ -1189,15 +1189,17 @@ impl Introspector {
         let sql = "SELECT
                        i.relname AS index_name,
                        a.attname AS column_name,
+                       k.ord AS column_ord,
                        ix.indisunique AS is_unique,
                        ix.indisprimary AS is_primary,
                        am.amname AS index_type
                    FROM pg_class t
                    JOIN pg_namespace n ON n.oid = t.relnamespace
                    JOIN pg_index ix ON t.oid = ix.indrelid
+                   JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
                    JOIN pg_class i ON i.oid = ix.indexrelid
                    JOIN pg_am am ON i.relam = am.oid
-                   JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+                   JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
                    WHERE t.relname = $1
                        AND n.nspname = current_schema()
                        AND t.relkind = 'r'
@@ -1208,7 +1210,7 @@ impl Introspector {
                              AND c.conindid = i.oid
                              AND c.contype IN ('p', 'u')
                        )
-                   ORDER BY i.relname, a.attnum";
+                   ORDER BY i.relname, k.ord";
 
         let rows = match conn
             .query(

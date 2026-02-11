@@ -386,3 +386,55 @@ fn postgres_introspection_reports_check_constraints_and_table_comment() {
         let _ = conn.execute(&cx, &drop_schema_sql, &[]).await;
     });
 }
+
+#[test]
+fn postgres_introspection_preserves_composite_index_column_order() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create asupersync runtime");
+    let cx = Cx::for_testing();
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
+
+        let table = test_table_name("sqlmodel_pg_idx_order");
+        let index = format!("{table}_c_a_idx");
+        let create_sql = format!(
+            "CREATE TABLE \"{table}\" (\
+             id BIGSERIAL PRIMARY KEY,\
+             a INTEGER NOT NULL,\
+             b INTEGER NOT NULL,\
+             c INTEGER NOT NULL\
+             )"
+        );
+        let create_index_sql = format!("CREATE INDEX \"{index}\" ON \"{table}\" (c, a)");
+        let drop_sql = format!("DROP TABLE IF EXISTS \"{table}\"");
+
+        let _ = conn.execute(&cx, &drop_sql, &[]).await;
+        unwrap_outcome(conn.execute(&cx, &create_sql, &[]).await);
+        unwrap_outcome(conn.execute(&cx, &create_index_sql, &[]).await);
+
+        let introspector = Introspector::new(Dialect::Postgres);
+        let table_info = unwrap_outcome(introspector.table_info(&cx, &conn, &table).await);
+        let index_info = table_info.indexes.iter().find(|idx| idx.name == index);
+        assert!(
+            index_info.is_some(),
+            "missing expected index {index} in {:?}",
+            table_info.indexes
+        );
+        let index_info = index_info.expect("checked above");
+
+        assert_eq!(
+            index_info.columns,
+            vec!["c".to_string(), "a".to_string()],
+            "composite index columns should preserve defined order"
+        );
+
+        let _ = conn.execute(&cx, &drop_sql, &[]).await;
+    });
+}
