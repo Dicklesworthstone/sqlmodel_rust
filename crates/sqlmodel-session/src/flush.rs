@@ -663,6 +663,224 @@ impl FlushPlan {
         batches
     }
 
+    #[allow(clippy::result_large_err)]
+    fn build_insert_batch_sql(
+        dialect: sqlmodel_core::Dialect,
+        ops: &[&PendingOp],
+    ) -> Result<(String, Vec<Value>), Error> {
+        let table = ops[0].table();
+        let PendingOp::Insert { columns, .. } = ops[0] else {
+            return Err(Error::Custom("expected insert operation".to_string()));
+        };
+
+        let col_list: String = columns
+            .iter()
+            .map(|c| dialect.quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            dialect.quote_identifier(table),
+            col_list
+        );
+        let mut params: Vec<Value> = Vec::new();
+        let mut param_idx = 1;
+
+        for (i, op) in ops.iter().enumerate() {
+            let PendingOp::Insert {
+                columns: row_columns,
+                values,
+                ..
+            } = op
+            else {
+                return Err(Error::Custom(
+                    "mixed operation kinds in insert batch".to_string(),
+                ));
+            };
+
+            if row_columns != columns {
+                return Err(Error::Custom(format!(
+                    "inconsistent insert columns in flush batch for table {table}"
+                )));
+            }
+            if values.len() != columns.len() {
+                return Err(Error::Custom(format!(
+                    "insert column/value length mismatch for table {table}: {} columns vs {} values",
+                    columns.len(),
+                    values.len()
+                )));
+            }
+
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (0..values.len())
+                .map(|_| {
+                    let p = dialect.placeholder(param_idx);
+                    param_idx += 1;
+                    p
+                })
+                .collect();
+            sql.push('(');
+            sql.push_str(&placeholders.join(", "));
+            sql.push(')');
+            params.extend(values.iter().cloned());
+        }
+
+        Ok((sql, params))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn build_delete_batch_sql(
+        dialect: sqlmodel_core::Dialect,
+        ops: &[&PendingOp],
+    ) -> Result<Option<(String, Vec<Value>, usize)>, Error> {
+        let table = ops[0].table();
+        let PendingOp::Delete { pk_columns, .. } = ops[0] else {
+            return Err(Error::Custom("expected delete operation".to_string()));
+        };
+
+        // No PK means no safe WHERE clause.
+        if pk_columns.is_empty() {
+            tracing::warn!(
+                table = table,
+                count = ops.len(),
+                "Skipping DELETE batch for table without primary key - cannot identify rows"
+            );
+            return Ok(None);
+        }
+
+        if pk_columns.len() == 1 {
+            let pk_col = pk_columns[0];
+            let mut params: Vec<Value> = Vec::new();
+            let placeholders: Vec<String> = ops
+                .iter()
+                .filter_map(|op| {
+                    if let PendingOp::Delete {
+                        pk_columns: row_pk_columns,
+                        pk_values,
+                        ..
+                    } = op
+                    {
+                        if row_pk_columns != pk_columns {
+                            return None;
+                        }
+                        if pk_values.len() != 1 {
+                            return None;
+                        }
+                        params.push(pk_values[0].clone());
+                        return Some(dialect.placeholder(params.len()));
+                    }
+                    None
+                })
+                .collect();
+
+            if placeholders.is_empty() {
+                return Ok(None);
+            }
+
+            let actual_count = params.len();
+            let sql = format!(
+                "DELETE FROM {} WHERE {} IN ({})",
+                dialect.quote_identifier(table),
+                dialect.quote_identifier(pk_col),
+                placeholders.join(", ")
+            );
+            return Ok(Some((sql, params, actual_count)));
+        }
+
+        Err(Error::Custom(
+            "composite delete batch must be handled per-row".to_string(),
+        ))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn build_update_sql(
+        dialect: sqlmodel_core::Dialect,
+        op: &PendingOp,
+    ) -> Result<Option<(String, Vec<Value>)>, Error> {
+        let PendingOp::Update {
+            table,
+            pk_columns,
+            pk_values,
+            set_columns,
+            set_values,
+            ..
+        } = op
+        else {
+            return Ok(None);
+        };
+
+        // No PK means no safe WHERE clause.
+        if pk_columns.is_empty() || pk_values.is_empty() {
+            tracing::warn!(
+                table = *table,
+                "Skipping UPDATE for row without primary key - cannot identify row"
+            );
+            return Ok(None);
+        }
+        if set_columns.is_empty() {
+            return Ok(None);
+        }
+
+        if pk_columns.len() != pk_values.len() {
+            return Err(Error::Custom(format!(
+                "update primary key column/value length mismatch for table {table}: {} columns vs {} values",
+                pk_columns.len(),
+                pk_values.len()
+            )));
+        }
+        if set_columns.len() != set_values.len() {
+            return Err(Error::Custom(format!(
+                "update set column/value length mismatch for table {table}: {} columns vs {} values",
+                set_columns.len(),
+                set_values.len()
+            )));
+        }
+
+        let mut param_idx = 1;
+        let set_clause: String = set_columns
+            .iter()
+            .map(|col| {
+                let clause = format!(
+                    "{} = {}",
+                    dialect.quote_identifier(col),
+                    dialect.placeholder(param_idx)
+                );
+                param_idx += 1;
+                clause
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let where_clause: String = pk_columns
+            .iter()
+            .map(|col| {
+                let clause = format!(
+                    "{} = {}",
+                    dialect.quote_identifier(col),
+                    dialect.placeholder(param_idx)
+                );
+                param_idx += 1;
+                clause
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let sql = format!(
+            "UPDATE {} SET {} WHERE {}",
+            dialect.quote_identifier(table),
+            set_clause,
+            where_clause
+        );
+
+        let mut params: Vec<Value> = set_values.clone();
+        params.extend(pk_values.iter().cloned());
+
+        Ok(Some((sql, params)))
+    }
+
     /// Execute a batch of insert operations.
     #[tracing::instrument(level = "debug", skip(cx, conn, ops))]
     async fn execute_insert_batch<C: Connection>(
@@ -675,42 +893,16 @@ impl FlushPlan {
         }
 
         let table = ops[0].table();
-        let PendingOp::Insert { columns, .. } = ops[0] else {
+        let PendingOp::Insert { .. } = ops[0] else {
             return Outcome::Ok(0);
         };
 
         tracing::debug!(table = table, count = ops.len(), "Executing insert batch");
-
-        // Build multi-row INSERT SQL
-        // INSERT INTO table ("col1", "col2") VALUES ($1, $2), ($3, $4), ...
-        let col_list: String = columns
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let mut sql = format!("INSERT INTO {} ({}) VALUES ", quote_ident(table), col_list);
-        let mut params: Vec<Value> = Vec::new();
-        let mut param_idx = 1;
-
-        for (i, op) in ops.iter().enumerate() {
-            if let PendingOp::Insert { values, .. } = op {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                let placeholders: Vec<String> = (0..values.len())
-                    .map(|_| {
-                        let p = format!("${}", param_idx);
-                        param_idx += 1;
-                        p
-                    })
-                    .collect();
-                sql.push('(');
-                sql.push_str(&placeholders.join(", "));
-                sql.push(')');
-                params.extend(values.iter().cloned());
-            }
-        }
+        let dialect = conn.dialect();
+        let (sql, params) = match Self::build_insert_batch_sql(dialect, ops) {
+            Ok(v) => v,
+            Err(e) => return Outcome::Err(e),
+        };
 
         match conn.execute(cx, &sql, &params).await {
             Outcome::Ok(_) => Outcome::Ok(ops.len()),
@@ -747,37 +939,16 @@ impl FlushPlan {
         }
 
         tracing::debug!(table = table, count = ops.len(), "Executing delete batch");
+        let dialect = conn.dialect();
 
         // For simple single-column PK, use IN clause
         // DELETE FROM table WHERE pk IN ($1, $2, $3, ...)
         if pk_columns.len() == 1 {
-            let pk_col = pk_columns[0];
-            let mut params: Vec<Value> = Vec::new();
-            let placeholders: Vec<String> = ops
-                .iter()
-                .filter_map(|op| {
-                    if let PendingOp::Delete { pk_values, .. } = op {
-                        if let Some(pk) = pk_values.first() {
-                            params.push(pk.clone());
-                            // Use params.len() for correct placeholder index after push
-                            return Some(format!("${}", params.len()));
-                        }
-                    }
-                    None
-                })
-                .collect();
-
-            if placeholders.is_empty() {
-                return Outcome::Ok(0);
-            }
-
-            let actual_count = params.len();
-            let sql = format!(
-                "DELETE FROM {} WHERE {} IN ({})",
-                quote_ident(table),
-                quote_ident(pk_col),
-                placeholders.join(", ")
-            );
+            let (sql, params, actual_count) = match Self::build_delete_batch_sql(dialect, ops) {
+                Ok(Some(v)) => v,
+                Ok(None) => return Outcome::Ok(0),
+                Err(e) => return Outcome::Err(e),
+            };
 
             match conn.execute(cx, &sql, &params).await {
                 // Return actual count of items in IN clause, not ops.len()
@@ -805,15 +976,32 @@ impl FlushPlan {
                         );
                         continue;
                     }
+                    if pk_values.len() != pk_columns.len() {
+                        return Outcome::Err(Error::Custom(format!(
+                            "delete primary key column/value length mismatch for table {table}: {} columns vs {} values",
+                            pk_columns.len(),
+                            pk_values.len()
+                        )));
+                    }
 
                     let where_clause: String = pk_columns
                         .iter()
                         .enumerate()
-                        .map(|(i, col)| format!("{} = ${}", quote_ident(col), i + 1))
+                        .map(|(i, col)| {
+                            format!(
+                                "{} = {}",
+                                dialect.quote_identifier(col),
+                                dialect.placeholder(i + 1)
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(" AND ");
 
-                    let sql = format!("DELETE FROM {} WHERE {}", quote_ident(table), where_clause);
+                    let sql = format!(
+                        "DELETE FROM {} WHERE {}",
+                        dialect.quote_identifier(table),
+                        where_clause
+                    );
 
                     match conn.execute(cx, &sql, pk_values).await {
                         Outcome::Ok(_) => deleted += 1,
@@ -834,68 +1022,17 @@ impl FlushPlan {
         conn: &C,
         op: &PendingOp,
     ) -> Outcome<(), Error> {
-        let PendingOp::Update {
-            table,
-            pk_columns,
-            pk_values,
-            set_columns,
-            set_values,
-            ..
-        } = op
-        else {
+        let PendingOp::Update { table, .. } = op else {
             return Outcome::Ok(());
         };
 
-        // Skip if no primary key columns/values - cannot safely UPDATE without WHERE clause
-        if pk_columns.is_empty() || pk_values.is_empty() {
-            tracing::warn!(
-                table = *table,
-                "Skipping UPDATE for row without primary key - cannot identify row"
-            );
-            return Outcome::Ok(());
-        }
-
-        if set_columns.is_empty() {
-            return Outcome::Ok(());
-        }
-
-        tracing::debug!(
-            table = *table,
-            columns = ?set_columns,
-            "Executing update"
-        );
-
-        // UPDATE table SET col1 = $1, col2 = $2 WHERE pk = $3
-        let mut param_idx = 1;
-        let set_clause: String = set_columns
-            .iter()
-            .map(|col| {
-                let clause = format!("{} = ${}", quote_ident(col), param_idx);
-                param_idx += 1;
-                clause
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let where_clause: String = pk_columns
-            .iter()
-            .map(|col| {
-                let clause = format!("{} = ${}", quote_ident(col), param_idx);
-                param_idx += 1;
-                clause
-            })
-            .collect::<Vec<_>>()
-            .join(" AND ");
-
-        let sql = format!(
-            "UPDATE {} SET {} WHERE {}",
-            quote_ident(table),
-            set_clause,
-            where_clause
-        );
-
-        let mut params: Vec<Value> = set_values.clone();
-        params.extend(pk_values.iter().cloned());
+        tracing::debug!(table = *table, "Executing update");
+        let dialect = conn.dialect();
+        let (sql, params) = match Self::build_update_sql(dialect, op) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Outcome::Ok(()),
+            Err(e) => return Outcome::Err(e),
+        };
 
         match conn.execute(cx, &sql, &params).await {
             Outcome::Ok(_) => Outcome::Ok(()),
@@ -1861,5 +1998,65 @@ mod tests {
         assert!(sql.starts_with("-- ERROR:"));
         assert!(sql.contains("INSERT"));
         assert!(sql.contains("no columns"));
+    }
+
+    #[test]
+    fn test_build_insert_batch_sql_mysql_dialect() {
+        let ops = [make_insert("teams", 1), make_insert("teams", 2)];
+        let refs: Vec<&PendingOp> = ops.iter().collect();
+        let (sql, params) = FlushPlan::build_insert_batch_sql(sqlmodel_core::Dialect::Mysql, &refs)
+            .expect("build insert batch sql");
+
+        assert_eq!(
+            sql,
+            "INSERT INTO `teams` (`id`, `name`) VALUES (?, ?), (?, ?)"
+        );
+        assert_eq!(params.len(), 4);
+    }
+
+    #[test]
+    fn test_build_delete_batch_sql_sqlite_dialect() {
+        let ops = [make_delete("heroes", 1), make_delete("heroes", 2)];
+        let refs: Vec<&PendingOp> = ops.iter().collect();
+        let built = FlushPlan::build_delete_batch_sql(sqlmodel_core::Dialect::Sqlite, &refs)
+            .expect("build delete batch sql")
+            .expect("non-empty delete sql");
+
+        assert_eq!(built.0, "DELETE FROM \"heroes\" WHERE \"id\" IN (?1, ?2)");
+        assert_eq!(built.1.len(), 2);
+        assert_eq!(built.2, 2);
+    }
+
+    #[test]
+    fn test_build_update_sql_mysql_dialect() {
+        let op = make_update("teams", 42);
+        let (sql, params) = FlushPlan::build_update_sql(sqlmodel_core::Dialect::Mysql, &op)
+            .expect("build update sql")
+            .expect("non-empty update sql");
+
+        assert_eq!(sql, "UPDATE `teams` SET `name` = ? WHERE `id` = ?");
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn test_build_update_sql_rejects_set_mismatch() {
+        let op = PendingOp::Update {
+            key: ObjectKey {
+                type_id: TypeId::of::<()>(),
+                pk_hash: 1,
+            },
+            table: "teams",
+            pk_columns: vec!["id"],
+            pk_values: vec![Value::BigInt(1)],
+            set_columns: vec!["name", "active"],
+            set_values: vec![Value::Text("A".to_string())],
+        };
+
+        let err = FlushPlan::build_update_sql(sqlmodel_core::Dialect::Postgres, &op)
+            .expect_err("expected set mismatch error");
+        assert!(
+            err.to_string()
+                .contains("update set column/value length mismatch")
+        );
     }
 }
