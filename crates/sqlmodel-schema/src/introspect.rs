@@ -304,7 +304,10 @@ impl Introspector {
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             }
             Dialect::Postgres => {
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+                "SELECT table_name
+                                   FROM information_schema.tables
+                                   WHERE table_schema = current_schema()
+                                     AND table_type = 'BASE TABLE'"
             }
             Dialect::Mysql => "SHOW TABLES",
         };
@@ -436,9 +439,11 @@ impl Introspector {
                        u.ord AS ordinal
                    FROM pg_constraint c
                    JOIN pg_class t ON t.oid = c.conrelid
+                   JOIN pg_namespace n ON n.oid = t.relnamespace
                    JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord) ON true
                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = u.attnum
                    WHERE t.relname = $1
+                     AND n.nspname = current_schema()
                      AND c.contype = 'u'
                    ORDER BY c.conname, u.ord";
 
@@ -587,7 +592,7 @@ impl Introspector {
                        ON c.table_schema = st.schemaname AND c.table_name = st.relname
                    LEFT JOIN pg_catalog.pg_description d
                        ON d.objoid = st.relid AND d.objsubid = c.ordinal_position
-                   WHERE c.table_name = $1 AND c.table_schema = 'public'
+                   WHERE c.table_name = $1 AND c.table_schema = current_schema()
                    ORDER BY c.ordinal_position";
 
         let rows = match conn
@@ -751,7 +756,7 @@ impl Introspector {
                    JOIN pg_class t ON t.oid = c.conrelid
                    JOIN pg_namespace n ON n.oid = t.relnamespace
                    WHERE t.relname = $1
-                     AND n.nspname = 'public'
+                     AND n.nspname = current_schema()
                      AND c.contype = 'c'
                    ORDER BY c.conname";
 
@@ -867,7 +872,7 @@ impl Introspector {
                    FROM pg_class c
                    JOIN pg_namespace n ON n.oid = c.relnamespace
                    WHERE c.relname = $1
-                     AND n.nspname = 'public'
+                     AND n.nspname = current_schema()
                    LIMIT 1";
 
         let rows = match conn
@@ -1005,7 +1010,7 @@ impl Introspector {
                        AND rc.constraint_schema = tc.table_schema
                    WHERE tc.constraint_type = 'FOREIGN KEY'
                        AND tc.table_name = $1
-                       AND tc.table_schema = 'public'";
+                       AND tc.table_schema = current_schema()";
 
         let rows = match conn
             .query(
@@ -1188,11 +1193,13 @@ impl Introspector {
                        ix.indisprimary AS is_primary,
                        am.amname AS index_type
                    FROM pg_class t
+                   JOIN pg_namespace n ON n.oid = t.relnamespace
                    JOIN pg_index ix ON t.oid = ix.indrelid
                    JOIN pg_class i ON i.oid = ix.indexrelid
                    JOIN pg_am am ON i.relam = am.oid
                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
                    WHERE t.relname = $1
+                       AND n.nspname = current_schema()
                        AND t.relkind = 'r'
                        AND NOT EXISTS (
                            SELECT 1

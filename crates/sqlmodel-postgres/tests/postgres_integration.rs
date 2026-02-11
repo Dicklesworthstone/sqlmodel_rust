@@ -307,23 +307,36 @@ fn postgres_introspection_reports_check_constraints_and_table_comment() {
     rt.block_on(async {
         let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
 
+        let schema = test_table_name("sqlmodel_pg_schema");
         let table = test_table_name("sqlmodel_pg_intro");
+        let create_schema_sql = format!("CREATE SCHEMA \"{schema}\"");
+        let set_search_path_sql = format!("SET search_path TO \"{schema}\", public");
+        let reset_search_path_sql = "RESET search_path";
         let create_sql = format!(
-            "CREATE TABLE \"{table}\" (\
+            "CREATE TABLE \"{schema}\".\"{table}\" (\
              id BIGSERIAL PRIMARY KEY,\
              age INTEGER NOT NULL,\
              CONSTRAINT age_non_negative CHECK (age >= 0),\
              CHECK (age <= 150)\
              )"
         );
-        let comment_sql = format!("COMMENT ON TABLE \"{table}\" IS 'hero table comment'");
-        let drop_sql = format!("DROP TABLE IF EXISTS \"{table}\"");
+        let comment_sql =
+            format!("COMMENT ON TABLE \"{schema}\".\"{table}\" IS 'hero table comment'");
+        let drop_schema_sql = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
 
-        let _ = conn.execute(&cx, &drop_sql, &[]).await;
+        let _ = conn.execute(&cx, &drop_schema_sql, &[]).await;
+        unwrap_outcome(conn.execute(&cx, &create_schema_sql, &[]).await);
+        unwrap_outcome(conn.execute(&cx, &set_search_path_sql, &[]).await);
         unwrap_outcome(conn.execute(&cx, &create_sql, &[]).await);
         unwrap_outcome(conn.execute(&cx, &comment_sql, &[]).await);
 
         let introspector = Introspector::new(Dialect::Postgres);
+        let table_names = unwrap_outcome(introspector.table_names(&cx, &conn).await);
+        assert!(
+            table_names.iter().any(|name| name == &table),
+            "expected table {table} in current schema table list, got {:?}",
+            table_names
+        );
         let table_info = unwrap_outcome(introspector.table_info(&cx, &conn, &table).await);
 
         assert_eq!(table_info.comment.as_deref(), Some("hero table comment"));
@@ -369,6 +382,7 @@ fn postgres_introspection_reports_check_constraints_and_table_comment() {
             );
         }
 
-        let _ = conn.execute(&cx, &drop_sql, &[]).await;
+        let _ = conn.execute(&cx, reset_search_path_sql, &[]).await;
+        let _ = conn.execute(&cx, &drop_schema_sql, &[]).await;
     });
 }
