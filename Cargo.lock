@@ -1316,6 +1316,7 @@ dependencies = [
  "sha2",
  "sqlmodel-console",
  "sqlmodel-core",
+ "sqlmodel-schema",
  "webpki-roots 0.26.11",
 ]
 
@@ -1344,6 +1345,7 @@ dependencies = [
  "sha2",
  "sqlmodel-console",
  "sqlmodel-core",
+ "sqlmodel-schema",
  "subtle",
  "webpki-roots 0.26.11",
 ]

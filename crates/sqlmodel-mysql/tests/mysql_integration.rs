@@ -7,6 +7,7 @@ use sqlmodel_core::error::QueryErrorKind;
 use sqlmodel_core::{Connection, Error, TransactionOps, Value};
 
 use sqlmodel_mysql::{MySqlConfig, SharedMySqlConnection};
+use sqlmodel_schema::introspect::{Dialect, Introspector};
 
 const MYSQL_URL_ENV: &str = "SQLMODEL_TEST_MYSQL_URL";
 
@@ -80,10 +81,27 @@ fn parse_host_port(input: &str) -> Option<(&str, u16)> {
 fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
     match outcome {
         Outcome::Ok(v) => v,
-        Outcome::Err(e) => panic!("unexpected error: {e}"),
-        Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
-        Outcome::Panicked(p) => panic!("panicked: {p:?}"),
+        Outcome::Err(e) => {
+            eprintln!("unexpected error: {e}");
+            std::process::abort();
+        }
+        Outcome::Cancelled(r) => {
+            eprintln!("cancelled: {r:?}");
+            std::process::abort();
+        }
+        Outcome::Panicked(p) => {
+            eprintln!("panicked: {p:?}");
+            std::process::abort();
+        }
     }
+}
+
+fn compact_sql_fragment(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '`')
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 fn unique_suffix() -> u128 {
@@ -243,16 +261,13 @@ fn mysql_unique_violation_maps_to_constraint() {
                 .await,
         );
 
-        match conn
+        let outcome = conn
             .execute(&cx, &insert_sql, &[Value::Text("dup".into())])
-            .await
-        {
-            Outcome::Err(Error::Query(q)) => assert_eq!(q.kind, QueryErrorKind::Constraint),
-            Outcome::Err(e) => panic!("expected constraint violation, got error: {e}"),
-            Outcome::Ok(n) => panic!("expected error, got ok rows_affected={n}"),
-            Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
-            Outcome::Panicked(p) => panic!("panicked: {p:?}"),
-        }
+            .await;
+        assert!(
+            matches!(&outcome, Outcome::Err(Error::Query(q)) if q.kind == QueryErrorKind::Constraint),
+            "expected constraint violation, got outcome: {outcome:?}"
+        );
 
         let _ = conn.execute(&cx, &drop_sql, &[]).await;
     });
@@ -272,12 +287,89 @@ fn mysql_syntax_error_maps_to_syntax() {
 
     rt.block_on(async {
         let conn = unwrap_outcome(SharedMySqlConnection::connect(&cx, cfg).await);
-        match conn.query(&cx, "SELEKT 1", &[]).await {
-            Outcome::Err(Error::Query(q)) => assert_eq!(q.kind, QueryErrorKind::Syntax),
-            Outcome::Err(e) => panic!("expected syntax error, got error: {e}"),
-            Outcome::Ok(rows) => panic!("expected error, got {rows:?}"),
-            Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
-            Outcome::Panicked(p) => panic!("panicked: {p:?}"),
+        let outcome = conn.query(&cx, "SELEKT 1", &[]).await;
+        assert!(
+            matches!(&outcome, Outcome::Err(Error::Query(q)) if q.kind == QueryErrorKind::Syntax),
+            "expected syntax error, got outcome: {outcome:?}"
+        );
+    });
+}
+
+#[test]
+fn mysql_introspection_reports_check_constraints_and_table_comment() {
+    let Some(cfg) = mysql_test_config() else {
+        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
+        return;
+    };
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create asupersync runtime");
+    let cx = Cx::for_testing();
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedMySqlConnection::connect(&cx, cfg).await);
+
+        let table = test_table_name("sqlmodel_intro");
+        let create_sql = format!(
+            "CREATE TABLE `{table}` (\
+             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,\
+             age INT NOT NULL,\
+             CONSTRAINT chk_age_non_negative CHECK (age >= 0),\
+             CONSTRAINT chk_age_max CHECK (age <= 150)\
+             ) COMMENT='hero table comment'"
+        );
+        let drop_sql = format!("DROP TABLE IF EXISTS `{table}`");
+
+        let _ = conn.execute(&cx, &drop_sql, &[]).await;
+        unwrap_outcome(conn.execute(&cx, &create_sql, &[]).await);
+
+        let introspector = Introspector::new(Dialect::Mysql);
+        let table_info = unwrap_outcome(introspector.table_info(&cx, &conn, &table).await);
+
+        assert_eq!(table_info.comment.as_deref(), Some("hero table comment"));
+        assert!(
+            table_info.check_constraints.len() >= 2,
+            "expected >=2 check constraints, got {:?}",
+            table_info
+                .check_constraints
+                .iter()
+                .map(|c| (&c.name, &c.expression))
+                .collect::<Vec<_>>()
+        );
+
+        let named_check = table_info
+            .check_constraints
+            .iter()
+            .find(|c| c.name.as_deref() == Some("chk_age_non_negative"));
+        assert!(
+            named_check.is_some(),
+            "missing chk_age_non_negative check in {:?}",
+            table_info
+                .check_constraints
+                .iter()
+                .map(|c| (&c.name, &c.expression))
+                .collect::<Vec<_>>()
+        );
+        let named_check = named_check.expect("named check should exist");
+        let normalized = compact_sql_fragment(&named_check.expression);
+        assert!(
+            normalized.contains("age>=0"),
+            "unexpected normalized expression for chk_age_non_negative: {}",
+            named_check.expression
+        );
+
+        for check in &table_info.check_constraints {
+            let expr = check.expression.trim_start();
+            assert!(
+                !expr
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CHECK")),
+                "expression should be normalized without CHECK prefix: {}",
+                check.expression
+            );
         }
+
+        let _ = conn.execute(&cx, &drop_sql, &[]).await;
     });
 }

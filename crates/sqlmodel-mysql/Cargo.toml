@@ -41,3 +41,4 @@ webpki-roots = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 
 [dev-dependencies]
+sqlmodel-schema.workspace = true
