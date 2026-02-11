@@ -455,7 +455,7 @@ impl MigrationStatus {
     /// and formatted content.
     #[must_use]
     pub fn render_styled(&self) -> String {
-        let width = self.width.unwrap_or(80);
+        let width = self.width.unwrap_or(80).max(6);
         let reset = MigrationState::reset_code();
         let dim = "\x1b[2m";
 
@@ -465,10 +465,14 @@ impl MigrationStatus {
         let title = self.title.as_deref().unwrap_or("Migration Status");
 
         // Top border with title
-        let title_display = format!(" {} ", title);
+        let max_title_chars = width.saturating_sub(4);
+        let title_text = self.truncate_plain_to_width(title, max_title_chars);
+        let title_display = format!(" {title_text} ");
         let title_len = title_display.chars().count();
-        let left_pad = (width - 2 - title_len) / 2;
-        let right_pad = width - 2 - title_len - left_pad;
+        let border_space = width.saturating_sub(2);
+        let total_pad = border_space.saturating_sub(title_len);
+        let left_pad = total_pad / 2;
+        let right_pad = total_pad.saturating_sub(left_pad);
 
         lines.push(format!(
             "{}╭{}{}{}╮{}",
@@ -498,7 +502,7 @@ impl MigrationStatus {
         lines.push(format!(
             "{}├{}┤{}",
             self.border_color(),
-            "─".repeat(width - 2),
+            "─".repeat(width.saturating_sub(2)),
             reset
         ));
 
@@ -519,7 +523,7 @@ impl MigrationStatus {
                 "{}│{}{}│{}",
                 self.border_color(),
                 dim,
-                "─".repeat(width - 2),
+                "─".repeat(width.saturating_sub(2)),
                 reset
             ));
 
@@ -530,11 +534,7 @@ impl MigrationStatus {
 
                 // Format version and name (truncate if needed)
                 let version_name = format!("{}_{}", record.version, record.name);
-                let version_name_display = if version_name.len() > 30 {
-                    format!("{}...", &version_name[..27])
-                } else {
-                    version_name
-                };
+                let version_name_display = self.truncate_plain_to_width(&version_name, 30);
 
                 // Format timestamp
                 let timestamp = record.format_timestamp().unwrap_or_else(|| "-".to_string());
@@ -585,7 +585,7 @@ impl MigrationStatus {
         lines.push(format!(
             "{}╰{}╯{}",
             self.border_color(),
-            "─".repeat(width - 2),
+            "─".repeat(width.saturating_sub(2)),
             reset
         ));
 
@@ -635,7 +635,7 @@ impl MigrationStatus {
     /// Wrap a line to fit within the panel width.
     fn wrap_line(&self, content: &str, width: usize) -> String {
         let visible_len = self.visible_length(content);
-        let padding = (width - 2).saturating_sub(visible_len);
+        let padding = width.saturating_sub(2).saturating_sub(visible_len);
         let reset = MigrationState::reset_code();
 
         format!(
@@ -647,6 +647,24 @@ impl MigrationStatus {
             reset,
             padding = padding
         )
+    }
+
+    fn truncate_plain_to_width(&self, s: &str, max_visible: usize) -> String {
+        if max_visible == 0 {
+            return String::new();
+        }
+
+        let char_count = s.chars().count();
+        if char_count <= max_visible {
+            return s.to_string();
+        }
+
+        if max_visible <= 3 {
+            return ".".repeat(max_visible);
+        }
+
+        let truncated: String = s.chars().take(max_visible - 3).collect();
+        format!("{truncated}...")
     }
 
     /// Calculate visible length of a string (excluding ANSI codes).
@@ -772,6 +790,37 @@ mod tests {
 
         // Should contain status icon
         assert!(styled.contains("✓"));
+    }
+
+    #[test]
+    fn test_migration_render_styled_tiny_width_does_not_panic() {
+        let status = MigrationStatus::new(vec![
+            MigrationRecord::new("001", "create_users").state(MigrationState::Applied),
+        ])
+        .width(1);
+
+        let styled = status.render_styled();
+
+        assert!(!styled.is_empty());
+        assert!(styled.contains('╭'));
+        assert!(styled.contains('╯'));
+    }
+
+    #[test]
+    fn test_migration_render_styled_unicode_name_truncation() {
+        let status = MigrationStatus::new(vec![
+            MigrationRecord::new(
+                "001",
+                "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥",
+            )
+            .state(MigrationState::Applied),
+        ])
+        .width(80);
+
+        let styled = status.render_styled();
+
+        assert!(styled.contains("..."));
+        assert!(styled.contains("001_"));
     }
 
     // === Test 7: test_migration_timestamps ===
