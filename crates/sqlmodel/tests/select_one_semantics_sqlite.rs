@@ -5,12 +5,12 @@ use sqlmodel::SchemaBuilder;
 use sqlmodel::prelude::*;
 use sqlmodel_sqlite::SqliteConnection;
 
-fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
+fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> std::result::Result<T, String> {
     match outcome {
-        Outcome::Ok(v) => v,
-        Outcome::Err(e) => panic!("unexpected error: {e}"),
-        Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
-        Outcome::Panicked(p) => panic!("panicked: {p:?}"),
+        Outcome::Ok(v) => Ok(v),
+        Outcome::Err(e) => Err(format!("unexpected error: {e}")),
+        Outcome::Cancelled(r) => Err(format!("cancelled: {r:?}")),
+        Outcome::Panicked(p) => Err(format!("panicked: {p:?}")),
     }
 }
 
@@ -34,7 +34,7 @@ fn sqlite_select_one_enforces_exactly_one_row() {
 
         let stmts = SchemaBuilder::new().create_table::<User>().build();
         for stmt in stmts {
-            unwrap_outcome(conn.execute(&cx, &stmt, &[]).await);
+            unwrap_outcome(conn.execute(&cx, &stmt, &[]).await).expect("execute ddl");
         }
 
         unwrap_outcome(
@@ -44,7 +44,8 @@ fn sqlite_select_one_enforces_exactly_one_row() {
                 &[Value::BigInt(1), Value::Text("Alice".to_string())],
             )
             .await,
-        );
+        )
+        .expect("insert alice");
         unwrap_outcome(
             conn.execute(
                 &cx,
@@ -52,14 +53,16 @@ fn sqlite_select_one_enforces_exactly_one_row() {
                 &[Value::BigInt(2), Value::Text("Bob".to_string())],
             )
             .await,
-        );
+        )
+        .expect("insert bob");
 
         let alice = unwrap_outcome(
             select!(User)
                 .filter(Expr::col("id").eq(1_i64))
                 .one(&cx, &conn)
                 .await,
-        );
+        )
+        .expect("one should return alice");
         assert_eq!(
             alice,
             User {
@@ -72,20 +75,51 @@ fn sqlite_select_one_enforces_exactly_one_row() {
             .filter(Expr::col("id").eq(999_i64))
             .one(&cx, &conn)
             .await;
-        match none {
-            Outcome::Err(Error::Custom(msg)) => assert!(msg.contains("found none")),
-            other => panic!("expected custom none-row error, got {other:?}"),
+        assert!(matches!(none, Outcome::Err(Error::Custom(_))));
+        if let Outcome::Err(Error::Custom(msg)) = none {
+            assert!(msg.contains("found none"));
         }
 
         let many = select!(User).one(&cx, &conn).await;
-        match many {
-            Outcome::Err(Error::Custom(msg)) => {
-                assert!(
-                    msg.contains("Expected one row, found 2"),
-                    "unexpected message: {msg}"
-                );
-            }
-            other => panic!("expected custom multi-row error, got {other:?}"),
+        assert!(matches!(many, Outcome::Err(Error::Custom(_))));
+        if let Outcome::Err(Error::Custom(msg)) = many {
+            assert!(
+                msg.contains("Expected zero or one row, found 2"),
+                "unexpected message: {msg}"
+            );
+        }
+
+        let one_or_none_hit = unwrap_outcome(
+            select!(User)
+                .filter(Expr::col("id").eq(1_i64))
+                .one_or_none(&cx, &conn)
+                .await,
+        )
+        .expect("one_or_none should return alice");
+        assert_eq!(
+            one_or_none_hit,
+            Some(User {
+                id: 1,
+                name: "Alice".to_string()
+            })
+        );
+
+        let one_or_none_missing = unwrap_outcome(
+            select!(User)
+                .filter(Expr::col("id").eq(999_i64))
+                .one_or_none(&cx, &conn)
+                .await,
+        )
+        .expect("one_or_none should return none");
+        assert!(one_or_none_missing.is_none());
+
+        let one_or_none_many = select!(User).one_or_none(&cx, &conn).await;
+        assert!(matches!(one_or_none_many, Outcome::Err(Error::Custom(_))));
+        if let Outcome::Err(Error::Custom(msg)) = one_or_none_many {
+            assert!(
+                msg.contains("Expected zero or one row, found 2"),
+                "unexpected message: {msg}"
+            );
         }
     });
 }

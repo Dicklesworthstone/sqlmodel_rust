@@ -890,6 +890,23 @@ impl<M: Model> Select<M> {
 
     /// Execute the query and return exactly one row, or error.
     pub async fn one<C: Connection>(self, cx: &Cx, conn: &C) -> Outcome<M, sqlmodel_core::Error> {
+        match self.one_or_none(cx, conn).await {
+            Outcome::Ok(Some(model)) => Outcome::Ok(model),
+            Outcome::Ok(None) => Outcome::Err(sqlmodel_core::Error::Custom(
+                "Expected one row, found none".to_string(),
+            )),
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        }
+    }
+
+    /// Execute the query and return zero or one row, or error on multiple rows.
+    pub async fn one_or_none<C: Connection>(
+        self,
+        cx: &Cx,
+        conn: &C,
+    ) -> Outcome<Option<M>, sqlmodel_core::Error> {
         // Fetch up to two rows so we can enforce exact-one semantics without
         // scanning the full result set.
         let mut query = self;
@@ -898,15 +915,13 @@ impl<M: Model> Select<M> {
         let rows = conn.query(cx, &sql, &params).await;
 
         rows.and_then(|rows| match rows.len() {
-            0 => Outcome::Err(sqlmodel_core::Error::Custom(
-                "Expected one row, found none".to_string(),
-            )),
+            0 => Outcome::Ok(None),
             1 => match M::from_row(&rows[0]) {
-                Ok(model) => Outcome::Ok(model),
+                Ok(model) => Outcome::Ok(Some(model)),
                 Err(e) => Outcome::Err(e),
             },
             n => Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "Expected one row, found {n}"
+                "Expected zero or one row, found {n}"
             ))),
         })
     }

@@ -119,7 +119,7 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Get all results | `.all()` | `.all()` | ✅ Complete |
 | Get first result | `.first()` | `.one()` | ✅ Complete |
 | Get exactly one | `.one()` | `.one()` (errors on 0 or >1 rows) | ✅ Complete |
-| Get one or none | `.one_or_none()` | `.one()` returns Option | ✅ Complete |
+| Get one or none | `.one_or_none()` | `.one_or_none()` | ✅ Complete |
 | Execute non-query | `session.execute()` | `conn.execute()` | ✅ Complete |
 | Raw SQL query | `text("...")` | `raw_query!()` | ✅ Complete |
 | Raw SQL execute | `text("...")` | `raw_execute!()` | ✅ Complete |
