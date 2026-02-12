@@ -104,6 +104,10 @@ impl FrankenConnection {
         }
         .map_err(|e| franken_to_query_error(&e, sql))?;
 
+        // Log query SQL and params
+        let param_strs: Vec<_> = params.iter().map(|p| format!("{:?}", p)).collect();
+        eprintln!("[DEBUG] query_sync: sql={} params={:?}", &sql[..sql.len().min(80)], param_strs);
+
         eprintln!("[DEBUG] Query returned {} rows", franken_rows.len());
         if !franken_rows.is_empty() {
             eprintln!("[DEBUG] First row has {} values", franken_rows[0].values().len());
@@ -175,7 +179,8 @@ impl FrankenConnection {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
 
-        eprintln!("[DEBUG] execute_sync: {}", &sql[..sql.len().min(100)]);
+        let param_strs: Vec<_> = params.iter().map(|p| format!("{:?}", p)).collect();
+        eprintln!("[DEBUG] execute_sync: {} params={:?}", &sql[..sql.len().min(80)], param_strs);
 
         let count = if sqlite_params.is_empty() {
             inner.conn.execute(sql)
