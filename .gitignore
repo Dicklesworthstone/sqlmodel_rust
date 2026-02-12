@@ -4,3 +4,8 @@ target/
 
 # Common local artifacts (avoid accidental commits)
 a.out
+.plan.md
+screenshots_for_diagnostics/
+rustc-ice-*.txt
+reports/
+.agent-mail.yaml
