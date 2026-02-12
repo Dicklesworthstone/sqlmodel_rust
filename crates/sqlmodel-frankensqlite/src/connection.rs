@@ -956,10 +956,11 @@ fn find_keyword_at_depth_zero(s: &str, keyword: &str) -> Option<usize> {
             _ => {}
         }
         if depth == 0 && upper[i..].starts_with(&kw_upper) {
-            // Ensure it's a word boundary
-            let before_ok = i == 0 || !upper.as_bytes()[i - 1].is_ascii_alphanumeric();
+            // Ensure it's a word boundary (alphanumeric OR underscore counts as word char)
+            let is_word_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let before_ok = i == 0 || !is_word_char(upper.as_bytes()[i - 1]);
             let after_ok =
-                i + kw_len >= upper.len() || !upper.as_bytes()[i + kw_len].is_ascii_alphanumeric();
+                i + kw_len >= upper.len() || !is_word_char(upper.as_bytes()[i + kw_len]);
             if before_ok && after_ok {
                 return Some(i);
             }
@@ -1509,6 +1510,21 @@ mod tests {
     }
 
     #[test]
+    fn infer_columns_table_qualified_with_alias() {
+        // This is the pattern used in mcp-agent-mail-db queries
+        let names = infer_column_names(
+            "SELECT m.id, m.subject, a.name as from_name, m.body_md FROM messages m JOIN agents a ON a.id = m.sender_id"
+        );
+        assert_eq!(names, vec!["id", "subject", "from_name", "body_md"]);
+    }
+
+    #[test]
+    fn infer_columns_lowercase_as() {
+        let names = infer_column_names("SELECT a.name as alias_name FROM t");
+        assert_eq!(names, vec!["alias_name"]);
+    }
+
+    #[test]
     fn infer_columns_with_cte() {
         let names = infer_column_names("WITH cte AS (SELECT 1 AS x) SELECT x, x + 1 AS y FROM cte");
         assert_eq!(names, vec!["x", "y"]);
@@ -1720,5 +1736,109 @@ mod tests {
             .query_sync("SELECT data FROM t WHERE id = 1", &[])
             .unwrap();
         assert_eq!(rows[0].get(0), Some(&Value::Bytes(blob)));
+    }
+
+    // br-22iss: Test UPDATE with numbered placeholders matching E2E failure scenario
+    #[test]
+    fn update_with_numbered_placeholders_in_where() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                name TEXT,
+                contact_policy TEXT
+            )",
+        )
+        .unwrap();
+
+        // Insert two agents
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, contact_policy) VALUES (?1, ?2, ?3)",
+            &[Value::BigInt(1), Value::Text("BlueLake".into()), Value::Text("auto".into())],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, contact_policy) VALUES (?1, ?2, ?3)",
+            &[Value::BigInt(1), Value::Text("RedFox".into()), Value::Text("auto".into())],
+        )
+        .unwrap();
+
+        // Verify both agents exist
+        let rows = conn
+            .query_sync("SELECT * FROM agents WHERE project_id = ?1", &[Value::BigInt(1)])
+            .unwrap();
+        assert_eq!(rows.len(), 2, "should have 2 agents");
+
+        // Update RedFox's contact_policy - this is the failing pattern from E2E
+        let affected = conn
+            .execute_sync(
+                "UPDATE agents SET contact_policy = ?1 WHERE project_id = ?2 AND name = ?3",
+                &[Value::Text("open".into()), Value::BigInt(1), Value::Text("RedFox".into())],
+            )
+            .unwrap();
+        assert_eq!(affected, 1, "should affect 1 row");
+
+        // Verify the update worked
+        let rows = conn
+            .query_sync(
+                "SELECT contact_policy FROM agents WHERE name = ?1",
+                &[Value::Text("RedFox".into())],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get(0), Some(&Value::Text("open".into())));
+    }
+
+    // br-22iss: Test UPDATE with 4 numbered placeholders matching exact E2E scenario
+    #[test]
+    fn update_with_four_numbered_placeholders_in_where() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER,
+                name TEXT,
+                contact_policy TEXT,
+                last_active_ts INTEGER
+            )",
+        )
+        .unwrap();
+
+        // Insert two agents
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, contact_policy, last_active_ts) VALUES (?1, ?2, ?3, ?4)",
+            &[Value::BigInt(1), Value::Text("BlueLake".into()), Value::Text("auto".into()), Value::BigInt(1000)],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, contact_policy, last_active_ts) VALUES (?1, ?2, ?3, ?4)",
+            &[Value::BigInt(1), Value::Text("RedFox".into()), Value::Text("auto".into()), Value::BigInt(1000)],
+        )
+        .unwrap();
+
+        // Verify both agents exist
+        let rows = conn
+            .query_sync("SELECT * FROM agents WHERE project_id = ?1", &[Value::BigInt(1)])
+            .unwrap();
+        assert_eq!(rows.len(), 2, "should have 2 agents");
+
+        // Exact E2E scenario: UPDATE agents SET contact_policy = ?1, last_active_ts = ?2 WHERE project_id = ?3 AND name = ?4
+        let affected = conn
+            .execute_sync(
+                "UPDATE agents SET contact_policy = ?1, last_active_ts = ?2 WHERE project_id = ?3 AND name = ?4",
+                &[Value::Text("open".into()), Value::BigInt(2000), Value::BigInt(1), Value::Text("RedFox".into())],
+            )
+            .unwrap();
+        assert_eq!(affected, 1, "should affect 1 row");
+
+        // Verify the update worked
+        let rows = conn
+            .query_sync(
+                "SELECT contact_policy, last_active_ts FROM agents WHERE name = ?1",
+                &[Value::Text("RedFox".into())],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get(0), Some(&Value::Text("open".into())));
+        assert_eq!(rows[0].get(1), Some(&Value::BigInt(2000)));
     }
 }
