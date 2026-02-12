@@ -104,7 +104,70 @@ impl FrankenConnection {
         }
         .map_err(|e| franken_to_query_error(&e, sql))?;
 
-        Ok(convert_rows(&franken_rows, sql))
+        eprintln!("[DEBUG] Query returned {} rows", franken_rows.len());
+        if !franken_rows.is_empty() {
+            eprintln!("[DEBUG] First row has {} values", franken_rows[0].values().len());
+            // Show the values for debugging
+            let vals: Vec<_> = franken_rows[0].values().iter().map(|v| format!("{:?}", v)).collect();
+            eprintln!("[DEBUG] Row values: {:?}", vals);
+        }
+
+        // For RETURNING *, get column names from table schema
+        let schema_columns = self.get_returning_star_columns(sql, &inner.conn);
+        Ok(convert_rows_with_schema(&franken_rows, sql, schema_columns.as_deref()))
+    }
+
+    /// Get column names for RETURNING * from the table schema.
+    fn get_returning_star_columns(
+        &self,
+        sql: &str,
+        conn: &fsqlite_core::connection::Connection,
+    ) -> Option<Vec<String>> {
+        let upper = sql.to_uppercase();
+
+        // Check if this is a RETURNING * query
+        if !upper.contains(" RETURNING *") && !upper.ends_with("RETURNING *") {
+            eprintln!("[DEBUG] Not a RETURNING * query: {}", &sql[..sql.len().min(100)]);
+            return None;
+        }
+        eprintln!("[DEBUG] Detected RETURNING * query");
+
+        // Extract table name
+        let table_name = extract_table_name_for_returning(sql)?;
+        eprintln!("[DEBUG] Extracted table name: {}", table_name);
+
+        // Query PRAGMA table_info to get column names
+        let pragma_sql = format!("PRAGMA table_info({})", table_name);
+        let pragma_rows = match conn.query(&pragma_sql) {
+            Ok(rows) => {
+                eprintln!("[DEBUG] PRAGMA returned {} rows", rows.len());
+                rows
+            }
+            Err(e) => {
+                eprintln!("[DEBUG] PRAGMA failed: {:?}", e);
+                return None;
+            }
+        };
+
+        // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+        // Column index 1 is the name
+        let columns: Vec<String> = pragma_rows
+            .iter()
+            .filter_map(|row| {
+                row.values().get(1).and_then(|v| match v {
+                    SqliteValue::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+
+        eprintln!("[DEBUG] Extracted columns: {:?}", columns);
+
+        if columns.is_empty() {
+            None
+        } else {
+            Some(columns)
+        }
     }
 
     /// Prepare and execute a statement synchronously, returning rows affected.
@@ -112,12 +175,16 @@ impl FrankenConnection {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
 
+        eprintln!("[DEBUG] execute_sync: {}", &sql[..sql.len().min(100)]);
+
         let count = if sqlite_params.is_empty() {
             inner.conn.execute(sql)
         } else {
             inner.conn.execute_with_params(sql, &sqlite_params)
         }
         .map_err(|e| franken_to_query_error(&e, sql))?;
+
+        eprintln!("[DEBUG] execute_sync result: {} rows affected", count);
 
         // Track last_insert_rowid for INSERT statements
         if is_insert_sql(sql) {
@@ -486,7 +553,20 @@ impl TransactionOps for FrankenTransaction<'_> {
 ///
 /// frankensqlite `Row` has no column names, so we infer them from the SQL
 /// or fall back to positional names (`_c0`, `_c1`, ...).
+#[allow(dead_code)]
 fn convert_rows(franken_rows: &[fsqlite_core::connection::Row], sql: &str) -> Vec<Row> {
+    convert_rows_with_schema(franken_rows, sql, None)
+}
+
+/// Convert frankensqlite rows to sqlmodel-core rows with optional schema-provided column names.
+///
+/// If `schema_columns` is provided (e.g., from PRAGMA table_info for RETURNING *),
+/// those names are used instead of inferring from SQL.
+fn convert_rows_with_schema(
+    franken_rows: &[fsqlite_core::connection::Row],
+    sql: &str,
+    schema_columns: Option<&[String]>,
+) -> Vec<Row> {
     if franken_rows.is_empty() {
         return Vec::new();
     }
@@ -494,14 +574,22 @@ fn convert_rows(franken_rows: &[fsqlite_core::connection::Row], sql: &str) -> Ve
     // Determine column count from first row
     let col_count = franken_rows[0].values().len();
 
-    // Try to infer column names from SQL
-    let mut col_names = infer_column_names(sql);
+    // Use schema columns if provided, otherwise infer from SQL
+    let mut col_names = if let Some(schema_cols) = schema_columns {
+        schema_cols.to_vec()
+    } else {
+        infer_column_names(sql)
+    };
+
+    eprintln!("[DEBUG] Inferred col_names (before padding): {:?}", col_names);
 
     // Pad or trim to match actual column count
     while col_names.len() < col_count {
         col_names.push(format!("_c{}", col_names.len()));
     }
     col_names.truncate(col_count);
+
+    eprintln!("[DEBUG] Final col_names: {:?}", col_names);
 
     let columns = Arc::new(ColumnInfo::new(col_names));
 
@@ -534,6 +622,11 @@ fn infer_column_names(sql: &str) -> Vec<String> {
     // For SELECT, try to extract column names from the result columns
     if upper.starts_with("SELECT") || upper.starts_with("WITH") {
         return infer_select_columns(trimmed);
+    }
+
+    // For INSERT/UPDATE/DELETE with RETURNING clause
+    if upper.contains(" RETURNING ") || upper.ends_with(" RETURNING *") {
+        return infer_returning_columns(trimmed);
     }
 
     Vec::new()
@@ -658,6 +751,110 @@ fn infer_select_columns(sql: &str) -> Vec<String> {
         .iter()
         .map(|col| extract_column_name(col.trim()))
         .collect()
+}
+
+/// Infer column names from a RETURNING clause in INSERT/UPDATE/DELETE.
+///
+/// For `RETURNING *`, we return `["*"]` and let the caller handle expansion.
+/// For explicit columns, we parse them like SELECT columns.
+fn infer_returning_columns(sql: &str) -> Vec<String> {
+    let upper = sql.to_uppercase();
+
+    // Find RETURNING keyword
+    let returning_pos = if let Some(pos) = find_keyword_at_depth_zero(&upper, "RETURNING") {
+        pos
+    } else {
+        return Vec::new();
+    };
+
+    // Extract the part after RETURNING
+    let after_returning = &sql[returning_pos + 9..].trim_start();
+
+    // Handle "RETURNING *"
+    if after_returning.trim() == "*" || after_returning.starts_with("* ") || after_returning.starts_with("*;") {
+        // For RETURNING *, we need to get column names from the table.
+        // Extract table name from INSERT INTO or UPDATE or DELETE FROM.
+        if let Some(table_name) = extract_table_name_for_returning(sql) {
+            // Return a marker that indicates we need schema lookup
+            return vec![format!("__returning_star_table:{table_name}")];
+        }
+        return vec!["*".to_string()];
+    }
+
+    // Parse explicit column list (same logic as SELECT columns)
+    // Find end markers (semicolon or end of string)
+    let end_pos = after_returning.find(';').unwrap_or(after_returning.len());
+    let cols_region = &after_returning[..end_pos];
+
+    // Split by commas at depth 0
+    let columns = split_at_depth_zero(cols_region, ',');
+
+    columns
+        .iter()
+        .map(|col| extract_column_name(col.trim()))
+        .collect()
+}
+
+/// Extract the table name from INSERT INTO, UPDATE, or DELETE FROM for RETURNING.
+fn extract_table_name_for_returning(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+
+    // INSERT INTO table_name (...)
+    if upper.starts_with("INSERT") {
+        if let Some(into_pos) = upper.find(" INTO ") {
+            let after_into = &sql[into_pos + 6..].trim_start();
+            // Table name is the next word (may be quoted)
+            let table = extract_identifier(after_into);
+            if !table.is_empty() {
+                return Some(table);
+            }
+        }
+    }
+
+    // UPDATE table_name SET ...
+    if upper.starts_with("UPDATE") {
+        let after_update = &sql[6..].trim_start();
+        let table = extract_identifier(after_update);
+        if !table.is_empty() {
+            return Some(table);
+        }
+    }
+
+    // DELETE FROM table_name ...
+    if upper.starts_with("DELETE") {
+        if let Some(from_pos) = upper.find(" FROM ") {
+            let after_from = &sql[from_pos + 6..].trim_start();
+            let table = extract_identifier(after_from);
+            if !table.is_empty() {
+                return Some(table);
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract an identifier (table/column name) from the start of a string.
+/// Handles quoted identifiers with double quotes.
+fn extract_identifier(s: &str) -> String {
+    let trimmed = s.trim_start();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Quoted identifier
+    if trimmed.starts_with('"') {
+        if let Some(end) = trimmed[1..].find('"') {
+            return trimmed[1..end + 1].to_string();
+        }
+        return String::new();
+    }
+
+    // Unquoted identifier
+    let end = trimmed
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(trimmed.len());
+    trimmed[..end].to_string()
 }
 
 /// Extract a column name or alias from a result column expression.
