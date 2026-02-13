@@ -16,9 +16,9 @@ sqlmodel-core.workspace = true
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
-fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
-fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
-fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
+fsqlite = { path = "../../../frankensqlite/crates/fsqlite" }
+fsqlite-core = { path = "../../../frankensqlite/crates/fsqlite-core" }
+fsqlite-types = { path = "../../../frankensqlite/crates/fsqlite-types" }
+fsqlite-error = { path = "../../../frankensqlite/crates/fsqlite-error" }
 
 [dev-dependencies]
