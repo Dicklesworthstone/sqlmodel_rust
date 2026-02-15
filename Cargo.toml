@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
@@ -71,18 +71,18 @@ tracing = "0.1"
 rich_rust = "0.1.1"
 
 # Internal crates
-sqlmodel = { path = "crates/sqlmodel", version = "0.1.1" }
-sqlmodel-core = { path = "crates/sqlmodel-core", version = "0.1.1" }
-sqlmodel-macros = { path = "crates/sqlmodel-macros", version = "0.1.1" }
-sqlmodel-query = { path = "crates/sqlmodel-query", version = "0.1.1" }
-sqlmodel-schema = { path = "crates/sqlmodel-schema", version = "0.1.1" }
-sqlmodel-session = { path = "crates/sqlmodel-session", version = "0.1.1" }
-sqlmodel-pool = { path = "crates/sqlmodel-pool", version = "0.1.1" }
-sqlmodel-console = { path = "crates/sqlmodel-console", version = "0.1.1" }
-sqlmodel-postgres = { path = "crates/sqlmodel-postgres", version = "0.1.1" }
-sqlmodel-sqlite = { path = "crates/sqlmodel-sqlite", version = "0.1.1" }
-sqlmodel-mysql = { path = "crates/sqlmodel-mysql", version = "0.1.1" }
-sqlmodel-frankensqlite = { path = "crates/sqlmodel-frankensqlite", version = "0.1.1" }
+sqlmodel = { path = "crates/sqlmodel", version = "0.2.0" }
+sqlmodel-core = { path = "crates/sqlmodel-core", version = "0.2.0" }
+sqlmodel-macros = { path = "crates/sqlmodel-macros", version = "0.2.0" }
+sqlmodel-query = { path = "crates/sqlmodel-query", version = "0.2.0" }
+sqlmodel-schema = { path = "crates/sqlmodel-schema", version = "0.2.0" }
+sqlmodel-session = { path = "crates/sqlmodel-session", version = "0.2.0" }
+sqlmodel-pool = { path = "crates/sqlmodel-pool", version = "0.2.0" }
+sqlmodel-console = { path = "crates/sqlmodel-console", version = "0.2.0" }
+sqlmodel-postgres = { path = "crates/sqlmodel-postgres", version = "0.2.0" }
+sqlmodel-sqlite = { path = "crates/sqlmodel-sqlite", version = "0.2.0" }
+sqlmodel-mysql = { path = "crates/sqlmodel-mysql", version = "0.2.0" }
+sqlmodel-frankensqlite = { path = "crates/sqlmodel-frankensqlite", version = "0.2.0" }
 
 [profile.release]
 opt-level = "z"
