@@ -1,3 +1,5 @@
+#![cfg(feature = "c-sqlite-tests")]
+
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 

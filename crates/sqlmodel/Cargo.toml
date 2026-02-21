@@ -18,6 +18,7 @@ workspace = true
 [features]
 default = []
 console = ["dep:sqlmodel-console"]
+c-sqlite-tests = ["dep:sqlmodel-sqlite"]
 
 [dependencies]
 sqlmodel-core.workspace = true
@@ -32,6 +33,4 @@ serde_json.workspace = true
 
 # Optional console support for rich output
 sqlmodel-console = { workspace = true, optional = true }
-
-[dev-dependencies]
-sqlmodel-sqlite.workspace = true
+sqlmodel-sqlite = { workspace = true, optional = true }

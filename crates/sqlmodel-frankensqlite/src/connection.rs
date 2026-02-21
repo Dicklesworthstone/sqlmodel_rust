@@ -701,7 +701,8 @@ fn infer_pragma_columns(upper_sql: &str) -> Vec<String> {
         "DATABASE_LIST" => vec!["seq".into(), "name".into(), "file".into()],
         "COMPILE_OPTIONS" => vec!["compile_option".into()],
         "COLLATION_LIST" => vec!["seq".into(), "name".into()],
-        "INTEGRITY_CHECK" | "QUICK_CHECK" => vec!["integrity_check".into()],
+        "INTEGRITY_CHECK" => vec!["integrity_check".into()],
+        "QUICK_CHECK" => vec!["quick_check".into()],
         "WAL_CHECKPOINT" => vec!["busy".into(), "log".into(), "checkpointed".into()],
         "FREELIST_COUNT" => vec!["freelist_count".into()],
         "PAGE_COUNT" => vec!["page_count".into()],
@@ -1551,6 +1552,12 @@ mod tests {
     fn infer_pragma_integrity_check() {
         let names = infer_column_names("PRAGMA integrity_check");
         assert_eq!(names, vec!["integrity_check"]);
+    }
+
+    #[test]
+    fn infer_pragma_quick_check() {
+        let names = infer_column_names("PRAGMA quick_check");
+        assert_eq!(names, vec!["quick_check"]);
     }
 
     #[test]
