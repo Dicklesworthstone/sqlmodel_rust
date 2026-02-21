@@ -103,29 +103,6 @@ impl FrankenConnection {
         }
         .map_err(|e| franken_to_query_error(&e, sql))?;
 
-        // Log query SQL and params
-        let param_strs: Vec<_> = params.iter().map(|p| format!("{:?}", p)).collect();
-        eprintln!(
-            "[DEBUG] query_sync: sql={} params={:?}",
-            &sql[..sql.len().min(80)],
-            param_strs
-        );
-
-        eprintln!("[DEBUG] Query returned {} rows", franken_rows.len());
-        if !franken_rows.is_empty() {
-            eprintln!(
-                "[DEBUG] First row has {} values",
-                franken_rows[0].values().len()
-            );
-            // Show the values for debugging
-            let vals: Vec<_> = franken_rows[0]
-                .values()
-                .iter()
-                .map(|v| format!("{:?}", v))
-                .collect();
-            eprintln!("[DEBUG] Row values: {:?}", vals);
-        }
-
         // For RETURNING *, get column names from table schema
         let schema_columns = self.get_returning_star_columns(sql, &inner.conn);
         Ok(convert_rows_with_schema(
@@ -145,29 +122,17 @@ impl FrankenConnection {
 
         // Check if this is a RETURNING * query
         if !upper.contains(" RETURNING *") && !upper.ends_with("RETURNING *") {
-            eprintln!(
-                "[DEBUG] Not a RETURNING * query: {}",
-                &sql[..sql.len().min(100)]
-            );
             return None;
         }
-        eprintln!("[DEBUG] Detected RETURNING * query");
 
         // Extract table name
         let table_name = extract_table_name_for_returning(sql)?;
-        eprintln!("[DEBUG] Extracted table name: {}", table_name);
 
         // Query PRAGMA table_info to get column names
         let pragma_sql = format!("PRAGMA table_info({})", table_name);
         let pragma_rows = match conn.query(&pragma_sql) {
-            Ok(rows) => {
-                eprintln!("[DEBUG] PRAGMA returned {} rows", rows.len());
-                rows
-            }
-            Err(e) => {
-                eprintln!("[DEBUG] PRAGMA failed: {:?}", e);
-                return None;
-            }
+            Ok(rows) => rows,
+            Err(_) => return None,
         };
 
         // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
@@ -182,8 +147,6 @@ impl FrankenConnection {
             })
             .collect();
 
-        eprintln!("[DEBUG] Extracted columns: {:?}", columns);
-
         if columns.is_empty() {
             None
         } else {
@@ -196,21 +159,12 @@ impl FrankenConnection {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
 
-        let param_strs: Vec<_> = params.iter().map(|p| format!("{:?}", p)).collect();
-        eprintln!(
-            "[DEBUG] execute_sync: {} params={:?}",
-            &sql[..sql.len().min(80)],
-            param_strs
-        );
-
         let count = if sqlite_params.is_empty() {
             inner.conn.execute(sql)
         } else {
             inner.conn.execute_with_params(sql, &sqlite_params)
         }
         .map_err(|e| franken_to_query_error(&e, sql))?;
-
-        eprintln!("[DEBUG] execute_sync result: {} rows affected", count);
 
         // Track last_insert_rowid for INSERT statements
         if is_insert_sql(sql) {
@@ -603,18 +557,11 @@ fn convert_rows_with_schema(
         infer_column_names(sql)
     };
 
-    eprintln!(
-        "[DEBUG] Inferred col_names (before padding): {:?}",
-        col_names
-    );
-
     // Pad or trim to match actual column count
     while col_names.len() < col_count {
         col_names.push(format!("_c{}", col_names.len()));
     }
     col_names.truncate(col_count);
-
-    eprintln!("[DEBUG] Final col_names: {:?}", col_names);
 
     let columns = Arc::new(ColumnInfo::new(col_names));
 
