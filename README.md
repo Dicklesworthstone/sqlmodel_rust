@@ -9,7 +9,7 @@
 **SQL databases in Rust, designed to be intuitive and type-safe.**
 
 [![CI](https://github.com/Dicklesworthstone/sqlmodel_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/sqlmodel_rust/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](LICENSE)
 [![Rust: Nightly](https://img.shields.io/badge/Rust-nightly-orange.svg)](https://www.rust-lang.org/)
 
 *A Rust port of [tiangolo/sqlmodel](https://github.com/tiangolo/sqlmodel) (Python), extended with [asupersync](https://github.com/Dicklesworthstone/asupersync) for structured concurrency and cancel-correct async database operations.*
@@ -549,4 +549,4 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE).
