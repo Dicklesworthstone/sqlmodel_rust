@@ -56,7 +56,7 @@ format_push_string = "allow"
 [workspace.dependencies]
 # Core async runtime - our custom cancel-correct runtime
 # Keep defaults off to avoid unsafe SIMD paths; enable only required internals.
-asupersync = { version = "0.2.5", default-features = false, features = ["test-internals"] }
+asupersync = { version = "0.2.6", default-features = false, features = ["test-internals"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
