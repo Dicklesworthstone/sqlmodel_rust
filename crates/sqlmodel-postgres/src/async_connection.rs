@@ -1310,10 +1310,14 @@ impl PgAsyncConnection {
                 }));
             }
 
-            if let Err(e) = self.reader.feed(&self.read_buf[..n]) {
-                self.state = ConnectionState::Error;
-                return Outcome::Err(protocol_error(format!("Protocol error: {}", e)));
-            }
+            // Only append raw bytes; let next_message() at the top of the
+            // loop handle parsing.  The old code called feed() here, which
+            // parsed *and consumed* all complete messages from the buffer and
+            // returned them in a Vec — but the caller only checked for Err,
+            // silently discarding the Ok(messages).  On the next iteration
+            // next_message() would see an empty buffer and block forever on
+            // the socket read.  (See issue #9.)
+            self.reader.push(&self.read_buf[..n]);
         }
     }
 }

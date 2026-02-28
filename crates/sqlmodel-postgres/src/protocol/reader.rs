@@ -89,6 +89,16 @@ impl MessageReader {
         self.buf.len()
     }
 
+    /// Append raw bytes to the internal buffer without parsing.
+    ///
+    /// Use this when the caller will drive parsing via [`next_message()`] in
+    /// its own loop (e.g. `receive_message_no_cx`). This avoids the
+    /// consume-then-discard bug where [`feed()`] parses and returns messages
+    /// that the caller never inspects.
+    pub fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
     /// Feed bytes into the reader and return any complete messages.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<BackendMessage>, ProtocolError> {
         self.buf.extend_from_slice(data);
