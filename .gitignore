@@ -16,3 +16,7 @@ storage.sqlite3*
 proptest-regressions/
 test_meminfo
 perf.data
+
+# Alternative target directories
+target-local/
+target-*/
