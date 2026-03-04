@@ -592,6 +592,15 @@ impl<C: Connection> Pool<C> {
     /// Close the pool, preventing new connections and closing all idle connections.
     ///
     /// If the pool mutex is poisoned, this logs an error but still wakes waiters.
+    pub fn clear_idle(&self) {
+        if let Ok(mut inner) = self.shared.inner.lock() {
+            let idle_count = inner.idle.len();
+            inner.idle.clear();
+            inner.total_count -= idle_count;
+            self.shared.connections_closed.fetch_add(idle_count as u64, Ordering::Relaxed);
+        }
+    }
+
     pub fn close(&self) {
         match self.shared.inner.lock() {
             Ok(mut inner) => {
