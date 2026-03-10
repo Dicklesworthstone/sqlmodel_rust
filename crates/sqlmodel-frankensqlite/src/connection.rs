@@ -81,6 +81,31 @@ impl FrankenConnection {
         &self.path
     }
 
+    fn close_inner(inner: Arc<Mutex<FrankenInner>>) -> Result<(), Error> {
+        match Arc::try_unwrap(inner) {
+            Ok(mutex) => {
+                let inner = mutex
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                inner.conn.close().map_err(|e| franken_to_conn_error(&e))
+            }
+            Err(inner) => Err(Error::Connection(ConnectionError {
+                kind: ConnectionErrorKind::Disconnected,
+                message: format!(
+                    "cannot close FrankenConnection cleanly while {} strong references remain",
+                    Arc::strong_count(&inner)
+                ),
+                source: None,
+            })),
+        }
+    }
+
+    /// Close the underlying frankensqlite connection synchronously.
+    pub fn close_sync(self) -> Result<(), Error> {
+        let Self { inner, path: _ } = self;
+        Self::close_inner(inner)
+    }
+
     /// Execute SQL directly without parameter binding (for DDL, PRAGMAs, etc.)
     pub fn execute_raw(&self, sql: &str) -> Result<(), Error> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -426,8 +451,7 @@ impl Connection for FrankenConnection {
     }
 
     async fn close(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
-        // Connection is closed on drop (inner Rc<RefCell<>> cleanup)
-        Ok(())
+        self.close_sync()
     }
 }
 
@@ -1044,6 +1068,13 @@ mod tests {
     fn open_memory_succeeds() {
         let conn = FrankenConnection::open_memory().expect("should open in-memory db");
         assert_eq!(conn.path(), ":memory:");
+    }
+
+    #[test]
+    fn close_sync_succeeds() {
+        let conn = FrankenConnection::open_memory().expect("should open in-memory db");
+        conn.close_sync()
+            .expect("close_sync should close the underlying frankensqlite connection");
     }
 
     #[test]
