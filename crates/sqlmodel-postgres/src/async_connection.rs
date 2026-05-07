@@ -320,7 +320,7 @@ impl PgAsyncConnection {
     /// Establish a new async connection to the PostgreSQL server.
     pub async fn connect(_cx: &Cx, config: PgConfig) -> Outcome<Self, Error> {
         let addr = config.socket_addr();
-        let socket_addr = match addr.parse() {
+        let socket_addr: std::net::SocketAddr = match addr.parse() {
             Ok(a) => a,
             Err(e) => {
                 return Outcome::Err(Error::Connection(ConnectionError {

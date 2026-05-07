@@ -301,7 +301,7 @@ impl MySqlAsyncConnection {
     pub async fn connect(_cx: &Cx, config: MySqlConfig) -> Outcome<Self, Error> {
         // Use async TCP connect
         let addr = config.socket_addr();
-        let socket_addr = match addr.parse() {
+        let socket_addr: std::net::SocketAddr = match addr.parse() {
             Ok(a) => a,
             Err(e) => {
                 return Outcome::Err(Error::Connection(ConnectionError {
