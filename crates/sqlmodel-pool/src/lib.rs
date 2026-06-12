@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use asupersync::{CancelReason, Cx, Outcome};
+use asupersync::{CancelReason, Cx, Outcome, runtime::RuntimeBuilder};
 use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind, PoolError, PoolErrorKind};
 use sqlmodel_core::{Connection, Error};
 
@@ -200,7 +200,7 @@ impl<C> ConnectionMeta<C> {
 }
 
 /// Internal pool state shared between pool and connections.
-struct PoolInner<C> {
+struct PoolInner<C: Connection> {
     /// Pool configuration
     config: PoolConfig,
     /// Idle connections available for use
@@ -215,7 +215,7 @@ struct PoolInner<C> {
     closed: bool,
 }
 
-impl<C> PoolInner<C> {
+impl<C: Connection> PoolInner<C> {
     fn new(config: PoolConfig) -> Self {
         Self {
             config,
@@ -243,7 +243,7 @@ impl<C> PoolInner<C> {
 }
 
 /// Shared state wrapper with condition variable for notification.
-struct PoolShared<C> {
+struct PoolShared<C: Connection> {
     /// Protected pool state
     inner: Mutex<PoolInner<C>>,
     /// Notifies waiters when connections become available
@@ -255,7 +255,7 @@ struct PoolShared<C> {
     timeouts: AtomicU64,
 }
 
-impl<C> PoolShared<C> {
+impl<C: Connection> PoolShared<C> {
     fn new(config: PoolConfig) -> Self {
         Self {
             inner: Mutex::new(PoolInner::new(config)),
@@ -298,6 +298,38 @@ impl<C> PoolShared<C> {
         self.inner
             .lock()
             .map_err(|_| Error::Pool(PoolError::poisoned(operation)))
+    }
+}
+
+fn close_connection_blocking<C: Connection>(conn: C, context: &'static str) {
+    let runtime = match RuntimeBuilder::current_thread().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!(
+                context,
+                error = %error,
+                "failed to build runtime while closing pooled connection"
+            );
+            drop(conn);
+            return;
+        }
+    };
+    let cx = Cx::for_testing();
+    if let Err(error) = runtime.block_on(async { conn.close(&cx).await }) {
+        tracing::warn!(
+            context,
+            error = %error,
+            "failed to close pooled connection explicitly"
+        );
+    }
+}
+
+fn close_connection_metas<C: Connection>(
+    metas: impl IntoIterator<Item = ConnectionMeta<C>>,
+    context: &'static str,
+) {
+    for meta in metas {
+        close_connection_blocking(meta.conn, context);
     }
 }
 
@@ -594,12 +626,14 @@ impl<C: Connection> Pool<C> {
     /// If the pool mutex is poisoned, this logs an error but still wakes waiters.
     pub fn clear_idle(&self) {
         if let Ok(mut inner) = self.shared.inner.lock() {
-            let idle_count = inner.idle.len();
-            inner.idle.clear();
+            let idle = inner.idle.drain(..).collect::<Vec<_>>();
+            let idle_count = idle.len();
             inner.total_count -= idle_count;
             self.shared
                 .connections_closed
                 .fetch_add(idle_count as u64, Ordering::Relaxed);
+            drop(inner);
+            close_connection_metas(idle, "pool clear_idle");
         }
     }
 
@@ -609,13 +643,14 @@ impl<C: Connection> Pool<C> {
                 inner.closed = true;
 
                 // Close all idle connections
-                let idle_count = inner.idle.len();
-                inner.idle.clear();
+                let idle = inner.idle.drain(..).collect::<Vec<_>>();
+                let idle_count = idle.len();
                 inner.total_count -= idle_count;
                 self.shared
                     .connections_closed
                     .fetch_add(idle_count as u64, Ordering::Relaxed);
                 drop(inner);
+                close_connection_metas(idle, "pool close");
             }
             Err(poisoned) => {
                 // Recover from poisoning - we still want to mark the pool as closed
@@ -626,12 +661,14 @@ impl<C: Connection> Pool<C> {
                 );
                 let mut inner = poisoned.into_inner();
                 inner.closed = true;
-                let idle_count = inner.idle.len();
-                inner.idle.clear();
+                let idle = inner.idle.drain(..).collect::<Vec<_>>();
+                let idle_count = idle.len();
                 inner.total_count -= idle_count;
                 self.shared
                     .connections_closed
                     .fetch_add(idle_count as u64, Ordering::Relaxed);
+                drop(inner);
+                close_connection_metas(idle, "pool close poisoned");
             }
         }
 
@@ -658,6 +695,12 @@ impl<C: Connection> Pool<C> {
     pub fn total_count(&self) -> usize {
         let inner = self.shared.lock_or_recover();
         inner.total_count
+    }
+}
+
+impl<C: Connection> Drop for Pool<C> {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -765,10 +808,9 @@ impl<C: Connection> Drop for PooledConnection<C> {
                     Err(_poisoned) => {
                         tracing::error!(
                             "Pool mutex poisoned during connection return; \
-                             connection will be leaked. A thread panicked while holding the lock."
+                             connection will be closed instead of returned. A thread panicked while holding the lock."
                         );
-                        // Connection is leaked - we can't safely return it or update counts.
-                        // The pool is likely in a bad state anyway.
+                        close_connection_blocking(meta.conn, "pooled connection drop poisoned");
                         return;
                     }
                 };
@@ -777,6 +819,8 @@ impl<C: Connection> Drop for PooledConnection<C> {
                     inner.total_count -= 1;
                     inner.active_count -= 1;
                     pool.connections_closed.fetch_add(1, Ordering::Relaxed);
+                    drop(inner);
+                    close_connection_blocking(meta.conn, "pooled connection drop closed pool");
                     return;
                 }
 
@@ -786,6 +830,8 @@ impl<C: Connection> Drop for PooledConnection<C> {
                     inner.total_count -= 1;
                     inner.active_count -= 1;
                     pool.connections_closed.fetch_add(1, Ordering::Relaxed);
+                    drop(inner);
+                    close_connection_blocking(meta.conn, "pooled connection drop max lifetime");
                     return;
                 }
 
@@ -794,8 +840,9 @@ impl<C: Connection> Drop for PooledConnection<C> {
 
                 drop(inner);
                 pool.conn_available.notify_one();
+            } else {
+                close_connection_blocking(meta.conn, "pooled connection drop missing pool");
             }
-            // If pool is gone, connection is just dropped
         }
     }
 }
