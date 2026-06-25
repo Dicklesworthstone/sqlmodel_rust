@@ -77,7 +77,7 @@ jobs:
             exit 0
           fi
 
-          crates=(sqlmodel-core sqlmodel-macros sqlmodel-query sqlmodel-schema sqlmodel-session sqlmodel-pool sqlmodel-console sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite sqlmodel)
+          crates=(sqlmodel-core sqlmodel-macros sqlmodel-query sqlmodel-schema sqlmodel-session sqlmodel-pool sqlmodel-console sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite sqlmodel-frankensqlite sqlmodel)
           for crate in "${crates[@]}"; do
             echo "=== Publishing ${crate} ==="
             while true; do
@@ -86,6 +86,10 @@ jobs:
               echo "${out}"
               if [ ${status} -eq 0 ]; then
                 echo "=== Published ${crate} ==="
+                break
+              fi
+              if echo "${out}" | grep -qiE 'already (uploaded|exists)|is already uploaded'; then
+                echo "=== ${crate} is already published; continuing ==="
                 break
               fi
               retry=$(echo "${out}" | sed -n "s/.*Please try again after \\(.*\\) GMT.*/\\1/p" | head -n1)
