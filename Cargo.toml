@@ -18,7 +18,9 @@ members = [
 [workspace.package]
 version = "0.2.2"
 edition = "2024"
-license = "MIT"
+# "MIT License (with OpenAI/Anthropic Rider)" (see ./LICENSE) — restrictive custom
+# license, NOT permissive MIT. Bare "MIT" misrepresented the terms. SPDX LicenseRef form:
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 rust-version = "1.85"
 authors = ["SQLModel Rust Contributors"]
 repository = "https://github.com/sqlmodel/sqlmodel-rust"
