@@ -124,13 +124,21 @@ impl FrankenConnection {
         &self.path
     }
 
-    fn close_inner(inner: Arc<Mutex<FrankenInner>>) -> Result<(), Error> {
+    fn close_inner(
+        inner: Arc<Mutex<FrankenInner>>,
+        checkpoint_on_close: bool,
+    ) -> Result<(), Error> {
         match Arc::try_unwrap(inner) {
             Ok(mutex) => {
                 let inner = mutex
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                inner.conn.close().map_err(|e| franken_to_conn_error(&e))
+                let result = if checkpoint_on_close {
+                    inner.conn.close()
+                } else {
+                    inner.conn.close_without_checkpoint()
+                };
+                result.map_err(|e| franken_to_conn_error(&e))
             }
             Err(inner) => Err(Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Disconnected,
@@ -146,7 +154,17 @@ impl FrankenConnection {
     /// Close the underlying frankensqlite connection synchronously.
     pub fn close_sync(self) -> Result<(), Error> {
         let Self { inner, path: _ } = self;
-        Self::close_inner(inner)
+        Self::close_inner(inner, true)
+    }
+
+    /// Close the underlying connection without forcing a final WAL checkpoint.
+    ///
+    /// Committed data remains durable in the WAL and is recovered by subsequent
+    /// opens. This is appropriate for short-lived file-backed connections that
+    /// must not contend with concurrent checkpoint activity.
+    pub fn close_without_checkpoint_sync(self) -> Result<(), Error> {
+        let Self { inner, path: _ } = self;
+        Self::close_inner(inner, false)
     }
 
     /// Execute SQL directly without parameter binding (for DDL, PRAGMAs, etc.)
@@ -1114,6 +1132,38 @@ mod tests {
         let conn = FrankenConnection::open_memory().expect("should open in-memory db");
         conn.close_sync()
             .expect("close_sync should close the underlying frankensqlite connection");
+    }
+
+    #[test]
+    fn close_without_checkpoint_preserves_committed_file_data() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sqlmodel-frankensqlite-close-without-checkpoint-{}-{unique}.sqlite3",
+            std::process::id()
+        ));
+        let path = path.to_string_lossy().into_owned();
+
+        let conn = FrankenConnection::open_file(&path).expect("open file-backed db");
+        conn.execute_raw("CREATE TABLE t (value INTEGER NOT NULL)")
+            .expect("create table");
+        conn.execute_raw("INSERT INTO t (value) VALUES (7)")
+            .expect("insert committed row");
+        conn.close_without_checkpoint_sync()
+            .expect("close without checkpoint");
+
+        let reopened = FrankenConnection::open_file(&path).expect("reopen file-backed db");
+        let rows = reopened
+            .query_sync("SELECT value FROM t", &[])
+            .expect("read committed row after reopen");
+        assert_eq!(rows[0].get(0), Some(&Value::BigInt(7)));
+        reopened.close_sync().expect("close reopened connection");
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
     }
 
     #[test]
