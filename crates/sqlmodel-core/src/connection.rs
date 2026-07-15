@@ -315,6 +315,18 @@ pub trait Connection: Send + Sync {
 
     /// Close the connection gracefully.
     fn close(self, cx: &Cx) -> impl Future<Output = Result<()>> + Send;
+
+    /// Close the connection when a pool retires it.
+    ///
+    /// The default uses the ordinary close method. Drivers with a lower-contention
+    /// teardown path can override this without changing explicit caller-owned
+    /// close semantics.
+    fn close_for_pool(self, cx: &Cx) -> impl Future<Output = Result<()>> + Send
+    where
+        Self: Sized,
+    {
+        self.close(cx)
+    }
 }
 
 /// Trait for transaction operations.

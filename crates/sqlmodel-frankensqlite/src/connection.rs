@@ -512,6 +512,10 @@ impl Connection for FrankenConnection {
     async fn close(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
         self.close_sync()
     }
+
+    async fn close_for_pool(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
+        self.close_without_checkpoint_sync()
+    }
 }
 
 // ── Transaction ───────────────────────────────────────────────────────────

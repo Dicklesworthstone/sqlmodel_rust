@@ -315,7 +315,7 @@ fn close_connection_blocking<C: Connection>(conn: C, context: &'static str) {
         }
     };
     let cx = Cx::for_testing();
-    if let Err(error) = runtime.block_on(async { conn.close(&cx).await }) {
+    if let Err(error) = runtime.block_on(async { conn.close_for_pool(&cx).await }) {
         tracing::warn!(
             context,
             error = %error,
@@ -862,13 +862,14 @@ mod tests {
     use super::*;
     use sqlmodel_core::connection::{IsolationLevel, PreparedStatement, TransactionOps};
     use sqlmodel_core::{Row, Value};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// A mock connection for testing pool behavior.
     #[derive(Debug)]
     struct MockConnection {
         id: u32,
         ping_should_fail: Arc<AtomicBool>,
+        pool_close_count: Option<Arc<AtomicUsize>>,
     }
 
     impl MockConnection {
@@ -876,6 +877,7 @@ mod tests {
             Self {
                 id,
                 ping_should_fail: Arc::new(AtomicBool::new(false)),
+                pool_close_count: None,
             }
         }
 
@@ -884,6 +886,15 @@ mod tests {
             Self {
                 id,
                 ping_should_fail: should_fail,
+                pool_close_count: None,
+            }
+        }
+
+        fn with_pool_close_count(id: u32, pool_close_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                id,
+                ping_should_fail: Arc::new(AtomicBool::new(false)),
+                pool_close_count: Some(pool_close_count),
             }
         }
     }
@@ -1009,6 +1020,13 @@ mod tests {
         }
 
         async fn close(self, _cx: &Cx) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn close_for_pool(self, _cx: &Cx) -> Result<(), Error> {
+            if let Some(count) = self.pool_close_count {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(())
         }
     }
@@ -1161,6 +1179,26 @@ mod tests {
         assert!(!pool.is_closed());
         pool.close();
         assert!(pool.is_closed());
+    }
+
+    #[test]
+    fn test_pool_close_uses_driver_pool_teardown() {
+        let pool_close_count = Arc::new(AtomicUsize::new(0));
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(1));
+        {
+            let mut inner = pool.shared.inner.lock().expect("lock pool");
+            inner.total_count = 1;
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::with_pool_close_count(
+                    1,
+                    Arc::clone(&pool_close_count),
+                )));
+        }
+
+        pool.close();
+
+        assert_eq!(pool_close_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
