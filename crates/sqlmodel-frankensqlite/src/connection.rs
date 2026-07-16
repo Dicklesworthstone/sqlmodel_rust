@@ -619,16 +619,39 @@ impl FrankenConnection {
         &self,
         operation: impl FnOnce(&mut FrankenExclusiveTransaction<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        match self.with_exclusive_transaction_result(operation) {
+            Ok(value) => Ok(value),
+            Err(FrankenExclusiveTransactionError::Database(error)) => Err(*error),
+            Err(FrankenExclusiveTransactionError::Operation(error)) => Err(error),
+            Err(FrankenExclusiveTransactionError::OperationRollback {
+                operation,
+                rollback,
+            }) => Err(Error::Custom(format!(
+                "exclusive transaction operation failed ({operation}); rollback also failed and the connection remains transaction-bound: {rollback}"
+            ))),
+        }
+    }
+
+    /// Execute a closure with its native operation error while retaining
+    /// database-boundary failures as a separate, boxed error variant.
+    pub fn with_exclusive_transaction_result<T, E>(
+        &self,
+        operation: impl FnOnce(&mut FrankenExclusiveTransaction<'_>) -> Result<T, E>,
+    ) -> Result<T, FrankenExclusiveTransactionError<E>> {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if inner.in_transaction {
-            return Err(Error::Custom(
-                "cannot start nested exclusive FrankenSQLite transaction".to_string(),
-            ));
+            return Err(FrankenExclusiveTransactionError::Database(Box::new(
+                Error::Custom(
+                    "cannot start nested exclusive FrankenSQLite transaction".to_string(),
+                ),
+            )));
         }
-        inner
-            .conn
-            .execute("BEGIN EXCLUSIVE")
-            .map_err(|error| franken_to_query_error(&error, "BEGIN EXCLUSIVE"))?;
+        inner.conn.execute("BEGIN EXCLUSIVE").map_err(|error| {
+            FrankenExclusiveTransactionError::Database(Box::new(franken_to_query_error(
+                &error,
+                "BEGIN EXCLUSIVE",
+            )))
+        })?;
         inner.in_transaction = true;
         if self.profile == ConnectionProfile::StrictDurableControlPlane
             && let Err(error) = verify_strict_durable_control_plane_profile(&inner.conn)
@@ -636,10 +659,12 @@ impl FrankenConnection {
             return match inner.conn.execute("ROLLBACK") {
                 Ok(_) => {
                     inner.in_transaction = false;
-                    Err(error)
+                    Err(FrankenExclusiveTransactionError::Database(Box::new(error)))
                 }
-                Err(rollback_error) => Err(Error::Custom(format!(
-                    "strict profile verification failed ({error}); rollback also failed and the connection remains transaction-bound: {rollback_error}"
+                Err(rollback_error) => Err(FrankenExclusiveTransactionError::Database(Box::new(
+                    Error::Custom(format!(
+                        "strict profile verification failed ({error}); rollback also failed and the connection remains transaction-bound: {rollback_error}"
+                    )),
                 ))),
             };
         }
@@ -650,19 +675,64 @@ impl FrankenConnection {
         };
         match operation(&mut transaction) {
             Ok(value) => {
-                transaction.commit()?;
+                transaction
+                    .commit()
+                    .map_err(|error| FrankenExclusiveTransactionError::Database(Box::new(error)))?;
                 Ok(value)
             }
             Err(error) => {
                 if let Err(rollback_error) = transaction.rollback() {
-                    return Err(Error::Custom(format!(
-                        "exclusive transaction operation failed ({error}); rollback also failed and the connection remains transaction-bound: {rollback_error}"
-                    )));
+                    return Err(FrankenExclusiveTransactionError::OperationRollback {
+                        operation: error,
+                        rollback: Box::new(rollback_error),
+                    });
                 }
-                Err(error)
+                Err(FrankenExclusiveTransactionError::Operation(error))
             }
         }
     }
+}
+
+/// Failure from an exclusive transaction, preserving whether the database
+/// boundary or the caller's operation rejected the transaction.
+#[derive(Debug)]
+pub enum FrankenExclusiveTransactionError<E> {
+    /// The database failed to begin, verify, commit, or roll back the transaction.
+    Database(Box<Error>),
+    /// The caller rejected the transaction and rollback succeeded.
+    Operation(E),
+    /// The caller rejected the transaction and rollback also failed.
+    OperationRollback {
+        /// The original caller error.
+        operation: E,
+        /// The database rollback failure.
+        rollback: Box<Error>,
+    },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for FrankenExclusiveTransactionError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => {
+                write!(formatter, "exclusive transaction database failure: {error}")
+            }
+            Self::Operation(error) => {
+                write!(formatter, "exclusive transaction operation failed: {error}")
+            }
+            Self::OperationRollback {
+                operation,
+                rollback,
+            } => write!(
+                formatter,
+                "exclusive transaction operation failed ({operation}); rollback also failed and the connection remains transaction-bound: {rollback}"
+            ),
+        }
+    }
+}
+
+impl<E> std::error::Error for FrankenExclusiveTransactionError<E> where
+    E: std::error::Error + 'static
+{
 }
 
 /// Synchronous operations scoped to one mutex-held exclusive transaction.
@@ -1626,14 +1696,21 @@ mod tests {
         })
         .unwrap();
 
-        let rejected: Result<(), Error> = conn.with_exclusive_transaction(|transaction| {
-            transaction.execute_sync(
-                "INSERT INTO t VALUES (?1, ?2)",
-                &[Value::BigInt(2), Value::Text("rolled-back".into())],
-            )?;
-            Err(Error::Custom("reject transaction".to_string()))
-        });
-        assert!(rejected.is_err());
+        let rejected: Result<(), FrankenExclusiveTransactionError<String>> = conn
+            .with_exclusive_transaction_result(|transaction| {
+                transaction
+                    .execute_sync(
+                        "INSERT INTO t VALUES (?1, ?2)",
+                        &[Value::BigInt(2), Value::Text("rolled-back".into())],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Err("reject transaction".to_string())
+            });
+        assert!(matches!(
+            rejected,
+            Err(FrankenExclusiveTransactionError::Operation(error))
+                if error == "reject transaction"
+        ));
 
         let rows = conn
             .query_sync("SELECT id, val FROM t ORDER BY id", &[])

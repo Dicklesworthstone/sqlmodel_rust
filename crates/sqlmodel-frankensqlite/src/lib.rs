@@ -23,4 +23,7 @@
 pub mod connection;
 pub mod value;
 
-pub use connection::{FrankenConnection, FrankenExclusiveTransaction, FrankenTransaction};
+pub use connection::{
+    FrankenConnection, FrankenExclusiveTransaction, FrankenExclusiveTransactionError,
+    FrankenTransaction,
+};
