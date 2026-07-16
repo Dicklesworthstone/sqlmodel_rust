@@ -18,7 +18,14 @@ use sqlmodel_core::{
     row::ColumnInfo,
 };
 use std::future::Future;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionProfile {
+    Generic,
+    StrictDurableControlPlane,
+}
 
 /// Inner state guarded by a mutex.
 struct FrankenInner {
@@ -43,14 +50,192 @@ unsafe impl Send for FrankenInner {}
 pub struct FrankenConnection {
     inner: Arc<Mutex<FrankenInner>>,
     path: String,
+    profile: ConnectionProfile,
 }
 
 // SAFETY: All access goes through Arc<Mutex<>> — single-thread serialization.
 unsafe impl Send for FrankenConnection {}
 unsafe impl Sync for FrankenConnection {}
 
+fn required_file_identity(
+    file: &std::fs::File,
+    path: &str,
+) -> Result<fsqlite::FileIdentity, Error> {
+    fsqlite::FileIdentity::from_file(file)
+        .map_err(Error::Io)?
+        .ok_or_else(|| {
+            Error::Connection(ConnectionError {
+                kind: ConnectionErrorKind::Connect,
+                message: format!(
+                    "strict durable control-plane database `{path}` has no stable filesystem identity"
+                ),
+                source: None,
+            })
+        })
+}
+
+fn raw_pragma_value(conn: &fsqlite::Connection, sql: &str) -> Result<SqliteValue, Error> {
+    conn.query(sql)
+        .map_err(|error| franken_to_query_error(&error, sql))?
+        .into_iter()
+        .next()
+        .and_then(|row| row.values().first().cloned())
+        .ok_or_else(|| {
+            Error::Custom(format!(
+                "profile verification query returned no value: {sql}"
+            ))
+        })
+}
+
+fn install_strict_durable_control_plane_profile(conn: &fsqlite::Connection) -> Result<(), Error> {
+    for sql in [
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = FULL;",
+        "PRAGMA fsqlite.stmt_microbatch = OFF;",
+    ] {
+        conn.execute(sql)
+            .map_err(|error| franken_to_query_error(&error, sql))?;
+    }
+
+    verify_strict_durable_control_plane_profile(conn)
+}
+
+fn verify_strict_durable_control_plane_profile(conn: &fsqlite::Connection) -> Result<(), Error> {
+    let journal_mode = raw_pragma_value(conn, "PRAGMA journal_mode;")?;
+    let synchronous = raw_pragma_value(conn, "PRAGMA synchronous;")?;
+    let microbatch = raw_pragma_value(conn, "PRAGMA fsqlite.stmt_microbatch;")?;
+    let journal_is_wal =
+        matches!(journal_mode, SqliteValue::Text(ref mode) if mode.eq_ignore_ascii_case("wal"));
+    let synchronous_is_full =
+        matches!(synchronous, SqliteValue::Text(ref mode) if mode.eq_ignore_ascii_case("full"));
+    if !journal_is_wal || !synchronous_is_full || microbatch != SqliteValue::Integer(0) {
+        return Err(Error::Custom(format!(
+            "strict durable control-plane profile did not hold: journal_mode={journal_mode:?}, synchronous={synchronous:?}, stmt_microbatch={microbatch:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_profile_sql(profile: ConnectionProfile, sql: &str) -> Result<(), Error> {
+    if profile != ConnectionProfile::StrictDurableControlPlane {
+        return Ok(());
+    }
+    let upper = sql.to_ascii_uppercase();
+    if upper.contains("PRAGMA")
+        && !matches!(
+            upper.trim(),
+            "PRAGMA TABLE_INFO(FLEET_TRUST_STATE);"
+                | "PRAGMA TABLE_INFO(FLEET_TRUST_STATE)"
+                | "PRAGMA JOURNAL_MODE;"
+                | "PRAGMA JOURNAL_MODE"
+                | "PRAGMA SYNCHRONOUS;"
+                | "PRAGMA SYNCHRONOUS"
+                | "PRAGMA FSQLITE.STMT_MICROBATCH;"
+                | "PRAGMA FSQLITE.STMT_MICROBATCH"
+        )
+    {
+        return Err(Error::Custom(
+            "strict durable control-plane connection rejects non-allowlisted PRAGMA statements"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_scoped_transaction_sql(sql: &str) -> Result<(), Error> {
+    const CONTROL_KEYWORDS: [&str; 6] =
+        ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"];
+
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut first_token_seen = false;
+    let mut statement_ended = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        index += 1;
+                        if index < bytes.len() && bytes[index] == quote {
+                            index += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'[' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b']' {
+                        index += 1;
+                        if index < bytes.len() && bytes[index] == b']' {
+                            index += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                let token = &sql[start..index];
+                if statement_ended {
+                    return Err(Error::Custom(
+                        "exclusive transaction scope accepts exactly one SQL statement".to_string(),
+                    ));
+                }
+                if !first_token_seen
+                    && CONTROL_KEYWORDS
+                        .iter()
+                        .any(|keyword| token.eq_ignore_ascii_case(keyword))
+                {
+                    return Err(Error::Custom(format!(
+                        "exclusive transaction scope rejects transaction-control keyword `{token}`"
+                    )));
+                }
+                first_token_seen = true;
+            }
+            b';' if first_token_seen => {
+                statement_ended = true;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(())
+}
+
 impl FrankenConnection {
-    fn from_raw_connection(path: String, conn: fsqlite::Connection) -> Self {
+    fn from_raw_connection(
+        path: String,
+        conn: fsqlite::Connection,
+        profile: ConnectionProfile,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(FrankenInner {
                 conn,
@@ -58,6 +243,7 @@ impl FrankenConnection {
                 last_insert_rowid: 0,
             })),
             path,
+            profile,
         }
     }
 
@@ -68,7 +254,11 @@ impl FrankenConnection {
     pub fn open(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
         let conn = fsqlite::Connection::open(&path).map_err(|e| franken_to_conn_error(&e))?;
-        Ok(Self::from_raw_connection(path, conn))
+        Ok(Self::from_raw_connection(
+            path,
+            conn,
+            ConnectionProfile::Generic,
+        ))
     }
 
     /// Open a connection while requesting a specific page size for newly created databases.
@@ -79,7 +269,11 @@ impl FrankenConnection {
         let path = path.into();
         let conn = fsqlite::Connection::open_with_page_size(&path, page_size_bytes)
             .map_err(|e| franken_to_conn_error(&e))?;
-        Ok(Self::from_raw_connection(path, conn))
+        Ok(Self::from_raw_connection(
+            path,
+            conn,
+            ConnectionProfile::Generic,
+        ))
     }
 
     /// Open an in-memory database.
@@ -92,12 +286,62 @@ impl FrankenConnection {
         Self::open(path)
     }
 
+    /// Open a file through the sealed control-plane durability profile.
+    ///
+    /// The pathname is atomically reserved when absent, or pinned by a live
+    /// descriptor when present. FrankenSQLite verifies that exact identity
+    /// before recovery or schema loading and enables strict multi-process
+    /// refusal. Before this method returns, the connection is configured for
+    /// WAL per-commit stable-media synchronization and statement
+    /// micro-batching is disabled. Policy-changing PRAGMAs are rejected for
+    /// the lifetime of the returned connection.
+    pub fn open_strict_durable_control_plane_file(path: impl Into<String>) -> Result<Self, Error> {
+        let path = path.into();
+        let path_ref = Path::new(&path);
+        let mut env = fsqlite::ConnectionEnv::default();
+        env.set_strict_multi_process(true);
+
+        let conn = match fsqlite::fsqlite_vfs::host_fs::reserve_new_file(path_ref) {
+            Ok(reservation) => {
+                let identity = required_file_identity(&reservation, &path)?;
+                fsqlite::Connection::open_reserved_with_expected_identity_and_env(
+                    &path, identity, env,
+                )
+                .map_err(|error| franken_to_conn_error(&error))?
+            }
+            Err(fsqlite_error::FrankenError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let identity_guard =
+                    fsqlite::fsqlite_vfs::host_fs::open_existing_regular_file_no_follow(path_ref)
+                        .map_err(|error| franken_to_conn_error(&error))?;
+                let identity = required_file_identity(&identity_guard, &path)?;
+                fsqlite::Connection::open_existing_with_expected_identity_and_env(
+                    &path, identity, env,
+                )
+                .map_err(|error| franken_to_conn_error(&error))?
+            }
+            Err(error) => return Err(franken_to_conn_error(&error)),
+        };
+
+        install_strict_durable_control_plane_profile(&conn)?;
+        Ok(Self::from_raw_connection(
+            path,
+            conn,
+            ConnectionProfile::StrictDurableControlPlane,
+        ))
+    }
+
     /// Open an existing file-based database with SQLite read-only flags.
     pub fn open_file_read_only(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
         let conn = open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| franken_to_conn_error(&e))?;
-        Ok(Self::from_raw_connection(path, conn))
+        Ok(Self::from_raw_connection(
+            path,
+            conn,
+            ConnectionProfile::Generic,
+        ))
     }
 
     /// Open a file-based database in schema-only read mode.
@@ -108,7 +352,11 @@ impl FrankenConnection {
         let path = path.into();
         let conn =
             fsqlite::Connection::open_schema_only(&path).map_err(|e| franken_to_conn_error(&e))?;
-        Ok(Self::from_raw_connection(path, conn))
+        Ok(Self::from_raw_connection(
+            path,
+            conn,
+            ConnectionProfile::Generic,
+        ))
     }
 
     /// Open a file-based database with a requested page size for new files.
@@ -145,12 +393,17 @@ impl FrankenConnection {
 
     /// Close the underlying frankensqlite connection synchronously.
     pub fn close_sync(self) -> Result<(), Error> {
-        let Self { inner, path: _ } = self;
+        let Self {
+            inner,
+            path: _,
+            profile: _,
+        } = self;
         Self::close_inner(inner)
     }
 
     /// Execute SQL directly without parameter binding (for DDL, PRAGMAs, etc.)
     pub fn execute_raw(&self, sql: &str) -> Result<(), Error> {
+        enforce_profile_sql(self.profile, sql)?;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .conn
@@ -161,6 +414,7 @@ impl FrankenConnection {
 
     /// Prepare and execute a query synchronously, returning all rows.
     pub fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, Error> {
+        enforce_profile_sql(self.profile, sql)?;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
         let schema_columns = self.get_returning_star_columns(sql, &inner.conn);
@@ -222,6 +476,7 @@ impl FrankenConnection {
 
     /// Prepare and execute a statement synchronously, returning rows affected.
     pub fn execute_sync(&self, sql: &str, params: &[Value]) -> Result<u64, Error> {
+        enforce_profile_sql(self.profile, sql)?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
 
@@ -351,6 +606,148 @@ impl FrankenConnection {
 
         inner.in_transaction = false;
         Ok(())
+    }
+
+    /// Execute a closure while holding one exclusive database transaction and
+    /// the connection mutex for its full lifetime.
+    ///
+    /// This is the synchronous initialization/read primitive for security
+    /// state that must not expose a probe-to-materialization or
+    /// preflight-to-DDL interleaving window. The transaction rolls back on a
+    /// closure error or unwind.
+    pub fn with_exclusive_transaction<T>(
+        &self,
+        operation: impl FnOnce(&mut FrankenExclusiveTransaction<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if inner.in_transaction {
+            return Err(Error::Custom(
+                "cannot start nested exclusive FrankenSQLite transaction".to_string(),
+            ));
+        }
+        inner
+            .conn
+            .execute("BEGIN EXCLUSIVE")
+            .map_err(|error| franken_to_query_error(&error, "BEGIN EXCLUSIVE"))?;
+        inner.in_transaction = true;
+        if self.profile == ConnectionProfile::StrictDurableControlPlane
+            && let Err(error) = verify_strict_durable_control_plane_profile(&inner.conn)
+        {
+            return match inner.conn.execute("ROLLBACK") {
+                Ok(_) => {
+                    inner.in_transaction = false;
+                    Err(error)
+                }
+                Err(rollback_error) => Err(Error::Custom(format!(
+                    "strict profile verification failed ({error}); rollback also failed and the connection remains transaction-bound: {rollback_error}"
+                ))),
+            };
+        }
+        let mut transaction = FrankenExclusiveTransaction {
+            inner: &mut inner,
+            profile: self.profile,
+            finished: false,
+        };
+        match operation(&mut transaction) {
+            Ok(value) => {
+                transaction.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback() {
+                    return Err(Error::Custom(format!(
+                        "exclusive transaction operation failed ({error}); rollback also failed and the connection remains transaction-bound: {rollback_error}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Synchronous operations scoped to one mutex-held exclusive transaction.
+pub struct FrankenExclusiveTransaction<'a> {
+    inner: &'a mut FrankenInner,
+    profile: ConnectionProfile,
+    finished: bool,
+}
+
+impl FrankenExclusiveTransaction<'_> {
+    /// Execute DDL or a parameter-free statement inside the transaction.
+    pub fn execute_raw(&mut self, sql: &str) -> Result<(), Error> {
+        enforce_scoped_transaction_sql(sql)?;
+        enforce_profile_sql(self.profile, sql)?;
+        self.inner
+            .conn
+            .execute(sql)
+            .map_err(|error| franken_to_query_error(&error, sql))?;
+        Ok(())
+    }
+
+    /// Execute a query inside the transaction and return converted SQLModel rows.
+    pub fn query_sync(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>, Error> {
+        enforce_scoped_transaction_sql(sql)?;
+        enforce_profile_sql(self.profile, sql)?;
+        let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
+        let rows = if sqlite_params.is_empty() {
+            self.inner.conn.query(sql)
+        } else {
+            self.inner.conn.query_with_params(sql, &sqlite_params)
+        }
+        .map_err(|error| franken_to_query_error(&error, sql))?;
+        Ok(convert_rows_with_schema(&rows, sql, None))
+    }
+
+    /// Execute a parameterized statement inside the transaction.
+    pub fn execute_sync(&mut self, sql: &str, params: &[Value]) -> Result<u64, Error> {
+        enforce_scoped_transaction_sql(sql)?;
+        enforce_profile_sql(self.profile, sql)?;
+        let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
+        let count = if sqlite_params.is_empty() {
+            self.inner.conn.execute(sql)
+        } else {
+            self.inner.conn.execute_with_params(sql, &sqlite_params)
+        }
+        .map_err(|error| franken_to_query_error(&error, sql))?;
+        Ok(count as u64)
+    }
+
+    fn commit(&mut self) -> Result<(), Error> {
+        match self.inner.conn.execute("COMMIT") {
+            Ok(_) => {
+                self.inner.in_transaction = false;
+                self.finished = true;
+                Ok(())
+            }
+            Err(commit_error) => match self.inner.conn.execute("ROLLBACK") {
+                Ok(_) => {
+                    self.inner.in_transaction = false;
+                    self.finished = true;
+                    Err(franken_to_query_error(&commit_error, "COMMIT"))
+                }
+                Err(rollback_error) => Err(Error::Custom(format!(
+                    "exclusive transaction commit failed ({commit_error}); rollback also failed and the connection remains transaction-bound: {rollback_error}"
+                ))),
+            },
+        }
+    }
+
+    fn rollback(&mut self) -> Result<(), Error> {
+        self.inner
+            .conn
+            .execute("ROLLBACK")
+            .map_err(|error| franken_to_query_error(&error, "ROLLBACK"))?;
+        self.inner.in_transaction = false;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for FrankenExclusiveTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.finished && self.inner.conn.execute("ROLLBACK").is_ok() {
+            self.inner.in_transaction = false;
+        }
     }
 }
 
@@ -491,8 +888,8 @@ impl Connection for FrankenConnection {
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
 
-    async fn close(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
-        self.close_sync()
+    fn close(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
+        std::future::ready(self.close_sync())
     }
 }
 
@@ -573,18 +970,22 @@ impl TransactionOps for FrankenTransaction<'_> {
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
 
-    async fn commit(mut self, _cx: &Cx) -> Outcome<(), Error> {
+    fn commit(mut self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         self.committed = true;
-        self.conn
-            .commit_sync()
-            .map_or_else(Outcome::Err, Outcome::Ok)
+        std::future::ready(
+            self.conn
+                .commit_sync()
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        )
     }
 
-    async fn rollback(mut self, _cx: &Cx) -> Outcome<(), Error> {
+    fn rollback(mut self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         self.committed = true; // Prevent double rollback in drop
-        self.conn
-            .rollback_sync()
-            .map_or_else(Outcome::Err, Outcome::Ok)
+        std::future::ready(
+            self.conn
+                .rollback_sync()
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        )
     }
 }
 
@@ -1208,6 +1609,142 @@ mod tests {
 
         let rows = conn.query_sync("SELECT val FROM t", &[]).unwrap();
         assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn exclusive_transaction_commits_or_rolls_back_as_one_unit() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+
+        conn.with_exclusive_transaction(|transaction| {
+            transaction.execute_sync(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[Value::BigInt(1), Value::Text("committed".into())],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let rejected: Result<(), Error> = conn.with_exclusive_transaction(|transaction| {
+            transaction.execute_sync(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[Value::BigInt(2), Value::Text("rolled-back".into())],
+            )?;
+            Err(Error::Custom("reject transaction".to_string()))
+        });
+        assert!(rejected.is_err());
+
+        let rows = conn
+            .query_sync("SELECT id, val FROM t ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::BigInt(1)));
+        assert_eq!(rows[0].get(1), Some(&Value::Text("committed".into())));
+    }
+
+    #[test]
+    fn exclusive_transaction_rejects_embedded_transaction_control() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        conn.with_exclusive_transaction(|transaction| {
+            for sql in [
+                "COMMIT;",
+                "/* hidden */ ROLLBACK;",
+                "SELECT 1; COMMIT;",
+                "-- hidden\nSAVEPOINT inner;",
+                "RELEASE inner;",
+                "END TRANSACTION;",
+                "BEGIN IMMEDIATE;",
+            ] {
+                let error = transaction
+                    .execute_raw(sql)
+                    .expect_err("scoped transaction control must be sealed");
+                let message = error.to_string();
+                assert!(
+                    message.contains("transaction-control keyword")
+                        || message.contains("exactly one SQL statement")
+                );
+            }
+            enforce_scoped_transaction_sql("SELECT 'COMMIT', \"BEGIN\", `ROLLBACK`, [SAVEPOINT];")
+                .expect("quoted strings and identifiers are not transaction control");
+            transaction.execute_sync("INSERT INTO t VALUES (1)", &[])?;
+            Ok(())
+        })
+        .expect("rejected control SQL must leave the wrapper transaction usable");
+
+        let rows = conn.query_sync("SELECT id FROM t", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires SQLMODEL_FSQLITE_RETAINED_TEST_DB and intentionally retains the database"]
+    fn strict_durable_control_plane_profile_opens_and_reopens_retained_file() {
+        let path = std::env::var("SQLMODEL_FSQLITE_RETAINED_TEST_DB")
+            .expect("set SQLMODEL_FSQLITE_RETAINED_TEST_DB to an isolated retained path");
+        let conn = FrankenConnection::open_strict_durable_control_plane_file(path.clone())
+            .expect("open strict durable file");
+
+        assert_eq!(
+            conn.query_sync("PRAGMA journal_mode;", &[]).unwrap()[0].get(0),
+            Some(&Value::Text("wal".into()))
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA synchronous;", &[]).unwrap()[0].get(0),
+            Some(&Value::Text("FULL".into()))
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA fsqlite.stmt_microbatch;", &[])
+                .unwrap()[0]
+                .get(0),
+            Some(&Value::BigInt(0))
+        );
+
+        conn.with_exclusive_transaction(|transaction| {
+            transaction.execute_raw(
+                "CREATE TABLE IF NOT EXISTS strict_profile_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )?;
+            transaction.execute_sync(
+                "INSERT OR REPLACE INTO strict_profile_probe VALUES (?1, ?2);",
+                &[Value::BigInt(1), Value::Text("durable".into())],
+            )?;
+            Ok(())
+        })
+        .expect("commit retained probe");
+        conn.close_sync().expect("close first connection");
+
+        let reopened = FrankenConnection::open_strict_durable_control_plane_file(path)
+            .expect("reopen strict durable file");
+        let rows = reopened
+            .query_sync(
+                "SELECT value FROM strict_profile_probe WHERE id = ?1;",
+                &[Value::BigInt(1)],
+            )
+            .expect("read retained probe");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::Text("durable".into())));
+    }
+
+    #[test]
+    fn strict_durable_profile_rejects_policy_downgrade_sql() {
+        for sql in [
+            "PRAGMA synchronous = NORMAL;",
+            "PRAGMA journal_mode=DELETE;",
+            "PRAGMA fsqlite.stmt_microbatch = ON;",
+            "PRAGMA synchronous(NORMAL);",
+            "/* policy bypass */ PRAGMA synchronous = NORMAL;",
+        ] {
+            let error = enforce_profile_sql(ConnectionProfile::StrictDurableControlPlane, sql)
+                .expect_err("sealed profile must reject a downgrade");
+            assert!(error.to_string().contains("non-allowlisted PRAGMA"));
+        }
+        enforce_profile_sql(
+            ConnectionProfile::StrictDurableControlPlane,
+            "PRAGMA synchronous;",
+        )
+        .expect("read-only profile inspection remains available");
     }
 
     #[test]
