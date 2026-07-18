@@ -57,6 +57,18 @@ pub struct FrankenConnection {
 unsafe impl Send for FrankenConnection {}
 unsafe impl Sync for FrankenConnection {}
 
+/// How the underlying frankensqlite handle is shut down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseMode {
+    /// Ordinary close: roll back any active transaction, then run the final
+    /// passive WAL checkpoint before releasing the handle.
+    Checkpoint,
+    /// Close without the final WAL checkpoint. Committed frames stay in the
+    /// WAL sidecar, where they remain durable and are recovered and
+    /// published by the next open.
+    SkipCheckpoint,
+}
+
 fn required_file_identity(
     file: &std::fs::File,
     path: &str,
@@ -372,13 +384,17 @@ impl FrankenConnection {
         &self.path
     }
 
-    fn close_inner(inner: Arc<Mutex<FrankenInner>>) -> Result<(), Error> {
+    fn close_inner(inner: Arc<Mutex<FrankenInner>>, mode: CloseMode) -> Result<(), Error> {
         match Arc::try_unwrap(inner) {
             Ok(mutex) => {
                 let inner = mutex
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                inner.conn.close().map_err(|e| franken_to_conn_error(&e))
+                let closed = match mode {
+                    CloseMode::Checkpoint => inner.conn.close(),
+                    CloseMode::SkipCheckpoint => inner.conn.close_without_checkpoint(),
+                };
+                closed.map_err(|e| franken_to_conn_error(&e))
             }
             Err(inner) => Err(Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Disconnected,
@@ -398,7 +414,26 @@ impl FrankenConnection {
             path: _,
             profile: _,
         } = self;
-        Self::close_inner(inner)
+        Self::close_inner(inner, CloseMode::Checkpoint)
+    }
+
+    /// Close the underlying connection synchronously, skipping the final WAL
+    /// checkpoint.
+    ///
+    /// FrankenSQLite's ordinary close runs a passive checkpoint (WAL -> DB)
+    /// before releasing the handle. This variant skips that step: committed
+    /// frames stay in the WAL sidecar, where they remain durable and are
+    /// recovered and published by the next open. Use it when teardown latency
+    /// or checkpoint contention matters more than compacting the WAL — the
+    /// pool retirement path ([`Connection::close_for_pool`]) uses it so bulk
+    /// connection churn never serializes on close-time checkpoints.
+    pub fn close_without_checkpoint_sync(self) -> Result<(), Error> {
+        let Self {
+            inner,
+            path: _,
+            profile: _,
+        } = self;
+        Self::close_inner(inner, CloseMode::SkipCheckpoint)
     }
 
     /// Execute SQL directly without parameter binding (for DDL, PRAGMAs, etc.)
@@ -960,6 +995,10 @@ impl Connection for FrankenConnection {
 
     fn close(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
         std::future::ready(self.close_sync())
+    }
+
+    fn close_for_pool(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
+        std::future::ready(self.close_without_checkpoint_sync())
     }
 }
 
@@ -2073,8 +2112,10 @@ mod tests {
         let db_path = dir.join("test_file.db");
         let path_str = db_path.display().to_string();
 
-        // Clean up from previous runs
-        let _ = std::fs::remove_file(&db_path);
+        // Clean up the main database and every WAL sidecar from previous runs.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
 
         {
             let conn = FrankenConnection::open_file(&path_str).unwrap();
@@ -2096,7 +2137,48 @@ mod tests {
             assert_eq!(rows[0].get(0), Some(&Value::Text("persistent".into())));
         }
 
-        let _ = std::fs::remove_file(&db_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
+    }
+
+    #[test]
+    fn close_without_checkpoint_keeps_committed_rows_durable() {
+        let dir = std::env::temp_dir().join("sqlmodel_franken_no_checkpoint_close_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test_file.db");
+        let path_str = db_path.display().to_string();
+
+        // Clean up from previous runs (main db plus WAL sidecars).
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
+
+        {
+            let conn = FrankenConnection::open_file(&path_str).unwrap();
+            conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .unwrap();
+            conn.execute_sync("INSERT INTO t VALUES (1, 'durable')", &[])
+                .unwrap();
+            conn.close_without_checkpoint_sync()
+                .expect("close without final WAL checkpoint");
+        }
+
+        // The skipped checkpoint must not cost durability: the committed row
+        // is recovered from the WAL sidecar on the next open.
+        {
+            let conn = FrankenConnection::open_file(&path_str).unwrap();
+            let rows = conn
+                .query_sync("SELECT val FROM t WHERE id = 1", &[])
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&Value::Text("durable".into())));
+            conn.close_sync().expect("close reopened connection");
+        }
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
     }
 
     #[test]
@@ -2106,7 +2188,9 @@ mod tests {
         let db_path = dir.join("test_file.db");
         let path_str = db_path.display().to_string();
 
-        let _ = std::fs::remove_file(&db_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
 
         {
             let conn = FrankenConnection::open_file(&path_str).unwrap();
@@ -2128,7 +2212,9 @@ mod tests {
             assert_eq!(rows[0].get(0), Some(&Value::Text("readable".into())));
         }
 
-        let _ = std::fs::remove_file(&db_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
     }
 
     // ── Error mapping tests ──────────────────────────────────────────────

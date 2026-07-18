@@ -439,7 +439,7 @@ impl Introspector {
         conn: &C,
         table_name: &str,
     ) -> Outcome<Vec<UniqueConstraintInfo>, Error> {
-        debug_assert!(self.dialect == Dialect::Postgres);
+        debug_assert_eq!(self.dialect, Dialect::Postgres);
 
         let sql = "SELECT
                        c.conname AS constraint_name,

@@ -16,9 +16,9 @@ sqlmodel-core.workspace = true
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-fsqlite = "0.1.16"
-fsqlite-core = "0.1.16"
-fsqlite-types = "0.1.16"
-fsqlite-error = "0.1.16"
+fsqlite = "0.1.17"
+fsqlite-core = "0.1.17"
+fsqlite-types = "0.1.17"
+fsqlite-error = "0.1.17"
 
 [dev-dependencies]

@@ -315,7 +315,7 @@ fn close_connection_blocking<C: Connection>(conn: C, context: &'static str) {
         }
     };
     let cx = Cx::for_testing();
-    if let Err(error) = runtime.block_on(async { conn.close(&cx).await }) {
+    if let Err(error) = runtime.block_on(async { conn.close_for_pool(&cx).await }) {
         tracing::warn!(
             context,
             error = %error,
@@ -434,13 +434,14 @@ impl<C: Connection> Pool<C> {
             }
 
             // Try to get an idle connection or determine if we can create new
-            let action = {
+            let (action, retired) = {
                 let mut inner = match self.shared.lock_or_error("acquire") {
                     Ok(guard) => guard,
                     Err(e) => return Outcome::Err(e),
                 };
+                let mut retired = Vec::new();
 
-                if inner.closed {
+                let action = if inner.closed {
                     AcquireAction::PoolClosed
                 } else {
                     // Try to get an idle connection
@@ -452,6 +453,7 @@ impl<C: Connection> Pool<C> {
                             self.shared
                                 .connections_closed
                                 .fetch_add(1, Ordering::Relaxed);
+                            retired.push(meta);
                             continue;
                         }
 
@@ -461,6 +463,7 @@ impl<C: Connection> Pool<C> {
                             self.shared
                                 .connections_closed
                                 .fetch_add(1, Ordering::Relaxed);
+                            retired.push(meta);
                             continue;
                         }
 
@@ -483,8 +486,20 @@ impl<C: Connection> Pool<C> {
                         inner.waiter_count += 1;
                         AcquireAction::Wait
                     }
-                }
+                };
+                (action, retired)
             };
+
+            // Teardown may perform driver I/O. Keep it outside the pool mutex
+            // so one slow close cannot block returns, acquires, or shutdown.
+            for meta in retired {
+                if let Err(error) = meta.conn.close_for_pool(cx).await {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to close expired pooled connection"
+                    );
+                }
+            }
 
             match action {
                 AcquireAction::PoolClosed => {
@@ -607,6 +622,12 @@ impl<C: Connection> Pool<C> {
                     self.shared
                         .connections_closed
                         .fetch_add(1, Ordering::Relaxed);
+                    if let Err(error) = meta.conn.close_for_pool(cx).await {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to close pooled connection after checkout validation"
+                        );
+                    }
                     // Return error - caller should retry
                     Outcome::Err(Error::Connection(ConnectionError {
                         kind: ConnectionErrorKind::Disconnected,
@@ -862,13 +883,20 @@ mod tests {
     use super::*;
     use sqlmodel_core::connection::{IsolationLevel, PreparedStatement, TransactionOps};
     use sqlmodel_core::{Row, Value};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// A mock connection for testing pool behavior.
     #[derive(Debug)]
     struct MockConnection {
         id: u32,
         ping_should_fail: Arc<AtomicBool>,
+        /// Incremented each time the pool retires this connection via
+        /// `close_for_pool` (as opposed to a caller-owned `close`).
+        pool_close_calls: Arc<AtomicUsize>,
+        /// Optional probe used to prove the pool mutex is not held while the
+        /// retirement hook runs.
+        pool_shared: Option<Weak<PoolShared<MockConnection>>>,
+        pool_lock_was_free: Option<Arc<AtomicBool>>,
     }
 
     impl MockConnection {
@@ -876,6 +904,9 @@ mod tests {
             Self {
                 id,
                 ping_should_fail: Arc::new(AtomicBool::new(false)),
+                pool_close_calls: Arc::new(AtomicUsize::new(0)),
+                pool_shared: None,
+                pool_lock_was_free: None,
             }
         }
 
@@ -884,6 +915,34 @@ mod tests {
             Self {
                 id,
                 ping_should_fail: should_fail,
+                pool_close_calls: Arc::new(AtomicUsize::new(0)),
+                pool_shared: None,
+                pool_lock_was_free: None,
+            }
+        }
+
+        fn with_pool_close_counter(id: u32, pool_close_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                id,
+                ping_should_fail: Arc::new(AtomicBool::new(false)),
+                pool_close_calls,
+                pool_shared: None,
+                pool_lock_was_free: None,
+            }
+        }
+
+        fn with_pool_close_probe(
+            id: u32,
+            pool_close_calls: Arc<AtomicUsize>,
+            pool_shared: Weak<PoolShared<MockConnection>>,
+            pool_lock_was_free: Arc<AtomicBool>,
+        ) -> Self {
+            Self {
+                id,
+                ping_should_fail: Arc::new(AtomicBool::new(false)),
+                pool_close_calls,
+                pool_shared: Some(pool_shared),
+                pool_lock_was_free: Some(pool_lock_was_free),
             }
         }
     }
@@ -891,6 +950,9 @@ mod tests {
     /// Mock transaction for MockConnection.
     struct MockTx;
 
+    // These test doubles deliberately mirror the trait's async spelling; the
+    // bodies are immediate because no real driver I/O occurs.
+    #[allow(clippy::unused_async_trait_impl)]
     impl TransactionOps for MockTx {
         async fn query(&self, _cx: &Cx, _sql: &str, _params: &[Value]) -> Outcome<Vec<Row>, Error> {
             Outcome::Ok(vec![])
@@ -930,6 +992,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     impl Connection for MockConnection {
         type Tx<'conn> = MockTx;
 
@@ -1009,6 +1072,19 @@ mod tests {
         }
 
         async fn close(self, _cx: &Cx) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn close_for_pool(self, _cx: &Cx) -> Result<(), Error> {
+            if let (Some(pool_shared), Some(pool_lock_was_free)) =
+                (self.pool_shared.as_ref(), self.pool_lock_was_free.as_ref())
+            {
+                let mutex_is_available = pool_shared
+                    .upgrade()
+                    .is_none_or(|shared| shared.inner.try_lock().is_ok());
+                pool_lock_was_free.store(mutex_is_available, Ordering::Relaxed);
+            }
+            self.pool_close_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -1161,6 +1237,99 @@ mod tests {
         assert!(!pool.is_closed());
         pool.close();
         assert!(pool.is_closed());
+    }
+
+    #[test]
+    fn test_pool_close_routes_through_close_for_pool() {
+        let pool_close_calls = Arc::new(AtomicUsize::new(0));
+        let pool_lock_was_free = Arc::new(AtomicBool::new(false));
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(2));
+
+        // Seed one idle connection whose `close_for_pool` override records
+        // the call, proving pool teardown uses the driver's pool-close path
+        // rather than the ordinary `close`.
+        {
+            let mut inner = pool
+                .shared
+                .inner
+                .lock()
+                .expect("pool mutex should not be poisoned");
+            inner.total_count = 1;
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(MockConnection::with_pool_close_probe(
+                    1,
+                    Arc::clone(&pool_close_calls),
+                    Arc::downgrade(&pool.shared),
+                    Arc::clone(&pool_lock_was_free),
+                )));
+        }
+
+        pool.close();
+
+        assert!(pool.is_closed());
+        assert_eq!(pool_close_calls.load(Ordering::Relaxed), 1);
+        assert!(pool_lock_was_free.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_expired_idle_connection_routes_through_close_for_pool() {
+        let pool_close_calls = Arc::new(AtomicUsize::new(0));
+        let pool: Pool<MockConnection> =
+            Pool::new(PoolConfig::new(2).max_lifetime(1).test_on_checkout(false));
+        let mut expired = ConnectionMeta::new(MockConnection::with_pool_close_counter(
+            1,
+            Arc::clone(&pool_close_calls),
+        ));
+        expired.created_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second must fit before the current instant");
+        {
+            let mut inner = pool
+                .shared
+                .inner
+                .lock()
+                .expect("pool mutex should not be poisoned");
+            inner.total_count = 1;
+            inner.idle.push_back(expired);
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let cx = Cx::for_testing();
+        let acquired =
+            runtime.block_on(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+
+        assert!(matches!(acquired, Outcome::Ok(_)));
+        assert_eq!(pool_close_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_failed_validation_routes_through_close_for_pool() {
+        let pool_close_calls = Arc::new(AtomicUsize::new(0));
+        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(2).test_on_checkout(true));
+        let failed = MockConnection::with_pool_close_counter(1, Arc::clone(&pool_close_calls));
+        failed.ping_should_fail.store(true, Ordering::Relaxed);
+        {
+            let mut inner = pool
+                .shared
+                .inner
+                .lock()
+                .expect("pool mutex should not be poisoned");
+            inner.total_count = 1;
+            inner.idle.push_back(ConnectionMeta::new(failed));
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let cx = Cx::for_testing();
+        let acquired =
+            runtime.block_on(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+
+        assert!(matches!(acquired, Outcome::Err(_)));
+        assert_eq!(pool_close_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

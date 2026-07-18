@@ -818,9 +818,9 @@ impl Connection for SqliteConnection {
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
 
-    async fn close(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
+    fn close(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
         // Connection is closed on drop
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -880,18 +880,22 @@ impl TransactionOps for SqliteTransaction<'_> {
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }
 
-    async fn commit(mut self, _cx: &Cx) -> Outcome<(), Error> {
+    fn commit(mut self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         self.committed = true;
-        self.conn
-            .commit_sync()
-            .map_or_else(Outcome::Err, Outcome::Ok)
+        std::future::ready(
+            self.conn
+                .commit_sync()
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        )
     }
 
-    async fn rollback(mut self, _cx: &Cx) -> Outcome<(), Error> {
+    fn rollback(mut self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         self.committed = true; // Prevent double rollback in drop
-        self.conn
-            .rollback_sync()
-            .map_or_else(Outcome::Err, Outcome::Ok)
+        std::future::ready(
+            self.conn
+                .rollback_sync()
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        )
     }
 }
 

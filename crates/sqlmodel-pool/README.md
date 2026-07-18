@@ -12,5 +12,5 @@ Most users should depend on `sqlmodel` and import from `sqlmodel::prelude::*`.
 Use this crate directly if you are extending internals or building tooling around the core APIs.
 
 ## Links
-- Repository: https://github.com/sqlmodel/sqlmodel-rust
+- Repository: https://github.com/Dicklesworthstone/sqlmodel_rust
 - Documentation: https://docs.rs/sqlmodel-pool

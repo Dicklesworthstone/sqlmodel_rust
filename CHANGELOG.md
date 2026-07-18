@@ -8,6 +8,49 @@ Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
 ---
 
+## [0.3.0] -- 2026-07-18
+
+**Contention-safe pooled FrankenSQLite teardown.** Pool retirement now has an
+explicit driver hook, allowing FrankenSQLite connections to skip the final WAL
+checkpoint without weakening durability. This is a pre-1.0 minor release
+because the new method extends the public `Connection` trait.
+
+### Added
+
+- Add `Connection::close_for_pool`, with a default implementation that retains
+  existing driver behavior and a documented lifecycle covering shutdown,
+  idle/max-lifetime eviction, and failed checkout validation.
+- Route every normal pool-retirement path through the hook after removing the
+  connection from pool state and releasing the internal mutex.
+- Add `FrankenConnection::close_without_checkpoint_sync` and use it for pooled
+  FrankenSQLite retirement. Committed WAL frames remain durable and are
+  recovered on the next open.
+- Add focused coverage for shutdown, eviction, validation failure, unlocked
+  callback execution, and a real close/reopen durability round trip.
+
+### Changed
+
+- Update the exact `asupersync` dependency from 0.3.5 to 0.3.9.
+- Migrate the shared PostgreSQL and MySQL wrappers to asupersync's owned mutex
+  guard, preserving `Send` futures across network awaits under the 0.3.9
+  non-`Send` borrowed-guard contract.
+- Update the FrankenSQLite driver crates to 0.1.17 and exercise their published
+  registry artifacts in the release gate matrix.
+- Remove obsolete local FrankenSQLite patches so a standalone checkout resolves
+  the same registry graph as published consumers without requiring a sibling
+  repository.
+- Clear newly enforced release-toolchain lints in immediate async trait
+  implementations, debug assertions, time arithmetic, and formatting so the
+  workspace remains warning-free.
+- Make repeated FrankenSQLite file tests deterministic by clearing the WAL and
+  shared-memory sidecars alongside the primary database.
+- Correct package and README repository links to the canonical
+  `Dicklesworthstone/sqlmodel_rust` repository.
+
+Thanks to [@lifeofgurpreet](https://github.com/lifeofgurpreet) for identifying
+the close-time checkpoint contention and proposing the pool-specific teardown
+direction in [PR #21](https://github.com/Dicklesworthstone/sqlmodel_rust/pull/21).
+
 ## [0.2.2] -- 2026-04-23
 
 **Windows SQLite linking fix.** `sqlmodel-sqlite` now bundles the SQLite amalgamation via `libsqlite3-sys` and pins the rlib with an explicit `#[link(name = "sqlite3", kind = "static")]` attribute, so downstream crates that don't import a symbol from `libsqlite3-sys` no longer see the rlib elided and the static-link directives dropped at link time.
