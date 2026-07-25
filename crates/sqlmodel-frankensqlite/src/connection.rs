@@ -288,6 +288,31 @@ impl FrankenConnection {
         ))
     }
 
+    /// Open an existing database without creating or rewriting anything.
+    ///
+    /// `open` joins the namespace with `NamespaceOpenIntent::Shared`, which
+    /// establishes a generation when none exists — and that writes the
+    /// `-fsqlite-ns-gate` and `-fsqlite-ns-use` sidecars next to the database.
+    /// A caller that promises to be strictly query-only (a read-only pool, a
+    /// probe, an inspection tool) must not touch the filesystem at all when the
+    /// target is absent or unreadable.
+    ///
+    /// This routes to fsqlite's `open_existing`, which is
+    /// `NamespaceOpenIntent::ReadOnlyExisting`: it joins an existing generation
+    /// without creating or rewriting namespace records, and fails closed when
+    /// they are missing or malformed. Use this instead of `open` wherever
+    /// "query only" is part of the contract.
+    pub fn open_existing(path: impl Into<String>) -> Result<Self, Error> {
+        let path = path.into();
+        let conn =
+            fsqlite::Connection::open_existing(&path).map_err(|e| franken_to_conn_error(&e))?;
+        Ok(Self::from_raw_connection(
+            path,
+            conn,
+            ConnectionProfile::Generic,
+        ))
+    }
+
     /// Open an in-memory database.
     pub fn open_memory() -> Result<Self, Error> {
         Self::open(":memory:")
