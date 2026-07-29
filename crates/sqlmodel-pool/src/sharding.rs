@@ -472,6 +472,7 @@ impl<C: Connection, S: ShardChooser> ShardedPool<C, S> {
     /// * `cx` - The async context
     /// * `hints` - Query routing hints
     /// * `factory` - Connection factory function
+    #[allow(clippy::result_large_err)] // Error is the workspace's rich public error type.
     pub async fn acquire_for_query<F, Fut>(
         &self,
         cx: &Cx,

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::net::TcpStream;
-use asupersync::sync::Mutex;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::{Cx, Outcome};
 
 use sqlmodel_core::connection::{Connection, IsolationLevel, PreparedStatement, TransactionOps};
@@ -1353,7 +1353,7 @@ impl SharedPgConnection {
         isolation: Option<IsolationLevel>,
     ) -> Outcome<SharedPgTransaction<'_>, Error> {
         let inner = Arc::clone(&self.inner);
-        let Ok(mut guard) = inner.lock(cx).await else {
+        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
             return Outcome::Err(connection_error("Failed to acquire connection lock"));
         };
 
@@ -1441,7 +1441,7 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.query_async(cx, &sql, &params).await
@@ -1458,7 +1458,7 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let rows = match guard.query_async(cx, &sql, &params).await {
@@ -1481,7 +1481,7 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_async(cx, &sql, &params).await
@@ -1498,7 +1498,7 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.insert_async(cx, &sql, &params).await
@@ -1513,7 +1513,7 @@ impl Connection for SharedPgConnection {
         let inner = Arc::clone(&self.inner);
         let statements = statements.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let mut results = Vec::with_capacity(statements.len());
@@ -1549,7 +1549,7 @@ impl Connection for SharedPgConnection {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.prepare_async(cx, &sql).await
@@ -1566,7 +1566,7 @@ impl Connection for SharedPgConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.query_prepared_async(cx, &stmt, &params).await
@@ -1583,7 +1583,7 @@ impl Connection for SharedPgConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_prepared_async(cx, &stmt, &params).await
@@ -1593,7 +1593,7 @@ impl Connection for SharedPgConnection {
     fn ping(&self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.ping_async(cx).await
@@ -1601,7 +1601,7 @@ impl Connection for SharedPgConnection {
     }
 
     async fn close(self, cx: &Cx) -> sqlmodel_core::Result<()> {
-        let Ok(mut guard) = self.inner.lock(cx).await else {
+        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await else {
             return Err(connection_error("Failed to acquire connection lock"));
         };
         match guard.close_async(cx).await {
@@ -1637,7 +1637,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.query_async(cx, &sql, &params).await
@@ -1654,7 +1654,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let rows = match guard.query_async(cx, &sql, &params).await {
@@ -1677,7 +1677,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_async(cx, &sql, &params).await
@@ -1692,7 +1692,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
                 return Outcome::Err(e);
             }
             let sql = format!("SAVEPOINT {}", name);
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_async(cx, &sql, &[]).await.map(|_| ())
@@ -1707,7 +1707,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
                 return Outcome::Err(e);
             }
             let sql = format!("ROLLBACK TO SAVEPOINT {}", name);
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_async(cx, &sql, &[]).await.map(|_| ())
@@ -1722,7 +1722,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
                 return Outcome::Err(e);
             }
             let sql = format!("RELEASE SAVEPOINT {}", name);
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             guard.execute_async(cx, &sql, &[]).await.map(|_| ())
@@ -1734,7 +1734,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
     fn commit(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let result = guard.execute_async(cx, "COMMIT", &[]).await;
@@ -1749,7 +1749,7 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
     fn rollback(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
-            let Ok(mut guard) = inner.lock(cx).await else {
+            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
             let result = guard.execute_async(cx, "ROLLBACK", &[]).await;

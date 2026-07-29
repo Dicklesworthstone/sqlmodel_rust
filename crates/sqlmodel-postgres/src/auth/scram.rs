@@ -1,8 +1,9 @@
 //! SCRAM-SHA-256 Authentication implementation.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use hmac::{Hmac, Mac};
-use rand::{Rng, distributions::Alphanumeric, rngs::OsRng};
+use hmac::{Hmac, KeyInit, Mac};
+use rand::rand_core::UnwrapErr;
+use rand::{RngExt, distr::Alphanumeric, rngs::SysRng};
 use sha2::{Digest, Sha256};
 use sqlmodel_core::Error;
 use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind, ProtocolError};
@@ -27,9 +28,12 @@ pub struct ScramClient {
 
 impl ScramClient {
     pub fn new(username: &str, password: &str) -> Self {
-        // Use OsRng for cryptographically secure nonce generation.
+        // Use SysRng (OS entropy; renamed from OsRng in rand 0.10) for
+        // cryptographically secure nonce generation.
         // 32 characters of alphanumeric provides ~190 bits of entropy.
-        let client_nonce: String = OsRng
+        // SysRng is fallible-only (TryRng) in rand 0.10; UnwrapErr adapts it to
+        // the infallible Rng surface `sample_iter` needs.
+        let client_nonce: String = UnwrapErr(SysRng)
             .sample_iter(&Alphanumeric)
             .take(32)
             .map(char::from)

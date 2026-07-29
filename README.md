@@ -138,16 +138,16 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 ```toml
 # Cargo.toml
 [dependencies]
-sqlmodel = "0.2.2"
+sqlmodel = "0.3.0"
 
 # Choose a driver (pick one or more)
-sqlmodel-postgres = "0.2.2"
-# sqlmodel-mysql = "0.2.2"
-# sqlmodel-sqlite = "0.2.2"
-# sqlmodel-frankensqlite = "0.2.2"
+sqlmodel-postgres = "0.3.0"
+# sqlmodel-mysql = "0.3.0"
+# sqlmodel-sqlite = "0.3.0"
+# sqlmodel-frankensqlite = "0.3.0"
 
 # Optional rich console output
-sqlmodel-console = { version = "0.2.2", features = ["rich"] }
+sqlmodel-console = { version = "0.3.0", features = ["rich"] }
 ```
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
@@ -156,8 +156,8 @@ re-exported from `sqlmodel` and `sqlmodel-core`.
 ### From Source
 
 ```bash
-git clone https://github.com/sqlmodel/sqlmodel-rust.git
-cd sqlmodel-rust
+git clone https://github.com/Dicklesworthstone/sqlmodel_rust.git
+cd sqlmodel_rust
 
 # Build the workspace
 cargo build --workspace
@@ -262,7 +262,7 @@ Add the console feature to your dependency:
 
 ```toml
 [dependencies]
-sqlmodel-console = { version = "0.2.2", features = ["rich"] }
+sqlmodel-console = { version = "0.3.0", features = ["rich"] }
 ```
 
 Create and use a console:

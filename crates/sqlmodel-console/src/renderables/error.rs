@@ -341,7 +341,7 @@ impl ErrorPanel {
             color,
             self.severity.as_str(),
             reset,
-            &self.message
+            self.message
         );
         lines.push(self.wrap_line(&severity_line, width, color, reset));
 
