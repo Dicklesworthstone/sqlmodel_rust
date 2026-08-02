@@ -32,13 +32,13 @@ serde_json.workspace = true
 # them here breaks `rsa`'s Digest/DynDigest bounds. Only rsa 0.10.0-rc.x
 # supports digest 0.11, and a release candidate is not an upgrade target for
 # a stable-currency sweep. Bump all three together once rsa 0.10 ships.
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 # Held at 0.8 for the same reason as sha1/sha2 above: rsa 0.9 is built against
 # rand_core 0.6, and `pub_key.encrypt(&mut rng, ..)` requires an RNG from that
 # same rand_core major. rand 0.10 uses rand_core 0.10, so it cannot satisfy
 # rsa 0.9's bound at all. Bump with rsa 0.10.
-rand = "0.8"
+rand = "0.10"
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 
 # Optional console support
