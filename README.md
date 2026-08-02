@@ -138,16 +138,16 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 ```toml
 # Cargo.toml
 [dependencies]
-sqlmodel = "0.3.0"
+sqlmodel = "0.3.2"
 
 # Choose a driver (pick one or more)
-sqlmodel-postgres = "0.3.0"
-# sqlmodel-mysql = "0.3.0"
-# sqlmodel-sqlite = "0.3.0"
-# sqlmodel-frankensqlite = "0.3.0"
+sqlmodel-postgres = "0.3.2"
+# sqlmodel-mysql = "0.3.2"
+# sqlmodel-sqlite = "0.3.2"
+# sqlmodel-frankensqlite = "0.3.2"
 
 # Optional rich console output
-sqlmodel-console = { version = "0.3.0", features = ["rich"] }
+sqlmodel-console = { version = "0.3.2", features = ["rich"] }
 ```
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
@@ -479,18 +479,18 @@ Expr::case()
 - **Nightly Rust required**: We use Edition 2024 features
 - **No stable release yet**: API may change
 - **Limited documentation**: We're working on it
-- **asupersync dependency**: Pulled via git for now (requires git access during builds)
+- **asupersync dependency**: Resolved from crates.io and pinned exactly for runtime type compatibility
 
 ---
 
 ## Troubleshooting
 
-### "Failed to fetch git dependency `asupersync`"
+### "Failed to resolve dependency `asupersync`"
 
 ```bash
-# Ensure git can reach GitHub and retry
-export CARGO_NET_GIT_FETCH_WITH_CLI=true
-cargo update -p asupersync
+# Keep SQLModel's exact runtime requirement aligned with the workspace patch
+cargo update -p sqlmodel-core --precise 0.3.2
+cargo update -p asupersync --precise 0.3.10
 cargo build
 ```
 

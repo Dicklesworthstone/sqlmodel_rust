@@ -8,6 +8,25 @@ Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
 ---
 
+## [0.3.2] -- 2026-08-02
+
+**Asupersync 0.3.10 compatibility release.** This patch keeps SQLModel on the
+same exact runtime version as sibling workspaces that patch crates.io to a local
+Asupersync 0.3.10 checkout.
+
+### Changed
+
+- Update the exact `asupersync` dependency from 0.3.9 to 0.3.10 across every
+  SQLModel crate through the shared workspace dependency.
+- Bump the SQLModel workspace and internal crate dependency requirements to
+  0.3.2 so registry consumers cannot select the previously published 0.3.1
+  crates, whose exact Asupersync 0.3.9 requirement conflicts with a 0.3.10
+  workspace patch.
+- Refresh the documented installation versions and dependency troubleshooting
+  guidance for registry-based Asupersync resolution.
+
+---
+
 ## [0.3.0] -- 2026-07-18
 
 **Contention-safe pooled FrankenSQLite teardown.** Pool retirement now has an
