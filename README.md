@@ -144,6 +144,7 @@ sqlmodel = "0.3.0"
 sqlmodel-postgres = "0.3.0"
 # sqlmodel-mysql = "0.3.0"
 # sqlmodel-sqlite = "0.3.0"
+# sqlmodel-frankensqlite = "0.3.0"
 
 # Optional rich console output
 sqlmodel-console = { version = "0.3.0", features = ["rich"] }
