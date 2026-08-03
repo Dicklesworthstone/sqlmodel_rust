@@ -1,5 +1,9 @@
 # bv (beads viewer) local config and caches
 .bv/
+.beads/.br_history/
+.beads/.write.lock
+.beads/*-fsqlite-ns-gate
+.beads/*-fsqlite-ns-use
 target/
 
 # Common local artifacts (avoid accidental commits)
