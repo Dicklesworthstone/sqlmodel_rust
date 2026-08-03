@@ -143,12 +143,15 @@ sqlmodel = "0.3.2"
 # Choose a driver (pick one or more)
 sqlmodel-postgres = "0.3.2"
 # sqlmodel-mysql = "0.3.2"
-# sqlmodel-sqlite = "0.3.2"
+# sqlmodel-sqlite = "0.3.3"
 # sqlmodel-frankensqlite = "0.3.2"
 
 # Optional rich console output
 sqlmodel-console = { version = "0.3.2", features = ["rich"] }
 ```
+
+`sqlmodel-sqlite` 0.3.3 is a component-only patch that adds exact native SQLite
+error-code inspection. The facade and all other driver crates remain at 0.3.2.
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
 re-exported from `sqlmodel` and `sqlmodel-core`.

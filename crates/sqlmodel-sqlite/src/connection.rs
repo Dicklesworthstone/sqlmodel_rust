@@ -33,14 +33,71 @@ use crate::ffi;
 use crate::types;
 use sqlmodel_core::{
     Connection, Cx, Error, IsolationLevel, Outcome, PreparedStatement, Row, TransactionOps, Value,
-    error::{ConnectionError, ConnectionErrorKind, QueryError, QueryErrorKind},
+    error::{ConfigError, ConnectionError, ConnectionErrorKind, QueryError, QueryErrorKind},
     row::ColumnInfo,
 };
 use std::ffi::{CStr, CString, c_int};
 use std::future::Future;
 use std::ptr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Exact SQLite result codes retained on errors produced by the native driver.
+///
+/// SQLite extended result codes preserve the primary result in their low byte.
+/// Callers that need a fail-closed contract can compare [`Self::primary`] with
+/// constants from [`crate::ffi`] while retaining [`Self::extended`] for more
+/// precise diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteErrorCode {
+    primary: c_int,
+    extended: c_int,
+}
+
+impl SqliteErrorCode {
+    const fn from_result_codes(result: c_int, extended: c_int) -> Self {
+        Self {
+            primary: result & 0xff,
+            extended,
+        }
+    }
+
+    /// SQLite primary result code, such as `SQLITE_READONLY`.
+    #[must_use]
+    pub const fn primary(self) -> c_int {
+        self.primary
+    }
+
+    /// SQLite extended result code, such as `SQLITE_READONLY_CANTLOCK`.
+    #[must_use]
+    pub const fn extended(self) -> c_int {
+        self.extended
+    }
+}
+
+impl std::fmt::Display for SqliteErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "SQLite result code {} (extended {})",
+            self.primary, self.extended
+        )
+    }
+}
+
+impl std::error::Error for SqliteErrorCode {}
+
+/// Return exact native SQLite result codes retained on a driver error.
+///
+/// Errors produced before SQLite is called (for example, SQL containing a NUL
+/// byte) and SQLModel lifecycle errors have no native result code and return
+/// `None`.
+#[must_use]
+pub fn sqlite_error_code(error: &Error) -> Option<SqliteErrorCode> {
+    std::error::Error::source(error)?
+        .downcast_ref::<SqliteErrorCode>()
+        .copied()
+}
 
 #[cfg(feature = "console")]
 use sqlmodel_console::{ConsoleAware, SqlModelConsole};
@@ -71,9 +128,12 @@ pub struct OpenFlags {
     pub no_mutex: bool,
     /// Open in serialized mode (connections can be shared).
     pub full_mutex: bool,
-    /// Enable shared cache mode.
+    /// Enable shared cache mode (except for a plain `:memory:` database, which
+    /// SQLite always keeps private).
     pub shared_cache: bool,
-    /// Disable shared cache mode.
+    /// Explicitly disable shared cache mode. Private cache is also the default
+    /// when `shared_cache` is false, so process-global SQLite configuration
+    /// cannot silently change a connection's cache mode.
     pub private_cache: bool,
 }
 
@@ -126,8 +186,13 @@ impl OpenFlags {
         }
         if self.shared_cache {
             flags |= ffi::SQLITE_OPEN_SHAREDCACHE;
-        }
-        if self.private_cache {
+        } else {
+            // A private cache is the fail-closed default. Besides matching
+            // SQLite's normal default, an explicit flag prevents a process-wide
+            // sqlite3_enable_shared_cache() call elsewhere from silently
+            // changing this connection's backup-safety contract. A URI
+            // `cache=` parameter can still override this flag and is inspected
+            // from SQLite's parsed filename after open.
             flags |= ffi::SQLITE_OPEN_PRIVATECACHE;
         }
 
@@ -195,6 +260,7 @@ unsafe impl Send for SqliteInner {}
 pub struct SqliteConnection {
     inner: Mutex<SqliteInner>,
     path: String,
+    uses_shared_cache: bool,
     /// Optional console for rich output
     #[cfg(feature = "console")]
     console: Option<Arc<SqlModelConsole>>,
@@ -207,6 +273,23 @@ unsafe impl Sync for SqliteConnection {}
 impl SqliteConnection {
     /// Open a new SQLite connection with the given configuration.
     pub fn open(config: &SqliteConfig) -> Result<Self, Error> {
+        if config.flags.shared_cache && config.flags.private_cache {
+            return Err(Error::Config(ConfigError {
+                message: "SQLite shared_cache and private_cache flags are mutually exclusive"
+                    .to_string(),
+                source: None,
+            }));
+        }
+        let busy_timeout_ms = c_int::try_from(config.busy_timeout_ms).map_err(|_| {
+            Error::Config(ConfigError {
+                message: format!(
+                    "SQLite busy timeout {}ms exceeds the native {}ms limit",
+                    config.busy_timeout_ms,
+                    c_int::MAX
+                ),
+                source: None,
+            })
+        })?;
         let c_path = CString::new(config.path.as_str()).map_err(|_| {
             Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Connect,
@@ -222,6 +305,7 @@ impl SqliteConnection {
         let rc = unsafe { ffi::sqlite3_open_v2(c_path.as_ptr(), &mut db, flags, ptr::null()) };
 
         if rc != ffi::SQLITE_OK {
+            let error_code = sqlite_error_code_from_db(db, rc);
             let msg = if !db.is_null() {
                 // SAFETY: db is valid, errmsg returns a valid C string
                 unsafe {
@@ -237,15 +321,26 @@ impl SqliteConnection {
             return Err(Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Connect,
                 message: format!("Failed to open database: {}", msg),
-                source: None,
+                source: Some(Box::new(error_code)),
             }));
         }
 
         // Set busy timeout
-        if config.busy_timeout_ms > 0 {
+        if busy_timeout_ms > 0 {
             // SAFETY: db is valid
-            unsafe {
-                ffi::sqlite3_busy_timeout(db, config.busy_timeout_ms as c_int);
+            let busy_rc = unsafe { ffi::sqlite3_busy_timeout(db, busy_timeout_ms) };
+            if busy_rc != ffi::SQLITE_OK {
+                let error_code = sqlite_error_code_from_db(db, busy_rc);
+                let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)) }
+                    .to_string_lossy()
+                    .into_owned();
+                // SAFETY: db was opened successfully above and is not shared yet.
+                unsafe { ffi::sqlite3_close(db) };
+                return Err(Error::Connection(ConnectionError {
+                    kind: ConnectionErrorKind::Connect,
+                    message: format!("Failed to configure SQLite busy timeout: {msg}"),
+                    source: Some(Box::new(error_code)),
+                }));
             }
         }
 
@@ -255,6 +350,7 @@ impl SqliteConnection {
                 in_transaction: false,
             }),
             path: config.path.clone(),
+            uses_shared_cache: connection_uses_shared_cache(config),
             #[cfg(feature = "console")]
             console: None,
         })
@@ -299,6 +395,7 @@ impl SqliteConnection {
         };
 
         if rc != ffi::SQLITE_OK {
+            let error_code = sqlite_error_code_from_db(inner.db, rc);
             let msg = if !errmsg.is_null() {
                 // SAFETY: errmsg is valid
                 let msg = unsafe { CStr::from_ptr(errmsg).to_string_lossy().into_owned() };
@@ -316,7 +413,7 @@ impl SqliteConnection {
                 detail: None,
                 hint: None,
                 position: None,
-                source: None,
+                source: Some(Box::new(error_code)),
             }));
         }
 
@@ -335,7 +432,31 @@ impl SqliteConnection {
     }
 
     /// Backup the current database to another open SQLite connection.
+    ///
+    /// The destination must not use SQLite shared-cache mode because this
+    /// wrapper cannot coordinate other connections attached to that cache.
     pub fn backup_to_connection(&self, dest: &SqliteConnection) -> Result<(), Error> {
+        if std::ptr::eq(self, dest) {
+            return Err(Error::Connection(ConnectionError {
+                kind: ConnectionErrorKind::Connect,
+                message: "SQLite backup source and destination must be different connections"
+                    .to_string(),
+                source: None,
+            }));
+        }
+        // SQLite requires exclusive in-process access to a shared-cache
+        // destination for the entire backup operation. This wrapper can lock
+        // the two participating connections, but it cannot discover or lock a
+        // third connection attached to the same shared cache. Reject that
+        // configuration instead of exposing SQLite's documented mutex
+        // deadlock/malfunction surface.
+        if dest.uses_shared_cache {
+            return Err(Error::Connection(ConnectionError {
+                kind: ConnectionErrorKind::Connect,
+                message: "SQLite backup destinations cannot use shared-cache mode".to_string(),
+                source: None,
+            }));
+        }
         let self_first = (std::ptr::from_ref(self) as usize) <= (std::ptr::from_ref(dest) as usize);
         let (source_guard, dest_guard) = if self_first {
             let source_guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,6 +470,8 @@ impl SqliteConnection {
 
         let source_db = source_guard.db;
         let dest_db = dest_guard.db;
+        let source_busy_timeout_ms = sqlite_busy_timeout_ms(source_db)?;
+        let dest_busy_timeout_ms = sqlite_busy_timeout_ms(dest_db)?;
 
         let main = CString::new("main").expect("static sqlite db name");
 
@@ -356,16 +479,35 @@ impl SqliteConnection {
         let backup =
             unsafe { ffi::sqlite3_backup_init(dest_db, main.as_ptr(), source_db, main.as_ptr()) };
         if backup.is_null() {
+            let result_code = unsafe { ffi::sqlite3_errcode(dest_db) };
+            let error_code = sqlite_error_code_from_db(dest_db, result_code);
             let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
                 .to_string_lossy()
                 .into_owned();
             return Err(Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Connect,
                 message: format!("SQLite backup init failed: {msg}"),
-                source: None,
+                source: Some(Box::new(error_code)),
             }));
         }
 
+        let busy_deadline = Instant::now()
+            + Duration::from_millis(
+                u64::try_from(source_busy_timeout_ms.max(dest_busy_timeout_ms))
+                    .expect("SQLite busy timeout is non-negative"),
+            );
+        // sqlite3_backup_step() may invoke either connection's configured
+        // busy handler before returning SQLITE_BUSY. Temporarily disable those
+        // native waits and apply the deadline in this loop instead; otherwise
+        // a retry started just before the deadline could block for another
+        // complete busy-timeout interval. The guard restores both connection
+        // settings before their mutex guards are released.
+        let _busy_timeout_guard = BackupBusyTimeoutGuard::disable(
+            source_db,
+            dest_db,
+            source_busy_timeout_ms,
+            dest_busy_timeout_ms,
+        );
         let mut rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
         loop {
             if rc == ffi::SQLITE_DONE {
@@ -376,27 +518,41 @@ impl SqliteConnection {
                 continue;
             }
             if rc == ffi::SQLITE_BUSY || rc == ffi::SQLITE_LOCKED {
-                std::thread::sleep(Duration::from_millis(50));
+                let now = Instant::now();
+                if now >= busy_deadline {
+                    break;
+                }
+                std::thread::sleep(
+                    Duration::from_millis(50).min(busy_deadline.saturating_duration_since(now)),
+                );
+                if Instant::now() >= busy_deadline {
+                    break;
+                }
                 rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
                 continue;
             }
             break;
         }
 
+        let backup_error = if rc != ffi::SQLITE_DONE && rc != ffi::SQLITE_OK {
+            // sqlite3_backup_step returns the authoritative result directly
+            // and does not promise to replace the destination connection's
+            // error state. Preserve that direct (possibly extended) code;
+            // consulting sqlite3_extended_errcode/sqlite3_errmsg here could
+            // substitute an unrelated stale error from the same family.
+            Some(backup_step_error(dest_db, rc))
+        } else {
+            None
+        };
+
         let finish_rc = unsafe { ffi::sqlite3_backup_finish(backup) };
 
-        if rc != ffi::SQLITE_DONE && rc != ffi::SQLITE_OK {
-            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
-                .to_string_lossy()
-                .into_owned();
-            return Err(Error::Connection(ConnectionError {
-                kind: ConnectionErrorKind::Connect,
-                message: format!("SQLite backup failed: {} ({})", msg, ffi::error_string(rc)),
-                source: None,
-            }));
+        if let Some(error) = backup_error {
+            return Err(error);
         }
 
         if finish_rc != ffi::SQLITE_OK {
+            let error_code = sqlite_error_code_from_db(dest_db, finish_rc);
             let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
                 .to_string_lossy()
                 .into_owned();
@@ -407,7 +563,7 @@ impl SqliteConnection {
                     msg,
                     ffi::error_string(finish_rc)
                 ),
-                source: None,
+                source: Some(Box::new(error_code)),
             }));
         }
 
@@ -444,9 +600,10 @@ impl SqliteConnection {
             // SAFETY: stmt is valid, index is 1-based
             let rc = unsafe { types::bind_value(stmt, (i + 1) as c_int, param) };
             if rc != ffi::SQLITE_OK {
+                let error = bind_error(inner.db, sql, i + 1, rc);
                 // SAFETY: stmt is valid
                 unsafe { ffi::sqlite3_finalize(stmt) };
-                return Err(bind_error(inner.db, sql, i + 1));
+                return Err(error);
             }
         }
 
@@ -478,9 +635,10 @@ impl SqliteConnection {
                 }
                 ffi::SQLITE_DONE => break,
                 _ => {
+                    let error = step_error(inner.db, sql, rc);
                     // SAFETY: stmt is valid
                     unsafe { ffi::sqlite3_finalize(stmt) };
-                    return Err(step_error(inner.db, sql));
+                    return Err(error);
                 }
             }
         }
@@ -514,34 +672,43 @@ impl SqliteConnection {
             // SAFETY: stmt is valid
             let rc = unsafe { types::bind_value(stmt, (i + 1) as c_int, param) };
             if rc != ffi::SQLITE_OK {
+                let error = bind_error(inner.db, sql, i + 1, rc);
                 // SAFETY: stmt is valid
                 unsafe { ffi::sqlite3_finalize(stmt) };
-                return Err(bind_error(inner.db, sql, i + 1));
+                return Err(error);
             }
         }
 
-        // Execute
-        // SAFETY: stmt is valid
-        let rc = unsafe { ffi::sqlite3_step(stmt) };
+        // Execute through SQLITE_DONE. DML with RETURNING can yield one or
+        // more SQLITE_ROW results before a later commit-time failure, so the
+        // first row is not proof that the statement completed successfully.
+        let execution_error = loop {
+            // SAFETY: stmt is valid until it reaches DONE or an error below.
+            let rc = unsafe { ffi::sqlite3_step(stmt) };
+            match rc {
+                ffi::SQLITE_ROW => continue,
+                ffi::SQLITE_DONE => break None,
+                _ => break Some(step_error(inner.db, sql, rc)),
+            }
+        };
 
         // SAFETY: stmt is valid
         unsafe { ffi::sqlite3_finalize(stmt) };
 
-        match rc {
-            ffi::SQLITE_DONE | ffi::SQLITE_ROW => {
-                // SAFETY: db is valid
-                let changes = unsafe { ffi::sqlite3_changes(inner.db) };
-
-                #[cfg(feature = "console")]
-                {
-                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    self.emit_execute_timing(sql, changes as u64, elapsed_ms);
-                }
-
-                Ok(changes as u64)
-            }
-            _ => Err(step_error(inner.db, sql)),
+        if let Some(error) = execution_error {
+            return Err(error);
         }
+
+        // SAFETY: db is valid
+        let changes = unsafe { ffi::sqlite3_changes(inner.db) };
+
+        #[cfg(feature = "console")]
+        {
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.emit_execute_timing(sql, changes as u64, elapsed_ms);
+        }
+
+        Ok(changes as u64)
     }
 
     /// Execute an INSERT and return the last inserted rowid.
@@ -901,6 +1068,202 @@ impl TransactionOps for SqliteTransaction<'_> {
 
 // Helper functions
 
+fn connection_uses_shared_cache(config: &SqliteConfig) -> bool {
+    // A plain :memory: database is always private even if SHAREDCACHE was
+    // requested. Named in-memory databases can share only through URI mode and
+    // are handled by the URI cache-mode parser below.
+    if config.path == ":memory:" || config.path.is_empty() {
+        return false;
+    }
+
+    let uri_mode = sqlite_uri_cache_mode(&config.path);
+    if config.flags.uri {
+        // SQLITE_OPEN_URI guarantees that SQLite interpreted this exact
+        // file: URI, so its final cache parameter is authoritative.
+        uri_mode.unwrap_or(config.flags.shared_cache)
+    } else {
+        // URI parsing can also be enabled process-wide by third-party code.
+        // Without visibility into that global setting, reject a connection as
+        // shared if either interpretation could be shared. This may reject a
+        // safe backup but can never admit an unsafe one.
+        config.flags.shared_cache || uri_mode == Some(true)
+    }
+}
+
+struct BackupBusyTimeoutGuard {
+    source_db: *mut ffi::sqlite3,
+    dest_db: *mut ffi::sqlite3,
+    source_timeout_ms: c_int,
+    dest_timeout_ms: c_int,
+}
+
+impl BackupBusyTimeoutGuard {
+    fn disable(
+        source_db: *mut ffi::sqlite3,
+        dest_db: *mut ffi::sqlite3,
+        source_timeout_ms: c_int,
+        dest_timeout_ms: c_int,
+    ) -> Self {
+        // SAFETY: backup_to_connection holds both connection mutexes and both
+        // database handles remain valid for this guard's lifetime.
+        let source_rc = unsafe { ffi::sqlite3_busy_timeout(source_db, 0) };
+        let dest_rc = unsafe { ffi::sqlite3_busy_timeout(dest_db, 0) };
+        debug_assert_eq!(source_rc, ffi::SQLITE_OK);
+        debug_assert_eq!(dest_rc, ffi::SQLITE_OK);
+
+        Self {
+            source_db,
+            dest_db,
+            source_timeout_ms,
+            dest_timeout_ms,
+        }
+    }
+}
+
+fn sqlite_busy_timeout_ms(db: *mut ffi::sqlite3) -> Result<c_int, Error> {
+    const SQL: &str = "PRAGMA busy_timeout";
+    let stmt = prepare_stmt(db, SQL)?;
+
+    // SAFETY: stmt is valid and PRAGMA busy_timeout returns exactly one row.
+    let row_rc = unsafe { ffi::sqlite3_step(stmt) };
+    if row_rc != ffi::SQLITE_ROW {
+        let error = step_error(db, SQL, row_rc);
+        unsafe { ffi::sqlite3_finalize(stmt) };
+        return Err(error);
+    }
+    let timeout_ms = unsafe { ffi::sqlite3_column_int(stmt, 0) };
+
+    let done_rc = unsafe { ffi::sqlite3_step(stmt) };
+    if done_rc != ffi::SQLITE_DONE {
+        let error = step_error(db, SQL, done_rc);
+        unsafe { ffi::sqlite3_finalize(stmt) };
+        return Err(error);
+    }
+    unsafe { ffi::sqlite3_finalize(stmt) };
+
+    Ok(timeout_ms.max(0))
+}
+
+impl Drop for BackupBusyTimeoutGuard {
+    fn drop(&mut self) {
+        // sqlite3_busy_timeout returns SQLITE_OK for valid handles. Both
+        // handles are still protected by their connection mutexes here.
+        let source_rc =
+            unsafe { ffi::sqlite3_busy_timeout(self.source_db, self.source_timeout_ms) };
+        let dest_rc = unsafe { ffi::sqlite3_busy_timeout(self.dest_db, self.dest_timeout_ms) };
+        debug_assert_eq!(source_rc, ffi::SQLITE_OK);
+        debug_assert_eq!(dest_rc, ffi::SQLITE_OK);
+    }
+}
+
+fn sqlite_uri_cache_mode(path: &str) -> Option<bool> {
+    let query = path.strip_prefix("file:")?.split_once('?')?.1;
+    let query = query.split_once('#').map_or(query, |(query, _)| query);
+    let mut cache_mode = None;
+
+    for parameter in query.split('&') {
+        let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        let name = percent_decode_uri_component(name);
+        if name != b"cache" {
+            continue;
+        }
+
+        match percent_decode_uri_component(value).as_slice() {
+            b"shared" => cache_mode = Some(true),
+            b"private" => cache_mode = Some(false),
+            _ => {
+                // With URI parsing enabled SQLite rejects unknown cache modes,
+                // so this branch cannot describe a successfully opened URI.
+                // If URI parsing was disabled, the text is only a filename and
+                // the explicit open flag remains authoritative.
+            }
+        }
+    }
+
+    cache_mode
+}
+
+fn percent_decode_uri_component(component: &str) -> Vec<u8> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2)) {
+                if let (Some(high), Some(low)) = (hex_nibble(*high), hex_nibble(*low)) {
+                    let byte = (high << 4) | low;
+                    if byte == 0 {
+                        // SQLite truncates the current URI component at an
+                        // encoded NUL and resumes at its next raw separator.
+                        break;
+                    }
+                    decoded.push(byte);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    decoded
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn sqlite_error_code_from_db(db: *mut ffi::sqlite3, result: c_int) -> SqliteErrorCode {
+    let primary = result & 0xff;
+    let observed_extended = if db.is_null() {
+        result
+    } else {
+        // SAFETY: every non-null pointer passed here is an open SQLite handle
+        // held by the caller for the duration of this observation.
+        unsafe { ffi::sqlite3_extended_errcode(db) }
+    };
+    // Some APIs return an error directly without replacing the connection's
+    // previous error state. Never expose a contradictory primary/extended pair;
+    // the direct result remains the authoritative fallback in that case.
+    let extended = if observed_extended & 0xff == primary {
+        observed_extended
+    } else {
+        result
+    };
+    SqliteErrorCode::from_result_codes(result, extended)
+}
+
+fn direct_sqlite_error_code(result: c_int) -> SqliteErrorCode {
+    SqliteErrorCode::from_result_codes(result, result)
+}
+
+fn backup_step_error(db: *mut ffi::sqlite3, result: c_int) -> Error {
+    let detail = if db.is_null() {
+        ffi::error_string(result).to_string()
+    } else {
+        // SQLite documents backup routine failures on the destination
+        // connection. Capture its detailed message while retaining `result`
+        // itself as the authoritative exact code.
+        unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    Error::Connection(ConnectionError {
+        kind: ConnectionErrorKind::Connect,
+        message: format!(
+            "SQLite backup failed: {detail} ({})",
+            ffi::error_string(result)
+        ),
+        source: Some(Box::new(direct_sqlite_error_code(result))),
+    })
+}
+
 fn prepare_stmt(db: *mut ffi::sqlite3, sql: &str) -> Result<*mut ffi::sqlite3_stmt, Error> {
     let c_sql = CString::new(sql).map_err(|_| {
         Error::Query(QueryError {
@@ -929,19 +1292,32 @@ fn prepare_stmt(db: *mut ffi::sqlite3, sql: &str) -> Result<*mut ffi::sqlite3_st
     };
 
     if rc != ffi::SQLITE_OK {
-        return Err(prepare_error(db, sql));
+        return Err(prepare_error(db, sql, rc));
+    }
+
+    if stmt.is_null() {
+        return Err(Error::Query(QueryError {
+            kind: QueryErrorKind::Syntax,
+            sql: Some(sql.to_string()),
+            sqlstate: None,
+            message: "SQL contains no executable statement".to_string(),
+            detail: None,
+            hint: None,
+            position: None,
+            source: None,
+        }));
     }
 
     Ok(stmt)
 }
 
-fn prepare_error(db: *mut ffi::sqlite3, sql: &str) -> Error {
+fn prepare_error(db: *mut ffi::sqlite3, sql: &str, code: c_int) -> Error {
     // SAFETY: db is valid
     let msg = unsafe {
         let ptr = ffi::sqlite3_errmsg(db);
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     };
-    let code = unsafe { ffi::sqlite3_errcode(db) };
+    let error_code = sqlite_error_code_from_db(db, code);
 
     Error::Query(QueryError {
         kind: error_code_to_kind(code),
@@ -951,36 +1327,37 @@ fn prepare_error(db: *mut ffi::sqlite3, sql: &str) -> Error {
         detail: None,
         hint: None,
         position: None,
-        source: None,
+        source: Some(Box::new(error_code)),
     })
 }
 
-fn bind_error(db: *mut ffi::sqlite3, sql: &str, param_index: usize) -> Error {
+fn bind_error(db: *mut ffi::sqlite3, sql: &str, param_index: usize, code: c_int) -> Error {
     // SAFETY: db is valid
     let msg = unsafe {
         let ptr = ffi::sqlite3_errmsg(db);
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     };
+    let error_code = sqlite_error_code_from_db(db, code);
 
     Error::Query(QueryError {
-        kind: QueryErrorKind::Database,
+        kind: error_code_to_kind(code),
         sql: Some(sql.to_string()),
         sqlstate: None,
         message: format!("Failed to bind parameter {}: {}", param_index, msg),
         detail: None,
         hint: None,
         position: None,
-        source: None,
+        source: Some(Box::new(error_code)),
     })
 }
 
-fn step_error(db: *mut ffi::sqlite3, sql: &str) -> Error {
+fn step_error(db: *mut ffi::sqlite3, sql: &str, code: c_int) -> Error {
     // SAFETY: db is valid
     let msg = unsafe {
         let ptr = ffi::sqlite3_errmsg(db);
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     };
-    let code = unsafe { ffi::sqlite3_errcode(db) };
+    let error_code = sqlite_error_code_from_db(db, code);
 
     Error::Query(QueryError {
         kind: error_code_to_kind(code),
@@ -990,15 +1367,15 @@ fn step_error(db: *mut ffi::sqlite3, sql: &str) -> Error {
         detail: None,
         hint: None,
         position: None,
-        source: None,
+        source: Some(Box::new(error_code)),
     })
 }
 
 fn error_code_to_kind(code: c_int) -> QueryErrorKind {
-    match code {
+    match code & 0xff {
         ffi::SQLITE_CONSTRAINT => QueryErrorKind::Constraint,
         ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED => QueryErrorKind::Deadlock,
-        ffi::SQLITE_PERM | ffi::SQLITE_AUTH => QueryErrorKind::Permission,
+        ffi::SQLITE_PERM | ffi::SQLITE_READONLY | ffi::SQLITE_AUTH => QueryErrorKind::Permission,
         ffi::SQLITE_NOTFOUND => QueryErrorKind::NotFound,
         ffi::SQLITE_TOOBIG => QueryErrorKind::DataTruncation,
         ffi::SQLITE_INTERRUPT => QueryErrorKind::Cancelled,
@@ -1359,6 +1736,17 @@ impl SqliteConnection {
 mod tests {
     use super::*;
 
+    static NEXT_TEMP_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn unique_temp_db_path(label: &str) -> std::path::PathBuf {
+        let nonce = NEXT_TEMP_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "sqlmodel_{label}_{}_{}.db",
+            std::process::id(),
+            nonce
+        ))
+    }
+
     #[test]
     fn test_open_memory() {
         let conn = SqliteConnection::open_memory().unwrap();
@@ -1374,6 +1762,15 @@ mod tests {
             .unwrap();
         assert_eq!(conn.changes(), 1);
         assert_eq!(conn.last_insert_rowid(), 1);
+
+        let pre_sqlite_error = conn
+            .execute_raw("SELECT \0")
+            .expect_err("NUL-bearing SQL must fail before SQLite");
+        assert_eq!(
+            sqlite_error_code(&pre_sqlite_error),
+            None,
+            "errors produced before the native call must not invent a SQLite result code"
+        );
     }
 
     #[test]
@@ -1417,6 +1814,366 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_named::<String>("name").unwrap(), "Alice");
         assert_eq!(rows[0].get_named::<i32>("age").unwrap(), 30);
+    }
+
+    #[test]
+    fn test_prepared_errors_retain_exact_native_codes() {
+        let conn = SqliteConnection::open_memory().unwrap();
+
+        let prepare_error = conn
+            .query_sync("SELEC 1", &[])
+            .expect_err("invalid SQL must fail during prepare");
+        let prepare_code = sqlite_error_code(&prepare_error)
+            .expect("prepare failures must retain their native SQLite result code");
+        assert_eq!(prepare_code.primary(), ffi::SQLITE_ERROR);
+        assert_eq!(prepare_code.extended(), ffi::SQLITE_ERROR);
+
+        let query_bind_error = conn
+            .query_sync("SELECT ?1", &[Value::Int(1), Value::Int(2)])
+            .expect_err("binding beyond the statement parameter count must fail");
+        let execute_bind_error = conn
+            .execute_sync("SELECT ?1", &[Value::Int(1), Value::Int(2)])
+            .expect_err("execute_sync must retain the same bind failure");
+        for error in [&query_bind_error, &execute_bind_error] {
+            let code = sqlite_error_code(error)
+                .expect("bind failures must survive statement finalization");
+            assert_eq!(code.primary(), ffi::SQLITE_RANGE);
+            assert_eq!(code.extended(), ffi::SQLITE_RANGE);
+        }
+
+        conn.execute_raw("CREATE TABLE exact_codes (value INTEGER UNIQUE)")
+            .unwrap();
+        conn.execute_sync("INSERT INTO exact_codes VALUES (1)", &[])
+            .unwrap();
+        let execute_step_error = conn
+            .execute_sync("INSERT INTO exact_codes VALUES (1)", &[])
+            .expect_err("duplicate prepared insert must fail during step");
+        let query_step_error = conn
+            .query_sync("INSERT INTO exact_codes VALUES (1) RETURNING value", &[])
+            .expect_err("query_sync must retain a step failure before finalization");
+        for error in [&execute_step_error, &query_step_error] {
+            let code = sqlite_error_code(error)
+                .expect("step failures must retain their extended SQLite result code");
+            assert_eq!(code.primary(), ffi::SQLITE_CONSTRAINT);
+            assert_eq!(code.extended(), ffi::SQLITE_CONSTRAINT_UNIQUE);
+            assert!(
+                matches!(error, Error::Query(query) if query.kind == QueryErrorKind::Constraint),
+                "unique violations should map to the constraint error family: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_prepared_sql_is_rejected_before_statement_ffi() {
+        let conn = SqliteConnection::open_memory().unwrap();
+
+        for sql in ["", " \n\t", "-- comment only\n", "/* comment only */"] {
+            for error in [
+                conn.query_sync(sql, &[])
+                    .expect_err("empty query SQL must not produce a null statement"),
+                conn.execute_sync(sql, &[])
+                    .expect_err("empty execute SQL must not produce a null statement"),
+            ] {
+                assert!(
+                    matches!(error, Error::Query(ref query) if query.kind == QueryErrorKind::Syntax),
+                    "empty prepared SQL should be a typed syntax error: {error}"
+                );
+                assert!(error.to_string().contains("no executable statement"));
+                assert_eq!(sqlite_error_code(&error), None);
+            }
+        }
+    }
+
+    #[test]
+    fn test_execute_returning_steps_until_done_and_retains_late_busy() {
+        let path = unique_temp_db_path("returning_busy");
+        let _ = std::fs::remove_file(&path);
+        let config = SqliteConfig::file(path.to_string_lossy().into_owned()).busy_timeout(0);
+        let writer = SqliteConnection::open(&config).unwrap();
+        writer.execute_raw("PRAGMA journal_mode=DELETE").unwrap();
+        writer
+            .execute_raw("CREATE TABLE returning_rows (value INTEGER)")
+            .unwrap();
+        let reader = SqliteConnection::open(&config).unwrap();
+        reader.execute_raw("BEGIN DEFERRED").unwrap();
+        reader
+            .query_sync("SELECT COUNT(*) FROM returning_rows", &[])
+            .unwrap();
+
+        let error = writer
+            .execute_sync("INSERT INTO returning_rows VALUES (7) RETURNING value", &[])
+            .expect_err("the read lock must surface after RETURNING rows but before DONE");
+        let code = sqlite_error_code(&error)
+            .expect("late RETURNING completion failure must retain its native code");
+        assert_eq!(code.primary(), ffi::SQLITE_BUSY);
+        assert!(
+            matches!(error, Error::Query(ref query) if query.kind == QueryErrorKind::Deadlock),
+            "late SQLITE_BUSY should map to the deadlock family: {error}"
+        );
+
+        reader.execute_raw("ROLLBACK").unwrap();
+        let rows = writer
+            .query_sync("SELECT COUNT(*) AS row_count FROM returning_rows", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("row_count").unwrap(), 0);
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_non_native_connection_preflights_have_no_sqlite_code() {
+        let invalid_timeout = SqliteConfig::memory().busy_timeout(c_int::MAX as u32 + 1);
+        let Err(timeout_error) = SqliteConnection::open(&invalid_timeout) else {
+            panic!("out-of-range native busy timeout must fail closed");
+        };
+        assert!(matches!(timeout_error, Error::Config(_)));
+        assert_eq!(sqlite_error_code(&timeout_error), None);
+
+        let conn = SqliteConnection::open_memory().unwrap();
+        let backup_error = conn
+            .backup_to_connection(&conn)
+            .expect_err("backing a connection up onto itself must fail before locking");
+        assert!(
+            backup_error
+                .to_string()
+                .contains("source and destination must be different")
+        );
+        assert_eq!(sqlite_error_code(&backup_error), None);
+
+        let contradictory_cache_flags = SqliteConfig::memory().flags(OpenFlags {
+            shared_cache: true,
+            private_cache: true,
+            ..OpenFlags::create_read_write()
+        });
+        let Err(cache_error) = SqliteConnection::open(&contradictory_cache_flags) else {
+            panic!("contradictory SQLite cache flags must fail before native open");
+        };
+        assert!(matches!(cache_error, Error::Config(_)));
+        assert_eq!(sqlite_error_code(&cache_error), None);
+        assert_ne!(
+            OpenFlags::create_read_write().to_sqlite_flags() & ffi::SQLITE_OPEN_PRIVATECACHE,
+            0,
+            "ordinary opens must override process-global shared-cache mode"
+        );
+    }
+
+    #[test]
+    fn test_backup_copies_data_and_opposite_directions_do_not_deadlock() {
+        let left = Arc::new(SqliteConnection::open_memory().unwrap());
+        let right = Arc::new(SqliteConnection::open_memory().unwrap());
+        left.execute_raw("CREATE TABLE backup_rows (value INTEGER)")
+            .unwrap();
+        left.execute_raw("INSERT INTO backup_rows VALUES (7)")
+            .unwrap();
+
+        left.backup_to_connection(&right)
+            .expect("ordinary backup should copy the source database");
+        let copied = right
+            .query_sync("SELECT value FROM backup_rows", &[])
+            .expect("copied table should be readable");
+        assert_eq!(copied[0].get_named::<i64>("value").unwrap(), 7);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for (source, destination) in [
+            (Arc::clone(&left), Arc::clone(&right)),
+            (Arc::clone(&right), Arc::clone(&left)),
+        ] {
+            let worker_barrier = Arc::clone(&barrier);
+            let worker_tx = completed_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                let result = source.backup_to_connection(&destination);
+                worker_tx.send(result).expect("test receiver remains live");
+            }));
+        }
+        drop(completed_tx);
+        barrier.wait();
+        for _ in 0..2 {
+            completed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("opposing backups must not deadlock")
+                .expect("serialized opposing backup should succeed");
+        }
+        for worker in workers {
+            worker.join().expect("backup worker should not panic");
+        }
+    }
+
+    #[test]
+    fn test_backup_lock_retries_respect_deadline_and_restore_busy_timeouts() {
+        let source = SqliteConnection::open(&SqliteConfig::memory().busy_timeout(500)).unwrap();
+        source
+            .execute_raw("CREATE TABLE backup_rows (value INTEGER)")
+            .unwrap();
+        source
+            .execute_raw("INSERT INTO backup_rows VALUES (7)")
+            .unwrap();
+
+        let path = unique_temp_db_path("backup_deadline");
+        let _ = std::fs::remove_file(&path);
+        let destination_config =
+            SqliteConfig::file(path.to_string_lossy().into_owned()).busy_timeout(450);
+        let destination = SqliteConnection::open(&destination_config).unwrap();
+        destination
+            .execute_raw("CREATE TABLE old_rows (value INTEGER)")
+            .unwrap();
+        source.execute_raw("PRAGMA busy_timeout=520").unwrap();
+        destination.execute_raw("PRAGMA busy_timeout=470").unwrap();
+        let blocker = SqliteConnection::open(&destination_config).unwrap();
+        blocker.execute_raw("BEGIN EXCLUSIVE").unwrap();
+
+        let started = Instant::now();
+        let error = source
+            .backup_to_connection(&destination)
+            .expect_err("an exclusive destination lock must block the backup");
+        let elapsed = started.elapsed();
+        let code = sqlite_error_code(&error)
+            .expect("a lock-blocked backup must retain its native SQLite result code");
+        assert!(
+            matches!(code.primary(), ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED),
+            "unexpected lock failure code: {code}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "backup retry deadline overran by a native busy-timeout interval: {elapsed:?}"
+        );
+
+        blocker.execute_raw("ROLLBACK").unwrap();
+        for (connection, expected_timeout) in [(&source, 520), (&destination, 470)] {
+            let rows = connection.query_sync("PRAGMA busy_timeout", &[]).unwrap();
+            assert_eq!(
+                rows[0].get_named::<i32>("timeout").unwrap(),
+                expected_timeout
+            );
+        }
+
+        drop(blocker);
+        drop(destination);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_backup_rejects_shared_cache_destination_before_locking() {
+        let source = SqliteConnection::open_memory().unwrap();
+        let shared_uri = format!(
+            "file:sqlmodel_backup_shared_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let destination =
+            SqliteConnection::open(&SqliteConfig::file(shared_uri).flags(OpenFlags {
+                uri: true,
+                ..OpenFlags::create_read_write()
+            }))
+            .expect("shared-cache connection should open for the preflight test");
+        assert!(destination.uses_shared_cache);
+
+        let error = source
+            .backup_to_connection(&destination)
+            .expect_err("shared-cache backup destination must fail closed");
+        assert!(error.to_string().contains("shared-cache mode"));
+        assert_eq!(sqlite_error_code(&error), None);
+
+        let plain_memory = SqliteConnection::open(&SqliteConfig::memory().flags(OpenFlags {
+            shared_cache: true,
+            ..OpenFlags::create_read_write()
+        }))
+        .expect("plain :memory: remains private even with SHAREDCACHE requested");
+        assert!(!plain_memory.uses_shared_cache);
+        source
+            .backup_to_connection(&plain_memory)
+            .expect("a truly private in-memory destination is backup-safe");
+
+        let private_uri = format!(
+            "file:sqlmodel_backup_private_{}?mode=memory&cache=private",
+            std::process::id()
+        );
+        let uri_overrides_flag =
+            SqliteConnection::open(&SqliteConfig::file(private_uri).flags(OpenFlags {
+                uri: true,
+                shared_cache: true,
+                ..OpenFlags::create_read_write()
+            }))
+            .expect("URI cache=private should override the shared-cache open flag");
+        assert!(!uri_overrides_flag.uses_shared_cache);
+        source
+            .backup_to_connection(&uri_overrides_flag)
+            .expect("an effectively private URI destination is backup-safe");
+    }
+
+    #[test]
+    fn test_sqlite_uri_cache_mode_matches_sqlite_uri_rules() {
+        assert_eq!(
+            sqlite_uri_cache_mode("file:memory?mode=memory&cache=shared"),
+            Some(true)
+        );
+        assert_eq!(
+            sqlite_uri_cache_mode("file:memory?cache=private&cache=shared"),
+            Some(true),
+            "SQLite applies duplicate cache parameters in order, so the last one wins"
+        );
+        assert_eq!(
+            sqlite_uri_cache_mode("file:memory?%63ache=%70rivate"),
+            Some(false),
+            "SQLite percent-decodes URI parameter names and values"
+        );
+        assert_eq!(
+            sqlite_uri_cache_mode("file:memory?cache%00ignored=shared%00ignored"),
+            Some(true),
+            "SQLite truncates URI components at encoded NUL bytes"
+        );
+        assert_eq!(
+            sqlite_uri_cache_mode("file:memory?CACHE=shared"),
+            None,
+            "SQLite URI parameter names are case-sensitive"
+        );
+        assert_eq!(
+            sqlite_uri_cache_mode("file:memory?cache=shared#cache=private"),
+            Some(true),
+            "SQLite ignores URI fragments"
+        );
+    }
+
+    #[test]
+    fn test_backup_failure_retains_native_destination_error() {
+        let source = SqliteConnection::open_memory().unwrap();
+        source
+            .execute_raw("CREATE TABLE backup_source (value INTEGER)")
+            .unwrap();
+
+        let path = unique_temp_db_path("readonly_backup");
+        let writable = SqliteConnection::open_file(path.to_string_lossy().into_owned()).unwrap();
+        writable
+            .execute_raw("CREATE TABLE backup_destination (value INTEGER)")
+            .unwrap();
+        drop(writable);
+        let destination = SqliteConnection::open(
+            &SqliteConfig::file(path.to_string_lossy().into_owned()).flags(OpenFlags::read_only()),
+        )
+        .unwrap();
+
+        let error = source
+            .backup_to_connection(&destination)
+            .expect_err("read-only destination must reject backup writes");
+        let code = sqlite_error_code(&error)
+            .expect("native backup failure must retain its SQLite result code");
+        assert_eq!(code.primary(), ffi::SQLITE_READONLY);
+        assert!(error.to_string().to_ascii_lowercase().contains("readonly"));
+
+        drop(destination);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_backup_step_error_preserves_direct_extended_result() {
+        let direct_extended = ffi::SQLITE_IOERR | (42 << 8);
+        let error = backup_step_error(std::ptr::null_mut(), direct_extended);
+        let code = sqlite_error_code(&error)
+            .expect("a backup-step failure must retain its direct native result");
+        assert_eq!(code.primary(), ffi::SQLITE_IOERR);
+        assert_eq!(code.extended(), direct_extended);
     }
 
     #[test]
@@ -1540,7 +2297,7 @@ mod tests {
     #[test]
     fn test_open_flags() {
         // Test creating a database with create flag
-        let tmp = std::env::temp_dir().join("sqlmodel_test.db");
+        let tmp = unique_temp_db_path("open_flags");
         let _ = std::fs::remove_file(&tmp); // Ensure it doesn't exist
 
         let config = SqliteConfig::file(tmp.to_string_lossy().to_string())
@@ -1559,8 +2316,28 @@ mod tests {
         assert_eq!(rows.len(), 0);
 
         // Writing should fail
-        let result = conn.execute_raw("INSERT INTO test VALUES (1)");
-        assert!(result.is_err());
+        let error = conn
+            .execute_raw("INSERT INTO test VALUES (1)")
+            .expect_err("read-only connection must reject writes");
+        let error_code = sqlite_error_code(&error)
+            .expect("native write rejection must retain its exact SQLite result code");
+        assert_eq!(error_code.primary(), ffi::SQLITE_READONLY);
+        assert_eq!(error_code.extended() & 0xff, ffi::SQLITE_READONLY);
+        assert!(
+            matches!(error, Error::Query(ref query) if query.kind == QueryErrorKind::Permission),
+            "SQLITE_READONLY should map to the permission error family: {error}"
+        );
+
+        let prepared_error = conn
+            .execute_sync("INSERT INTO test VALUES (1)", &[])
+            .expect_err("prepared writes must also retain SQLITE_READONLY");
+        let prepared_code = sqlite_error_code(&prepared_error)
+            .expect("prepared write rejection must retain its native result code");
+        assert_eq!(prepared_code.primary(), ffi::SQLITE_READONLY);
+        assert!(
+            matches!(prepared_error, Error::Query(ref query) if query.kind == QueryErrorKind::Permission),
+            "prepared SQLITE_READONLY should map to permission: {prepared_error}"
+        );
 
         drop(conn);
         let _ = std::fs::remove_file(&tmp);

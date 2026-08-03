@@ -60,6 +60,9 @@ pub const SQLITE_WARNING: c_int = 28;
 pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
 
+// SQLite extended result codes used by the driver's exact-code contract.
+pub const SQLITE_CONSTRAINT_UNIQUE: c_int = SQLITE_CONSTRAINT | (8 << 8);
+
 // sqlite3_open_v2 flags
 pub const SQLITE_OPEN_READONLY: c_int = 0x00000001;
 pub const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
@@ -113,7 +116,6 @@ unsafe extern "C" {
 
     pub fn sqlite3_close(db: *mut sqlite3) -> c_int;
     pub fn sqlite3_close_v2(db: *mut sqlite3) -> c_int;
-
     // Backup API
     pub fn sqlite3_backup_init(
         pDest: *mut sqlite3,

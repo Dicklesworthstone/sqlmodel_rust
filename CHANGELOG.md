@@ -8,6 +8,47 @@ Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
 ---
 
+## sqlmodel-sqlite [0.3.3] -- 2026-08-02
+
+**Exact native SQLite error-code release.** This component-only patch lets
+fail-closed callers distinguish `SQLITE_READONLY` and other native failures
+without parsing human-readable messages. The workspace and every other SQLModel
+crate remain at 0.3.2 because their public APIs and dependency contracts are
+unchanged.
+
+### Added
+
+- Add `SqliteErrorCode` and `sqlite_error_code` to expose the primary and
+  extended SQLite result codes retained by `sqlmodel-sqlite` errors.
+- Re-export the result-code API from the crate root and expose the standard
+  `SQLITE_CONSTRAINT_UNIQUE` extended-code constant for exact comparisons.
+- Add regression coverage for prepare, bind, step, read-only, extended
+  constraint, delayed `RETURNING`, effective shared-cache, empty-statement,
+  backup, and non-native preflight failures.
+
+### Fixed
+
+- Snapshot prepared-statement errors before finalization, so finalization
+  cannot replace SQLite's connection error state.
+- Reject same-connection backups before locking, and bound backup lock retries
+  by the connections' configured busy timeout.
+- Preserve direct `sqlite3_backup_step` result codes without consulting stale
+  connection error state while retaining SQLite's detailed destination error
+  message, and reject shared-cache backup destinations that the wrapper cannot
+  coordinate safely across third-party connections.
+- Make private cache mode explicit for ordinary opens so process-global SQLite
+  configuration cannot silently weaken backup safety, while honoring and
+  detecting URI `cache=shared` and `cache=private` overrides.
+- Continue stepping statements through `SQLITE_DONE`, preventing DML with a
+  `RETURNING` clause from reporting success before a later commit-time failure.
+- Reject empty and comment-only prepared SQL instead of passing SQLite's
+  successful null-statement result into statement APIs.
+- Reject busy timeouts that cannot be represented by SQLite's native API and
+  surface failures from `sqlite3_busy_timeout` instead of silently ignoring
+  them.
+
+---
+
 ## [0.3.2] -- 2026-08-02
 
 **Asupersync 0.3.10 compatibility release.** This patch keeps SQLModel on the

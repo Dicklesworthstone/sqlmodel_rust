@@ -75,7 +75,10 @@ pub mod connection;
 pub mod ffi;
 pub mod types;
 
-pub use connection::{OpenFlags, SqliteConfig, SqliteConnection, SqliteTransaction};
+pub use connection::{
+    OpenFlags, SqliteConfig, SqliteConnection, SqliteErrorCode, SqliteTransaction,
+    sqlite_error_code,
+};
 
 // Console integration (feature-gated)
 #[cfg(feature = "console")]

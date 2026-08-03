@@ -84,7 +84,7 @@ sqlmodel-session = { path = "crates/sqlmodel-session", version = "0.3.2" }
 sqlmodel-pool = { path = "crates/sqlmodel-pool", version = "0.3.2" }
 sqlmodel-console = { path = "crates/sqlmodel-console", version = "0.3.2" }
 sqlmodel-postgres = { path = "crates/sqlmodel-postgres", version = "0.3.2" }
-sqlmodel-sqlite = { path = "crates/sqlmodel-sqlite", version = "0.3.2" }
+sqlmodel-sqlite = { path = "crates/sqlmodel-sqlite", version = "0.3.3" }
 sqlmodel-mysql = { path = "crates/sqlmodel-mysql", version = "0.3.2" }
 sqlmodel-frankensqlite = { path = "crates/sqlmodel-frankensqlite", version = "0.3.2" }
 
