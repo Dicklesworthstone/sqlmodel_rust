@@ -13,8 +13,7 @@ Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 **Exact native SQLite error-code release.** This component-only patch lets
 fail-closed callers distinguish `SQLITE_READONLY` and other native failures
 without parsing human-readable messages. The workspace and every other SQLModel
-crate remain at 0.3.2 because their public APIs and dependency contracts are
-unchanged.
+crate remain at version 0.3.2; only `sqlmodel-sqlite` advances in this release.
 
 ### Added
 
@@ -25,6 +24,13 @@ unchanged.
 - Add regression coverage for prepare, bind, step, read-only, extended
   constraint, delayed `RETURNING`, effective shared-cache, empty-statement,
   backup, and non-native preflight failures.
+
+### Changed
+
+- Correct the declared workspace MSRV from Rust 1.85 to Rust 1.95, the actual
+  minimum required by Asupersync 0.3.10's mandatory `sysinfo` 0.39 dependency
+  graph. This makes Cargo reject unsupported toolchains up front instead of
+  advertising a configuration that cannot resolve and compile.
 
 ### Fixed
 
