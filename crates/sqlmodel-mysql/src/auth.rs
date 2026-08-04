@@ -23,7 +23,8 @@
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use rand::rngs::OsRng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 
 use rsa::RsaPublicKey;
 use rsa::pkcs1::DecodeRsaPublicKey;
@@ -146,12 +147,14 @@ pub fn caching_sha2_password(password: &str, auth_data: &[u8]) -> Vec<u8> {
 
 /// Generate a random nonce for client-side use.
 ///
-/// Uses `OsRng` for cryptographically secure random generation.
+/// Uses `SysRng` (OS entropy; renamed from `OsRng` in rand 0.10) for
+/// cryptographically secure random generation. `SysRng` is fallible-only
+/// (`TryRng`) in rand 0.10; `UnwrapErr` adapts it to the infallible `Rng`
+/// surface `fill_bytes` needs.
 pub fn generate_nonce(length: usize) -> Vec<u8> {
-    use rand::RngCore;
-    use rand::rngs::OsRng;
+    use rand::Rng;
     let mut bytes = vec![0u8; length];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     bytes
 }
 
@@ -199,14 +202,14 @@ pub fn sha256_password_rsa(
 
     let encrypted = if use_oaep {
         // MySQL 8.0.5+ uses OAEP padding for caching_sha2_password.
-        let padding = rsa::Oaep::new::<Sha1>();
+        let padding = rsa::Oaep::<Sha1>::new();
         pub_key
-            .encrypt(&mut OsRng, padding, &pw)
+            .encrypt(&mut UnwrapErr(SysRng), padding, &pw)
             .map_err(|e| format!("RSA OAEP encryption failed: {e}"))?
     } else {
         let padding = rsa::Pkcs1v15Encrypt;
         pub_key
-            .encrypt(&mut OsRng, padding, &pw)
+            .encrypt(&mut UnwrapErr(SysRng), padding, &pw)
             .map_err(|e| format!("RSA PKCS1v1.5 encryption failed: {e}"))?
     };
 
