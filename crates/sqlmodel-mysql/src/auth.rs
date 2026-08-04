@@ -344,6 +344,60 @@ mod tests {
         assert_eq!(recovered, password.as_bytes());
     }
 
+    /// Test-only RSA public key in SPKI (`BEGIN PUBLIC KEY`) form — the shape
+    /// MySQL serves for `caching_sha2_password`/`sha256_password` full auth.
+    const SPKI_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArJ59U1RtRan3BEJqsItb\n\
+tD3nDU7ThwlNaJ42vRSEt/UzFO5/yemxUz3ogTUcsDMgXeLVjQjwwV0+lh+s9IWc\n\
+9fU6nu4Q8yW7Pc/SDpDkFBdEtLAOIjfSMv0CzoPQB0A0njVFe7l7SuyrMWQ/19N5\n\
+iEtqZQmP2y7h5a23XgPGogXHm0XnKpueZn9KFXhK2lNhZj9IUuQLmhzrH0pov8Ae\n\
+FknazXZxL5aoAG+cJIoHKsf9NcGTzj0Hewb36YlgVi+yZ5NRkhgjklQ8E6IL+aaW\n\
+yEOsCBtS8kCd/nHP4t6ZeyExdpggPGQ2nJq18jG+sttI+3AnzQhXtR2Adq9LKVdN\n\
+RQIDAQAB\n\
+-----END PUBLIC KEY-----\n";
+
+    /// The same key in PKCS#1 (`BEGIN RSA PUBLIC KEY`) form — the fallback
+    /// encoding `sha256_password_rsa` accepts.
+    const PKCS1_PUBLIC_KEY: &str = "-----BEGIN RSA PUBLIC KEY-----\n\
+MIIBCgKCAQEArJ59U1RtRan3BEJqsItbtD3nDU7ThwlNaJ42vRSEt/UzFO5/yemx\n\
+Uz3ogTUcsDMgXeLVjQjwwV0+lh+s9IWc9fU6nu4Q8yW7Pc/SDpDkFBdEtLAOIjfS\n\
+Mv0CzoPQB0A0njVFe7l7SuyrMWQ/19N5iEtqZQmP2y7h5a23XgPGogXHm0XnKpue\n\
+Zn9KFXhK2lNhZj9IUuQLmhzrH0pov8AeFknazXZxL5aoAG+cJIoHKsf9NcGTzj0H\n\
+ewb36YlgVi+yZ5NRkhgjklQ8E6IL+aaWyEOsCBtS8kCd/nHP4t6ZeyExdpggPGQ2\n\
+nJq18jG+sttI+3AnzQhXtR2Adq9LKVdNRQIDAQAB\n\
+-----END RSA PUBLIC KEY-----\n";
+
+    /// The RSA full-auth path must keep working across `rsa` major bumps: the
+    /// `pem` feature was folded into `encoding` in 0.10, so both PEM encodings
+    /// MySQL can serve must still parse, and both padding modes must produce a
+    /// modulus-sized, randomized ciphertext.
+    #[test]
+    fn test_sha256_password_rsa_accepts_both_pem_encodings() {
+        let seed = [
+            0x3d, 0x4c, 0x5e, 0x2f, 0x1a, 0x0b, 0x7c, 0x8d, 0x9e, 0xaf, 0x10, 0x21, 0x32, 0x43,
+            0x54, 0x65, 0x76, 0x87, 0x98, 0xa9,
+        ];
+
+        for pem in [SPKI_PUBLIC_KEY, PKCS1_PUBLIC_KEY] {
+            for use_oaep in [true, false] {
+                let out = sha256_password_rsa("hunter2", &seed, pem.as_bytes(), use_oaep)
+                    .expect("RSA encryption with a 2048-bit MySQL-style key");
+                // RSA output is always exactly the modulus size (2048 bits).
+                assert_eq!(out.len(), 256, "pem={pem} oaep={use_oaep}");
+                // Both paddings are randomized: two encryptions must differ.
+                let again = sha256_password_rsa("hunter2", &seed, pem.as_bytes(), use_oaep)
+                    .expect("second encryption");
+                assert_ne!(out, again, "padding must be randomized");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sha256_password_rsa_rejects_bad_input() {
+        assert!(sha256_password_rsa("pw", &[], SPKI_PUBLIC_KEY.as_bytes(), true).is_err());
+        assert!(sha256_password_rsa("pw", &[1, 2, 3], b"not a pem", true).is_err());
+    }
+
     #[test]
     fn test_plugin_names() {
         assert_eq!(plugins::MYSQL_NATIVE_PASSWORD, "mysql_native_password");
