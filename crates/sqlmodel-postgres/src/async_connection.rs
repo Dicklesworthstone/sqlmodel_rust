@@ -45,6 +45,9 @@ use crate::types::{Format, decode_value, encode_value};
 #[cfg(feature = "tls")]
 use crate::tls;
 
+// A TLS stream is ~1KB vs ~72B for plain TCP; boxing it would add a
+// pointer chase on every read/write of the hot I/O path, so keep it inline.
+#[allow(clippy::large_enum_variant)]
 enum PgAsyncStream {
     Plain(TcpStream),
     #[cfg(feature = "tls")]

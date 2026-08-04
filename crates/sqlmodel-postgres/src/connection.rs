@@ -45,6 +45,9 @@ use crate::protocol::{
 #[cfg(feature = "tls")]
 use crate::tls;
 
+// A TLS stream is ~1KB vs a few bytes for the other variants; boxing it
+// would add a pointer chase on every read/write of the hot I/O path.
+#[allow(clippy::large_enum_variant)]
 enum PgStream {
     Plain(TcpStream),
     #[cfg(feature = "tls")]

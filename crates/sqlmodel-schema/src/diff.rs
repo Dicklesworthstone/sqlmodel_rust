@@ -960,20 +960,21 @@ fn diff_foreign_keys(
     // Changed foreign keys (compare references)
     for (col, expected_fk) in &expected_map {
         if let Some(current_fk) = current_map.get(col)
-            && !fk_matches(current_fk, expected_fk) {
-                // Drop and recreate
-                let name = fk_effective_name(table, current_fk);
-                diff.add_op(SchemaOperation::DropForeignKey {
-                    table: table.to_string(),
-                    name,
-                    table_info: Some(current_table.clone()),
-                });
-                diff.add_op(SchemaOperation::AddForeignKey {
-                    table: table.to_string(),
-                    fk: (*expected_fk).clone(),
-                    table_info: Some(current_table.clone()),
-                });
-            }
+            && !fk_matches(current_fk, expected_fk)
+        {
+            // Drop and recreate
+            let name = fk_effective_name(table, current_fk);
+            diff.add_op(SchemaOperation::DropForeignKey {
+                table: table.to_string(),
+                name,
+                table_info: Some(current_table.clone()),
+            });
+            diff.add_op(SchemaOperation::AddForeignKey {
+                table: table.to_string(),
+                fk: (*expected_fk).clone(),
+                table_info: Some(current_table.clone()),
+            });
+        }
     }
 }
 
@@ -1070,17 +1071,17 @@ fn diff_indexes(table: &str, current: &[IndexInfo], expected: &[IndexInfo], diff
         if let Some(current_idx) = current_map.get(name)
             && (current_idx.columns != expected_idx.columns
                 || current_idx.unique != expected_idx.unique)
-            {
-                // Drop and recreate
-                diff.add_op(SchemaOperation::DropIndex {
-                    table: table.to_string(),
-                    name: (*name).to_string(),
-                });
-                diff.add_op(SchemaOperation::CreateIndex {
-                    table: table.to_string(),
-                    index: (**expected_idx).clone(),
-                });
-            }
+        {
+            // Drop and recreate
+            diff.add_op(SchemaOperation::DropIndex {
+                table: table.to_string(),
+                name: (*name).to_string(),
+            });
+            diff.add_op(SchemaOperation::CreateIndex {
+                table: table.to_string(),
+                index: (**expected_idx).clone(),
+            });
+        }
     }
 }
 

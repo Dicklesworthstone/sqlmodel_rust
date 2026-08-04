@@ -683,11 +683,11 @@ mod tests {
     #[test]
     fn test_format_uptime_days() {
         assert_eq!(
-            PoolStatusDisplay::format_uptime(Duration::from_secs(90000)),
+            PoolStatusDisplay::format_uptime(Duration::from_hours(25)),
             "1d 1h"
         );
         assert_eq!(
-            PoolStatusDisplay::format_uptime(Duration::from_secs(86400)),
+            PoolStatusDisplay::format_uptime(Duration::from_hours(24)),
             "1d"
         );
     }

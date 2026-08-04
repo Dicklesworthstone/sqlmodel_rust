@@ -60,7 +60,7 @@ fn main() {
         .name("primary")
         .with_acquisition_stats(120, 1)
         .with_lifetime_stats(15, 3)
-        .uptime(Duration::from_secs(2 * 60 * 60 + 15 * 60));
+        .uptime(Duration::from_mins(2 * 60 + 15));
     rich.print(&pool.render_styled());
     plain.print(&pool.render_plain());
 

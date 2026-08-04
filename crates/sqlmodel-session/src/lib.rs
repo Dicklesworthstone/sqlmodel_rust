@@ -829,20 +829,20 @@ impl<C: Connection> Session<C> {
         let key = ObjectKey::from_pk::<M>(pk_values);
 
         // Check identity map first (unless with_for_update which needs fresh DB state)
-        if !options.with_for_update {
-            if let Some(tracked) = self.identity_map.get(&key) {
-                match tracked.state {
-                    ObjectState::Deleted | ObjectState::Detached => {
-                        // Return None for deleted/detached objects
-                    }
-                    ObjectState::Expired => {
-                        // Skip cache, will reload from DB below
-                        tracing::debug!("Object is expired, reloading from database");
-                    }
-                    ObjectState::New | ObjectState::Persistent => {
-                        if let Some(obj) = tracked.object.downcast_ref::<M>() {
-                            return Outcome::Ok(Some(obj.clone()));
-                        }
+        if !options.with_for_update
+            && let Some(tracked) = self.identity_map.get(&key)
+        {
+            match tracked.state {
+                ObjectState::Deleted | ObjectState::Detached => {
+                    // Return None for deleted/detached objects
+                }
+                ObjectState::Expired => {
+                    // Skip cache, will reload from DB below
+                    tracing::debug!("Object is expired, reloading from database");
+                }
+                ObjectState::New | ObjectState::Persistent => {
+                    if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                        return Outcome::Ok(Some(obj.clone()));
                     }
                 }
             }
@@ -2172,11 +2172,12 @@ impl<C: Connection> Session<C> {
 
         for (idx, obj) in objects.iter().enumerate() {
             let lazy = accessor(obj);
-            if !lazy.is_loaded() && !lazy.is_empty() {
-                if let Some(fk) = lazy.fk() {
-                    fk_values.push(fk.clone());
-                    fk_indices.push(idx);
-                }
+            if !lazy.is_loaded()
+                && !lazy.is_empty()
+                && let Some(fk) = lazy.fk()
+            {
+                fk_values.push(fk.clone());
+                fk_indices.push(idx);
             }
         }
 

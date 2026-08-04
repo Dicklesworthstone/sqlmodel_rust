@@ -87,7 +87,9 @@ struct PreparedStmtMeta {
 }
 
 /// Connection stream wrapper for sync/async compatibility.
-#[allow(dead_code)]
+// A TLS stream is ~1KB vs ~72B for plain TCP; boxing it would add a
+// pointer chase on every read/write of the hot I/O path, so keep it inline.
+#[allow(dead_code, clippy::large_enum_variant)]
 enum ConnectionStream {
     /// Standard sync TCP stream (for initial connection)
     Sync(StdTcpStream),
@@ -1356,10 +1358,11 @@ impl MySqlAsyncConnection {
                             self.warnings = ok.warnings;
                         }
                     } else if payload[0] == 0xFE
-                        && let Some(eof) = reader.parse_eof_packet() {
-                            self.status_flags = eof.status_flags;
-                            self.warnings = eof.warnings;
-                        }
+                        && let Some(eof) = reader.parse_eof_packet()
+                    {
+                        self.status_flags = eof.status_flags;
+                        self.warnings = eof.warnings;
+                    }
                     break;
                 }
                 PacketType::Error => {
@@ -1791,10 +1794,11 @@ impl MySqlAsyncConnection {
                             self.warnings = ok.warnings;
                         }
                     } else if payload[0] == 0xFE
-                        && let Some(eof) = reader.parse_eof_packet() {
-                            self.status_flags = eof.status_flags;
-                            self.warnings = eof.warnings;
-                        }
+                        && let Some(eof) = reader.parse_eof_packet()
+                    {
+                        self.status_flags = eof.status_flags;
+                        self.warnings = eof.warnings;
+                    }
                     break;
                 }
                 PacketType::Error => {

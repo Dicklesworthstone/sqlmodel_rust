@@ -1358,9 +1358,10 @@ fn build_postgres_type(
 
     // For numeric types with precision/scale
     if let (Some(p), Some(s)) = (precision, scale)
-        && data_type == "numeric" {
-            return format!("NUMERIC({},{})", p, s);
-        }
+        && data_type == "numeric"
+    {
+        return format!("NUMERIC({},{})", p, s);
+    }
 
     // Default: just return the data type
     data_type.to_uppercase()

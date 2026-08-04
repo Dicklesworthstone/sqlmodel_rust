@@ -550,12 +550,11 @@ impl FrankenConnection {
         // Track last_insert_rowid for INSERT statements
         if is_insert_sql(sql) {
             // After an INSERT, query last_insert_rowid()
-            if let Ok(rows) = inner.conn.query("SELECT last_insert_rowid()") {
-                if let Some(row) = rows.first() {
-                    if let Some(SqliteValue::Integer(id)) = row.get(0) {
-                        inner.last_insert_rowid = *id;
-                    }
-                }
+            if let Ok(rows) = inner.conn.query("SELECT last_insert_rowid()")
+                && let Some(row) = rows.first()
+                && let Some(SqliteValue::Integer(id)) = row.get(0)
+            {
+                inner.last_insert_rowid = *id;
             }
         }
 
@@ -571,12 +570,11 @@ impl FrankenConnection {
     /// Get the number of rows changed by the last statement.
     pub fn changes(&self) -> i64 {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Ok(rows) = inner.conn.query("SELECT changes()") {
-            if let Some(row) = rows.first() {
-                if let Some(SqliteValue::Integer(n)) = row.get(0) {
-                    return *n;
-                }
-            }
+        if let Ok(rows) = inner.conn.query("SELECT changes()")
+            && let Some(row) = rows.first()
+            && let Some(SqliteValue::Integer(n)) = row.get(0)
+        {
+            return *n;
         }
         0
     }
@@ -1374,14 +1372,14 @@ fn extract_table_name_for_returning(sql: &str) -> Option<String> {
     let upper = sql.to_uppercase();
 
     // INSERT INTO table_name (...)
-    if upper.starts_with("INSERT") {
-        if let Some(into_pos) = upper.find(" INTO ") {
-            let after_into = &sql[into_pos + 6..].trim_start();
-            // Table name is the next word (may be quoted)
-            let table = extract_identifier(after_into);
-            if !table.is_empty() {
-                return Some(table);
-            }
+    if upper.starts_with("INSERT")
+        && let Some(into_pos) = upper.find(" INTO ")
+    {
+        let after_into = &sql[into_pos + 6..].trim_start();
+        // Table name is the next word (may be quoted)
+        let table = extract_identifier(after_into);
+        if !table.is_empty() {
+            return Some(table);
         }
     }
 
@@ -1395,13 +1393,13 @@ fn extract_table_name_for_returning(sql: &str) -> Option<String> {
     }
 
     // DELETE FROM table_name ...
-    if upper.starts_with("DELETE") {
-        if let Some(from_pos) = upper.find(" FROM ") {
-            let after_from = &sql[from_pos + 6..].trim_start();
-            let table = extract_identifier(after_from);
-            if !table.is_empty() {
-                return Some(table);
-            }
+    if upper.starts_with("DELETE")
+        && let Some(from_pos) = upper.find(" FROM ")
+    {
+        let after_from = &sql[from_pos + 6..].trim_start();
+        let table = extract_identifier(after_from);
+        if !table.is_empty() {
+            return Some(table);
         }
     }
 

@@ -123,25 +123,26 @@ impl<M: Model> CreateTable<M> {
 
         // For joined table inheritance child models, add FK to parent table
         if inheritance.strategy == InheritanceStrategy::Joined
-            && let Some(parent_table) = inheritance.parent {
-                // In joined inheritance, the child's primary key columns are also a foreign key
-                // to the parent table's primary key columns (same column names).
-                let pk_cols = M::PRIMARY_KEY;
-                if !pk_cols.is_empty() {
-                    let quoted_child_cols: Vec<String> =
-                        pk_cols.iter().map(|c| quote_ident(c)).collect();
-                    let quoted_parent_cols = quoted_child_cols.clone();
-                    let constraint_name = format!("fk_{}_parent", M::TABLE_NAME);
-                    let fk_sql = format!(
-                        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE CASCADE",
-                        quote_ident(&constraint_name),
-                        quoted_child_cols.join(", "),
-                        quote_ident(parent_table),
-                        quoted_parent_cols.join(", ")
-                    );
-                    constraints.push(fk_sql);
-                }
+            && let Some(parent_table) = inheritance.parent
+        {
+            // In joined inheritance, the child's primary key columns are also a foreign key
+            // to the parent table's primary key columns (same column names).
+            let pk_cols = M::PRIMARY_KEY;
+            if !pk_cols.is_empty() {
+                let quoted_child_cols: Vec<String> =
+                    pk_cols.iter().map(|c| quote_ident(c)).collect();
+                let quoted_parent_cols = quoted_child_cols.clone();
+                let constraint_name = format!("fk_{}_parent", M::TABLE_NAME);
+                let fk_sql = format!(
+                    "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE CASCADE",
+                    quote_ident(&constraint_name),
+                    quoted_child_cols.join(", "),
+                    quote_ident(parent_table),
+                    quoted_parent_cols.join(", ")
+                );
+                constraints.push(fk_sql);
             }
+        }
 
         // Add primary key constraint (unless embedded for SQLite-style auto-increment single PK).
         let pk_cols = M::PRIMARY_KEY;

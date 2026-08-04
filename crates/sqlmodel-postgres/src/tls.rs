@@ -23,6 +23,9 @@ fn tls_error(message: impl Into<String>) -> Error {
     })
 }
 
+// `sqlmodel_core::Error` is ~160 bytes; it is the crate-wide error type, so
+// boxing it just for these helpers would fragment the error surface.
+#[allow(clippy::result_large_err)]
 #[cfg(feature = "tls")]
 pub(crate) fn server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>, Error> {
     host.to_string()
@@ -36,6 +39,7 @@ pub(crate) fn server_name(host: &str) -> Result<rustls::pki_types::ServerName<'s
 /// - Disable: not applicable (should not call)
 /// - Prefer/Require: encrypt, do not verify certificates
 /// - VerifyCa/VerifyFull: verify against webpki-roots CA bundle
+#[allow(clippy::result_large_err)]
 #[cfg(feature = "tls")]
 pub(crate) fn build_client_config(ssl_mode: SslMode) -> Result<rustls::ClientConfig, Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -48,6 +52,7 @@ pub(crate) fn build_client_config(ssl_mode: SslMode) -> Result<rustls::ClientCon
 }
 
 /// Build a ClientConfig that skips certificate verification (dangerous!).
+#[allow(clippy::result_large_err)]
 #[cfg(feature = "tls")]
 fn build_no_verify_config(
     provider: &Arc<rustls::crypto::CryptoProvider>,
@@ -116,6 +121,7 @@ fn build_no_verify_config(
 }
 
 /// Build a ClientConfig using webpki-roots CA bundle.
+#[allow(clippy::result_large_err)]
 #[cfg(feature = "tls")]
 fn build_webpki_config(
     provider: &Arc<rustls::crypto::CryptoProvider>,

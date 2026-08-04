@@ -180,11 +180,11 @@ impl IdentityMap {
         let key = (type_id, pk_hash);
 
         // Check if already exists - return clone of the existing Arc
-        if let Some(entry) = self.entries.get(&key) {
-            if let Some(existing_arc) = entry.arc.downcast_ref::<Arc<RwLock<M>>>() {
-                // Return clone of the same Arc (not a new Arc with cloned value)
-                return Arc::clone(existing_arc);
-            }
+        if let Some(entry) = self.entries.get(&key)
+            && let Some(existing_arc) = entry.arc.downcast_ref::<Arc<RwLock<M>>>()
+        {
+            // Return clone of the same Arc (not a new Arc with cloned value)
+            return Arc::clone(existing_arc);
         }
 
         // Insert new entry - store the Arc itself in type-erased form
