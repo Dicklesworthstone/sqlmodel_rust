@@ -121,10 +121,10 @@ pub fn init_logging() {
 
     LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
 
-    if let Ok(level_str) = env::var("SQLMODEL_LOG_LEVEL") {
-        if let Some(level) = LogLevel::from_str(&level_str) {
-            MIN_LOG_LEVEL.store(level as u8, Ordering::Relaxed);
-        }
+    if let Ok(level_str) = env::var("SQLMODEL_LOG_LEVEL")
+        && let Some(level) = LogLevel::from_str(&level_str)
+    {
+        MIN_LOG_LEVEL.store(level as u8, Ordering::Relaxed);
     }
 }
 

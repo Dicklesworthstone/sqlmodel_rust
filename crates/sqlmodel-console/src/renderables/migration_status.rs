@@ -404,26 +404,26 @@ impl MigrationStatus {
             }
 
             // Add duration if showing and available
-            if self.show_duration {
-                if let Some(dur) = record.format_duration() {
-                    parts.push(format!("({})", dur));
-                }
+            if self.show_duration
+                && let Some(dur) = record.format_duration()
+            {
+                parts.push(format!("({})", dur));
             }
 
             lines.push(parts.join(" "));
 
             // Add error message for failed migrations
-            if record.state == MigrationState::Failed {
-                if let Some(ref err) = record.error_message {
-                    lines.push(format!("    Error: {}", err));
-                }
+            if record.state == MigrationState::Failed
+                && let Some(ref err) = record.error_message
+            {
+                lines.push(format!("    Error: {}", err));
             }
 
             // Add checksum if showing
-            if self.show_checksums {
-                if let Some(ref checksum) = record.checksum {
-                    lines.push(format!("    Checksum: {}", checksum));
-                }
+            if self.show_checksums
+                && let Some(ref checksum) = record.checksum
+            {
+                lines.push(format!("    Checksum: {}", checksum));
             }
 
             // Add SQL preview if showing
@@ -435,12 +435,12 @@ impl MigrationStatus {
                             lines.push(format!("      {}", sql_line));
                         }
                     }
-                } else if record.state == MigrationState::Applied {
-                    if let Some(ref sql) = record.down_sql {
-                        lines.push("    Down SQL:".to_string());
-                        for sql_line in sql.lines().take(3) {
-                            lines.push(format!("      {}", sql_line));
-                        }
+                } else if record.state == MigrationState::Applied
+                    && let Some(ref sql) = record.down_sql
+                {
+                    lines.push("    Down SQL:".to_string());
+                    for sql_line in sql.lines().take(3) {
+                        lines.push(format!("      {}", sql_line));
                     }
                 }
             }
@@ -559,24 +559,24 @@ impl MigrationStatus {
                 lines.push(self.wrap_line(&row, width));
 
                 // Show error for failed migrations
-                if record.state == MigrationState::Failed {
-                    if let Some(ref err) = record.error_message {
-                        let err_line = format!(
-                            "   {}Error: {}{}",
-                            self.theme.error.color_code(),
-                            err,
-                            reset
-                        );
-                        lines.push(self.wrap_line(&err_line, width));
-                    }
+                if record.state == MigrationState::Failed
+                    && let Some(ref err) = record.error_message
+                {
+                    let err_line = format!(
+                        "   {}Error: {}{}",
+                        self.theme.error.color_code(),
+                        err,
+                        reset
+                    );
+                    lines.push(self.wrap_line(&err_line, width));
                 }
 
                 // Show checksum if enabled
-                if self.show_checksums {
-                    if let Some(ref checksum) = record.checksum {
-                        let checksum_line = format!("   {}Checksum: {}{}", dim, checksum, reset);
-                        lines.push(self.wrap_line(&checksum_line, width));
-                    }
+                if self.show_checksums
+                    && let Some(ref checksum) = record.checksum
+                {
+                    let checksum_line = format!("   {}Checksum: {}{}", dim, checksum, reset);
+                    lines.push(self.wrap_line(&checksum_line, width));
                 }
             }
         }

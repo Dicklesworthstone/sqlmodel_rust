@@ -115,12 +115,12 @@ impl ValueType {
         }
 
         // Check for date pattern (YYYY-MM-DD)
-        if trimmed.len() == 10 && trimmed.chars().filter(|c| *c == '-').count() == 2 {
-            if let Some(year) = trimmed.get(0..4) {
-                if year.parse::<u32>().is_ok() {
-                    return Self::Date;
-                }
-            }
+        if trimmed.len() == 10
+            && trimmed.chars().filter(|c| *c == '-').count() == 2
+            && let Some(year) = trimmed.get(0..4)
+            && year.parse::<u32>().is_ok()
+        {
+            return Self::Date;
         }
 
         // Check for timestamp pattern (contains 'T' or date-like with time)

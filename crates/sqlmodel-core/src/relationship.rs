@@ -536,19 +536,19 @@ pub fn validate_back_populates<Source: crate::Model, Target: crate::Model>(
     })?;
 
     // Validate that target points back to source
-    if let Some(target_back) = target_rel.back_populates {
-        if target_back != source_field {
-            return Err(format!(
-                "{}.{} has back_populates='{}' but {}.{} has back_populates='{}' (expected '{}')",
-                Source::TABLE_NAME,
-                source_field,
-                back_field,
-                Target::TABLE_NAME,
-                back_field,
-                target_back,
-                source_field
-            ));
-        }
+    if let Some(target_back) = target_rel.back_populates
+        && target_back != source_field
+    {
+        return Err(format!(
+            "{}.{} has back_populates='{}' but {}.{} has back_populates='{}' (expected '{}')",
+            Source::TABLE_NAME,
+            source_field,
+            back_field,
+            Target::TABLE_NAME,
+            back_field,
+            target_back,
+            source_field
+        ));
     }
 
     Ok(())

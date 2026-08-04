@@ -739,12 +739,12 @@ fn generate_is_new(model: &ModelDef) -> proc_macro2::TokenStream {
     }
 
     // Otherwise, try "id" field if it exists and is Option<T>
-    if let Some(id_field) = model.fields.iter().find(|f| f.name == "id") {
-        if parse::is_option_type(&id_field.ty) {
-            return quote::quote! {
-                self.id.is_none()
-            };
-        }
+    if let Some(id_field) = model.fields.iter().find(|f| f.name == "id")
+        && parse::is_option_type(&id_field.ty)
+    {
+        return quote::quote! {
+            self.id.is_none()
+        };
     }
 
     // Default: cannot determine, always return true
@@ -1176,7 +1176,7 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
 /// - `#[validate(pattern = "regex")]` - Regex pattern for strings
 /// - `#[validate(email)]` - Email format validation
 /// - `#[validate(url)]` - URL format validation
-/// - `#[validate(required)]` - Mark an Option<T> field as required
+/// - `#[validate(required)]` - Mark an `Option<T>` field as required
 /// - `#[validate(custom = "fn_name")]` - Custom validation function
 ///
 /// # Example

@@ -14,7 +14,7 @@ use syn::{GenericArgument, PathArguments, Type};
 /// - Primitive types (i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool)
 /// - String types (String, &str, char)
 /// - Binary types (Vec<u8>)
-/// - Option<T> (unwraps to inner type)
+/// - `Option<T>` (unwraps to inner type)
 /// - Common library types (chrono, uuid, etc.) when detected
 pub fn infer_sql_type(ty: &Type) -> TokenStream {
     // First, unwrap Option<T> to get the inner type
@@ -110,56 +110,48 @@ pub fn parse_sql_type_attr(sql_type: &str) -> TokenStream {
     let trimmed = sql_type_upper.trim();
 
     // Handle parameterized types first
-    if let Some(rest) = trimmed.strip_prefix("VARCHAR(") {
-        if let Some(len_str) = rest.strip_suffix(')') {
-            if let Ok(len) = len_str.trim().parse::<u32>() {
-                return quote! { sqlmodel_core::SqlType::VarChar(#len) };
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("VARCHAR(")
+        && let Some(len_str) = rest.strip_suffix(')')
+        && let Ok(len) = len_str.trim().parse::<u32>()
+    {
+        return quote! { sqlmodel_core::SqlType::VarChar(#len) };
     }
 
-    if let Some(rest) = trimmed.strip_prefix("CHAR(") {
-        if let Some(len_str) = rest.strip_suffix(')') {
-            if let Ok(len) = len_str.trim().parse::<u32>() {
-                return quote! { sqlmodel_core::SqlType::Char(#len) };
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("CHAR(")
+        && let Some(len_str) = rest.strip_suffix(')')
+        && let Ok(len) = len_str.trim().parse::<u32>()
+    {
+        return quote! { sqlmodel_core::SqlType::Char(#len) };
     }
 
-    if let Some(rest) = trimmed.strip_prefix("NUMERIC(") {
-        if let Some(params_str) = rest.strip_suffix(')') {
-            if let Some((p_str, s_str)) = params_str.split_once(',') {
-                if let (Ok(p), Ok(s)) = (p_str.trim().parse::<u8>(), s_str.trim().parse::<u8>()) {
-                    return quote! { sqlmodel_core::SqlType::Numeric { precision: #p, scale: #s } };
-                }
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("NUMERIC(")
+        && let Some(params_str) = rest.strip_suffix(')')
+        && let Some((p_str, s_str)) = params_str.split_once(',')
+        && let (Ok(p), Ok(s)) = (p_str.trim().parse::<u8>(), s_str.trim().parse::<u8>())
+    {
+        return quote! { sqlmodel_core::SqlType::Numeric { precision: #p, scale: #s } };
     }
 
-    if let Some(rest) = trimmed.strip_prefix("DECIMAL(") {
-        if let Some(params_str) = rest.strip_suffix(')') {
-            if let Some((p_str, s_str)) = params_str.split_once(',') {
-                if let (Ok(p), Ok(s)) = (p_str.trim().parse::<u8>(), s_str.trim().parse::<u8>()) {
-                    return quote! { sqlmodel_core::SqlType::Decimal { precision: #p, scale: #s } };
-                }
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("DECIMAL(")
+        && let Some(params_str) = rest.strip_suffix(')')
+        && let Some((p_str, s_str)) = params_str.split_once(',')
+        && let (Ok(p), Ok(s)) = (p_str.trim().parse::<u8>(), s_str.trim().parse::<u8>())
+    {
+        return quote! { sqlmodel_core::SqlType::Decimal { precision: #p, scale: #s } };
     }
 
-    if let Some(rest) = trimmed.strip_prefix("BINARY(") {
-        if let Some(len_str) = rest.strip_suffix(')') {
-            if let Ok(len) = len_str.trim().parse::<u32>() {
-                return quote! { sqlmodel_core::SqlType::Binary(#len) };
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("BINARY(")
+        && let Some(len_str) = rest.strip_suffix(')')
+        && let Ok(len) = len_str.trim().parse::<u32>()
+    {
+        return quote! { sqlmodel_core::SqlType::Binary(#len) };
     }
 
-    if let Some(rest) = trimmed.strip_prefix("VARBINARY(") {
-        if let Some(len_str) = rest.strip_suffix(')') {
-            if let Ok(len) = len_str.trim().parse::<u32>() {
-                return quote! { sqlmodel_core::SqlType::VarBinary(#len) };
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("VARBINARY(")
+        && let Some(len_str) = rest.strip_suffix(')')
+        && let Ok(len) = len_str.trim().parse::<u32>()
+    {
+        return quote! { sqlmodel_core::SqlType::VarBinary(#len) };
     }
 
     // Handle simple type names
@@ -217,18 +209,15 @@ pub fn parse_sql_type_attr(sql_type: &str) -> TokenStream {
     }
 }
 
-/// Unwrap Option<T> to get the inner type, or return the original type.
+/// Unwrap `Option<T>` to get the inner type, or return the original type.
 fn unwrap_option_type(ty: &Type) -> &Type {
-    if let Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            if segment.ident == "Option" {
-                if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(GenericArgument::Type(inner)) = args.args.first() {
-                        return inner;
-                    }
-                }
-            }
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+        && segment.ident == "Option"
+        && let PathArguments::AngleBracketed(args) = &segment.arguments
+        && let Some(GenericArgument::Type(inner)) = args.args.first()
+    {
+        return inner;
     }
     ty
 }

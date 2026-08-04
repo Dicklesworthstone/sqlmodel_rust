@@ -103,13 +103,14 @@ fn validate_table_name(table_name: &str, span: Span, errors: &mut Vec<Error>) {
     }
 
     // Check it starts with a letter or underscore
-    if let Some(first) = table_name.chars().next() {
-        if !first.is_alphabetic() && first != '_' {
-            errors.push(Error::new(
-                span,
-                format!("table name must start with a letter or underscore, got '{first}'"),
-            ));
-        }
+    if let Some(first) = table_name.chars().next()
+        && !first.is_alphabetic()
+        && first != '_'
+    {
+        errors.push(Error::new(
+            span,
+            format!("table name must start with a letter or underscore, got '{first}'"),
+        ));
     }
 }
 
@@ -210,20 +211,16 @@ fn validate_skip_conflicts(field: &FieldDef, errors: &mut Vec<Error>) {
     }
 }
 
-/// Check if a type is Option<Option<T>> (nested Option).
+/// Check if a type is `Option<Option<T>>` (nested Option).
 fn is_nested_option(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            if segment.ident == "Option" {
-                if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(GenericArgument::Type(Type::Path(inner_path))) = args.args.first() {
-                        if let Some(inner_seg) = inner_path.path.segments.last() {
-                            return inner_seg.ident == "Option";
-                        }
-                    }
-                }
-            }
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+        && segment.ident == "Option"
+        && let PathArguments::AngleBracketed(args) = &segment.arguments
+        && let Some(GenericArgument::Type(Type::Path(inner_path))) = args.args.first()
+        && let Some(inner_seg) = inner_path.path.segments.last()
+    {
+        return inner_seg.ident == "Option";
     }
     false
 }

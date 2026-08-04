@@ -162,7 +162,7 @@ pub fn is_valid_credit_card(value: &str) -> bool {
         // Count from right: rightmost is position 1 (odd)
         // We double every second digit starting from the second-to-last
         let position_from_right = len - i;
-        let is_double_position = position_from_right % 2 == 0;
+        let is_double_position = position_from_right.is_multiple_of(2);
 
         let value = if is_double_position {
             let doubled = digit * 2;
@@ -174,7 +174,7 @@ pub fn is_valid_credit_card(value: &str) -> bool {
         sum += value;
     }
 
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 // ============================================================================
@@ -343,11 +343,11 @@ impl<T: DeserializeOwned> ModelValidate for T {
         };
 
         // Apply update values if provided
-        if let Some(update) = options.update {
-            if let serde_json::Value::Object(ref mut map) = json_value {
-                for (key, value) in update {
-                    map.insert(key, value);
-                }
+        if let Some(update) = options.update
+            && let serde_json::Value::Object(ref mut map) = json_value
+        {
+            for (key, value) in update {
+                map.insert(key, value);
             }
         }
 
@@ -851,11 +851,11 @@ pub trait SqlModelValidate: Model + DeserializeOwned + Sized {
         apply_validation_aliases(&mut json_value, Self::fields());
 
         // Apply update values if provided
-        if let Some(update) = options.update {
-            if let serde_json::Value::Object(ref mut map) = json_value {
-                for (key, value) in update {
-                    map.insert(key, value);
-                }
+        if let Some(update) = options.update
+            && let serde_json::Value::Object(ref mut map) = json_value
+        {
+            for (key, value) in update {
+                map.insert(key, value);
             }
         }
 
@@ -902,11 +902,11 @@ pub trait SqlModelValidate: Model + DeserializeOwned + Sized {
 
         apply_validation_aliases(&mut json_value, Self::fields());
 
-        if let Some(update) = options.update {
-            if let serde_json::Value::Object(ref mut map) = json_value {
-                for (key, value) in update {
-                    map.insert(key, value);
-                }
+        if let Some(update) = options.update
+            && let serde_json::Value::Object(ref mut map) = json_value
+        {
+            for (key, value) in update {
+                map.insert(key, value);
             }
         }
 
@@ -1006,16 +1006,15 @@ pub trait SqlModelDump: Model + serde::Serialize {
             // Exclude fields with default values if requested
             if options.exclude_defaults {
                 for field in Self::fields() {
-                    if let Some(default_json) = field.default_json {
-                        if let Some(current_value) = map.get(field.name) {
-                            // Parse the default JSON and compare
-                            if let Ok(default_value) =
-                                serde_json::from_str::<serde_json::Value>(default_json)
-                            {
-                                if current_value == &default_value {
-                                    map.remove(field.name);
-                                }
-                            }
+                    if let Some(default_json) = field.default_json
+                        && let Some(current_value) = map.get(field.name)
+                    {
+                        // Parse the default JSON and compare
+                        if let Ok(default_value) =
+                            serde_json::from_str::<serde_json::Value>(default_json)
+                            && current_value == &default_value
+                        {
+                            map.remove(field.name);
                         }
                     }
                 }
@@ -1274,10 +1273,10 @@ pub trait SqlModelUpdate: Model + serde::Serialize + DeserializeOwned {
                 }
 
                 // Check if field is allowed by update_fields option
-                if let Some(ref allowed) = options.update_fields {
-                    if !allowed.contains(&key) {
-                        continue; // Skip fields not in update_fields
-                    }
+                if let Some(ref allowed) = options.update_fields
+                    && !allowed.contains(&key)
+                {
+                    continue; // Skip fields not in update_fields
                 }
 
                 // Update the field

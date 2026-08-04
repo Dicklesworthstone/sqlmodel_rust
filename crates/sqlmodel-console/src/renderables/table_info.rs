@@ -272,29 +272,29 @@ impl TableInfo {
         lines.push("=".repeat(lines[0].len().min(60)));
 
         // Statistics section
-        if let Some(ref stats) = self.stats {
-            if !stats.is_empty() {
-                let mut stats_parts = Vec::new();
-                if let Some(rows) = stats.row_count {
-                    stats_parts.push(format!("Rows: {}", format_number(rows)));
-                }
-                if let Some(size) = stats.size_bytes {
-                    stats_parts.push(format!("Size: {}", format_bytes(size)));
-                }
-                if let Some(idx_size) = stats.index_size_bytes {
-                    stats_parts.push(format!("Index Size: {}", format_bytes(idx_size)));
-                }
-                if !stats_parts.is_empty() {
-                    lines.push(stats_parts.join(" | "));
-                }
-                if let Some(ref analyzed) = stats.last_analyzed {
-                    lines.push(format!("Last Analyzed: {}", analyzed));
-                }
-                if let Some(ref modified) = stats.last_modified {
-                    lines.push(format!("Last Modified: {}", modified));
-                }
-                lines.push(String::new());
+        if let Some(ref stats) = self.stats
+            && !stats.is_empty()
+        {
+            let mut stats_parts = Vec::new();
+            if let Some(rows) = stats.row_count {
+                stats_parts.push(format!("Rows: {}", format_number(rows)));
             }
+            if let Some(size) = stats.size_bytes {
+                stats_parts.push(format!("Size: {}", format_bytes(size)));
+            }
+            if let Some(idx_size) = stats.index_size_bytes {
+                stats_parts.push(format!("Index Size: {}", format_bytes(idx_size)));
+            }
+            if !stats_parts.is_empty() {
+                lines.push(stats_parts.join(" | "));
+            }
+            if let Some(ref analyzed) = stats.last_analyzed {
+                lines.push(format!("Last Analyzed: {}", analyzed));
+            }
+            if let Some(ref modified) = stats.last_modified {
+                lines.push(format!("Last Modified: {}", modified));
+            }
+            lines.push(String::new());
         }
 
         // Columns section
@@ -435,38 +435,38 @@ impl TableInfo {
         lines.push(format!("{dim}├{}┤{reset}", "─".repeat(width - 2)));
 
         // Statistics section
-        if let Some(ref stats) = self.stats {
-            if !stats.is_empty() {
-                let mut stats_parts = Vec::new();
-                if let Some(rows) = stats.row_count {
-                    stats_parts.push(format!("{info_color}Rows:{reset} {}", format_number(rows)));
-                }
-                if let Some(size) = stats.size_bytes {
-                    stats_parts.push(format!("{info_color}Size:{reset} {}", format_bytes(size)));
-                }
-                if let Some(idx_size) = stats.index_size_bytes {
-                    stats_parts.push(format!(
-                        "{info_color}Idx:{reset} {}",
-                        format_bytes(idx_size)
-                    ));
-                }
-                if !stats_parts.is_empty() {
-                    let stats_line = stats_parts.join(" {dim}│{reset} ");
-                    lines.push(format!(
-                        "{dim}│{reset} {:<width$} {dim}│{reset}",
-                        stats_line,
-                        width = width - 4
-                    ));
-                }
-                if let Some(ref analyzed) = stats.last_analyzed {
-                    lines.push(format!(
-                        "{dim}│{reset} {info_color}Analyzed:{reset} {:<width$} {dim}│{reset}",
-                        analyzed,
-                        width = width - 14
-                    ));
-                }
-                lines.push(format!("{dim}├{}┤{reset}", "─".repeat(width - 2)));
+        if let Some(ref stats) = self.stats
+            && !stats.is_empty()
+        {
+            let mut stats_parts = Vec::new();
+            if let Some(rows) = stats.row_count {
+                stats_parts.push(format!("{info_color}Rows:{reset} {}", format_number(rows)));
             }
+            if let Some(size) = stats.size_bytes {
+                stats_parts.push(format!("{info_color}Size:{reset} {}", format_bytes(size)));
+            }
+            if let Some(idx_size) = stats.index_size_bytes {
+                stats_parts.push(format!(
+                    "{info_color}Idx:{reset} {}",
+                    format_bytes(idx_size)
+                ));
+            }
+            if !stats_parts.is_empty() {
+                let stats_line = stats_parts.join(" {dim}│{reset} ");
+                lines.push(format!(
+                    "{dim}│{reset} {:<width$} {dim}│{reset}",
+                    stats_line,
+                    width = width - 4
+                ));
+            }
+            if let Some(ref analyzed) = stats.last_analyzed {
+                lines.push(format!(
+                    "{dim}│{reset} {info_color}Analyzed:{reset} {:<width$} {dim}│{reset}",
+                    analyzed,
+                    width = width - 14
+                ));
+            }
+            lines.push(format!("{dim}├{}┤{reset}", "─".repeat(width - 2)));
         }
 
         // Columns header
@@ -711,7 +711,7 @@ pub fn format_number(n: u64) -> String {
     let mut result = String::new();
 
     for (i, &c) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(c);

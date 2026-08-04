@@ -665,15 +665,15 @@ impl FieldInfo {
         if input == self.name {
             return true;
         }
-        if let Some(alias) = self.alias {
-            if input == alias {
-                return true;
-            }
+        if let Some(alias) = self.alias
+            && input == alias
+        {
+            return true;
         }
-        if let Some(val_alias) = self.validation_alias {
-            if input == val_alias {
-                return true;
-            }
+        if let Some(val_alias) = self.validation_alias
+            && input == val_alias
+        {
+            return true;
         }
         false
     }

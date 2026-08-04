@@ -389,16 +389,16 @@ impl FieldDef {
         let field_name = self.name.to_string();
         let mut names = vec![field_name];
 
-        if let Some(ref alias) = self.alias {
-            if !names.iter().any(|n| n == alias) {
-                names.push(alias.clone());
-            }
+        if let Some(ref alias) = self.alias
+            && !names.iter().any(|n| n == alias)
+        {
+            names.push(alias.clone());
         }
 
-        if let Some(ref val_alias) = self.validation_alias {
-            if !names.iter().any(|n| n == val_alias) {
-                names.push(val_alias.clone());
-            }
+        if let Some(ref val_alias) = self.validation_alias
+            && !names.iter().any(|n| n == val_alias)
+        {
+            names.push(val_alias.clone());
         }
 
         names
@@ -802,10 +802,10 @@ fn pluralize(word: &str) -> String {
     // Words ending in 'y' preceded by consonant -> change 'y' to 'ies'
     if let Some(stripped) = word.strip_suffix('y') {
         let chars: Vec<char> = stripped.chars().collect();
-        if let Some(&second_last) = chars.last() {
-            if !"aeiou".contains(second_last) {
-                return format!("{stripped}ies");
-            }
+        if let Some(&second_last) = chars.last()
+            && !"aeiou".contains(second_last)
+        {
+            return format!("{stripped}ies");
         }
         return format!("{word}s");
     }
@@ -1814,16 +1814,16 @@ fn validate_field_attrs(attrs: &FieldAttrs, field_name: &Ident, field_type: &Typ
     // We allow it for flexibility, but the generate phase may warn
 
     // Validate decimal precision constraints
-    if let (Some(max_digits), Some(decimal_places)) = (attrs.max_digits, attrs.decimal_places) {
-        if decimal_places > max_digits {
-            return Err(Error::new_spanned(
-                field_name,
-                format!(
-                    "decimal_places ({}) cannot be greater than max_digits ({})",
-                    decimal_places, max_digits
-                ),
-            ));
-        }
+    if let (Some(max_digits), Some(decimal_places)) = (attrs.max_digits, attrs.decimal_places)
+        && decimal_places > max_digits
+    {
+        return Err(Error::new_spanned(
+            field_name,
+            format!(
+                "decimal_places ({}) cannot be greater than max_digits ({})",
+                decimal_places, max_digits
+            ),
+        ));
     }
 
     // Warn if max_digits/decimal_places used without a Decimal type
@@ -1896,10 +1896,10 @@ fn validate_field_attrs(attrs: &FieldAttrs, field_name: &Ident, field_type: &Typ
 
 /// Check if a type is `Option<T>`.
 pub fn is_option_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            return segment.ident == "Option";
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        return segment.ident == "Option";
     }
     false
 }

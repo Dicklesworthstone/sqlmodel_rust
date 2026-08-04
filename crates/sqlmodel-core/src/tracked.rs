@@ -104,16 +104,13 @@ impl<T: Model> TrackedModel<T> {
 
         if exclude_defaults {
             for field in fields {
-                if let Some(default_json) = field.default_json {
-                    if let Some(current_value) = map.get(field.name) {
-                        if let Ok(default_value) =
-                            serde_json::from_str::<serde_json::Value>(default_json)
-                        {
-                            if current_value == &default_value {
-                                map.remove(field.name);
-                            }
-                        }
-                    }
+                if let Some(default_json) = field.default_json
+                    && let Some(current_value) = map.get(field.name)
+                    && let Ok(default_value) =
+                        serde_json::from_str::<serde_json::Value>(default_json)
+                    && current_value == &default_value
+                {
+                    map.remove(field.name);
                 }
             }
         }

@@ -268,10 +268,11 @@ impl OperationProgress {
             parts.push(format!("{rate:.1}{unit_label}/s"));
         }
 
-        if self.show_eta && !self.is_complete() {
-            if let Some(eta) = self.eta_secs() {
-                parts.push(format!("ETA: {}", format_duration(eta)));
-            }
+        if self.show_eta
+            && !self.is_complete()
+            && let Some(eta) = self.eta_secs()
+        {
+            parts.push(format!("ETA: {}", format_duration(eta)));
         }
 
         parts.join(" ")
@@ -319,10 +320,11 @@ impl OperationProgress {
             parts.push(format!("{rate:.1}{unit_label}/s"));
         }
 
-        if self.show_eta && !self.is_complete() {
-            if let Some(eta) = self.eta_secs() {
-                parts.push(format!("ETA: {}", format_duration(eta)));
-            }
+        if self.show_eta
+            && !self.is_complete()
+            && let Some(eta) = self.eta_secs()
+        {
+            parts.push(format!("ETA: {}", format_duration(eta)));
         }
 
         parts.join(" ")
