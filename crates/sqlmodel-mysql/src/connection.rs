@@ -687,12 +687,11 @@ impl MySqlConnection {
                             self.status_flags = ok.status_flags;
                             self.warnings = ok.warnings;
                         }
-                    } else if payload[0] == 0xFE {
-                        if let Some(eof) = reader.parse_eof_packet() {
+                    } else if payload[0] == 0xFE
+                        && let Some(eof) = reader.parse_eof_packet() {
                             self.status_flags = eof.status_flags;
                             self.warnings = eof.warnings;
                         }
-                    }
                     break;
                 }
                 PacketType::Error => {
@@ -772,12 +771,11 @@ impl MySqlConnection {
                             self.status_flags = ok.status_flags;
                             self.warnings = ok.warnings;
                         }
-                    } else if payload[0] == 0xFE {
-                        if let Some(eof) = reader.parse_eof_packet() {
+                    } else if payload[0] == 0xFE
+                        && let Some(eof) = reader.parse_eof_packet() {
                             self.status_flags = eof.status_flags;
                             self.warnings = eof.warnings;
                         }
-                    }
                     break;
                 }
                 PacketType::Error => {

@@ -803,14 +803,13 @@ impl SqliteConnection {
 
 impl Drop for SqliteConnection {
     fn drop(&mut self) {
-        if let Ok(inner) = self.inner.lock() {
-            if !inner.db.is_null() {
+        if let Ok(inner) = self.inner.lock()
+            && !inner.db.is_null() {
                 // SAFETY: db is valid
                 unsafe {
                     ffi::sqlite3_close_v2(inner.db);
                 }
             }
-        }
     }
 }
 
@@ -1188,9 +1187,9 @@ fn percent_decode_uri_component(component: &str) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2)) {
-                if let (Some(high), Some(low)) = (hex_nibble(*high), hex_nibble(*low)) {
+        if bytes[index] == b'%'
+            && let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2))
+                && let (Some(high), Some(low)) = (hex_nibble(*high), hex_nibble(*low)) {
                     let byte = (high << 4) | low;
                     if byte == 0 {
                         // SQLite truncates the current URI component at an
@@ -1201,8 +1200,6 @@ fn percent_decode_uri_component(component: &str) -> Vec<u8> {
                     index += 3;
                     continue;
                 }
-            }
-        }
 
         decoded.push(bytes[index]);
         index += 1;

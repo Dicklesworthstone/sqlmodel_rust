@@ -453,12 +453,11 @@ fn decode_text_time(original: &str) -> Value {
 
     let mut bytes = trimmed.as_bytes();
     let mut negative = false;
-    if let Some((&first, rest)) = bytes.split_first() {
-        if first == b'-' {
+    if let Some((&first, rest)) = bytes.split_first()
+        && first == b'-' {
             negative = true;
             bytes = rest;
         }
-    }
 
     // Support both "HH:MM:SS[.ffffff]" and "D HH:MM:SS[.ffffff]".
     let (days_part, time_part) = match bytes.iter().position(|&c| c == b' ') {

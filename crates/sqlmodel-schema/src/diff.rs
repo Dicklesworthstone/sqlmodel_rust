@@ -959,8 +959,8 @@ fn diff_foreign_keys(
 
     // Changed foreign keys (compare references)
     for (col, expected_fk) in &expected_map {
-        if let Some(current_fk) = current_map.get(col) {
-            if !fk_matches(current_fk, expected_fk) {
+        if let Some(current_fk) = current_map.get(col)
+            && !fk_matches(current_fk, expected_fk) {
                 // Drop and recreate
                 let name = fk_effective_name(table, current_fk);
                 diff.add_op(SchemaOperation::DropForeignKey {
@@ -974,7 +974,6 @@ fn diff_foreign_keys(
                     table_info: Some(current_table.clone()),
                 });
             }
-        }
     }
 }
 
@@ -1068,9 +1067,9 @@ fn diff_indexes(table: &str, current: &[IndexInfo], expected: &[IndexInfo], diff
 
     // Changed indexes (check columns and unique flag)
     for (name, expected_idx) in &expected_map {
-        if let Some(current_idx) = current_map.get(name) {
-            if current_idx.columns != expected_idx.columns
-                || current_idx.unique != expected_idx.unique
+        if let Some(current_idx) = current_map.get(name)
+            && (current_idx.columns != expected_idx.columns
+                || current_idx.unique != expected_idx.unique)
             {
                 // Drop and recreate
                 diff.add_op(SchemaOperation::DropIndex {
@@ -1082,7 +1081,6 @@ fn diff_indexes(table: &str, current: &[IndexInfo], expected: &[IndexInfo], diff
                     index: (**expected_idx).clone(),
                 });
             }
-        }
     }
 }
 

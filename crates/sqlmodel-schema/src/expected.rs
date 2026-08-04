@@ -87,8 +87,8 @@ pub fn table_schema_from_fields(
         });
 
         // Extract foreign key if present
-        if let Some(fk_ref) = field.foreign_key {
-            if let Some((ref_table, ref_col)) = parse_fk_reference(fk_ref) {
+        if let Some(fk_ref) = field.foreign_key
+            && let Some((ref_table, ref_col)) = parse_fk_reference(fk_ref) {
                 foreign_keys.push(ForeignKeyInfo {
                     name: Some(format!("fk_{}_{}", table_name, field.column_name)),
                     column: field.column_name.to_string(),
@@ -98,7 +98,6 @@ pub fn table_schema_from_fields(
                     on_update: field.on_update.map(|a| a.as_sql().to_string()),
                 });
             }
-        }
 
         // Extract unique constraint if present (and not part of PK)
         if field.unique && !field.primary_key {

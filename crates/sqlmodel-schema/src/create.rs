@@ -122,8 +122,8 @@ impl<M: Model> CreateTable<M> {
         }
 
         // For joined table inheritance child models, add FK to parent table
-        if inheritance.strategy == InheritanceStrategy::Joined {
-            if let Some(parent_table) = inheritance.parent {
+        if inheritance.strategy == InheritanceStrategy::Joined
+            && let Some(parent_table) = inheritance.parent {
                 // In joined inheritance, the child's primary key columns are also a foreign key
                 // to the parent table's primary key columns (same column names).
                 let pk_cols = M::PRIMARY_KEY;
@@ -142,7 +142,6 @@ impl<M: Model> CreateTable<M> {
                     constraints.push(fk_sql);
                 }
             }
-        }
 
         // Add primary key constraint (unless embedded for SQLite-style auto-increment single PK).
         let pk_cols = M::PRIMARY_KEY;

@@ -535,11 +535,10 @@ fn build_insert_sql_for_table_with_columns(
         .iter()
         .map(|(name, value)| {
             let field = fields.iter().find(|f| f.column_name == *name);
-            if let Some(f) = field {
-                if f.auto_increment && matches!(value, Value::Null) {
+            if let Some(f) = field
+                && f.auto_increment && matches!(value, Value::Null) {
                     return (*name, Value::Default);
                 }
-            }
             (*name, value.clone())
         })
         .collect();
@@ -891,11 +890,10 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             .iter()
             .map(|(name, value)| {
                 let field = fields.iter().find(|f| f.column_name == *name);
-                if let Some(f) = field {
-                    if f.auto_increment && matches!(value, Value::Null) {
+                if let Some(f) = field
+                    && f.auto_increment && matches!(value, Value::Null) {
                         return (*name, Value::Default);
                     }
-                }
                 (*name, value.clone())
             })
             .collect();
@@ -1596,11 +1594,10 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
                     .map_or(Value::Null, |(_, v)| v.clone());
 
                 // Map Null auto-increment fields to DEFAULT
-                if let Some(f) = fields.iter().find(|f| f.column_name == *col) {
-                    if f.auto_increment && matches!(val, Value::Null) {
+                if let Some(f) = fields.iter().find(|f| f.column_name == *col)
+                    && f.auto_increment && matches!(val, Value::Null) {
                         val = Value::Default;
                     }
-                }
 
                 if matches!(val, Value::Default) {
                     continue;
@@ -1686,11 +1683,10 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
 
                     // Map Null auto-increment fields to DEFAULT
                     let field = fields.iter().find(|f| f.column_name == *col);
-                    if let Some(f) = field {
-                        if f.auto_increment && matches!(val, Value::Null) {
+                    if let Some(f) = field
+                        && f.auto_increment && matches!(val, Value::Null) {
                             return Value::Default;
                         }
-                    }
                     val
                 })
                 .collect();
@@ -2402,11 +2398,10 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                 if pk_cols.contains(&name) {
                     continue;
                 }
-                if let Some(fields) = &self.set_fields {
-                    if !fields.contains(&name) {
+                if let Some(fields) = &self.set_fields
+                    && !fields.contains(&name) {
                         continue;
                     }
-                }
                 child_sets.push((name, value));
             }
             let (child_sql, child_params) =
@@ -2687,11 +2682,10 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                 if pk_cols.contains(&name) {
                     continue;
                 }
-                if let Some(fields) = &self.set_fields {
-                    if !fields.contains(&name) {
+                if let Some(fields) = &self.set_fields
+                    && !fields.contains(&name) {
                         continue;
                     }
-                }
                 child_sets.push((name, value));
             }
             let (mut child_sql, child_params) =

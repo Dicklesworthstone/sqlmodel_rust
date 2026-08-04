@@ -607,7 +607,7 @@ fn utf8_error(_e: std::str::Utf8Error) -> Error {
 /// Decode hex string to bytes.
 fn decode_hex(s: &str) -> Result<Vec<u8>, Error> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(type_error("bytea hex", s));
     }
 
