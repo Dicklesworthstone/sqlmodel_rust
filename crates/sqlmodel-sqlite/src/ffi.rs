@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn test_version() {
         let v = version();
-        assert!(!v.is_empty());
+        assert_ne!(v, "");
         // SQLite version should start with 3.
         assert!(v.starts_with('3'));
     }

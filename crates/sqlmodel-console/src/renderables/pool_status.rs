@@ -756,7 +756,7 @@ mod tests {
         let display = PoolStatusDisplay::new(5, 3, 20, 2, 0).width(1);
         let output = display.render_styled();
 
-        assert!(!output.is_empty());
+        assert_ne!(output, "");
         assert!(output.contains("┌"));
         assert!(output.contains("┘"));
     }

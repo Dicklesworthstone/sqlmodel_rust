@@ -5248,7 +5248,7 @@ mod tests {
 
             // No modifications yet
             let modified = session.modified_attributes(&team);
-            assert!(modified.is_empty());
+            assert_eq!(modified.len(), 0);
 
             // Modify and mark dirty
             let mut modified_team = team.clone();
@@ -5273,7 +5273,7 @@ mod tests {
         };
 
         let modified = session.modified_attributes(&team);
-        assert!(modified.is_empty());
+        assert_eq!(modified.len(), 0);
     }
 
     #[test]
@@ -5290,7 +5290,7 @@ mod tests {
 
         // New objects don't have original values to compare
         let modified = session.modified_attributes(&team);
-        assert!(modified.is_empty());
+        assert_eq!(modified.len(), 0);
     }
 
     // ==================== Expire Tests ====================

@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_default_relationships_is_empty() {
-        assert!(TestModel::RELATIONSHIPS.is_empty());
+        assert_eq!(TestModel::RELATIONSHIPS.len(), 0);
     }
 
     // Test default ModelEvents implementation

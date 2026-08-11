@@ -1025,7 +1025,7 @@ mod tests {
         // Empty bytes
         let value: Value = Vec::<u8>::new().into();
         let recovered: Vec<u8> = value.try_into().unwrap();
-        assert!(recovered.is_empty());
+        assert_eq!(recovered, [] as [u8; 0]);
 
         // Max values
         let value: Value = i64::MAX.into();
@@ -1067,7 +1067,7 @@ mod tests {
         let v: Value = Vec::<String>::new().into();
         assert_eq!(v, Value::Array(vec![]));
         let recovered: Vec<String> = v.try_into().unwrap();
-        assert!(recovered.is_empty());
+        assert_eq!(recovered, [] as [String; 0]);
     }
 
     #[test]

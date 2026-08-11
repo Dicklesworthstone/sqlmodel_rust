@@ -287,7 +287,7 @@ fn e2e_query_results_parseable() {
     let plain = results.render_plain();
 
     // Output should be valid UTF-8 text
-    assert!(!plain.is_empty());
+    assert_ne!(plain, "");
 
     // Lines should be reasonably sized
     for line in plain.lines() {

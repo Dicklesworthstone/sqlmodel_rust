@@ -3419,7 +3419,7 @@ mod tests {
         let (sql, params) = InsertBuilder::new(&model).build_with_dialect(Dialect::Sqlite);
 
         assert_eq!(sql, "INSERT INTO only_ids DEFAULT VALUES");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -3482,8 +3482,8 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].0, "INSERT INTO only_ids DEFAULT VALUES");
         assert_eq!(batches[1].0, "INSERT INTO only_ids DEFAULT VALUES");
-        assert!(batches[0].1.is_empty());
-        assert!(batches[1].1.is_empty());
+        assert_eq!(batches[0].1, [] as [sqlmodel_core::Value; 0]);
+        assert_eq!(batches[1].1, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]

@@ -1628,7 +1628,7 @@ mod tests {
         let rel: RelatedMany<Team> = RelatedMany::new("team_id");
         let json = serde_json::to_value(&rel).unwrap();
         assert!(json.is_array());
-        assert!(json.as_array().unwrap().is_empty());
+        assert_eq!(json.as_array().unwrap().len(), 0);
     }
 
     #[test]

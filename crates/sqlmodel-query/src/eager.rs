@@ -338,7 +338,7 @@ mod tests {
         let (sql, params) = build_join_clause("heroes", &rel, 0);
 
         assert_eq!(sql, " LEFT JOIN teams ON heroes.team_id = teams.id");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         let (sql, params) = build_join_clause("teams", &rel, 0);
 
         assert_eq!(sql, " LEFT JOIN heroes ON heroes.team_id = teams.id");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
 
         assert!(sql.contains("LEFT JOIN hero_powers"));
         assert!(sql.contains("LEFT JOIN powers"));
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]

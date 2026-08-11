@@ -2550,7 +2550,7 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build(&mut params, 0);
         assert_eq!(sql, "\"name\"");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -2559,7 +2559,7 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build(&mut params, 0);
         assert_eq!(sql, "\"users\".\"name\"");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     // ==================== Literal Tests ====================
@@ -2989,7 +2989,7 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build(&mut params, 0);
         assert_eq!(sql, "\"id\" = $1");
-        assert!(params.is_empty()); // Placeholder doesn't add to params
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]); // Placeholder doesn't add to params
     }
 
     // ==================== Subquery Tests ====================
@@ -3386,7 +3386,7 @@ mod tests {
             sql,
             "EXISTS (SELECT 1 FROM orders WHERE orders.customer_id = customers.id)"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -3402,7 +3402,7 @@ mod tests {
             sql,
             "NOT EXISTS (SELECT 1 FROM orders WHERE orders.customer_id = customers.id)"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -3561,7 +3561,7 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build_with_dialect(Dialect::Postgres, &mut params, 0);
         assert_eq!(sql, "\"data\" -> 'name'");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -3570,7 +3570,7 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
         assert_eq!(sql, "JSON_EXTRACT(`data`, '$.name')");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -3579,7 +3579,7 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build_with_dialect(Dialect::Sqlite, &mut params, 0);
         assert_eq!(sql, "json_extract(\"data\", '$.name')");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]

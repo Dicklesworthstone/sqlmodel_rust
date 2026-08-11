@@ -644,7 +644,7 @@ mod tests {
         let ddl = SqliteDdlGenerator;
         let m = Migration::from_operations(&ops, &ddl, "Create heroes table");
 
-        assert!(!m.id.is_empty());
+        assert_ne!(m.id, "");
         assert_eq!(m.description, "Create heroes table");
         assert!(m.up.contains("CREATE TABLE"));
         assert!(m.up.contains("heroes"));

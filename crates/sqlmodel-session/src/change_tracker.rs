@@ -407,7 +407,7 @@ mod tests {
 
         assert!(tracker.has_snapshot(&key));
         let snapshot = tracker.get_snapshot(&key).unwrap();
-        assert!(!snapshot.data().is_empty());
+        assert_ne!(snapshot.data().len(), 0);
     }
 
     #[test]
@@ -499,7 +499,7 @@ mod tests {
         tracker.snapshot(key, &hero);
 
         let changed = tracker.changed_fields(&key, &hero);
-        assert!(changed.is_empty());
+        assert_eq!(changed.len(), 0);
     }
 
     #[test]

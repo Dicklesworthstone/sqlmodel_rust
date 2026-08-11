@@ -334,7 +334,7 @@ mod tests {
             sql,
             "(SELECT * FROM users WHERE role = 'admin') UNION (SELECT * FROM users WHERE role = 'manager')"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]

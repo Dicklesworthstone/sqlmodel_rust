@@ -207,7 +207,7 @@ fn e2e_error_output_parseable() {
     let plain = panel.render_plain();
 
     // Output should be parseable text
-    assert!(!plain.is_empty());
+    assert_ne!(plain, "");
     assert!(plain.lines().count() > 0);
 
     // Each line should be valid UTF-8 (implicit in Rust strings)

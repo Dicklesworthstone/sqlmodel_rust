@@ -363,7 +363,7 @@ mod tests {
             sql,
             "\"active_users\" AS (SELECT * FROM users WHERE active = true)"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
             sql,
             "\"user_totals\" (\"user_id\", \"total\") AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id)"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -430,7 +430,7 @@ mod tests {
             sql,
             "WITH \"active_users\" AS (SELECT * FROM users WHERE active = true) SELECT * FROM active_users"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]

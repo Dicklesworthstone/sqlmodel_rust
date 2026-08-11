@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn test_mysql_native_password_empty() {
         let result = mysql_native_password("", &[0; 20]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u8; 0]);
     }
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn test_caching_sha2_password_empty() {
         let result = caching_sha2_password("", &[0; 20]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u8; 0]);
     }
 
     #[test]

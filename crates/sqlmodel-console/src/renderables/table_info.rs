@@ -889,7 +889,7 @@ mod tests {
         let styled = info.render_styled();
         // Verify the box is roughly the right width
         let lines: Vec<&str> = styled.lines().collect();
-        assert!(!lines.is_empty());
+        assert_ne!(lines, [] as [&str; 0]);
     }
 
     #[test]

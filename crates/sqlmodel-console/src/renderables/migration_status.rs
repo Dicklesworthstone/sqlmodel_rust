@@ -801,7 +801,7 @@ mod tests {
 
         let styled = status.render_styled();
 
-        assert!(!styled.is_empty());
+        assert_ne!(styled, "");
         assert!(styled.contains('╭'));
         assert!(styled.contains('╯'));
     }

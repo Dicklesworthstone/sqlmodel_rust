@@ -589,7 +589,7 @@ mod tests {
 
         let mut reader = MessageReader::new();
         let first = reader.feed(left).unwrap();
-        assert!(first.is_empty());
+        assert_eq!(first.len(), 0);
 
         let second = reader.feed(right).unwrap();
         assert_eq!(second.len(), 1);

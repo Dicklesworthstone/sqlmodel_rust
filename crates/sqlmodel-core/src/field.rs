@@ -1342,7 +1342,7 @@ mod tests {
 
         // Default should be empty
         let field1 = FieldInfo::new("price", "price", SqlType::Integer);
-        assert!(field1.column_constraints.is_empty());
+        assert_eq!(field1.column_constraints, [] as [&str; 0]);
 
         // With constraints
         let field2 =

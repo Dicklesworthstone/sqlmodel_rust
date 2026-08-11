@@ -1542,7 +1542,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT * FROM heroes");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1649,7 +1649,7 @@ mod tests {
         let query = Select::<JoinedChild>::new();
         let (sql, params) = query.build();
 
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
         assert!(sql.starts_with("SELECT "));
         assert!(sql.contains("employees.id AS employees__id"));
         assert!(sql.contains("employees.department AS employees__department"));
@@ -1666,7 +1666,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT id, name, power FROM heroes");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1675,7 +1675,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT DISTINCT team_id FROM heroes");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1727,7 +1727,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT * FROM heroes ORDER BY \"name\" ASC");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1736,7 +1736,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT * FROM heroes ORDER BY \"created_at\" DESC");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1750,7 +1750,7 @@ mod tests {
             sql,
             "SELECT * FROM heroes ORDER BY \"team_id\" ASC, \"name\" ASC"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1759,7 +1759,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT * FROM heroes LIMIT 10");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1768,7 +1768,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT * FROM heroes OFFSET 20");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1777,7 +1777,7 @@ mod tests {
         let (sql, params) = query.build();
 
         assert_eq!(sql, "SELECT * FROM heroes LIMIT 10 OFFSET 20");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1791,7 +1791,7 @@ mod tests {
             sql,
             "SELECT team_id, COUNT(*) as count FROM heroes GROUP BY team_id"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -1805,7 +1805,7 @@ mod tests {
             sql,
             "SELECT team_id, role, COUNT(*) as count FROM heroes GROUP BY team_id, role"
         );
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
@@ -2035,7 +2035,7 @@ mod tests {
 
         // Should have join info
         assert_eq!(join_info.len(), 1);
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [sqlmodel_core::Value; 0]);
     }
 
     #[test]
