@@ -1,33 +1,24 @@
 //! FrankenSQLite connection implementing `sqlmodel_core::Connection`.
 //!
-//! Wraps `fsqlite::Connection` (which is `!Send` due to `Rc<RefCell<>>`) in
-//! `Arc<Mutex<>>` to satisfy the `Connection: Send + Sync` requirement.
-//! All operations execute synchronously under the mutex, matching the pattern
-//! used by `sqlmodel-sqlite` for its FFI-based wrapper.
+//! Wraps [`fsqlite::AsyncConnection`] in `Arc<Mutex<>>` so SQLModel can retain
+//! its synchronous adapter surface and transaction bookkeeping while the raw
+//! FrankenSQLite connection remains owned by a dedicated worker thread.
 //!
 //! # fsqlite 0.2 async bridge
 //!
 //! fsqlite 0.2 made every engine entry point `async fn` with `!Send` futures
-//! (the engine lives in `Rc<RefCell<>>`). This adapter stays synchronous: each
-//! connection owns a private current-thread [`asupersync::runtime::Runtime`]
-//! and drives every fsqlite future to completion inside a single blocking call
-//! while holding the connection mutex. The future is created, polled, and
-//! dropped on one thread, so the `Rc` never crosses a thread boundary.
-//! `Runtime::block_on` has no `Send` bound and saves/restores the ambient
-//! runtime handle, so nested use from inside a consumer's own `block_on` or
-//! worker thread is safe (probed by the `nested_block_on_*` tests).
+//! (the engine lives in `Rc<RefCell<>>`). [`fsqlite::AsyncConnection`] owns
+//! that engine and drives its futures on a dedicated large-stack worker. The
+//! adapter's synchronous methods exchange commands and results over channels,
+//! so engine futures never consume the caller's stack or cross thread
+//! boundaries.
 
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::result_large_err)]
-// fsqlite's statement futures are large (~19 KiB), but every one is driven to
-// completion immediately on the blocking thread's stack via `drive`/`block_on`;
-// they are never embedded in another future, so boxing would only add churn.
-#![allow(clippy::large_futures)]
 
 use crate::value::{sqlite_to_value, value_to_sqlite};
-use asupersync::runtime::{Runtime, RuntimeBuilder};
-use fsqlite::compat::{OpenFlags, open_with_flags};
+use fsqlite::compat::OpenFlags;
 use fsqlite_types::value::SqliteValue;
 use sqlmodel_core::{
     Connection, Cx, IsolationLevel, Outcome, PreparedStatement, Row, TransactionOps, Value,
@@ -46,33 +37,13 @@ enum ConnectionProfile {
 
 /// Inner state guarded by a mutex.
 struct FrankenInner {
-    /// The underlying frankensqlite connection (`!Send`, hence wrapped).
-    conn: fsqlite::Connection,
-    /// Private current-thread runtime that drives fsqlite's `!Send` futures
-    /// to completion inside a single blocking call (see the module docs).
-    runtime: Runtime,
+    /// Channel handle for the worker-owned FrankenSQLite connection.
+    conn: fsqlite::AsyncConnection,
     /// Whether we are currently inside a transaction.
     in_transaction: bool,
     /// The last inserted rowid (tracked manually since frankensqlite stubs it).
     last_insert_rowid: i64,
 }
-
-impl FrankenInner {
-    /// Drive a `!Send` fsqlite future to completion on the calling thread.
-    ///
-    /// The future is created, polled, and dropped entirely within this call
-    /// while the caller holds the connection mutex, so the engine's
-    /// `Rc<RefCell<>>` state never crosses a thread boundary.
-    fn drive<T>(&self, future: impl Future<Output = T>) -> T {
-        self.runtime.block_on(future)
-    }
-}
-
-// SAFETY: All access to `FrankenInner` goes through the `Mutex`, which
-// serializes access. The `Rc<RefCell<>>` inside `fsqlite::Connection` is
-// never shared across threads — the mutex ensures single-threaded access,
-// and `drive` completes and drops every fsqlite future on the locking thread.
-unsafe impl Send for FrankenInner {}
 
 /// A SQLite connection backed by FrankenSQLite (pure Rust).
 ///
@@ -84,10 +55,6 @@ pub struct FrankenConnection {
     path: String,
     profile: ConnectionProfile,
 }
-
-// SAFETY: All access goes through Arc<Mutex<>> — single-thread serialization.
-unsafe impl Send for FrankenConnection {}
-unsafe impl Sync for FrankenConnection {}
 
 /// How the underlying frankensqlite handle is shut down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,24 +85,8 @@ fn required_file_identity(
         })
 }
 
-/// Build the private current-thread runtime that drives fsqlite futures.
-fn build_driver_runtime() -> Result<Runtime, Error> {
-    RuntimeBuilder::current_thread().build().map_err(|error| {
-        Error::Connection(ConnectionError {
-            kind: ConnectionErrorKind::Connect,
-            message: format!("failed to build FrankenSQLite driver runtime: {error}"),
-            source: None,
-        })
-    })
-}
-
-fn raw_pragma_value(
-    runtime: &Runtime,
-    conn: &fsqlite::Connection,
-    sql: &str,
-) -> Result<SqliteValue, Error> {
-    runtime
-        .block_on(conn.query(sql))
+fn raw_pragma_value(conn: &fsqlite::AsyncConnection, sql: &str) -> Result<SqliteValue, Error> {
+    conn.query_sync(sql)
         .map_err(|error| franken_to_query_error(&error, sql))?
         .into_iter()
         .next()
@@ -148,29 +99,26 @@ fn raw_pragma_value(
 }
 
 fn install_strict_durable_control_plane_profile(
-    runtime: &Runtime,
-    conn: &fsqlite::Connection,
+    conn: &fsqlite::AsyncConnection,
 ) -> Result<(), Error> {
     for sql in [
         "PRAGMA journal_mode = WAL;",
         "PRAGMA synchronous = FULL;",
         "PRAGMA fsqlite.stmt_microbatch = OFF;",
     ] {
-        runtime
-            .block_on(conn.execute(sql))
+        conn.execute_sync(sql)
             .map_err(|error| franken_to_query_error(&error, sql))?;
     }
 
-    verify_strict_durable_control_plane_profile(runtime, conn)
+    verify_strict_durable_control_plane_profile(conn)
 }
 
 fn verify_strict_durable_control_plane_profile(
-    runtime: &Runtime,
-    conn: &fsqlite::Connection,
+    conn: &fsqlite::AsyncConnection,
 ) -> Result<(), Error> {
-    let journal_mode = raw_pragma_value(runtime, conn, "PRAGMA journal_mode;")?;
-    let synchronous = raw_pragma_value(runtime, conn, "PRAGMA synchronous;")?;
-    let microbatch = raw_pragma_value(runtime, conn, "PRAGMA fsqlite.stmt_microbatch;")?;
+    let journal_mode = raw_pragma_value(conn, "PRAGMA journal_mode;")?;
+    let synchronous = raw_pragma_value(conn, "PRAGMA synchronous;")?;
+    let microbatch = raw_pragma_value(conn, "PRAGMA fsqlite.stmt_microbatch;")?;
     let journal_is_wal =
         matches!(journal_mode, SqliteValue::Text(ref mode) if mode.eq_ignore_ascii_case("wal"));
     let synchronous_is_full =
@@ -300,14 +248,12 @@ fn enforce_scoped_transaction_sql(sql: &str) -> Result<(), Error> {
 impl FrankenConnection {
     fn from_raw_connection(
         path: String,
-        runtime: Runtime,
-        conn: fsqlite::Connection,
+        conn: fsqlite::AsyncConnection,
         profile: ConnectionProfile,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(FrankenInner {
                 conn,
-                runtime,
                 in_transaction: false,
                 last_insert_rowid: 0,
             })),
@@ -322,13 +268,10 @@ impl FrankenConnection {
     /// persistent storage.
     pub fn open(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
-        let runtime = build_driver_runtime()?;
-        let conn = runtime
-            .block_on(fsqlite::Connection::open(&path))
-            .map_err(|e| franken_to_conn_error(&e))?;
+        let conn =
+            fsqlite::AsyncConnection::open_sync(&path).map_err(|e| franken_to_conn_error(&e))?;
         Ok(Self::from_raw_connection(
             path,
-            runtime,
             conn,
             ConnectionProfile::Generic,
         ))
@@ -340,16 +283,10 @@ impl FrankenConnection {
         page_size_bytes: u32,
     ) -> Result<Self, Error> {
         let path = path.into();
-        let runtime = build_driver_runtime()?;
-        let conn = runtime
-            .block_on(fsqlite::Connection::open_with_page_size(
-                &path,
-                page_size_bytes,
-            ))
+        let conn = fsqlite::AsyncConnection::open_with_page_size_sync(&path, page_size_bytes)
             .map_err(|e| franken_to_conn_error(&e))?;
         Ok(Self::from_raw_connection(
             path,
-            runtime,
             conn,
             ConnectionProfile::Generic,
         ))
@@ -371,13 +308,10 @@ impl FrankenConnection {
     /// "query only" is part of the contract.
     pub fn open_existing(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
-        let runtime = build_driver_runtime()?;
-        let conn = runtime
-            .block_on(fsqlite::Connection::open_existing(&path))
+        let conn = fsqlite::AsyncConnection::open_existing_sync(&path)
             .map_err(|e| franken_to_conn_error(&e))?;
         Ok(Self::from_raw_connection(
             path,
-            runtime,
             conn,
             ConnectionProfile::Generic,
         ))
@@ -405,20 +339,16 @@ impl FrankenConnection {
     pub fn open_strict_durable_control_plane_file(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
         let path_ref = Path::new(&path);
-        let runtime = build_driver_runtime()?;
         let mut env = fsqlite::ConnectionEnv::default();
         env.set_strict_multi_process(true);
 
         let conn = match fsqlite::fsqlite_vfs::host_fs::reserve_new_file(path_ref) {
             Ok(reservation) => {
                 let identity = required_file_identity(&reservation, &path)?;
-                runtime
-                    .block_on(
-                        fsqlite::Connection::open_reserved_with_expected_identity_and_env(
-                            &path, identity, env,
-                        ),
-                    )
-                    .map_err(|error| franken_to_conn_error(&error))?
+                fsqlite::AsyncConnection::open_reserved_with_expected_identity_and_env_sync(
+                    &path, identity, env,
+                )
+                .map_err(|error| franken_to_conn_error(&error))?
             }
             Err(fsqlite_error::FrankenError::Io(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
@@ -427,21 +357,17 @@ impl FrankenConnection {
                     fsqlite::fsqlite_vfs::host_fs::open_existing_regular_file_no_follow(path_ref)
                         .map_err(|error| franken_to_conn_error(&error))?;
                 let identity = required_file_identity(&identity_guard, &path)?;
-                runtime
-                    .block_on(
-                        fsqlite::Connection::open_existing_with_expected_identity_and_env(
-                            &path, identity, env,
-                        ),
-                    )
-                    .map_err(|error| franken_to_conn_error(&error))?
+                fsqlite::AsyncConnection::open_existing_with_expected_identity_and_env_sync(
+                    &path, identity, env,
+                )
+                .map_err(|error| franken_to_conn_error(&error))?
             }
             Err(error) => return Err(franken_to_conn_error(&error)),
         };
 
-        install_strict_durable_control_plane_profile(&runtime, &conn)?;
+        install_strict_durable_control_plane_profile(&conn)?;
         Ok(Self::from_raw_connection(
             path,
-            runtime,
             conn,
             ConnectionProfile::StrictDurableControlPlane,
         ))
@@ -450,13 +376,11 @@ impl FrankenConnection {
     /// Open an existing file-based database with SQLite read-only flags.
     pub fn open_file_read_only(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
-        let runtime = build_driver_runtime()?;
-        let conn = runtime
-            .block_on(open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY))
-            .map_err(|e| franken_to_conn_error(&e))?;
+        let conn =
+            fsqlite::AsyncConnection::open_with_flags_sync(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| franken_to_conn_error(&e))?;
         Ok(Self::from_raw_connection(
             path,
-            runtime,
             conn,
             ConnectionProfile::Generic,
         ))
@@ -468,13 +392,10 @@ impl FrankenConnection {
     /// introducing writer semantics such as close-time checkpoints.
     pub fn open_schema_only(path: impl Into<String>) -> Result<Self, Error> {
         let path = path.into();
-        let runtime = build_driver_runtime()?;
-        let conn = runtime
-            .block_on(fsqlite::Connection::open_schema_only(&path))
+        let conn = fsqlite::AsyncConnection::open_schema_only_sync(&path)
             .map_err(|e| franken_to_conn_error(&e))?;
         Ok(Self::from_raw_connection(
             path,
-            runtime,
             conn,
             ConnectionProfile::Generic,
         ))
@@ -496,14 +417,14 @@ impl FrankenConnection {
     fn close_inner(inner: Arc<Mutex<FrankenInner>>, mode: CloseMode) -> Result<(), Error> {
         match Arc::try_unwrap(inner) {
             Ok(mutex) => {
-                let FrankenInner { conn, runtime, .. } = mutex
+                let FrankenInner { mut conn, .. } = mutex
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let closed = match mode {
-                    CloseMode::Checkpoint => runtime.block_on(conn.close()),
-                    CloseMode::SkipCheckpoint => runtime.block_on(conn.close_without_checkpoint()),
+                    CloseMode::Checkpoint => conn.close_sync(),
+                    CloseMode::SkipCheckpoint => conn.close_without_checkpoint_sync(),
                 };
-                closed.map_err(|e| franken_to_conn_error(&e))
+                closed.map_err(|e| franken_to_conn_error(e.as_ref()))
             }
             Err(inner) => Err(Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Disconnected,
@@ -550,7 +471,8 @@ impl FrankenConnection {
         enforce_profile_sql(self.profile, sql)?;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
-            .drive(inner.conn.execute(sql))
+            .conn
+            .execute_sync(sql)
             .map_err(|e| franken_to_query_error(&e, sql))?;
         Ok(())
     }
@@ -562,15 +484,12 @@ impl FrankenConnection {
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
         let schema_columns = self.get_returning_star_columns(sql, &inner);
 
-        let franken_rows = inner
-            .drive(async {
-                if sqlite_params.is_empty() {
-                    inner.conn.query(sql).await
-                } else {
-                    inner.conn.query_with_params(sql, &sqlite_params).await
-                }
-            })
-            .map_err(|e| franken_to_query_error(&e, sql))?;
+        let franken_rows = if sqlite_params.is_empty() {
+            inner.conn.query_sync(sql)
+        } else {
+            inner.conn.query_with_params_sync(sql, &sqlite_params)
+        }
+        .map_err(|e| franken_to_query_error(&e, sql))?;
 
         Ok(convert_rows_with_schema(
             &franken_rows,
@@ -593,7 +512,7 @@ impl FrankenConnection {
 
         // Query PRAGMA table_info to get column names
         let pragma_sql = format!("PRAGMA table_info({})", table_name);
-        let Ok(pragma_rows) = inner.drive(inner.conn.query(&pragma_sql)) else {
+        let Ok(pragma_rows) = inner.conn.query_sync(&pragma_sql) else {
             return None;
         };
 
@@ -622,24 +541,18 @@ impl FrankenConnection {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
 
-        let count = inner
-            .drive(async {
-                if sqlite_params.is_empty() {
-                    inner.conn.execute(sql).await
-                } else {
-                    inner.conn.execute_with_params(sql, &sqlite_params).await
-                }
-            })
-            .map_err(|e| franken_to_query_error(&e, sql))?;
+        let count = if sqlite_params.is_empty() {
+            inner.conn.execute_sync(sql)
+        } else {
+            inner.conn.execute_with_params_sync(sql, &sqlite_params)
+        }
+        .map_err(|e| franken_to_query_error(&e, sql))?;
 
         // Track last_insert_rowid for INSERT statements
         if is_insert_sql(sql) {
             // After an INSERT, query last_insert_rowid()
-            if let Ok(rows) = inner.drive(inner.conn.query("SELECT last_insert_rowid()"))
-                && let Some(row) = rows.first()
-                && let Some(SqliteValue::Integer(id)) = row.get(0)
-            {
-                inner.last_insert_rowid = *id;
+            if let Ok(id) = inner.conn.last_insert_rowid_sync() {
+                inner.last_insert_rowid = id;
             }
         }
 
@@ -655,7 +568,7 @@ impl FrankenConnection {
     /// Get the number of rows changed by the last statement.
     pub fn changes(&self) -> i64 {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Ok(rows) = inner.drive(inner.conn.query("SELECT changes()"))
+        if let Ok(rows) = inner.conn.query_sync("SELECT changes()")
             && let Some(row) = rows.first()
             && let Some(SqliteValue::Integer(n)) = row.get(0)
         {
@@ -693,7 +606,8 @@ impl FrankenConnection {
         };
 
         inner
-            .drive(inner.conn.execute(begin_sql))
+            .conn
+            .execute_sync(begin_sql)
             .map_err(|e| franken_to_query_error(&e, begin_sql))?;
 
         inner.in_transaction = true;
@@ -717,7 +631,8 @@ impl FrankenConnection {
         }
 
         inner
-            .drive(inner.conn.execute("COMMIT"))
+            .conn
+            .execute_sync("COMMIT")
             .map_err(|e| franken_to_query_error(&e, "COMMIT"))?;
 
         inner.in_transaction = false;
@@ -741,7 +656,8 @@ impl FrankenConnection {
         }
 
         inner
-            .drive(inner.conn.execute("ROLLBACK"))
+            .conn
+            .execute_sync("ROLLBACK")
             .map_err(|e| franken_to_query_error(&e, "ROLLBACK"))?;
 
         inner.in_transaction = false;
@@ -787,7 +703,8 @@ impl FrankenConnection {
             )));
         }
         inner
-            .drive(inner.conn.execute("BEGIN EXCLUSIVE"))
+            .conn
+            .execute_sync("BEGIN EXCLUSIVE")
             .map_err(|error| {
                 FrankenExclusiveTransactionError::Database(Box::new(franken_to_query_error(
                     &error,
@@ -796,10 +713,9 @@ impl FrankenConnection {
             })?;
         inner.in_transaction = true;
         if self.profile == ConnectionProfile::StrictDurableControlPlane
-            && let Err(error) =
-                verify_strict_durable_control_plane_profile(&inner.runtime, &inner.conn)
+            && let Err(error) = verify_strict_durable_control_plane_profile(&inner.conn)
         {
-            return match inner.drive(inner.conn.execute("ROLLBACK")) {
+            return match inner.conn.execute_sync("ROLLBACK") {
                 Ok(_) => {
                     inner.in_transaction = false;
                     Err(FrankenExclusiveTransactionError::Database(Box::new(error)))
@@ -891,7 +807,8 @@ impl FrankenExclusiveTransaction<'_> {
         enforce_scoped_transaction_sql(sql)?;
         enforce_profile_sql(self.profile, sql)?;
         self.inner
-            .drive(self.inner.conn.execute(sql))
+            .conn
+            .execute_sync(sql)
             .map_err(|error| franken_to_query_error(&error, sql))?;
         Ok(())
     }
@@ -902,15 +819,12 @@ impl FrankenExclusiveTransaction<'_> {
         enforce_profile_sql(self.profile, sql)?;
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
         let inner = &*self.inner;
-        let rows = inner
-            .drive(async {
-                if sqlite_params.is_empty() {
-                    inner.conn.query(sql).await
-                } else {
-                    inner.conn.query_with_params(sql, &sqlite_params).await
-                }
-            })
-            .map_err(|error| franken_to_query_error(&error, sql))?;
+        let rows = if sqlite_params.is_empty() {
+            inner.conn.query_sync(sql)
+        } else {
+            inner.conn.query_with_params_sync(sql, &sqlite_params)
+        }
+        .map_err(|error| franken_to_query_error(&error, sql))?;
         Ok(convert_rows_with_schema(&rows, sql, None))
     }
 
@@ -920,26 +834,23 @@ impl FrankenExclusiveTransaction<'_> {
         enforce_profile_sql(self.profile, sql)?;
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
         let inner = &*self.inner;
-        let count = inner
-            .drive(async {
-                if sqlite_params.is_empty() {
-                    inner.conn.execute(sql).await
-                } else {
-                    inner.conn.execute_with_params(sql, &sqlite_params).await
-                }
-            })
-            .map_err(|error| franken_to_query_error(&error, sql))?;
+        let count = if sqlite_params.is_empty() {
+            inner.conn.execute_sync(sql)
+        } else {
+            inner.conn.execute_with_params_sync(sql, &sqlite_params)
+        }
+        .map_err(|error| franken_to_query_error(&error, sql))?;
         Ok(count as u64)
     }
 
     fn commit(&mut self) -> Result<(), Error> {
-        match self.inner.drive(self.inner.conn.execute("COMMIT")) {
+        match self.inner.conn.execute_sync("COMMIT") {
             Ok(_) => {
                 self.inner.in_transaction = false;
                 self.finished = true;
                 Ok(())
             }
-            Err(commit_error) => match self.inner.drive(self.inner.conn.execute("ROLLBACK")) {
+            Err(commit_error) => match self.inner.conn.execute_sync("ROLLBACK") {
                 Ok(_) => {
                     self.inner.in_transaction = false;
                     self.finished = true;
@@ -954,7 +865,8 @@ impl FrankenExclusiveTransaction<'_> {
 
     fn rollback(&mut self) -> Result<(), Error> {
         self.inner
-            .drive(self.inner.conn.execute("ROLLBACK"))
+            .conn
+            .execute_sync("ROLLBACK")
             .map_err(|error| franken_to_query_error(&error, "ROLLBACK"))?;
         self.inner.in_transaction = false;
         self.finished = true;
@@ -964,12 +876,7 @@ impl FrankenExclusiveTransaction<'_> {
 
 impl Drop for FrankenExclusiveTransaction<'_> {
     fn drop(&mut self) {
-        if !self.finished
-            && self
-                .inner
-                .drive(self.inner.conn.execute("ROLLBACK"))
-                .is_ok()
-        {
+        if !self.finished && self.inner.conn.execute_sync("ROLLBACK").is_ok() {
             self.inner.in_transaction = false;
         }
     }
@@ -1743,6 +1650,51 @@ mod tests {
         let conn = FrankenConnection::open_memory().expect("should open in-memory db");
         conn.close_sync()
             .expect("close_sync should close the underlying frankensqlite connection");
+    }
+
+    #[test]
+    fn small_stack_open_schema_and_insert_are_worker_backed() {
+        let dir = std::env::temp_dir().join("sqlmodel_frankensqlite_small_stack_test");
+        std::fs::create_dir_all(&dir).expect("small-stack test directory should exist");
+        let path = dir
+            .join(format!("fresh-schema-{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        for suffix in ["", "-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+
+        let worker_path = path.clone();
+        std::thread::Builder::new()
+            .name("sqlmodel-frankensqlite-small-stack".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let conn = FrankenConnection::open_file(&worker_path)
+                    .expect("small-stack consumer should open through the worker");
+                conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+                    .expect("small-stack consumer should create a fresh schema through the worker");
+                conn.execute_sync(
+                    "INSERT INTO t (id, name) VALUES (?1, ?2)",
+                    &[Value::BigInt(1), Value::Text("stack-safe".into())],
+                )
+                .expect("small-stack consumer should insert through the worker");
+                let rows = conn
+                    .query_sync("SELECT name FROM t WHERE id = 1", &[])
+                    .expect("small-stack consumer should query through the worker");
+                assert_eq!(
+                    rows.first().and_then(|row| row.get(0)),
+                    Some(&Value::Text("stack-safe".into()))
+                );
+                conn.close_sync()
+                    .expect("small-stack consumer should join the worker cleanly");
+            })
+            .expect("small-stack consumer thread should spawn")
+            .join()
+            .expect("worker-backed operations must not overflow the consumer stack");
+
+        for suffix in ["", "-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
     }
 
     #[test]
@@ -2560,12 +2512,11 @@ mod tests {
         assert_eq!(rows[0].get(0), Some(&Value::BigInt(0)));
     }
 
-    // ── Nested block_on probes (fsqlite 0.2 async bridge safety) ────────
+    // ── Runtime-nesting probes (fsqlite 0.2 worker bridge safety) ───────
     //
-    // The adapter drives fsqlite's `!Send` futures with a per-connection
-    // current-thread `Runtime::block_on` while a consumer may itself be
-    // inside `block_on` or on an asupersync worker thread. These probes
-    // prove the nested bridge neither deadlocks nor panics in either case.
+    // The adapter blocks on worker-channel responses while a consumer may
+    // itself be inside `block_on` or on an asupersync worker thread. These
+    // probes prove that bridge neither deadlocks nor panics in either case.
 
     #[test]
     fn nested_block_on_inside_outer_block_on() {
@@ -2579,8 +2530,8 @@ mod tests {
             .unwrap();
         let cx = Cx::for_testing();
 
-        // Every adapter call below performs the inner `drive` block_on while
-        // the outer runtime's block_on is active on this thread.
+        // Every adapter call below waits on the dedicated worker while the
+        // outer runtime's block_on is active on this thread.
         outer.block_on(async {
             conn.execute_sync("INSERT INTO t VALUES (1, 'nested')", &[])
                 .unwrap();
@@ -2612,8 +2563,8 @@ mod tests {
             .unwrap();
 
         // The spawned task's Send future runs on an asupersync worker thread;
-        // the adapter's sync helpers then nest the per-connection block_on
-        // inside that worker.
+        // the adapter's sync helpers then wait on the dedicated connection
+        // worker from inside that runtime worker.
         let task_conn = Arc::clone(&conn);
         let handle = outer.handle().spawn(async move {
             let cx = Cx::for_testing();
