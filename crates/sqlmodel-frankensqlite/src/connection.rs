@@ -1639,6 +1639,25 @@ fn franken_to_query_error(e: &fsqlite_error::FrankenError, sql: &str) -> Error {
 mod tests {
     use super::*;
 
+    /// Remove a database file and every engine sidecar the fsqlite 0.3.x
+    /// family can leave behind (`-wal`/`-shm`, the ns gate/use pair, and the
+    /// WAL certificate files). Orphaned sidecars without their main database
+    /// make the engine refuse a fresh open, so every file-based test must
+    /// clean the full family before and after running.
+    fn remove_db_family(path: &str) {
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            "-wal-cert",
+            "-wal-cert-head",
+        ] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
     #[test]
     fn open_memory_succeeds() {
         let conn = FrankenConnection::open_memory().expect("should open in-memory db");
@@ -1660,9 +1679,7 @@ mod tests {
             .join(format!("fresh-schema-{}.db", std::process::id()))
             .to_string_lossy()
             .into_owned();
-        for suffix in ["", "-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
-            let _ = std::fs::remove_file(format!("{path}{suffix}"));
-        }
+        remove_db_family(&path);
 
         let worker_path = path.clone();
         std::thread::Builder::new()
@@ -1692,9 +1709,7 @@ mod tests {
             .join()
             .expect("worker-backed operations must not overflow the consumer stack");
 
-        for suffix in ["", "-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
-            let _ = std::fs::remove_file(format!("{path}{suffix}"));
-        }
+        remove_db_family(&path);
     }
 
     #[test]
@@ -2184,9 +2199,7 @@ mod tests {
         let path_str = db_path.display().to_string();
 
         // Clean up the main database and every WAL sidecar from previous runs.
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
-        }
+        remove_db_family(&path_str);
 
         {
             let conn = FrankenConnection::open_file(&path_str).unwrap();
@@ -2208,9 +2221,7 @@ mod tests {
             assert_eq!(rows[0].get(0), Some(&Value::Text("persistent".into())));
         }
 
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
-        }
+        remove_db_family(&path_str);
     }
 
     #[test]
@@ -2221,9 +2232,7 @@ mod tests {
         let path_str = db_path.display().to_string();
 
         // Clean up from previous runs (main db plus WAL sidecars).
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
-        }
+        remove_db_family(&path_str);
 
         {
             let conn = FrankenConnection::open_file(&path_str).unwrap();
@@ -2247,9 +2256,7 @@ mod tests {
             conn.close_sync().expect("close reopened connection");
         }
 
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
-        }
+        remove_db_family(&path_str);
     }
 
     #[test]
@@ -2259,9 +2266,7 @@ mod tests {
         let db_path = dir.join("test_file.db");
         let path_str = db_path.display().to_string();
 
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
-        }
+        remove_db_family(&path_str);
 
         {
             let conn = FrankenConnection::open_file(&path_str).unwrap();
@@ -2283,9 +2288,7 @@ mod tests {
             assert_eq!(rows[0].get(0), Some(&Value::Text("readable".into())));
         }
 
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
-        }
+        remove_db_family(&path_str);
     }
 
     // ── Error mapping tests ──────────────────────────────────────────────
