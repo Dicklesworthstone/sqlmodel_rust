@@ -89,13 +89,14 @@ sqlmodel-mysql = { path = "crates/sqlmodel-mysql", version = "0.4.0" }
 sqlmodel-frankensqlite = { path = "crates/sqlmodel-frankensqlite", version = "0.4.0" }
 
 # =====================================================================
-# TEMPORARY — REMOVE BEFORE PUBLISH; stand-in for unpublished fsqlite 0.3.0.
+# TEMPORARY — REMOVE BEFORE PUBLISH; local engine stand-in for fsqlite 0.3.x.
 # The fsqlite family below is patched to the local frankensqlite checkout
-# (asupersync 0.4.3) because fsqlite 0.3.0 is not yet on crates.io. The local
-# checkout still reports crate version 0.2.1, so sqlmodel-frankensqlite keeps
-# its fsqlite version-req at "0.2" FOR GATES ONLY. AT PUBLISH TIME:
-#   1. flip fsqlite/fsqlite-core/fsqlite-types/fsqlite-error reqs to "0.3"
-#      in crates/sqlmodel-frankensqlite/Cargo.toml, and
+# (crate version 0.3.1, asupersync 0.4.4). crates.io DOES have fsqlite 0.3.1,
+# but that tag ships a fixed-after-tag P0 (bd-r82et: append-gate false
+# positive on single-writer DDL batches; fixed on frankensqlite main). Do NOT
+# switch to the registry fsqlite until 0.3.2 is published. AT THAT POINT:
+#   1. bump fsqlite/fsqlite-core/fsqlite-types/fsqlite-error reqs in
+#      crates/sqlmodel-frankensqlite/Cargo.toml if needed (already "0.3.0"),
 #   2. delete this entire [patch.crates-io] block, then `cargo update`.
 # =====================================================================
 [patch.crates-io]
