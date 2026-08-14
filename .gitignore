@@ -2,8 +2,12 @@
 .bv/
 .beads/.br_history/
 .beads/.write.lock
+# br live write locks (.br-jsonl-write-*.lock, .br-db-write-*.lock)
+.beads/*.lock
 .beads/*-fsqlite-ns-gate
 .beads/*-fsqlite-ns-use
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
 target/
 
 # Common local artifacts (avoid accidental commits)
