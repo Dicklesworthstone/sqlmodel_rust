@@ -46,5 +46,19 @@ sync_base.jsonl
 # Local history backups
 .br_history/
 
+# DB-family recovery artifacts (truncated WAL/SHM, quarantined sidecars)
+.br_recovery/
+
+# Lock files (includes .br-db-write-*.lock and .br-jsonl-write-*.lock)
+*.lock
+
+# br fsqlite-ns VFS sidecars + vacuum copies
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+
+# WAL certification sidecars (`*.db-wal` does not match these)
+*.db-wal-cert
+*.db-wal-cert-head
+
 # bv (beads viewer) lock file
 .bv.lock
