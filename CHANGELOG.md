@@ -6,6 +6,27 @@ This project follows approximate [Semantic Versioning](https://semver.org/). Ver
 
 Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
+Scope window: first commit through v0.4.0 (2026-08-20).
+
+Sources: git history and tags on `main`, GitHub Releases, the crates.io
+version list for `sqlmodel`, and the `.beads` issue records referenced inline.
+Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
+(which can be one day later).
+
+## Version Timeline
+
+| Version | Date | Git tag | GitHub Release | crates.io | Notes |
+|---------|------|---------|----------------|-----------|-------|
+| 0.4.0 | 2026-08-20 | [v0.4.0](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.0) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.0) | [yes](https://crates.io/crates/sqlmodel/0.4.0) | asupersync ^0.4.9 + fsqlite 0.3.7; all 12 crates in lockstep |
+| sqlmodel-sqlite 0.3.3 | 2026-08-02 | [sqlmodel-sqlite-v0.3.3](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-sqlite-v0.3.3) | no | [yes](https://crates.io/crates/sqlmodel-sqlite/0.3.3) | component-only patch |
+| 0.3.2 | 2026-08-02 | [v0.3.2](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/v0.3.2) | no | [yes](https://crates.io/crates/sqlmodel/0.3.2) | asupersync =0.3.10 alignment |
+| 0.3.1 | 2026-07-26 | no | no | [yes](https://crates.io/crates/sqlmodel/0.3.1) | crates.io only |
+| 0.3.0 | 2026-07-18 | [v0.3.0](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.3.0) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.3.0) | [yes](https://crates.io/crates/sqlmodel/0.3.0) | |
+| 0.2.2 | 2026-04-23 | [v0.2.2](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/v0.2.2) | no | [yes](https://crates.io/crates/sqlmodel/0.2.2) | |
+| 0.2.1 | 2026-03-22 | no | no | [yes](https://crates.io/crates/sqlmodel/0.2.1) | crates.io only |
+| 0.2.0 | 2026-02-15 | [v0.2.0](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.2.0) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.2.0) | [yes](https://crates.io/crates/sqlmodel/0.2.0) | |
+| 0.1.1 | 2026-02-05 | no | no | [yes](https://crates.io/crates/sqlmodel/0.1.1) | initial crates.io publish |
+
 ---
 
 ## [0.4.0] -- 2026-08-20
@@ -35,6 +56,16 @@ the public API, this is a semver-minor (pre-1.0 breaking) bump.
   nightly.
 - README: dependency snippets and the asupersync troubleshooting section now
   describe the caret requirement instead of an exact pin.
+- Post-release (on `main`, not in the 0.4.0 crates): the CI MSRV job excludes
+  the nightly-only `sqlmodel-frankensqlite` driver and overrides the repo's
+  `-Z threads` rustflags; README states the stable-1.95 vs nightly split
+  ([`da65ee2`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/da65ee2),
+  [`9f3191b`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/9f3191b)).
+
+### Representative commits
+
+- [`aa1c6ec`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/aa1c6ec) -- asupersync ^0.4.9 + fsqlite 0.3.7, lockstep 0.4.0
+- [`d347728`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/d347728) -- adapter tests scrub the wal-cert sidecars
 
 ### Since 0.3.2 (previously unreleased on `main`)
 
@@ -112,6 +143,23 @@ Asupersync 0.3.10 checkout.
   workspace patch.
 - Refresh the documented installation versions and dependency troubleshooting
   guidance for registry-based Asupersync resolution.
+- Pool: `close`-and-drain made cancel-correct (bd-rofu,
+  [`38b2c0b`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/38b2c0b)).
+
+---
+
+## [0.3.1] -- 2026-07-26 (crates.io only; no git tag or GitHub Release)
+
+Dependency refresh on the asupersync 0.3.9 line
+([`deff737`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/deff737)).
+
+- `sqlmodel-frankensqlite`: `open_existing` for strictly query-only callers
+  ([`c023052`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/c023052)).
+- Deps: fsqlite 0.1.18, `syn` 3, `base64` 0.23, `hmac`/`pbkdf2` 0.13, `rand`
+  0.10 for the Postgres driver
+  ([`c4bcc61`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/c4bcc61)).
+- Docs/CI: frankensqlite driver documented, docs bumped to 0.2.2
+  ([`54191f7`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/54191f7)).
 
 ---
 
