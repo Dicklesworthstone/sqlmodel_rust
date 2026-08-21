@@ -138,16 +138,16 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 ```toml
 # Cargo.toml
 [dependencies]
-sqlmodel = "0.3.2"
+sqlmodel = "0.4.0"
 
 # Choose a driver (pick one or more)
-sqlmodel-postgres = "0.3.2"
-# sqlmodel-mysql = "0.3.2"
-# sqlmodel-sqlite = "0.3.3"
-# sqlmodel-frankensqlite = "0.3.2"
+sqlmodel-postgres = "0.4.0"
+# sqlmodel-mysql = "0.4.0"
+# sqlmodel-sqlite = "0.4.0"
+# sqlmodel-frankensqlite = "0.4.0"
 
 # Optional rich console output
-sqlmodel-console = { version = "0.3.2", features = ["rich"] }
+sqlmodel-console = { version = "0.4.0", features = ["rich"] }
 ```
 
 `sqlmodel-sqlite` 0.3.3 is a component-only patch that adds exact native SQLite
@@ -265,7 +265,7 @@ Add the console feature to your dependency:
 
 ```toml
 [dependencies]
-sqlmodel-console = { version = "0.3.0", features = ["rich"] }
+sqlmodel-console = { version = "0.4.0", features = ["rich"] }
 ```
 
 Create and use a console:
@@ -482,7 +482,7 @@ Expr::case()
 - **Nightly Rust required**: We use Edition 2024 features
 - **No stable release yet**: API may change
 - **Limited documentation**: We're working on it
-- **asupersync dependency**: Resolved from crates.io and pinned exactly for runtime type compatibility
+- **asupersync dependency**: Resolved from crates.io as `^0.4.9` (same 0.4.x line as `fsqlite`), so a single runtime version unifies across the stack
 
 ---
 
@@ -491,9 +491,9 @@ Expr::case()
 ### "Failed to resolve dependency `asupersync`"
 
 ```bash
-# Keep SQLModel's exact runtime requirement aligned with the workspace patch
-cargo update -p sqlmodel-core --precise 0.3.2
-cargo update -p asupersync --precise 0.3.10
+# SQLModel 0.4.x requires asupersync ^0.4.9 (shared with fsqlite 0.3.x).
+# If another dependency pins an older 0.4.x, let cargo unify on the newest:
+cargo update -p asupersync
 cargo build
 ```
 

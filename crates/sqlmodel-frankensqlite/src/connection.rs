@@ -1640,19 +1640,24 @@ mod tests {
     use super::*;
 
     /// Remove a database file and every engine sidecar the fsqlite 0.3.x
-    /// family can leave behind (`-wal`/`-shm`, the ns gate/use pair, and the
-    /// WAL certificate files). Orphaned sidecars without their main database
-    /// make the engine refuse a fresh open, so every file-based test must
-    /// clean the full family before and after running.
+    /// family can leave behind (`-wal`/`-shm`/`-journal`, the ns gate/use
+    /// pair, the WAL certificate files, the migration-state marker, and the
+    /// time-travel history files). Orphaned sidecars without their main
+    /// database make the engine refuse a fresh open, so every file-based test
+    /// must clean the full family before and after running.
     fn remove_db_family(path: &str) {
         for suffix in [
             "",
             "-wal",
             "-shm",
+            "-journal",
             "-fsqlite-ns-gate",
             "-fsqlite-ns-use",
             "-wal-cert",
             "-wal-cert-head",
+            ".fsqlite-migration-state",
+            ".fsqlite-history",
+            ".fsqlite-history-idx",
         ] {
             let _ = std::fs::remove_file(format!("{path}{suffix}"));
         }

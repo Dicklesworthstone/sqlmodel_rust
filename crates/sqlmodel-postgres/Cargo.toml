@@ -32,7 +32,7 @@ pbkdf2 = "0.13"
 base64 = "0.23"
 rand = "0.10"
 md5 = "0.8"
-subtle = "2.5"
+subtle = "2.6"
 
 # Optional console support
 sqlmodel-console = { workspace = true, optional = true }

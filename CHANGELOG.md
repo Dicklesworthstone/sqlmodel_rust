@@ -8,6 +8,47 @@ Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
 ---
 
+## [0.4.0] -- 2026-08-20
+
+**One-runtime release: asupersync 0.4 + fsqlite 0.3.7.** Every SQLModel crate
+(including `sqlmodel-sqlite`, previously drifted at 0.3.3) moves to 0.4.0 in
+lockstep. The exact `asupersync = "=0.3.10"` pin is gone; the workspace now
+requires `asupersync ^0.4.9`, the same 0.4.x line that `fsqlite` 0.3.x
+requires, so a downstream graph (e.g. FrankenGit) resolves a single asupersync
+instead of two incompatible copies. Because `Cx`/`Outcome` types are part of
+the public API, this is a semver-minor (pre-1.0 breaking) bump.
+
+### Changed
+
+- **asupersync =0.3.10 -> ^0.4.9**. No source changes were required; the
+  0.4.0 break (capability-threaded tracked session channels) does not touch
+  any surface SQLModel uses.
+- **sqlmodel-frankensqlite: fsqlite 0.3.0 -> 0.3.7** (`fsqlite`,
+  `fsqlite-core`, `fsqlite-types`, `fsqlite-error`), resolved from crates.io
+  with no path patches.
+- `sqlmodel-sqlite` returns to `version.workspace = true` (0.3.3 -> 0.4.0).
+- Third-party refresh: `libsqlite3-sys` 0.38.2, `rich_rust` 0.2.3, `subtle`
+  2.6, plus a full `Cargo.lock` refresh.
+- Lint config: allow the new nightly-2026-08-19 `clippy::assert_is_empty`
+  lint workspace-wide (its suggested `assert_eq!(v, [] as [T; 0])` form is
+  less readable in tests); the `-D warnings` gate stays green on current
+  nightly.
+- README: dependency snippets and the asupersync troubleshooting section now
+  describe the caret requirement instead of an exact pin.
+
+### Since 0.3.2 (previously unreleased on `main`)
+
+- `sqlmodel-frankensqlite` adapter migrated to the fsqlite 0.2/0.3 async
+  facade via a stack-safe connection bridge
+  ([`d9a3355`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/d9a3355),
+  [`fdb7ebd`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/fdb7ebd),
+  [`44fbb63`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/44fbb63)).
+- MySQL auth: RSA full-auth path covered across the `rsa` 0.10 bump
+  ([`f034a97`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/f034a97)).
+- Nightly clippy/rustc style debt cleared across driver crates.
+
+---
+
 ## sqlmodel-sqlite [0.3.3] -- 2026-08-02
 
 **Exact native SQLite error-code release.** This component-only patch lets
