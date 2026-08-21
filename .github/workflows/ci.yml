@@ -172,7 +172,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check MSRV compilation
-        run: cargo check --workspace
+        # RUSTFLAGS="" overrides the nightly-only `-Z threads=4` in .cargo/config.toml.
+        # sqlmodel-frankensqlite is excluded: fsqlite-pager enables
+        # `feature(core_intrinsics)` on x86_64, so that driver is nightly-only.
+        env:
+          RUSTFLAGS: ""
+        run: cargo check --workspace --exclude sqlmodel-frankensqlite
 
   build:
     name: Build (${{ matrix.target }})

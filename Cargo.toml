@@ -21,6 +21,7 @@ edition = "2024"
 # "MIT License (with OpenAI/Anthropic Rider)" (see ./LICENSE) — restrictive custom
 # license, NOT permissive MIT. Bare "MIT" misrepresented the terms. SPDX LicenseRef form:
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+# Floor for everything except sqlmodel-frankensqlite, which is nightly-only (fsqlite).
 rust-version = "1.95"
 authors = ["SQLModel Rust Contributors"]
 repository = "https://github.com/Dicklesworthstone/sqlmodel_rust"

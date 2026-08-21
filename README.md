@@ -479,7 +479,7 @@ Expr::case()
 
 ### Known Limitations
 
-- **Nightly Rust required**: We use Edition 2024 features
+- **Rust 1.95+** for the facade and the Postgres/MySQL/SQLite drivers; **nightly** for `sqlmodel-frankensqlite` (fsqlite enables `core_intrinsics` on x86_64) and for building this repo itself (`.cargo/config.toml` passes `-Z threads`)
 - **No stable release yet**: API may change
 - **Limited documentation**: We're working on it
 - **asupersync dependency**: Resolved from crates.io as `^0.4.9` (same 0.4.x line as `fsqlite`), so a single runtime version unifies across the stack
