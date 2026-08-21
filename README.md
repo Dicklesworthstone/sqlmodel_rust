@@ -150,8 +150,8 @@ sqlmodel-postgres = "0.4.0"
 sqlmodel-console = { version = "0.4.0", features = ["rich"] }
 ```
 
-`sqlmodel-sqlite` 0.3.3 is a component-only patch that adds exact native SQLite
-error-code inspection. The facade and all other driver crates remain at 0.3.2.
+All SQLModel crates are released in lockstep at the same version (0.4.0); mix
+and match drivers freely.
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
 re-exported from `sqlmodel` and `sqlmodel-core`.
@@ -491,9 +491,11 @@ Expr::case()
 ### "Failed to resolve dependency `asupersync`"
 
 ```bash
-# SQLModel 0.4.x requires asupersync ^0.4.9 (shared with fsqlite 0.3.x).
-# If another dependency pins an older 0.4.x, let cargo unify on the newest:
-cargo update -p asupersync
+# SQLModel 0.4.x requires asupersync ^0.4.9, the same 0.4.x line fsqlite 0.3.x
+# uses, so one asupersync should resolve for the whole graph. If resolution
+# fails, another dependency is pinning asupersync to an older line (<0.4.9):
+cargo tree -i asupersync     # find who requires the conflicting version
+# then upgrade that crate (or use `cargo update -p asupersync` once it allows 0.4.9)
 cargo build
 ```
 
