@@ -1,3 +1,18 @@
+# Pinned by DATE, deliberately — do not revert this to a bare `channel = "nightly"`.
+#
+# A floating nightly means an upstream rustc regression lands here with no warning
+# and no reproducible green build. That is not hypothetical: rustc
+# 1.100.0-nightly (c54751567, 2026-08-22) ICEs building this workspace with
+#
+#   internal compiler error: unexpected rigid alias in layout_of after normalization
+#
+# on async opaque types in sqlmodel-core (relationship lazy-load) and
+# sqlmodel-mysql (async_connection), plus asupersync's connect_timeout.
+# nightly-2026-08-20 builds cleanly. The same regression hit charmed_rust; the
+# sibling repos that pin by date (mcp_agent_mail_rust, fastmcp_rust) were unaffected.
+#
+# Advancing the pin is a deliberate step: bump the date, run the full gate
+# (fmt + clippy -D warnings + test --workspace), and keep the new date only if green.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-20"
 components = ["rustfmt", "clippy"]
