@@ -29,6 +29,41 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ---
 
+## [0.4.1] -- 2026-08-25
+
+Small release. The workspace version was bumped to 0.4.1 by
+`3b71a61 chore(release): prepare sqlmodel-frankensqlite 0.4.1 on native-only fsqlite features`
+but never tagged or published, leaving crates.io on 0.4.0. This ships it.
+
+### Changed
+
+- **`sqlmodel-frankensqlite` builds against native-only fsqlite features.**
+- Collapsed a duplicate `base64` (to 0.23.1) in the lockfile.
+
+### Build
+
+- **Pinned the nightly toolchain by date (`nightly-2026-08-20`).** `rust-toolchain.toml`
+  previously specified a floating `channel = "nightly"`. As of 2026-08-22 that resolves to
+  `rustc 1.100.0-nightly (c54751567)`, which ICEs this workspace with
+  `internal compiler error: unexpected rigid alias in layout_of after normalization` on async
+  opaque types in `sqlmodel-core`'s relationship lazy-load and `sqlmodel-mysql`'s
+  `async_connection`, plus `asupersync`'s `connect_timeout`. Nothing here was wrong — the
+  compiler was — but a floating channel lets an upstream regression land with no warning and
+  no reproducible green build. The dated pin clears it (0 ICEs). The rationale is recorded in
+  the toolchain file so it does not get tidied away.
+- MSRV `cargo check` excludes the nightly-only frankensqlite driver.
+
+### Docs
+
+- Changelog version timeline plus the missing 0.3.1 entry.
+- README: dropped a stale 0.3.3 sqlite exception; tightened asupersync 0.4.x troubleshooting.
+
+### Gate
+
+    cargo fmt --check                                      exit 0
+    cargo clippy --workspace --all-targets -- -D warnings   exit 0  (0 ICEs)
+    cargo test --workspace --no-fail-fast                   1960 passed, 0 failed (40 suites)
+
 ## [0.4.0] -- 2026-08-20
 
 **One-runtime release: asupersync 0.4 + fsqlite 0.3.7.** Every SQLModel crate
