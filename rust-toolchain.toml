@@ -8,11 +8,11 @@
 #
 # on async opaque types in sqlmodel-core (relationship lazy-load) and
 # sqlmodel-mysql (async_connection), plus asupersync's connect_timeout.
-# nightly-2026-08-20 builds cleanly. The same regression hit charmed_rust; the
+# nightly-2026-08-25 builds cleanly. The same regression hit charmed_rust; the
 # sibling repos that pin by date (mcp_agent_mail_rust, fastmcp_rust) were unaffected.
 #
 # Advancing the pin is a deliberate step: bump the date, run the full gate
 # (fmt + clippy -D warnings + test --workspace), and keep the new date only if green.
 [toolchain]
-channel = "nightly-2026-08-20"
+channel = "nightly-2026-08-25"
 components = ["rustfmt", "clippy"]
