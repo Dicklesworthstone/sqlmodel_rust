@@ -138,19 +138,19 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 ```toml
 # Cargo.toml
 [dependencies]
-sqlmodel = "0.4.0"
+sqlmodel = "0.4.2"
 
 # Choose a driver (pick one or more)
-sqlmodel-postgres = "0.4.0"
-# sqlmodel-mysql = "0.4.0"
-# sqlmodel-sqlite = "0.4.0"
-# sqlmodel-frankensqlite = "0.4.0"
+sqlmodel-postgres = "0.4.2"
+# sqlmodel-mysql = "0.4.2"
+# sqlmodel-sqlite = "0.4.2"
+# sqlmodel-frankensqlite = "0.4.2"
 
 # Optional rich console output
-sqlmodel-console = { version = "0.4.0", features = ["rich"] }
+sqlmodel-console = { version = "0.4.2", features = ["rich"] }
 ```
 
-All SQLModel crates are released in lockstep at the same version (0.4.0); mix
+All SQLModel crates are released in lockstep at the same version (0.4.2); mix
 and match drivers freely.
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
@@ -265,7 +265,7 @@ Add the console feature to your dependency:
 
 ```toml
 [dependencies]
-sqlmodel-console = { version = "0.4.0", features = ["rich"] }
+sqlmodel-console = { version = "0.4.2", features = ["rich"] }
 ```
 
 Create and use a console:

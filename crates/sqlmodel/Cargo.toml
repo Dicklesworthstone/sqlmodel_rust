@@ -34,3 +34,6 @@ serde_json.workspace = true
 # Optional console support for rich output
 sqlmodel-console = { workspace = true, optional = true }
 sqlmodel-sqlite = { workspace = true, optional = true }
+
+[dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }

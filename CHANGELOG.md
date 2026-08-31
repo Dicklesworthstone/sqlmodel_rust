@@ -29,6 +29,21 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ---
 
+## [0.4.2] -- 2026-08-31
+
+### Fixed
+
+- Removed Asupersync's `test-internals` feature from every normal dependency. Test crates enable it only through development dependencies, so published consumers no longer acquire the `visibility` procedural macro through Cargo feature unification.
+- Replaced the production pool-retirement path's `Cx::for_testing()` call with a runtime-owned request context carrying an explicit infinite cleanup budget.
+
+### Gate
+
+- `cargo check --workspace --all-targets`
+- `cargo test --workspace --no-fail-fast`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo fmt --check`
+- `cargo tree -p sqlmodel-core -e normal -i visibility` returns no dependency path.
+
 ## [0.4.1] -- 2026-08-25
 
 Small release. The workspace version was bumped to 0.4.1 by

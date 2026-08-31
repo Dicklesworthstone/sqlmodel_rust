@@ -55,7 +55,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use asupersync::{
-    CancelReason, Cx, Outcome,
+    Budget, CancelReason, Cx, Outcome,
     combinator::{Either, Select},
     runtime::RuntimeBuilder,
     sync::OnceCell,
@@ -418,7 +418,7 @@ fn close_connection_blocking<C: Connection>(conn: C, context: &'static str) -> R
             )));
         }
     };
-    let cx = Cx::for_testing();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let result = runtime.block_on(async { conn.close_for_pool(&cx).await });
     if let Err(error) = &result {
         tracing::warn!(

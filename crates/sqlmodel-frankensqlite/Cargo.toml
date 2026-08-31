@@ -22,3 +22,4 @@ fsqlite-types = { version = "0.3.7", default-features = false, features = ["nati
 fsqlite-error = { version = "0.3.7", default-features = false }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }

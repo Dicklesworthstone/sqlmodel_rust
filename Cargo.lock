@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "serde",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-console"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "rich_rust",
  "serde",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "regex",
@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-frankensqlite"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "fsqlite",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-macros"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-mysql"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "rand 0.10.2",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-pool"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "sqlmodel-core",
@@ -2491,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-postgres"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "base64 0.23.1",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "serde",
@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-schema"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "serde",
@@ -2533,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-session"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "serde",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-sqlite"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "libsqlite3-sys",
