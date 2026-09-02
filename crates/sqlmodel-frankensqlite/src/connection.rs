@@ -1468,12 +1468,11 @@ fn star_columns_from_schema(sql: &str, inner: &FrankenInner) -> Option<Vec<Strin
     Some(columns)
 }
 
+/// Always quoted: a bare reserved word such as `order` or `select` is a syntax
+/// error inside `PRAGMA table_info(...)`, and that lookup is what gives
+/// `SELECT *` its column names.
 fn quote_pragma_table(table: &str) -> String {
-    if table.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        table.to_string()
-    } else {
-        format!("\"{}\"", table.replace('"', "\"\""))
-    }
+    format!("\"{}\"", table.replace('"', "\"\""))
 }
 
 /// The single source table of a statement whose result projection is `*`
@@ -1986,6 +1985,32 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0), Some(&Value::BigInt(30)));
+    }
+
+    /// `SELECT *` gets its names from `PRAGMA table_info`, which must quote a
+    /// reserved-word table (`order`) or the lookup fails and every column is
+    /// unnamed (found by the e2e reserved-word scenario, 2026-09).
+    #[test]
+    fn select_star_names_columns_of_a_reserved_word_table() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE \"order\" (id INTEGER PRIMARY KEY, \"user\" TEXT, \"select\" INTEGER)",
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO \"order\" (id, \"user\", \"select\") VALUES (1, 'ann', 10)",
+            &[],
+        )
+        .unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT * FROM \"order\" WHERE \"select\" > ?1",
+                &[Value::BigInt(5)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("user").unwrap(), "ann");
+        assert_eq!(rows[0].get_named::<i64>("select").unwrap(), 10);
     }
 
     #[test]
