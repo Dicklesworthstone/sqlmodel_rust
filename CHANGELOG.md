@@ -81,6 +81,12 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   table, lazy many-to-one, lifecycle events, `merge`, session-side cascades), the pool, and two OS
   threads of concurrent writers with `retry_transaction` (no lost updates; C SQLite asserts the
   `UnsupportedMode` refusal).
+- **Migration checksums.** `MigrationRunner` records a fingerprint of each applied migration's
+  `up` SQL (`Migration::checksum`, 64-bit FNV-1a) in a new `checksum` column of the tracking table
+  and compares it on every run: an applied migration whose SQL was edited afterwards is reported as
+  `MigrationStatus::Drifted` and `migrate` refuses to run until it is rolled back or restored.
+  Rows recorded before this change have an empty checksum and are not verified. Proven on every
+  driver by the e2e migrations scenario.
 - New facade tests: `single_table_inheritance_sqlite.rs` (first STI run against a database) and
   `migration_runner_sqlite.rs` (first `MigrationRunner` run against a database).
 - Security configuration as code: `.cargo/audit.toml` (justified, dated ignores) and `deny.toml`
