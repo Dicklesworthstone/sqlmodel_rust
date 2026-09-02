@@ -162,6 +162,110 @@ impl Scenario for Smoke {
     }
 }
 
+/// A table and columns named after reserved words. Every builder must quote
+/// identifiers for the dialect or this cannot even be created.
+#[derive(sqlmodel::Model, Debug, Clone, PartialEq)]
+#[sqlmodel(table = "order")]
+struct Order {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    #[sqlmodel(column = "user")]
+    user: String,
+    #[sqlmodel(column = "select")]
+    select_: i32,
+}
+
+struct ReservedWords;
+
+impl Scenario for ReservedWords {
+    async fn run<C: Connection>(&self, cx: &Cx, conn: &C, driver: &DriverUnderTest) {
+        let d = driver.name();
+        let table = driver.dialect().quote_identifier("order");
+        expect_outcome(
+            conn.execute(cx, &format!("DROP TABLE IF EXISTS {table}"), &[])
+                .await,
+            &format!("{d}: drop stale order"),
+        );
+        for stmt in SchemaBuilder::new()
+            .dialect(driver.dialect())
+            .create_table::<Order>()
+            .build()
+        {
+            expect_outcome(
+                conn.execute(cx, &stmt, &[]).await,
+                &format!("{d}: ddl `{stmt}`"),
+            );
+        }
+        let rows = [
+            Order {
+                id: 1,
+                user: "ann".into(),
+                select_: 10,
+            },
+            Order {
+                id: 2,
+                user: "bob".into(),
+                select_: 20,
+            },
+        ];
+        for o in &rows {
+            expect_outcome(
+                insert!(o).execute(cx, conn).await,
+                &format!("{d}: insert order {}", o.id),
+            );
+        }
+        let big: Vec<Order> = expect_outcome(
+            select!(Order)
+                .filter(Expr::col("select").gt(15))
+                .order_by(Expr::col("user").asc())
+                .all(cx, conn)
+                .await,
+            &format!("{d}: select from order"),
+        );
+        assert_eq!(
+            big,
+            vec![rows[1].clone()],
+            "{d}: filter on a reserved column"
+        );
+        let updated = expect_outcome(
+            update!(&Order {
+                id: 1,
+                user: "ann".into(),
+                select_: 11
+            })
+            .execute(cx, conn)
+            .await,
+            &format!("{d}: update order"),
+        );
+        assert_eq!(updated, 1, "{d}");
+        let deleted = expect_outcome(
+            delete!(Order)
+                .filter(Expr::col("user").eq("bob"))
+                .execute(cx, conn)
+                .await,
+            &format!("{d}: delete from order"),
+        );
+        assert_eq!(deleted, 1, "{d}");
+        let left: Vec<Order> = expect_outcome(
+            select!(Order).all(cx, conn).await,
+            &format!("{d}: select remaining"),
+        );
+        assert_eq!(left.len(), 1, "{d}");
+        assert_eq!(left[0].select_, 11, "{d}: update landed");
+        expect_outcome(
+            conn.execute(cx, &format!("DROP TABLE {table}"), &[]).await,
+            &format!("{d}: drop order"),
+        );
+    }
+}
+
+#[test]
+fn reserved_word_identifiers_work_on_every_available_driver() {
+    let cx = Cx::for_testing();
+    let ran = run_on_every_driver(&cx, &ReservedWords);
+    assert!(ran.contains(&"frankensqlite"), "{ran:?}");
+}
+
 #[test]
 fn model_crud_round_trips_on_every_available_driver() {
     let cx = Cx::for_testing();

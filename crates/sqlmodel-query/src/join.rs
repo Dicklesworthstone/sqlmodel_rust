@@ -279,7 +279,9 @@ impl Join {
                 self.subquery_params.clone(),
             )
         } else {
-            (self.table.clone(), Vec::new())
+            // A plain (possibly schema-qualified) table name: quote it for the
+            // dialect so reserved words such as `order` or `user` work.
+            (dialect.quote_table(&self.table), Vec::new())
         };
 
         let mut sql = format!(

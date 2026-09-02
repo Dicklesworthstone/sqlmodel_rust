@@ -321,6 +321,20 @@ impl Dialect {
             }
         }
     }
+
+    /// Quote a table reference that may be schema-qualified (`schema.table`):
+    /// each dot-separated segment is quoted on its own. A reference that is
+    /// already quoted (starts with `"` or `` ` ``) is returned unchanged, so
+    /// callers can pass through pre-quoted names.
+    pub fn quote_table(self, name: &str) -> String {
+        if name.starts_with('"') || name.starts_with('`') {
+            return name.to_string();
+        }
+        name.split('.')
+            .map(|segment| self.quote_identifier(segment))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
 }
 
 pub trait Connection: Send + Sync {

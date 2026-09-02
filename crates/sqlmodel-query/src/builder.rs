@@ -122,25 +122,30 @@ fn build_joined_pk_select_sql<M: Model>(
         ));
     }
 
+    let child_q = dialect.quote_table(M::TABLE_NAME);
+    let parent_q = dialect.quote_table(parent_table);
     let mut sql = String::new();
     sql.push_str("SELECT ");
     // Always select PK columns from the child table to avoid ambiguity.
     sql.push_str(
         &pk_cols
             .iter()
-            .map(|c| format!("{}.{}", M::TABLE_NAME, c))
+            .map(|c| format!("{child_q}.{}", dialect.quote_identifier(c)))
             .collect::<Vec<_>>()
             .join(", "),
     );
     sql.push_str(" FROM ");
-    sql.push_str(M::TABLE_NAME);
+    sql.push_str(&child_q);
     sql.push_str(" JOIN ");
-    sql.push_str(parent_table);
+    sql.push_str(&parent_q);
     sql.push_str(" ON ");
     sql.push_str(
         &pk_cols
             .iter()
-            .map(|c| format!("{}.{} = {}.{}", M::TABLE_NAME, c, parent_table, c))
+            .map(|c| {
+                let c = dialect.quote_identifier(c);
+                format!("{child_q}.{c} = {parent_q}.{c}")
+            })
             .collect::<Vec<_>>()
             .join(" AND "),
     );
@@ -281,7 +286,11 @@ fn build_pk_in_where_qualified(
     pk_values: &[Vec<Value>],
     param_offset: usize,
 ) -> (String, Vec<Value>) {
-    let qualified_cols: Vec<String> = pk_cols.iter().map(|c| format!("{table}.{c}")).collect();
+    let table_q = dialect.quote_table(table);
+    let qualified_cols: Vec<String> = pk_cols
+        .iter()
+        .map(|c| format!("{table_q}.{}", dialect.quote_identifier(c)))
+        .collect();
 
     let mut params: Vec<Value> = Vec::new();
     if qualified_cols.is_empty() || pk_values.is_empty() {
@@ -346,7 +355,7 @@ fn build_update_sql_for_table_pk_in(
 
     let sql = format!(
         "UPDATE {} SET {} WHERE {}",
-        table,
+        dialect.quote_table(table),
         set_clauses.join(", "),
         pk_where
     );
@@ -364,7 +373,13 @@ fn build_delete_sql_for_table_pk_in(
     if pk_where.is_empty() {
         return (String::new(), Vec::new());
     }
-    (format!("DELETE FROM {table} WHERE {pk_where}"), pk_params)
+    (
+        format!(
+            "DELETE FROM {} WHERE {pk_where}",
+            dialect.quote_table(table)
+        ),
+        pk_params,
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -383,20 +398,21 @@ fn build_joined_child_select_sql_by_pk_in<M: Model>(
     let child_cols: Vec<&'static str> = M::fields().iter().map(|f| f.column_name).collect();
     let parent_cols: Vec<&'static str> = parent_fields.iter().map(|f| f.column_name).collect();
 
+    let child_q = dialect.quote_table(M::TABLE_NAME);
+    let parent_q = dialect.quote_table(parent_table);
     let mut col_parts = Vec::new();
     for col in &child_cols {
         col_parts.push(format!(
-            "{}.{} AS {}__{}",
-            M::TABLE_NAME,
-            col,
-            M::TABLE_NAME,
-            col
+            "{child_q}.{} AS {}",
+            dialect.quote_identifier(col),
+            dialect.quote_identifier(&format!("{}__{col}", M::TABLE_NAME))
         ));
     }
     for col in &parent_cols {
         col_parts.push(format!(
-            "{}.{} AS {}__{}",
-            parent_table, col, parent_table, col
+            "{parent_q}.{} AS {}",
+            dialect.quote_identifier(col),
+            dialect.quote_identifier(&format!("{parent_table}__{col}"))
         ));
     }
 
@@ -404,14 +420,17 @@ fn build_joined_child_select_sql_by_pk_in<M: Model>(
     sql.push_str("SELECT ");
     sql.push_str(&col_parts.join(", "));
     sql.push_str(" FROM ");
-    sql.push_str(M::TABLE_NAME);
+    sql.push_str(&child_q);
     sql.push_str(" JOIN ");
-    sql.push_str(parent_table);
+    sql.push_str(&parent_q);
     sql.push_str(" ON ");
     sql.push_str(
         &pk_cols
             .iter()
-            .map(|c| format!("{}.{} = {}.{}", M::TABLE_NAME, c, parent_table, c))
+            .map(|c| {
+                let c = dialect.quote_identifier(c);
+                format!("{child_q}.{c} = {parent_q}.{c}")
+            })
             .collect::<Vec<_>>()
             .join(" AND "),
     );
@@ -586,12 +605,12 @@ fn build_insert_sql_for_table_with_columns(
         }
     }
 
+    let table_q = dialect.quote_table(table);
     let mut sql = if columns.is_empty() {
-        format!("INSERT INTO {} DEFAULT VALUES", table)
+        format!("INSERT INTO {table_q} DEFAULT VALUES")
     } else {
         format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            table,
+            "INSERT INTO {table_q} ({}) VALUES ({})",
             quoted_list(dialect, &columns),
             placeholders.join(", ")
         )
@@ -639,7 +658,11 @@ fn build_update_sql_for_table(
         return (String::new(), Vec::new());
     }
 
-    let mut sql = format!("UPDATE {} SET {}", table, set_clauses.join(", "));
+    let mut sql = format!(
+        "UPDATE {} SET {}",
+        dialect.quote_table(table),
+        set_clauses.join(", ")
+    );
     if !pk_cols.is_empty() && pk_cols.len() == pk_vals.len() {
         let where_parts: Vec<String> = pk_cols
             .iter()
@@ -943,14 +966,14 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             }
         }
 
+        // Table and column names are quoted (like `Expr` columns in WHERE) so
+        // reserved words such as `order`, `user`, `real`, or `double` work everywhere.
+        let table_q = dialect.quote_table(M::TABLE_NAME);
         let mut sql = if columns.is_empty() {
-            format!("INSERT INTO {} DEFAULT VALUES", M::TABLE_NAME)
+            format!("INSERT INTO {table_q} DEFAULT VALUES")
         } else {
-            // Column names are quoted (like `Expr` columns in WHERE) so reserved
-            // words such as `real`, `double`, `order`, or `user` work everywhere.
             format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                M::TABLE_NAME,
+                "INSERT INTO {table_q} ({}) VALUES ({})",
                 quoted_list(dialect, &columns),
                 placeholders.join(", ")
             )
@@ -1667,7 +1690,10 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
         for batch in batches {
             match batch {
                 Batch::DefaultValues => {
-                    let mut sql = format!("INSERT INTO {} DEFAULT VALUES", M::TABLE_NAME);
+                    let mut sql = format!(
+                        "INSERT INTO {} DEFAULT VALUES",
+                        dialect.quote_table(M::TABLE_NAME)
+                    );
                     self.append_on_conflict(dialect, &mut sql, &[]);
                     self.append_returning(&mut sql);
                     statements.push((sql, Vec::new()));
@@ -1747,7 +1773,7 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
 
         let mut sql = format!(
             "INSERT INTO {} ({}) VALUES {}",
-            M::TABLE_NAME,
+            dialect.quote_table(M::TABLE_NAME),
             quoted_list(dialect, &insert_columns),
             value_groups.join(", ")
         );
@@ -1780,13 +1806,13 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
             value_groups.push(format!("({})", placeholders.join(", ")));
         }
 
+        let table_q = dialect.quote_table(M::TABLE_NAME);
         let mut sql = if columns.is_empty() {
-            format!("INSERT INTO {} DEFAULT VALUES", M::TABLE_NAME)
+            format!("INSERT INTO {table_q} DEFAULT VALUES")
         } else {
             format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                M::TABLE_NAME,
-                columns.join(", "),
+                "INSERT INTO {table_q} ({}) VALUES {}",
+                quoted_list(dialect, &columns),
                 value_groups.join(", ")
             )
         };
@@ -2186,7 +2212,11 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
             return (String::new(), Vec::new());
         }
 
-        let mut sql = format!("UPDATE {} SET {}", M::TABLE_NAME, set_clauses.join(", "));
+        let mut sql = format!(
+            "UPDATE {} SET {}",
+            dialect.quote_table(M::TABLE_NAME),
+            set_clauses.join(", ")
+        );
 
         // Single-table inheritance child models always carry their implicit
         // discriminator predicate so an UPDATE can never touch sibling kinds.
@@ -2871,7 +2901,7 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
     /// unfiltered `DeleteBuilder::<Manager>::new()`) can never remove rows of a
     /// sibling kind that shares the physical table.
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        let mut sql = format!("DELETE FROM {}", M::TABLE_NAME);
+        let mut sql = format!("DELETE FROM {}", dialect.quote_table(M::TABLE_NAME));
         let mut params = Vec::new();
         let sti = crate::select::sti_discriminator_filter::<M>();
 
@@ -3360,7 +3390,7 @@ mod tests {
         // Column names are quoted so reserved words work on every dialect.
         assert_eq!(
             sql,
-            "INSERT INTO heroes (\"id\", \"name\", \"age\") VALUES (DEFAULT, $1, $2)"
+            "INSERT INTO \"heroes\" (\"id\", \"name\", \"age\") VALUES (DEFAULT, $1, $2)"
         );
         assert_eq!(params.len(), 2);
     }
@@ -3416,7 +3446,7 @@ mod tests {
             .on_conflict_do_nothing()
             .build_with_dialect(Dialect::Mysql);
 
-        assert!(sql.starts_with("INSERT IGNORE INTO heroes"));
+        assert!(sql.starts_with("INSERT IGNORE INTO `heroes`"));
         assert!(!sql.contains("ON CONFLICT"));
     }
 
@@ -3478,7 +3508,7 @@ mod tests {
         let (sql, params) = InsertManyBuilder::new(&heroes).build();
 
         // Auto-increment columns with None get DEFAULT, other columns get placeholders
-        assert!(sql.starts_with("INSERT INTO heroes (\"id\", \"name\", \"age\") VALUES"));
+        assert!(sql.starts_with("INSERT INTO \"heroes\" (\"id\", \"name\", \"age\") VALUES"));
         assert!(sql.contains("(DEFAULT, $1, $2), (DEFAULT, $3, $4)"));
         assert_eq!(params.len(), 4);
     }
@@ -3494,7 +3524,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "INSERT INTO heroes (\"name\", \"age\") VALUES (?1, ?2)"
+            "INSERT INTO \"heroes\" (\"name\", \"age\") VALUES (?1, ?2)"
         );
         assert_eq!(params.len(), 2);
     }
@@ -3504,7 +3534,7 @@ mod tests {
         let model = TestOnlyId { id: None };
         let (sql, params) = InsertBuilder::new(&model).build_with_dialect(Dialect::Sqlite);
 
-        assert_eq!(sql, "INSERT INTO only_ids DEFAULT VALUES");
+        assert_eq!(sql, "INSERT INTO \"only_ids\" DEFAULT VALUES");
         assert!(params.is_empty());
     }
 
@@ -3526,7 +3556,7 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         let (sql, params) = &batches[0];
-        assert!(sql.starts_with("INSERT INTO heroes (name, age) VALUES"));
+        assert!(sql.starts_with("INSERT INTO \"heroes\" (\"name\", \"age\") VALUES"));
         assert!(sql.contains("(?1, ?2), (?3, ?4)"));
         assert_eq!(params.len(), 4);
     }
@@ -3550,11 +3580,11 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(
             batches[0].0,
-            "INSERT INTO heroes (id, name, age) VALUES (?1, ?2, ?3)"
+            "INSERT INTO \"heroes\" (\"id\", \"name\", \"age\") VALUES (?1, ?2, ?3)"
         );
         assert_eq!(
             batches[1].0,
-            "INSERT INTO heroes (name, age) VALUES (?1, ?2)"
+            "INSERT INTO \"heroes\" (\"name\", \"age\") VALUES (?1, ?2)"
         );
         assert_eq!(batches[0].1.len(), 3);
         assert_eq!(batches[1].1.len(), 2);
@@ -3566,8 +3596,8 @@ mod tests {
         let batches = InsertManyBuilder::new(&rows).build_batches_with_dialect(Dialect::Sqlite);
 
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].0, "INSERT INTO only_ids DEFAULT VALUES");
-        assert_eq!(batches[1].0, "INSERT INTO only_ids DEFAULT VALUES");
+        assert_eq!(batches[0].0, "INSERT INTO \"only_ids\" DEFAULT VALUES");
+        assert_eq!(batches[1].0, "INSERT INTO \"only_ids\" DEFAULT VALUES");
         assert!(batches[0].1.is_empty());
         assert!(batches[1].1.is_empty());
     }
@@ -3581,7 +3611,7 @@ mod tests {
         };
         let (sql, params) = UpdateBuilder::new(&hero).build();
 
-        assert!(sql.starts_with("UPDATE heroes SET"));
+        assert!(sql.starts_with("UPDATE \"heroes\" SET"));
         assert!(sql.contains("WHERE \"id\" = "));
         assert!(params.len() >= 2); // At least name, age, and id
     }
@@ -3593,7 +3623,7 @@ mod tests {
             .filter(Expr::col("id").eq(1))
             .build_with_dialect(Dialect::Postgres);
 
-        assert_eq!(sql, "UPDATE heroes SET \"age\" = $1 WHERE \"id\" = $2");
+        assert_eq!(sql, "UPDATE \"heroes\" SET \"age\" = $1 WHERE \"id\" = $2");
         assert_eq!(params.len(), 2);
     }
 
@@ -3615,7 +3645,7 @@ mod tests {
             .filter(Expr::col("age").lt(18))
             .build_with_dialect(Dialect::Postgres);
 
-        assert_eq!(sql, "DELETE FROM heroes WHERE \"age\" < $1");
+        assert_eq!(sql, "DELETE FROM \"heroes\" WHERE \"age\" < $1");
     }
 
     #[test]

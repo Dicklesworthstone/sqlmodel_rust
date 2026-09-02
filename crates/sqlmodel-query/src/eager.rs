@@ -4,7 +4,7 @@
 //! relationships to load with a query. Eager loading fetches related
 //! objects in the same query using SQL JOINs.
 
-use sqlmodel_core::{Model, RelationshipInfo, RelationshipKind, Value};
+use sqlmodel_core::{Dialect, Model, RelationshipInfo, RelationshipKind, Value};
 use std::marker::PhantomData;
 
 /// Builder for eager loading configuration.
@@ -148,58 +148,52 @@ pub fn find_relationship<M: Model>(name: &str) -> Option<&'static RelationshipIn
 /// Generate a JOIN clause for a relationship.
 #[must_use]
 pub fn build_join_clause(
+    dialect: Dialect,
     parent_table: &str,
     rel: &RelationshipInfo,
     _param_offset: usize,
 ) -> (String, Vec<Value>) {
     let params = Vec::new();
+    // Every table and column is quoted for the dialect so reserved words work.
+    let q = |name: &str| dialect.quote_identifier(name);
+    let t = |name: &str| dialect.quote_table(name);
+    let parent = t(parent_table);
+    let related = t(rel.related_table);
 
     // Get the primary key column name from the relationship, defaulting to "id"
-    let remote_pk = rel.remote_key.unwrap_or("id");
+    let remote_pk = q(rel.remote_key.unwrap_or("id"));
 
     let sql = match rel.kind {
         RelationshipKind::ManyToOne | RelationshipKind::OneToOne => {
             // LEFT JOIN related_table ON parent.fk = related.pk
-            let local_key = rel.local_key.unwrap_or("id");
-            format!(
-                " LEFT JOIN {} ON {}.{} = {}.{}",
-                rel.related_table, parent_table, local_key, rel.related_table, remote_pk
-            )
+            let local_key = q(rel.local_key.unwrap_or("id"));
+            format!(" LEFT JOIN {related} ON {parent}.{local_key} = {related}.{remote_pk}")
         }
         RelationshipKind::OneToMany => {
             // LEFT JOIN related_table ON related.fk = parent.pk
             // For OneToMany, remote_key is the FK on the related table pointing to us
-            let fk_on_related = rel.remote_key.unwrap_or("id");
+            let fk_on_related = q(rel.remote_key.unwrap_or("id"));
             // And we need local_key as our PK (default "id")
-            let local_pk = rel.local_key.unwrap_or("id");
-            format!(
-                " LEFT JOIN {} ON {}.{} = {}.{}",
-                rel.related_table, rel.related_table, fk_on_related, parent_table, local_pk
-            )
+            let local_pk = q(rel.local_key.unwrap_or("id"));
+            format!(" LEFT JOIN {related} ON {related}.{fk_on_related} = {parent}.{local_pk}")
         }
         RelationshipKind::ManyToMany => {
             // LEFT JOIN link_table ON parent.pk = link.local_col
             // LEFT JOIN related_table ON link.remote_col = related.pk
             if let Some(link) = &rel.link_table {
-                let local_pk = rel.local_key.unwrap_or("id");
+                let local_pk = q(rel.local_key.unwrap_or("id"));
                 let Some(link_local_col) = link.local_cols().first().copied() else {
                     return (String::new(), params);
                 };
                 let Some(link_remote_col) = link.remote_cols().first().copied() else {
                     return (String::new(), params);
                 };
+                let link_t = t(link.table_name);
+                let link_local = q(link_local_col);
+                let link_remote = q(link_remote_col);
                 format!(
-                    " LEFT JOIN {} ON {}.{} = {}.{} LEFT JOIN {} ON {}.{} = {}.{}",
-                    link.table_name,
-                    parent_table,
-                    local_pk,
-                    link.table_name,
-                    link_local_col,
-                    rel.related_table,
-                    link.table_name,
-                    link_remote_col,
-                    rel.related_table,
-                    remote_pk
+                    " LEFT JOIN {link_t} ON {parent}.{local_pk} = {link_t}.{link_local} \
+                     LEFT JOIN {related} ON {link_t}.{link_remote} = {related}.{remote_pk}"
                 )
             } else {
                 String::new()
@@ -212,12 +206,25 @@ pub fn build_join_clause(
 
 /// Generate aliased column names for eager loading.
 ///
-/// Prefixes each column with the table name to avoid conflicts.
+/// Prefixes each column with the table name to avoid conflicts. The alias
+/// itself is `table__column` (what `Row::subset_by_prefix` expects); table,
+/// column, and alias are quoted for the dialect.
 #[must_use]
-pub fn build_aliased_column_parts(table_name: &str, columns: &[&str]) -> Vec<String> {
+pub fn build_aliased_column_parts(
+    dialect: Dialect,
+    table_name: &str,
+    columns: &[&str],
+) -> Vec<String> {
+    let table = dialect.quote_table(table_name);
     columns
         .iter()
-        .map(|col| format!("{}.{} AS {}__{}", table_name, col, table_name, col))
+        .map(|col| {
+            format!(
+                "{table}.{} AS {}",
+                dialect.quote_identifier(col),
+                dialect.quote_identifier(&format!("{table_name}__{col}"))
+            )
+        })
         .collect()
 }
 
@@ -225,8 +232,8 @@ pub fn build_aliased_column_parts(table_name: &str, columns: &[&str]) -> Vec<Str
 ///
 /// Prefixes each column with the table name to avoid conflicts.
 #[must_use]
-pub fn build_aliased_columns(table_name: &str, columns: &[&str]) -> String {
-    build_aliased_column_parts(table_name, columns).join(", ")
+pub fn build_aliased_columns(dialect: Dialect, table_name: &str, columns: &[&str]) -> String {
+    build_aliased_column_parts(dialect, table_name, columns).join(", ")
 }
 
 #[cfg(test)]
@@ -335,10 +342,20 @@ mod tests {
         let rel = RelationshipInfo::new("team", "teams", RelationshipKind::ManyToOne)
             .local_key("team_id");
 
-        let (sql, params) = build_join_clause("heroes", &rel, 0);
+        let (sql, params) = build_join_clause(Dialect::Sqlite, "heroes", &rel, 0);
 
-        assert_eq!(sql, " LEFT JOIN teams ON heroes.team_id = teams.id");
+        assert_eq!(
+            sql,
+            " LEFT JOIN \"teams\" ON \"heroes\".\"team_id\" = \"teams\".\"id\""
+        );
         assert!(params.is_empty());
+
+        // MySQL quotes with backticks.
+        let (sql, _) = build_join_clause(Dialect::Mysql, "heroes", &rel, 0);
+        assert_eq!(
+            sql,
+            " LEFT JOIN `teams` ON `heroes`.`team_id` = `teams`.`id`"
+        );
     }
 
     #[test]
@@ -346,9 +363,12 @@ mod tests {
         let rel = RelationshipInfo::new("heroes", "heroes", RelationshipKind::OneToMany)
             .remote_key("team_id");
 
-        let (sql, params) = build_join_clause("teams", &rel, 0);
+        let (sql, params) = build_join_clause(Dialect::Sqlite, "teams", &rel, 0);
 
-        assert_eq!(sql, " LEFT JOIN heroes ON heroes.team_id = teams.id");
+        assert_eq!(
+            sql,
+            " LEFT JOIN \"heroes\" ON \"heroes\".\"team_id\" = \"teams\".\"id\""
+        );
         assert!(params.is_empty());
     }
 
@@ -359,19 +379,19 @@ mod tests {
                 sqlmodel_core::LinkTableInfo::new("hero_powers", "hero_id", "power_id"),
             );
 
-        let (sql, params) = build_join_clause("heroes", &rel, 0);
+        let (sql, params) = build_join_clause(Dialect::Sqlite, "heroes", &rel, 0);
 
-        assert!(sql.contains("LEFT JOIN hero_powers"));
-        assert!(sql.contains("LEFT JOIN powers"));
+        assert!(sql.contains("LEFT JOIN \"hero_powers\""));
+        assert!(sql.contains("LEFT JOIN \"powers\""));
         assert!(params.is_empty());
     }
 
     #[test]
     fn test_build_aliased_columns() {
-        let result = build_aliased_columns("heroes", &["id", "name", "team_id"]);
-        assert!(result.contains("heroes.id AS heroes__id"));
-        assert!(result.contains("heroes.name AS heroes__name"));
-        assert!(result.contains("heroes.team_id AS heroes__team_id"));
+        let result = build_aliased_columns(Dialect::Sqlite, "heroes", &["id", "name", "team_id"]);
+        assert!(result.contains("\"heroes\".\"id\" AS \"heroes__id\""));
+        assert!(result.contains("\"heroes\".\"name\" AS \"heroes__name\""));
+        assert!(result.contains("\"heroes\".\"team_id\" AS \"heroes__team_id\""));
     }
 
     #[test]

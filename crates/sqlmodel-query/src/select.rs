@@ -52,16 +52,41 @@ fn joined_inheritance_join<M: Model>() -> Option<Join> {
     Some(Join::inner(parent_table, on))
 }
 
-fn joined_inheritance_select_columns<M: Model>() -> Option<Vec<String>> {
+fn joined_inheritance_select_columns<M: Model>(dialect: Dialect) -> Option<Vec<String>> {
     let (parent_table, parent_fields_fn) = joined_inheritance_parent::<M>()?;
 
     let child_cols: Vec<&str> = M::fields().iter().map(|f| f.column_name).collect();
     let parent_cols: Vec<&str> = parent_fields_fn().iter().map(|f| f.column_name).collect();
 
     let mut parts = Vec::new();
-    parts.extend(build_aliased_column_parts(M::TABLE_NAME, &child_cols));
-    parts.extend(build_aliased_column_parts(parent_table, &parent_cols));
+    parts.extend(build_aliased_column_parts(
+        dialect,
+        M::TABLE_NAME,
+        &child_cols,
+    ));
+    parts.extend(build_aliased_column_parts(
+        dialect,
+        parent_table,
+        &parent_cols,
+    ));
     Some(parts)
+}
+
+/// `(table, column)` pairs for every column of `T`, rendered as quoted
+/// `table.column AS table__column` projections once the dialect is known.
+fn table_columns<T: Model>() -> Vec<(&'static str, &'static str)> {
+    T::fields()
+        .iter()
+        .map(|f| (T::TABLE_NAME, f.column_name))
+        .collect()
+}
+
+fn render_aliased_projection(dialect: Dialect, pairs: &[(&'static str, &'static str)]) -> String {
+    pairs
+        .iter()
+        .flat_map(|(table, col)| build_aliased_column_parts(dialect, table, &[col]))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Information about a JOIN for eager loading.
@@ -89,6 +114,9 @@ struct EagerJoinInfo {
 pub struct Select<M: Model> {
     /// Columns to select (empty = all)
     columns: Vec<String>,
+    /// `(table, column)` pairs projected as quoted `table.column AS table__column`
+    /// at build time (polymorphic joined selects); empty otherwise.
+    aliased_projection: Vec<(&'static str, &'static str)>,
     /// WHERE clause conditions
     where_clause: Option<Where>,
     /// ORDER BY clauses
@@ -118,6 +146,7 @@ impl<M: Model> Select<M> {
     pub fn new() -> Self {
         Self {
             columns: Vec::new(),
+            aliased_projection: Vec::new(),
             where_clause: None,
             order_by: Vec::new(),
             joins: Vec::new(),
@@ -238,7 +267,7 @@ impl<M: Model> Select<M> {
     ///   since hydration depends on a complete prefixed projection.
     #[must_use]
     pub fn polymorphic_joined<Child: Model>(mut self) -> PolymorphicJoinedSelect<M, Child> {
-        self.columns = polymorphic_joined_select_columns::<M, Child>();
+        self.aliased_projection = [table_columns::<M>(), table_columns::<Child>()].concat();
         if let Some(join) = polymorphic_joined_left_join::<M, Child>() {
             self.joins.push(join);
         }
@@ -256,7 +285,12 @@ impl<M: Model> Select<M> {
     pub fn polymorphic_joined2<C1: Model, C2: Model>(
         mut self,
     ) -> PolymorphicJoinedSelect2<M, C1, C2> {
-        self.columns = polymorphic_joined_select_columns2::<M, C1, C2>();
+        self.aliased_projection = [
+            table_columns::<M>(),
+            table_columns::<C1>(),
+            table_columns::<C2>(),
+        ]
+        .concat();
         if let Some(join) = polymorphic_joined_left_join::<M, C1>() {
             self.joins.push(join);
         }
@@ -277,7 +311,13 @@ impl<M: Model> Select<M> {
     pub fn polymorphic_joined3<C1: Model, C2: Model, C3: Model>(
         mut self,
     ) -> PolymorphicJoinedSelect3<M, C1, C2, C3> {
-        self.columns = polymorphic_joined_select_columns3::<M, C1, C2, C3>();
+        self.aliased_projection = [
+            table_columns::<M>(),
+            table_columns::<C1>(),
+            table_columns::<C2>(),
+            table_columns::<C3>(),
+        ]
+        .concat();
         if let Some(join) = polymorphic_joined_left_join::<M, C1>() {
             self.joins.push(join);
         }
@@ -330,22 +370,17 @@ impl<M: Model> Select<M> {
         }
 
         // Build column list with model's table aliased
-        let mut col_parts = Vec::new();
-        for col in &parent_cols {
-            col_parts.push(format!(
-                "{}.{} AS {}__{}",
-                M::TABLE_NAME,
-                col,
-                M::TABLE_NAME,
-                col
-            ));
-        }
+        let mut col_parts = build_aliased_column_parts(dialect, M::TABLE_NAME, &parent_cols);
 
         // For joined inheritance, also project parent-table columns so `#[sqlmodel(parent)]`
         // hydration can build the embedded parent model from `row.subset_by_prefix(parent_table)`.
         if let Some((parent_table, parent_fields_fn)) = joined_inheritance_parent::<M>() {
             let parent_cols: Vec<&str> = parent_fields_fn().iter().map(|f| f.column_name).collect();
-            col_parts.extend(build_aliased_column_parts(parent_table, &parent_cols));
+            col_parts.extend(build_aliased_column_parts(
+                dialect,
+                parent_table,
+                &parent_cols,
+            ));
         }
 
         // Add columns for each eagerly loaded relationship
@@ -365,7 +400,11 @@ impl<M: Model> Select<M> {
                         .iter()
                         .map(|f| f.column_name)
                         .collect();
-                    col_parts.extend(build_aliased_column_parts(rel.related_table, &related_cols));
+                    col_parts.extend(build_aliased_column_parts(
+                        dialect,
+                        rel.related_table,
+                        &related_cols,
+                    ));
                 }
             }
         }
@@ -374,14 +413,14 @@ impl<M: Model> Select<M> {
 
         // FROM
         sql.push_str(" FROM ");
-        sql.push_str(M::TABLE_NAME);
+        sql.push_str(&dialect.quote_table(M::TABLE_NAME));
 
         // Add JOINs for eager loading
         if let Some(loader) = &self.eager_loader {
             for include in loader.includes() {
                 if let Some(rel) = find_relationship::<M>(include.relationship) {
                     let (join_sql, join_params) =
-                        build_join_clause(M::TABLE_NAME, rel, params.len());
+                        build_join_clause(dialect, M::TABLE_NAME, rel, params.len());
                     sql.push_str(&join_sql);
                     params.extend(join_params);
                 }
@@ -577,8 +616,15 @@ impl<M: Model> Select<M> {
             sql.push_str("DISTINCT ");
         }
 
-        if let Some(cols) = joined_inheritance_select_columns::<M>() {
+        if let Some(cols) = joined_inheritance_select_columns::<M>(dialect) {
             sql.push_str(&cols.join(", "));
+        } else if !self.aliased_projection.is_empty() {
+            // Polymorphic joined selects: full base + child projections, quoted
+            // for the dialect now that it is known.
+            sql.push_str(&render_aliased_projection(
+                dialect,
+                &self.aliased_projection,
+            ));
         } else if self.columns.is_empty() {
             sql.push('*');
         } else {
@@ -587,7 +633,7 @@ impl<M: Model> Select<M> {
 
         // FROM
         sql.push_str(" FROM ");
-        sql.push_str(M::TABLE_NAME);
+        sql.push_str(&dialect.quote_table(M::TABLE_NAME));
 
         // JOINs
         for join in &joins {
@@ -758,6 +804,8 @@ impl<M: Model> Select<M> {
     fn into_query(self) -> SelectQuery {
         let Select {
             columns,
+            // Polymorphic projections are not meaningful inside a subquery.
+            aliased_projection: _,
             where_clause,
             order_by,
             joins,
@@ -818,7 +866,7 @@ impl<M: Model> Select<M> {
 
         // SELECT 1 for optimal EXISTS performance
         sql.push_str("SELECT 1 FROM ");
-        sql.push_str(M::TABLE_NAME);
+        sql.push_str(&dialect.quote_table(M::TABLE_NAME));
 
         // JOINs (if any)
         for join in &joins {
@@ -987,43 +1035,6 @@ fn polymorphic_joined_left_join<Base: Model, Child: Model>() -> Option<Join> {
     }
 
     Some(Join::left(Child::TABLE_NAME, on))
-}
-
-fn polymorphic_joined_select_columns<Base: Model, Child: Model>() -> Vec<String> {
-    let base_cols: Vec<&str> = Base::fields().iter().map(|f| f.column_name).collect();
-    let child_cols: Vec<&str> = Child::fields().iter().map(|f| f.column_name).collect();
-
-    let mut parts = Vec::new();
-    parts.extend(build_aliased_column_parts(Base::TABLE_NAME, &base_cols));
-    parts.extend(build_aliased_column_parts(Child::TABLE_NAME, &child_cols));
-    parts
-}
-
-fn polymorphic_joined_select_columns2<Base: Model, C1: Model, C2: Model>() -> Vec<String> {
-    let base_cols: Vec<&str> = Base::fields().iter().map(|f| f.column_name).collect();
-    let c1_cols: Vec<&str> = C1::fields().iter().map(|f| f.column_name).collect();
-    let c2_cols: Vec<&str> = C2::fields().iter().map(|f| f.column_name).collect();
-
-    let mut parts = Vec::new();
-    parts.extend(build_aliased_column_parts(Base::TABLE_NAME, &base_cols));
-    parts.extend(build_aliased_column_parts(C1::TABLE_NAME, &c1_cols));
-    parts.extend(build_aliased_column_parts(C2::TABLE_NAME, &c2_cols));
-    parts
-}
-
-fn polymorphic_joined_select_columns3<Base: Model, C1: Model, C2: Model, C3: Model>() -> Vec<String>
-{
-    let base_cols: Vec<&str> = Base::fields().iter().map(|f| f.column_name).collect();
-    let c1_cols: Vec<&str> = C1::fields().iter().map(|f| f.column_name).collect();
-    let c2_cols: Vec<&str> = C2::fields().iter().map(|f| f.column_name).collect();
-    let c3_cols: Vec<&str> = C3::fields().iter().map(|f| f.column_name).collect();
-
-    let mut parts = Vec::new();
-    parts.extend(build_aliased_column_parts(Base::TABLE_NAME, &base_cols));
-    parts.extend(build_aliased_column_parts(C1::TABLE_NAME, &c1_cols));
-    parts.extend(build_aliased_column_parts(C2::TABLE_NAME, &c2_cols));
-    parts.extend(build_aliased_column_parts(C3::TABLE_NAME, &c3_cols));
-    parts
 }
 
 /// Output of a joined-table inheritance polymorphic query with a single child type.
@@ -1532,7 +1543,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT * FROM heroes INNER JOIN teams ON \"teams\".\"active\" = $1 WHERE \"age\" > $2 GROUP BY team_id HAVING \"count\" > $3"
+            "SELECT * FROM \"heroes\" INNER JOIN \"teams\" ON \"teams\".\"active\" = $1 WHERE \"age\" > $2 GROUP BY team_id HAVING \"count\" > $3"
         );
         assert_eq!(
             params,
@@ -1545,7 +1556,7 @@ mod tests {
         let query = Select::<Hero>::new();
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes");
+        assert_eq!(sql, "SELECT * FROM \"heroes\"");
         assert!(params.is_empty());
     }
 
@@ -1555,7 +1566,7 @@ mod tests {
         let (sql, params) = query.build();
         assert_eq!(
             sql,
-            "SELECT * FROM employees WHERE \"employees\".\"type_\" = $1"
+            "SELECT * FROM \"employees\" WHERE \"employees\".\"type_\" = $1"
         );
         assert_eq!(params, vec![Value::Text("manager".to_string())]);
     }
@@ -1566,7 +1577,7 @@ mod tests {
         let (sql, params) = query.build();
         assert_eq!(
             sql,
-            "SELECT * FROM employees WHERE \"active\" = $1 AND \"employees\".\"type_\" = $2"
+            "SELECT * FROM \"employees\" WHERE \"active\" = $1 AND \"employees\".\"type_\" = $2"
         );
         assert_eq!(
             params,
@@ -1655,12 +1666,12 @@ mod tests {
 
         assert!(params.is_empty());
         assert!(sql.starts_with("SELECT "));
-        assert!(sql.contains("employees.id AS employees__id"));
-        assert!(sql.contains("employees.department AS employees__department"));
-        assert!(sql.contains("persons.id AS persons__id"));
-        assert!(sql.contains("persons.name AS persons__name"));
+        assert!(sql.contains("\"employees\".\"id\" AS \"employees__id\""));
+        assert!(sql.contains("\"employees\".\"department\" AS \"employees__department\""));
+        assert!(sql.contains("\"persons\".\"id\" AS \"persons__id\""));
+        assert!(sql.contains("\"persons\".\"name\" AS \"persons__name\""));
         assert!(sql.contains(
-            "FROM employees INNER JOIN persons ON \"employees\".\"id\" = \"persons\".\"id\""
+            "FROM \"employees\" INNER JOIN \"persons\" ON \"employees\".\"id\" = \"persons\".\"id\""
         ));
     }
 
@@ -1669,7 +1680,7 @@ mod tests {
         let query = Select::<Hero>::new().columns(&["id", "name", "power"]);
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT id, name, power FROM heroes");
+        assert_eq!(sql, "SELECT id, name, power FROM \"heroes\"");
         assert!(params.is_empty());
     }
 
@@ -1678,7 +1689,7 @@ mod tests {
         let query = Select::<Hero>::new().columns(&["team_id"]).distinct();
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT DISTINCT team_id FROM heroes");
+        assert_eq!(sql, "SELECT DISTINCT team_id FROM \"heroes\"");
         assert!(params.is_empty());
     }
 
@@ -1687,7 +1698,7 @@ mod tests {
         let query = Select::<Hero>::new().filter(Expr::col("active").eq(true));
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes WHERE \"active\" = $1");
+        assert_eq!(sql, "SELECT * FROM \"heroes\" WHERE \"active\" = $1");
         assert_eq!(params, vec![Value::Bool(true)]);
     }
 
@@ -1700,7 +1711,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT * FROM heroes WHERE \"active\" = $1 AND \"age\" > $2"
+            "SELECT * FROM \"heroes\" WHERE \"active\" = $1 AND \"age\" > $2"
         );
         assert_eq!(params, vec![Value::Bool(true), Value::Int(18)]);
     }
@@ -1714,7 +1725,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT * FROM heroes WHERE \"role\" = $1 OR \"role\" = $2"
+            "SELECT * FROM \"heroes\" WHERE \"role\" = $1 OR \"role\" = $2"
         );
         assert_eq!(
             params,
@@ -1730,7 +1741,7 @@ mod tests {
         let query = Select::<Hero>::new().order_by(OrderBy::asc(Expr::col("name")));
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes ORDER BY \"name\" ASC");
+        assert_eq!(sql, "SELECT * FROM \"heroes\" ORDER BY \"name\" ASC");
         assert!(params.is_empty());
     }
 
@@ -1739,7 +1750,7 @@ mod tests {
         let query = Select::<Hero>::new().order_by(OrderBy::desc(Expr::col("created_at")));
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes ORDER BY \"created_at\" DESC");
+        assert_eq!(sql, "SELECT * FROM \"heroes\" ORDER BY \"created_at\" DESC");
         assert!(params.is_empty());
     }
 
@@ -1752,7 +1763,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT * FROM heroes ORDER BY \"team_id\" ASC, \"name\" ASC"
+            "SELECT * FROM \"heroes\" ORDER BY \"team_id\" ASC, \"name\" ASC"
         );
         assert!(params.is_empty());
     }
@@ -1762,7 +1773,7 @@ mod tests {
         let query = Select::<Hero>::new().limit(10);
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes LIMIT 10");
+        assert_eq!(sql, "SELECT * FROM \"heroes\" LIMIT 10");
         assert!(params.is_empty());
     }
 
@@ -1771,7 +1782,7 @@ mod tests {
         let query = Select::<Hero>::new().offset(20);
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes OFFSET 20");
+        assert_eq!(sql, "SELECT * FROM \"heroes\" OFFSET 20");
         assert!(params.is_empty());
     }
 
@@ -1780,7 +1791,7 @@ mod tests {
         let query = Select::<Hero>::new().limit(10).offset(20);
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes LIMIT 10 OFFSET 20");
+        assert_eq!(sql, "SELECT * FROM \"heroes\" LIMIT 10 OFFSET 20");
         assert!(params.is_empty());
     }
 
@@ -1793,7 +1804,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT team_id, COUNT(*) as count FROM heroes GROUP BY team_id"
+            "SELECT team_id, COUNT(*) as count FROM \"heroes\" GROUP BY team_id"
         );
         assert!(params.is_empty());
     }
@@ -1807,7 +1818,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT team_id, role, COUNT(*) as count FROM heroes GROUP BY team_id, role"
+            "SELECT team_id, role, COUNT(*) as count FROM \"heroes\" GROUP BY team_id, role"
         );
         assert!(params.is_empty());
     }
@@ -1819,7 +1830,7 @@ mod tests {
             .for_update();
         let (sql, params) = query.build();
 
-        assert_eq!(sql, "SELECT * FROM heroes WHERE \"id\" = $1 FOR UPDATE");
+        assert_eq!(sql, "SELECT * FROM \"heroes\" WHERE \"id\" = $1 FOR UPDATE");
         assert_eq!(params, vec![Value::Int(1)]);
     }
 
@@ -1831,7 +1842,7 @@ mod tests {
         ));
         let (sql, _) = query.build();
 
-        assert!(sql.contains("INNER JOIN teams ON"));
+        assert!(sql.contains("INNER JOIN \"teams\" ON"));
     }
 
     #[test]
@@ -1842,7 +1853,7 @@ mod tests {
         ));
         let (sql, _) = query.build();
 
-        assert!(sql.contains("LEFT JOIN teams ON"));
+        assert!(sql.contains("LEFT JOIN \"teams\" ON"));
     }
 
     #[test]
@@ -1853,7 +1864,7 @@ mod tests {
         ));
         let (sql, _) = query.build();
 
-        assert!(sql.contains("RIGHT JOIN teams ON"));
+        assert!(sql.contains("RIGHT JOIN \"teams\" ON"));
     }
 
     #[test]
@@ -1869,8 +1880,8 @@ mod tests {
             ));
         let (sql, _) = query.build();
 
-        assert!(sql.contains("INNER JOIN teams ON"));
-        assert!(sql.contains("LEFT JOIN powers ON"));
+        assert!(sql.contains("INNER JOIN \"teams\" ON"));
+        assert!(sql.contains("LEFT JOIN \"powers\" ON"));
     }
 
     #[test]
@@ -1892,9 +1903,9 @@ mod tests {
         let (sql, params) = query.build();
 
         assert!(sql.starts_with(
-            "SELECT DISTINCT heroes.id, heroes.name, teams.name as team_name FROM heroes"
+            "SELECT DISTINCT heroes.id, heroes.name, teams.name as team_name FROM \"heroes\""
         ));
-        assert!(sql.contains("INNER JOIN teams ON"));
+        assert!(sql.contains("INNER JOIN \"teams\" ON"));
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("GROUP BY"));
         assert!(sql.contains("HAVING"));
@@ -1911,7 +1922,7 @@ mod tests {
     fn test_select_default() {
         let query = Select::<Hero>::default();
         let (sql, _) = query.build();
-        assert_eq!(sql, "SELECT * FROM heroes");
+        assert_eq!(sql, "SELECT * FROM \"heroes\"");
     }
 
     #[test]
@@ -2025,17 +2036,17 @@ mod tests {
         let (sql, params, join_info) = query.build_eager_with_dialect(Dialect::default());
 
         // Should have LEFT JOIN for team relationship
-        assert!(sql.contains("LEFT JOIN teams"));
-        assert!(sql.contains("heroes.team_id = teams.id"));
+        assert!(sql.contains("LEFT JOIN \"teams\""));
+        assert!(sql.contains("\"heroes\".\"team_id\" = \"teams\".\"id\""));
 
         // Should have aliased columns for parent table
-        assert!(sql.contains("heroes.id AS heroes__id"));
-        assert!(sql.contains("heroes.name AS heroes__name"));
-        assert!(sql.contains("heroes.team_id AS heroes__team_id"));
+        assert!(sql.contains("\"heroes\".\"id\" AS \"heroes__id\""));
+        assert!(sql.contains("\"heroes\".\"name\" AS \"heroes__name\""));
+        assert!(sql.contains("\"heroes\".\"team_id\" AS \"heroes__team_id\""));
 
         // Should have aliased columns for related table (so subset_by_prefix works)
-        assert!(sql.contains("teams.id AS teams__id"));
-        assert!(sql.contains("teams.name AS teams__name"));
+        assert!(sql.contains("\"teams\".\"id\" AS \"teams__id\""));
+        assert!(sql.contains("\"teams\".\"name\" AS \"teams__name\""));
 
         // Should have join info
         assert_eq!(join_info.len(), 1);
@@ -2051,7 +2062,7 @@ mod tests {
 
         let (sql, params, _) = query.build_eager_with_dialect(Dialect::default());
 
-        assert!(sql.contains("LEFT JOIN teams"));
+        assert!(sql.contains("LEFT JOIN \"teams\""));
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("\"active\" = $1"));
         assert_eq!(params, vec![Value::Bool(true)]);
@@ -2068,7 +2079,7 @@ mod tests {
 
         let (sql, _, _) = query.build_eager_with_dialect(Dialect::default());
 
-        assert!(sql.contains("LEFT JOIN teams"));
+        assert!(sql.contains("LEFT JOIN \"teams\""));
         assert!(sql.contains("ORDER BY"));
         assert!(sql.contains("LIMIT 10"));
         assert!(sql.contains("OFFSET 5"));
@@ -2108,10 +2119,10 @@ mod tests {
         let mut params = Vec::new();
         let sql = exists_expr.build(&mut params, 0);
 
-        // Should generate EXISTS (SELECT 1 FROM heroes WHERE ...)
+        // Should generate EXISTS (SELECT 1 FROM \"heroes\" WHERE ...)
         assert_eq!(
             sql,
-            "EXISTS (SELECT 1 FROM heroes WHERE orders.customer_id = customers.id)"
+            "EXISTS (SELECT 1 FROM \"heroes\" WHERE orders.customer_id = customers.id)"
         );
     }
 
@@ -2127,7 +2138,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "NOT EXISTS (SELECT 1 FROM heroes WHERE orders.customer_id = customers.id)"
+            "NOT EXISTS (SELECT 1 FROM \"heroes\" WHERE orders.customer_id = customers.id)"
         );
     }
 
@@ -2141,7 +2152,10 @@ mod tests {
         let mut params = Vec::new();
         let sql = exists_expr.build(&mut params, 0);
 
-        assert_eq!(sql, "EXISTS (SELECT 1 FROM heroes WHERE \"status\" = $1)");
+        assert_eq!(
+            sql,
+            "EXISTS (SELECT 1 FROM \"heroes\" WHERE \"status\" = $1)"
+        );
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], Value::Text("active".to_string()));
     }
@@ -2155,7 +2169,7 @@ mod tests {
         let mut params = Vec::new();
         let sql = exists_expr.build_with_dialect(Dialect::Mysql, &mut params, 0);
 
-        assert_eq!(sql, "EXISTS (SELECT 1 FROM heroes WHERE `status` = ?)");
+        assert_eq!(sql, "EXISTS (SELECT 1 FROM `heroes` WHERE `status` = ?)");
         assert_eq!(params, vec![Value::Text("active".to_string())]);
     }
 
@@ -2173,8 +2187,8 @@ mod tests {
         let mut params = Vec::new();
         let sql = exists_expr.build(&mut params, 0);
 
-        assert!(sql.starts_with("EXISTS (SELECT 1 FROM heroes"));
-        assert!(sql.contains("INNER JOIN teams ON"));
+        assert!(sql.starts_with("EXISTS (SELECT 1 FROM \"heroes\""));
+        assert!(sql.contains("INNER JOIN \"teams\" ON"));
         assert!(sql.contains("WHERE"));
     }
 
@@ -2196,7 +2210,10 @@ mod tests {
         assert!(!sql.contains("ORDER BY"));
         assert!(!sql.contains("LIMIT"));
         assert!(!sql.contains("OFFSET"));
-        assert_eq!(sql, "EXISTS (SELECT 1 FROM heroes WHERE \"active\" = $1)");
+        assert_eq!(
+            sql,
+            "EXISTS (SELECT 1 FROM \"heroes\" WHERE \"active\" = $1)"
+        );
     }
 
     #[test]
@@ -2211,7 +2228,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT * FROM teams WHERE \"active\" = $1 AND EXISTS (SELECT 1 FROM heroes WHERE heroes.team_id = teams.id)"
+            "SELECT * FROM \"teams\" WHERE \"active\" = $1 AND EXISTS (SELECT 1 FROM \"heroes\" WHERE heroes.team_id = teams.id)"
         );
         assert_eq!(params, vec![Value::Bool(true)]);
     }
@@ -2229,7 +2246,7 @@ mod tests {
         let (sql, params) = query.build_with_dialect(Dialect::Sqlite);
 
         assert!(sql.contains(
-            "LEFT JOIN LATERAL (SELECT * FROM heroes WHERE \"status\" = ?1) AS recent ON TRUE"
+            "LEFT JOIN LATERAL (SELECT * FROM \"heroes\" WHERE \"status\" = ?1) AS recent ON TRUE"
         ));
         assert!(sql.contains("WHERE \"active\" = ?2"));
         assert_eq!(params.len(), 2);

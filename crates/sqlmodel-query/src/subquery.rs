@@ -55,7 +55,7 @@ impl SelectQuery {
 
         // FROM
         sql.push_str(" FROM ");
-        sql.push_str(&self.table);
+        sql.push_str(&dialect.quote_table(&self.table));
 
         // JOINs
         for join in &self.joins {
@@ -120,7 +120,7 @@ impl SelectQuery {
 
         // SELECT 1 for optimal EXISTS performance
         sql.push_str("SELECT 1 FROM ");
-        sql.push_str(&self.table);
+        sql.push_str(&dialect.quote_table(&self.table));
 
         // JOINs (if any)
         for join in &self.joins {
