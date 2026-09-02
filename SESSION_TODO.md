@@ -12,7 +12,7 @@ items it carried have a recorded disposition.
 |---|---|
 | Joined inheritance: extend polymorphic support beyond a single child type | Done for 2 and 3 children (`fb379fe`, `polymorphic_joined2/3`); N-ary generation is bd-kzp1.3 |
 | Joined inheritance: track/decide DML semantics across base+child | Done (`8784476`, `d9ed0a9`); auto-increment upsert and RETURNING with ON CONFLICT remain as bd-kzp1.4 |
-| bd-3bmd block: explicit UPDATE SET/WHERE, DELETE WHERE (+RETURNING), INSERT ON CONFLICT for joined children | Implemented in `d9ed0a9` (`crates/sqlmodel-query/src/builder.rs`); the planned end-to-end file `joined_inheritance_dml_advanced_sqlite.rs` was never written and is bd-kzp1.6 |
+| bd-3bmd block: explicit UPDATE SET/WHERE, DELETE WHERE (+RETURNING), INSERT ON CONFLICT for joined children | Implemented in `d9ed0a9` (`crates/sqlmodel-query/src/builder.rs`); the end-to-end coverage lives in `crates/sqlmodel/tests/joined_inheritance_dml_sqlite.rs` rather than the separately planned `..._advanced_sqlite.rs` file. Auto-increment upsert and `insert_returning` with ON CONFLICT remain unsupported by design and are bd-kzp1.4 |
 | bd-3bmd quality gates | Superseded by the workspace gates run in CI |
 | B2: remove obsolete "Rust Equivalent (Serde only)" guidance in EXISTING_SQLMODEL_STRUCTURE.md; never claim unverified features | bd-si4u.1 (doc-truth pass) |
 | B4 / C: doc quality gates, landing the plane | Session ended; no action |

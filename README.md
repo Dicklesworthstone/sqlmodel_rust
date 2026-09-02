@@ -245,6 +245,40 @@ let deleted = delete!(User)
     .await?;
 ```
 
+### 4. Transactions, Concurrent Writers, and Retries
+
+Every driver starts transactions through the same `Connection` API. `TransactionOptions` adds a
+`TransactionMode` on top of the isolation level: `Concurrent` selects FrankenSQLite's `BEGIN CONCURRENT`
+(page-level MVCC, several writers on one file) and is the native behavior on PostgreSQL and MySQL;
+`Immediate`, `Exclusive`, and `Deferred` pick SQLite's locking forms. A driver that cannot honor a mode
+returns `TransactionErrorKind::UnsupportedMode` instead of silently downgrading (C SQLite has no
+concurrent-writer mode). Conflicting concurrent writers fail with a retryable error, and
+`retry_transaction` re-runs the whole transaction with jittered backoff that respects the `Cx` budget
+and never retries after a cancellation:
+
+```rust
+use sqlmodel::prelude::*;
+
+let moved = retry_transaction(
+    &cx,
+    &conn,
+    TransactionOptions::concurrent(),
+    &RetryPolicy::default(),
+    async |cx, tx| {
+        tx.execute(cx, "UPDATE accounts SET balance = balance - 10 WHERE id = ?1", &[Value::BigInt(1)]).await?;
+        tx.execute(cx, "UPDATE accounts SET balance = balance + 10 WHERE id = ?1", &[Value::BigInt(2)]).await?;
+        Outcome::Ok(10)
+    },
+)
+.await;
+
+// Sessions can start every transaction concurrently:
+let session = Session::with_config(
+    conn,
+    SessionConfig::default().with_transaction_mode(TransactionMode::Concurrent),
+);
+```
+
 ---
 
 ## Console Output

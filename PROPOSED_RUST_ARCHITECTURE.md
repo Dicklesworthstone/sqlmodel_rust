@@ -194,10 +194,8 @@ Design intent:
 
 ## 9. Current Known Gaps / Follow-ups
 
-Remaining architectural follow-ups are tracked in beads (updated 2026-09-02; the earlier `bd-3bmd` reference pointed at a bead that no longer exists — its implementation landed in `d9ed0a9` and the missing end-to-end proof is now `bd-kzp1.6`).
+Remaining architectural follow-ups are tracked in beads (updated 2026-09-02; the earlier `bd-3bmd` reference pointed at a bead that no longer exists — its implementation landed in `d9ed0a9` and its end-to-end proof lives in `crates/sqlmodel/tests/joined_inheritance_dml_sqlite.rs`: explicit `WHERE`/`SET`, ON CONFLICT DO UPDATE, RETURNING shape, ambiguity errors).
 
-- `bd-kzp1.6`:
-  End-to-end coverage for joined-table inheritance DML with explicit `WHERE`/`SET`, ON CONFLICT, and RETURNING.
 - `bd-kzp1.1` / `bd-kzp1.2` / `bd-kzp1.3` / `bd-kzp1.4` / `bd-kzp1.5`:
   Single-table inheritance end-to-end, concrete-table polymorphic queries, N-ary polymorphic joined selects, joined auto-increment upsert, and the multi-level joined-inheritance decision.
 - `bd-7wal.3` / `bd-7wal.4`:

@@ -29,6 +29,80 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ---
 
+## [Unreleased]
+
+Work from the 2026-09-01/02 reality check (beads labeled `reality-check-2026-09`). Note that as of
+2026-09-02 only `sqlmodel-core` and `sqlmodel-frankensqlite` had been published at 0.4.2; the other
+ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that release).
+
+### Added
+
+- **Concurrent writers through the public API.** `sqlmodel_core::TransactionMode`
+  (`Default | Concurrent | Immediate | Exclusive | Deferred`) and `TransactionOptions`, plus
+  `Connection::supports_transaction_mode` and `Connection::begin_with_options` (default
+  implementation refuses unsupported modes with the new
+  `TransactionErrorKind::UnsupportedMode` instead of downgrading). FrankenSQLite maps
+  `Concurrent` to `BEGIN CONCURRENT` (page-level MVCC; previously reachable only via raw SQL) and
+  gains `begin_concurrent_sync`; C SQLite offers the three locking forms and rejects `Concurrent`
+  with a message pointing at `sqlmodel-frankensqlite`; PostgreSQL and MySQL accept `Concurrent` as
+  their native MVCC default. `SessionConfig::transaction_mode` /
+  `SessionConfig::with_transaction_mode` make `Session` start its transactions in a chosen mode.
+  Re-exported from the facade and its prelude.
+- **`retry_transaction` and `RetryPolicy`** (`sqlmodel_core::retry`): re-run a whole transaction
+  when it fails with an error `Error::is_retryable()` accepts (serialization failures, write
+  conflicts, deadlocks), with jittered exponential backoff that never sleeps past the `Cx` budget
+  deadline, never retries after `Cancelled`/`Panicked`, and reports exhaustion as
+  `TransactionErrorKind::RetriesExhausted` (`Error::retries_exhausted`). Uses async closures
+  (`AsyncFnMut`).
+- **`crates/sqlmodel-e2e`** (workspace member, `publish = false`): an all-driver end-to-end harness
+  (`DriverUnderTest`, `Scenario`, `run_on_every_driver`) that runs the same ORM scenarios on
+  C SQLite (memory and file), FrankenSQLite, and, when `SQLMODEL_TEST_{POSTGRES,MYSQL,MARIADB}_URL`
+  are set, PostgreSQL/MySQL/MariaDB. Scenarios: model CRUD smoke, `MigrationRunner`, and two OS
+  threads of concurrent writers with `retry_transaction` (no lost updates; C SQLite asserts the
+  `UnsupportedMode` refusal).
+- New facade tests: `single_table_inheritance_sqlite.rs` (first STI run against a database) and
+  `migration_runner_sqlite.rs` (first `MigrationRunner` run against a database).
+- Security configuration as code: `.cargo/audit.toml` (justified, dated ignores) and `deny.toml`
+  (bans the AGENTS.md forbidden crates, advisories, licenses, registry sources).
+
+### Fixed
+
+- `MigrationRunner` could not work on MySQL: the tracking table used `TEXT PRIMARY KEY` (MySQL
+  requires a key length) and the record/delete statements hard-coded PostgreSQL `$n` placeholders
+  (SQLite only accepted them by treating `$1` as a named parameter). Now `VARCHAR(255)`, `BIGINT`,
+  and `Dialect::placeholder`.
+- `SchemaBuilder::create_table` for single-table-inheritance children emitted `ALTER TABLE ... ADD
+  COLUMN` for columns the base model already declares (a child that redeclares `name` to be able
+  to insert it broke DDL with a duplicate column). Inherited columns are now skipped.
+- Two unresolved rustdoc links in `sqlmodel-postgres`'s protocol reader made `cargo doc -D warnings`
+  fail (bd-o59n).
+
+### Changed
+
+- `sqlmodel-mysql` no longer depends on the unmaintained `rustls-pemfile` (RUSTSEC-2025-0134); PEM
+  parsing uses `rustls::pki_types::pem`. Behavior preserved, covered by fixture tests.
+- Dependencies: asupersync 0.4.9 → 0.4.10, fsqlite family 0.3.13 → 0.3.14 (manifest requirements
+  aligned to 0.3.14), yanked chacha20 0.10.1 → 0.10.2, 55-package transitive refresh. Details and
+  release-note research in UPGRADE_LOG.md.
+- CI: new `integration` job with PostgreSQL 16, MySQL 8.4, and MariaDB 11 services that fails if a
+  suite skips; Security job now `cargo audit --deny warnings` + `cargo deny check` and gates the
+  release build; removed the path-dependency-era `git clone` of asupersync/rich_rust and the
+  Windows vcpkg SQLite install (libsqlite3-sys is bundled); MSRV job also runs tests; lint job checks
+  that Cargo.toml, README, and CHANGELOG agree on the version.
+- `Connection::close` returning `Result` is documented as the deliberate exception to the
+  `Outcome` invariant (PROPOSED_RUST_ARCHITECTURE.md §9).
+
+### Docs
+
+- README: FrankenSQLite in the architecture diagram and crate table; a transactions/concurrent
+  writers/retry section; truthful production-readiness FAQ; the obsolete "edition 2024 is
+  unstable" troubleshooting entry replaced with the real nightly reasons. FEATURE_PARITY test-coverage
+  table now lists every crate with real-database status. PLAN_TO_PORT marks phases complete and
+  records that success criteria are unmeasured. EXISTING_SQLMODEL_STRUCTURE §12 rewritten from
+  "exclusions" to design differences. AGENTS.md: real test locations, `deny.toml` enforcement note,
+  RCH `rch exec` note. New `crates/sqlmodel-frankensqlite/README.md`; `crates/sqlmodel-mysql/README.md`
+  gains a security note on RUSTSEC-2023-0071. SESSION_TODO.md retired in place.
+
 ## [0.4.2] -- 2026-08-31
 
 ### Fixed
