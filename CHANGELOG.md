@@ -271,6 +271,19 @@ run locally against Docker because remote workers cannot reach the containers):
   pushed commits were still queued when this was written, so CI itself has not yet been observed
   running the new integration job.
 
+Second round, same day, on the tree that adds the type matrix, Session, Pool, and retry scenarios:
+
+- `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps` clean.
+- `cargo test --workspace --no-fail-fast` (run as two halves): 50 suites, 1994 passed, 0 failed, 188
+  ignored (pre-existing). `cargo test --workspace --doc --features sqlmodel/nightly-try`: 55 passed,
+  including the three compiled README blocks.
+- `cargo audit --deny warnings` clean; `cargo deny check advisories bans licenses sources` all ok.
+- Live databases: all six `sqlmodel-e2e` scenarios (smoke, types, migrations, session, pool,
+  concurrent-writers with both `retry_transaction` and `Session::with_retry`) pass on C SQLite
+  (memory, file), FrankenSQLite, PostgreSQL 16, and MySQL 8.4; driver integration suites 7/7 each.
+  GitHub Actions runs still had not started when checked.
+
 ## [0.4.1] -- 2026-08-25
 
 Small release. The workspace version was bumped to 0.4.1 by

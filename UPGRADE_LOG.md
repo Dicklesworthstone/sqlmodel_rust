@@ -65,6 +65,7 @@ serde 1.0.229, serde_json 1.0.151, regex 1.13.1, tracing 0.1.44, rich_rust 0.2.3
 - `cargo test --workspace --no-fail-fast`: 61 suites, 2041 passed, 0 failed, 329 ignored (pre-existing); `cargo test --workspace --doc`: 52 passed.
 - `cargo audit --deny warnings` clean; `cargo deny check advisories bans licenses sources` all ok.
 - Live databases (local Docker): postgres:16 and mysql:8.4 integration suites 7/7 each; `sqlmodel-e2e` smoke/migrations/concurrent-writers green on C SQLite, FrankenSQLite, PostgreSQL, MySQL. The refreshed asupersync 0.4.10 / fsqlite 0.3.14 lockfile is what these ran on.
+- Second round on the same lockfile (types, session, pool, and retry scenarios added): fmt/clippy/doc clean; 50 suites, 1994 passed, 0 failed; 55 doctests (`--features sqlmodel/nightly-try`); audit and deny clean; all six e2e scenarios green on all five drivers.
 
 ### Commands used
 ```bash
