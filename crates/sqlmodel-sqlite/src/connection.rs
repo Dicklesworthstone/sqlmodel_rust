@@ -32,7 +32,8 @@
 use crate::ffi;
 use crate::types;
 use sqlmodel_core::{
-    Connection, Cx, Error, IsolationLevel, Outcome, PreparedStatement, Row, TransactionOps, Value,
+    Connection, Cx, Dialect, Error, IsolationLevel, Outcome, PreparedStatement, Row,
+    TransactionMode, TransactionOps, TransactionOptions, Value,
     error::{ConfigError, ConnectionError, ConnectionErrorKind, QueryError, QueryErrorKind},
     row::ColumnInfo,
 };
@@ -717,8 +718,38 @@ impl SqliteConnection {
         Ok(self.last_insert_rowid())
     }
 
-    /// Begin a transaction.
+    /// Begin a transaction, mapping the isolation level onto SQLite's locking forms.
     fn begin_sync(&self, isolation: IsolationLevel) -> Result<(), Error> {
+        // SQLite doesn't support isolation levels in the same way as PostgreSQL,
+        // but we can approximate with different transaction types
+        let begin_sql = match isolation {
+            IsolationLevel::Serializable => "BEGIN EXCLUSIVE",
+            IsolationLevel::RepeatableRead | IsolationLevel::ReadCommitted => "BEGIN IMMEDIATE",
+            IsolationLevel::ReadUncommitted => "BEGIN DEFERRED",
+        };
+        self.begin_statement_sync(begin_sql)
+    }
+
+    /// Begin a transaction with explicit [`TransactionOptions`].
+    ///
+    /// `Default` uses the isolation-level mapping; `Immediate`/`Exclusive`/
+    /// `Deferred` select SQLite's locking forms directly; `Concurrent` is
+    /// refused because C SQLite has no concurrent-writer mode (use
+    /// `sqlmodel-frankensqlite`).
+    fn begin_options_sync(&self, options: TransactionOptions) -> Result<(), Error> {
+        match options.mode {
+            TransactionMode::Default => self.begin_sync(options.isolation),
+            TransactionMode::Immediate => self.begin_statement_sync("BEGIN IMMEDIATE"),
+            TransactionMode::Exclusive => self.begin_statement_sync("BEGIN EXCLUSIVE"),
+            TransactionMode::Deferred => self.begin_statement_sync("BEGIN DEFERRED"),
+            TransactionMode::Concurrent => {
+                Err(Error::unsupported_transaction_mode(options.mode, Dialect::Sqlite))
+            }
+        }
+    }
+
+    /// Issue the given `BEGIN ...` statement and mark the connection as in a transaction.
+    fn begin_statement_sync(&self, begin_sql: &str) -> Result<(), Error> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.in_transaction {
             return Err(Error::Query(QueryError {
@@ -732,14 +763,6 @@ impl SqliteConnection {
                 source: None,
             }));
         }
-
-        // SQLite doesn't support isolation levels in the same way as PostgreSQL,
-        // but we can approximate with different transaction types
-        let begin_sql = match isolation {
-            IsolationLevel::Serializable => "BEGIN EXCLUSIVE",
-            IsolationLevel::RepeatableRead | IsolationLevel::ReadCommitted => "BEGIN IMMEDIATE",
-            IsolationLevel::ReadUncommitted => "BEGIN DEFERRED",
-        };
 
         drop(inner); // Release lock before calling execute_raw
         self.execute_raw(begin_sql)?;
@@ -926,6 +949,22 @@ impl Connection for SqliteConnection {
     ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
         let result = self
             .begin_sync(isolation)
+            .map(|()| SqliteTransaction::new(self));
+        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+    }
+
+    /// C SQLite offers the three locking forms but no concurrent-writer mode.
+    fn supports_transaction_mode(&self, mode: TransactionMode) -> bool {
+        !matches!(mode, TransactionMode::Concurrent)
+    }
+
+    fn begin_with_options(
+        &self,
+        _cx: &Cx,
+        options: TransactionOptions,
+    ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
+        let result = self
+            .begin_options_sync(options)
             .map(|()| SqliteTransaction::new(self));
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }

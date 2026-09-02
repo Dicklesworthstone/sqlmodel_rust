@@ -110,7 +110,7 @@ pub struct TransactionError {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionErrorKind {
     /// Already committed
     AlreadyCommitted,
@@ -120,6 +120,12 @@ pub enum TransactionErrorKind {
     SavepointNotFound,
     /// Nested transaction not supported
     NestedNotSupported,
+    /// The connection cannot start a transaction in the requested
+    /// [`crate::TransactionMode`] (for example `BEGIN CONCURRENT` on C SQLite).
+    UnsupportedMode,
+    /// A retried transaction exhausted its retry budget; the message carries
+    /// the attempt count and the last error.
+    RetriesExhausted,
 }
 
 #[derive(Debug)]
@@ -420,6 +426,42 @@ impl Default for ValidationError {
 }
 
 impl Error {
+    /// The connection cannot start a transaction in `mode` on `dialect`.
+    ///
+    /// Returned by [`crate::Connection::begin_with_options`] and by session
+    /// `begin()` instead of silently downgrading to a supported mode.
+    pub fn unsupported_transaction_mode(
+        mode: crate::connection::TransactionMode,
+        dialect: crate::connection::Dialect,
+    ) -> Self {
+        let hint = match (mode, dialect) {
+            (crate::connection::TransactionMode::Concurrent, crate::connection::Dialect::Sqlite) => {
+                " (BEGIN CONCURRENT needs the pure-Rust FrankenSQLite driver, sqlmodel-frankensqlite; C SQLite has no concurrent-writer mode)"
+            }
+            (_, crate::connection::Dialect::Postgres | crate::connection::Dialect::Mysql) => {
+                " (SQLite locking forms have no equivalent on this dialect; use TransactionMode::Default or Concurrent)"
+            }
+            _ => "",
+        };
+        Error::Transaction(TransactionError {
+            kind: TransactionErrorKind::UnsupportedMode,
+            message: format!(
+                "transaction mode '{}' is not supported by this {:?} connection{hint}",
+                mode.name(),
+                dialect
+            ),
+        })
+    }
+
+    /// A retried transaction gave up after `attempts` attempts; `last` is the
+    /// error from the final attempt.
+    pub fn retries_exhausted(attempts: u32, last: &Error) -> Self {
+        Error::Transaction(TransactionError {
+            kind: TransactionErrorKind::RetriesExhausted,
+            message: format!("transaction failed after {attempts} attempt(s); last error: {last}"),
+        })
+    }
+
     /// Is this a retryable error (deadlock, serialization, pool exhausted, timeouts)?
     pub fn is_retryable(&self) -> bool {
         match self {

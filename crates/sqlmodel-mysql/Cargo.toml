@@ -19,8 +19,10 @@ workspace = true
 [features]
 default = []
 console = ["dep:sqlmodel-console"]
-# TLS support via rustls
-tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+# TLS support via rustls. PEM parsing uses rustls' re-exported `pki_types::pem`
+# (rustls-pki-types), the maintained successor of the unmaintained
+# rustls-pemfile crate (RUSTSEC-2025-0134).
+tls = ["dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 sqlmodel-core.workspace = true
@@ -41,7 +43,6 @@ sqlmodel-console = { workspace = true, optional = true }
 # Optional TLS support
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = { version = "1", optional = true }
-rustls-pemfile = { version = "2.2", optional = true }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }

@@ -491,8 +491,7 @@ fn build_custom_ca_config(
     })?;
     let mut reader = BufReader::new(ca_file);
 
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
+    let certs = read_pem_certificates(&mut reader)
         .map_err(|e| tls_error(format!("Failed to parse CA certificate: {}", e)))?;
 
     if certs.is_empty() {
@@ -542,8 +541,7 @@ fn add_client_auth(
         })?;
         let mut cert_reader = BufReader::new(cert_file);
 
-        let certs = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
+        let certs = read_pem_certificates(&mut cert_reader)
             .map_err(|e| tls_error(format!("Failed to parse client certificate: {}", e)))?;
 
         if certs.is_empty() {
@@ -563,11 +561,12 @@ fn add_client_auth(
         })?;
         let mut key_reader = BufReader::new(key_file);
 
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| tls_error(format!("Failed to parse client key: {}", e)))?
-            .ok_or_else(|| {
+        let key = read_pem_private_key(&mut key_reader).map_err(|e| match e {
+            PemError::NoItemsFound => {
                 tls_error(format!("No private key found in '{}'", key_path.display()))
-            })?;
+            }
+            other => tls_error(format!("Failed to parse client key: {}", other)),
+        })?;
 
         builder
             .with_client_auth_cert(certs, key)
@@ -575,6 +574,37 @@ fn add_client_auth(
     } else {
         Ok(builder.with_no_client_auth())
     }
+}
+
+#[cfg(feature = "tls")]
+use rustls::pki_types::pem::Error as PemError;
+
+/// Read every `CERTIFICATE` section from PEM text.
+///
+/// Non-certificate sections (keys, comments, unrelated blocks) are skipped;
+/// a malformed section is an error. Uses `rustls-pki-types`' PEM parser (the
+/// maintained successor of `rustls-pemfile`).
+#[cfg(feature = "tls")]
+fn read_pem_certificates(
+    reader: &mut dyn std::io::BufRead,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, PemError> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    CertificateDer::pem_reader_iter(reader).collect()
+}
+
+/// Read the first private key (PKCS#8, PKCS#1/RSA, or SEC1/EC) from PEM text.
+///
+/// Returns [`PemError::NoItemsFound`] when the input has no private-key
+/// section (for example a certificate file passed by mistake). Encrypted
+/// PKCS#8 keys are not supported and surface as a parse error.
+#[cfg(feature = "tls")]
+fn read_pem_private_key(
+    reader: &mut dyn std::io::BufRead,
+) -> Result<rustls::pki_types::PrivateKeyDer<'static>, PemError> {
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    PrivateKeyDer::from_pem_reader(reader)
 }
 
 // ============================================================================
@@ -724,5 +754,165 @@ mod tests {
             .client_cert("/path/to/client.pem")
             .client_key("/path/to/client-key.pem");
         assert!(validate_tls_config(SslMode::VerifyCa, &config).is_ok());
+    }
+}
+
+/// PEM parsing tests for the rustls-pki-types based loaders that replaced
+/// `rustls-pemfile`. The fixtures are throwaway keys and self-signed
+/// certificates generated with OpenSSL for these tests only; they secure
+/// nothing.
+#[cfg(all(test, feature = "tls"))]
+mod pem_tests {
+    use super::{PemError, read_pem_certificates, read_pem_private_key};
+    use rustls::pki_types::PrivateKeyDer;
+    use std::io::Cursor;
+
+    const EC_SEC1_KEY: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIC2fKWVerV0o9016nVpKkeKanx3CQCLZrGT06XA3AMz5oAoGCCqGSM49
+AwEHoUQDQgAEo5udO1PuDK/uQRFkMICCDeNvxpWnNWvZyaxN6T3q5hJjpP14CeUN
+BXcUZChtKdS9H5xNgdQ6QNmINcdYumgjKA==
+-----END EC PRIVATE KEY-----
+";
+
+    const EC_PKCS8_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgLZ8pZV6tXSj3TXqd
+WkqR4pqfHcJAItmsZPTpcDcAzPmhRANCAASjm507U+4Mr+5BEWQwgIIN42/Glac1
+a9nJrE3pPermEmOk/XgJ5Q0FdxRkKG0p1L0fnE2B1DpA2Yg1x1i6aCMo
+-----END PRIVATE KEY-----
+";
+
+    const RSA_PKCS1_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIICXQIBAAKBgQDLY+qnjclMlTAEveDAcCS34cElboRyMRsCVgXB43fmBeItbr6A
+9P9YAPGlfffP6+O4MbLnEXkdxz0o6/IWIm+B6ldVrQEWncEXqy1L8z/MGH0o7pWQ
+G63OI9nxa8zEnBjJTqE5C4f22g8OfpB5lqLX1jDsA6RE7B2ryijf+BOPgQIDAQAB
+AoGBAIOaxW1hm01Ig2euDU23wqqRE09LMbxJ9fYO/26z5xMZ334SWIZNASRKiBHT
+bpRFSHYZAm/tqHcSQorGEUEtSwSW5mk2bEQ8AnZtHHnLwUB3jj9ZnuAtdZ9Atw32
+Luz6vT1bMZpBH/GHpEkJzNFo/tIqq2JpnL/cVh9ejXc4nvoZAkEA+GcmD01dhoIn
+jhGuTbmMOIhMJUYGrFfLlKz5iYs7VZUj3poddSUhVZ60KxNGNcmCF6Nz3ENnWunX
+b8b7HFpcZwJBANGcWFkNw+IRnEOU3fx8Q18QlA4Ifv00MvwwFEkxCVTw6cjZQUPo
+tDhsb9Q4a9YboxRytRWGvnuXLJibBC1XQ9cCQQCZCTNxigBsthMYe9wfFolE6vO+
+ov3Jf+10k3zJOHY9q7yFj/1GBrIaxcPKJf3DdXoohhMDSKOMZzTLMJPUS/dRAkAe
+Te9L+LyAO7GO57/sV/7ZiKkPGlVZwCk64qycJFXIDQiPvDE+Yy9jFPJaCUo160r5
+ktfxY8i4T5PoAElrULmDAkAvB7jmQ/CnAT2fD9HQpWuOhKpzKYmnZVo/I9dW9TSQ
+fQaudez852RpY/hvOBwyptzADnglItjscMKzqnYLQHzy
+-----END RSA PRIVATE KEY-----
+";
+
+    const ENCRYPTED_PKCS8_KEY: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIH0MF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBDsh60Px5uYlDv6iq1r
+alPgAgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQLHWjHeHXNDatiQjc
+Y2YlGwSBkLtB+wbPRRlaDa43B+XgeT/hgAKm5P1udztbDd0sRKC3RyuX2mg3IQYh
+rLoKaG3lnZs5kh9iGPUFCyc5MsAGH5zZK4riJwxLcNcmttdKhfk3weshUp8IY4Bf
+Od9wWs4JTIavcTN08xjXl7KYLIlssfxlZbsW1QEipxcBYG2/xDFmAD3GXmER0qB5
+XHlpWJ+KUg==
+-----END ENCRYPTED PRIVATE KEY-----
+";
+
+    const CERT_EC: &str = "-----BEGIN CERTIFICATE-----
+MIIBizCCATGgAwIBAgIUdzI6g0GsVlMulSGYwbyO14Cae9QwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQc3FsbW9kZWwtdGVzdC1jYTAeFw0yNjA5MDIwNDQ1NDhaFw0y
+NjA5MDMwNDQ1NDhaMBsxGTAXBgNVBAMMEHNxbG1vZGVsLXRlc3QtY2EwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAASjm507U+4Mr+5BEWQwgIIN42/Glac1a9nJrE3p
+PermEmOk/XgJ5Q0FdxRkKG0p1L0fnE2B1DpA2Yg1x1i6aCMoo1MwUTAdBgNVHQ4E
+FgQUnRLuUrUZhNJkXyFKSKXZOej3D/QwHwYDVR0jBBgwFoAUnRLuUrUZhNJkXyFK
+SKXZOej3D/QwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAPv7+R
+gI2ZcA1QofsPWmrvyiZ1e1CAkWTVDXOsHGmo9QIhAJf5PthsrHpNCbTjlQFUjf3B
+bf05cSBBV4ynUoQYyHjU
+-----END CERTIFICATE-----
+";
+
+    const CERT_RSA: &str = "-----BEGIN CERTIFICATE-----
+MIICFDCCAX2gAwIBAgIUXLxhpjqIdor1v4rnL9uKTTnsaFEwDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRc3FsbW9kZWwtdGVzdC1jYTIwHhcNMjYwOTAyMDQ0NTQ4
+WhcNMjYwOTAzMDQ0NTQ4WjAcMRowGAYDVQQDDBFzcWxtb2RlbC10ZXN0LWNhMjCB
+nzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEAy2Pqp43JTJUwBL3gwHAkt+HBJW6E
+cjEbAlYFweN35gXiLW6+gPT/WADxpX33z+vjuDGy5xF5Hcc9KOvyFiJvgepXVa0B
+Fp3BF6stS/M/zBh9KO6VkButziPZ8WvMxJwYyU6hOQuH9toPDn6QeZai19Yw7AOk
+ROwdq8oo3/gTj4ECAwEAAaNTMFEwHQYDVR0OBBYEFNafV3XvPPr5TeoDHU49z7Sj
+RCXMMB8GA1UdIwQYMBaAFNafV3XvPPr5TeoDHU49z7SjRCXMMA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADgYEAWoiLxWCh9oeMCXj/phrm6cugPDL29pNm
+CEb2+znfw+C3ZK7fP/vtzjZfZ7ZIarU9b+WDd1/+33G2weT5B2RVcJA1hRQovmLO
+G1euYZaoD1WUYYMQFMsBgnsGSrkeNSAnXGNEEWqweFLwSzZ6jUGAT95IEodL7J9j
+8nN1O8VELb8=
+-----END CERTIFICATE-----
+";
+
+    fn cursor(s: &str) -> Cursor<Vec<u8>> {
+        Cursor::new(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn ca_bundle_with_two_certs_comments_and_crlf_parses_both() {
+        let bundle = format!(
+            "# corporate roots\r\n{}\r\n# second root\r\n{}",
+            CERT_EC.replace('\n', "\r\n"),
+            CERT_RSA.replace('\n', "\r\n")
+        );
+        let certs = read_pem_certificates(&mut cursor(&bundle)).expect("two certificates");
+        assert_eq!(certs.len(), 2);
+        // DER of a self-signed cert is well over 200 bytes for either key type.
+        assert!(certs.iter().all(|c| c.len() > 200));
+    }
+
+    #[test]
+    fn certificate_loader_skips_key_sections_and_returns_empty_for_key_only_input() {
+        let certs = read_pem_certificates(&mut cursor(EC_PKCS8_KEY)).expect("no error");
+        assert!(certs.is_empty(), "a key file has no certificates");
+
+        let mixed = format!("{EC_PKCS8_KEY}{CERT_EC}");
+        let certs = read_pem_certificates(&mut cursor(&mixed)).expect("mixed input parses");
+        assert_eq!(certs.len(), 1, "only the certificate section is returned");
+    }
+
+    #[test]
+    fn certificate_loader_returns_empty_for_empty_input() {
+        let certs = read_pem_certificates(&mut cursor("")).expect("empty is not an error");
+        assert!(certs.is_empty());
+    }
+
+    #[test]
+    fn private_key_loader_accepts_pkcs8_pkcs1_and_sec1() {
+        match read_pem_private_key(&mut cursor(EC_PKCS8_KEY)).expect("pkcs8") {
+            PrivateKeyDer::Pkcs8(_) => {}
+            other => panic!("expected PKCS#8, got {other:?}"),
+        }
+        match read_pem_private_key(&mut cursor(RSA_PKCS1_KEY)).expect("pkcs1") {
+            PrivateKeyDer::Pkcs1(_) => {}
+            other => panic!("expected PKCS#1, got {other:?}"),
+        }
+        match read_pem_private_key(&mut cursor(EC_SEC1_KEY)).expect("sec1") {
+            PrivateKeyDer::Sec1(_) => {}
+            other => panic!("expected SEC1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn private_key_loader_reports_no_items_when_given_a_certificate() {
+        let err = read_pem_private_key(&mut cursor(CERT_EC)).expect_err("cert is not a key");
+        assert!(matches!(err, PemError::NoItemsFound), "got {err:?}");
+    }
+
+    #[test]
+    fn private_key_loader_rejects_encrypted_pkcs8_instead_of_guessing() {
+        // rustls-pki-types does not decrypt keys; an ENCRYPTED PRIVATE KEY
+        // section must not be silently accepted as a usable key.
+        let result = read_pem_private_key(&mut cursor(ENCRYPTED_PKCS8_KEY));
+        assert!(result.is_err(), "encrypted key must not parse as a private key");
+    }
+
+    #[test]
+    fn private_key_loader_returns_first_key_when_cert_precedes_it() {
+        let combined = format!("{CERT_RSA}{RSA_PKCS1_KEY}");
+        match read_pem_private_key(&mut cursor(&combined)).expect("key after cert") {
+            PrivateKeyDer::Pkcs1(_) => {}
+            other => panic!("expected PKCS#1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_base64_is_a_parse_error_not_a_panic() {
+        let truncated = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIU\n-----END CERTIFICATE-----\n";
+        let result = read_pem_certificates(&mut cursor(truncated));
+        assert!(result.is_err());
     }
 }

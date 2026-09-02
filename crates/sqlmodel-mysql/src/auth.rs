@@ -404,4 +404,36 @@ nJq18jG+sttI+3AnzQhXtR2Adq9LKVdNRQIDAQAB\n\
         assert_eq!(plugins::CACHING_SHA2_PASSWORD, "caching_sha2_password");
         assert_eq!(plugins::SHA256_PASSWORD, "sha256_password");
     }
+
+    /// RUSTSEC-2023-0071 (Marvin) is a timing side channel on RSA *private-key*
+    /// decryption. It is ignored in `.cargo/audit.toml` on the grounds that this
+    /// crate only ever encrypts with the server's public key. This test keeps that
+    /// argument true: if anyone introduces a private-key operation here, the audit
+    /// ignore must be revisited, and this test fails first.
+    #[test]
+    fn rsa_is_used_for_public_key_encryption_only() {
+        let sources = [
+            include_str!("auth.rs"),
+            include_str!("connection.rs"),
+            include_str!("async_connection.rs"),
+            include_str!("tls.rs"),
+        ];
+        for (name, src) in ["auth.rs", "connection.rs", "async_connection.rs", "tls.rs"]
+            .iter()
+            .zip(sources)
+        {
+            for forbidden in ["RsaPrivateKey", ".decrypt(", "SigningKey", ".sign(", "DecodePrivateKey"] {
+                // The docs of this very test mention the names; skip doc-comment lines.
+                let hit = src
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .any(|l| l.contains(forbidden));
+                assert!(
+                    !hit,
+                    "{name} references `{forbidden}`: the RUSTSEC-2023-0071 audit ignore assumes \
+                     rsa is used only for public-key encryption; update .cargo/audit.toml"
+                );
+            }
+        }
+    }
 }

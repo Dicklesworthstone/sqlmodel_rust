@@ -2356,6 +2356,14 @@ impl Connection for SharedMySqlConnection {
         self.begin_transaction_impl(cx, Some(isolation))
     }
 
+    /// InnoDB transactions are MVCC-concurrent by nature, so
+    /// [`TransactionMode::Concurrent`] is the same as the default; the SQLite
+    /// locking forms have no equivalent.
+    fn supports_transaction_mode(&self, mode: sqlmodel_core::TransactionMode) -> bool {
+        use sqlmodel_core::TransactionMode;
+        matches!(mode, TransactionMode::Default | TransactionMode::Concurrent)
+    }
+
     fn prepare(
         &self,
         cx: &Cx,

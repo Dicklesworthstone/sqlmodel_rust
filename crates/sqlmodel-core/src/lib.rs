@@ -40,12 +40,14 @@ pub mod row;
 pub mod tracked;
 pub mod types;
 pub mod validate;
+pub mod retry;
 pub mod value;
 
 pub use connection::{
     Connection, Dialect, IsolationLevel, PreparedStatement, Transaction, TransactionInternal,
-    TransactionOps,
+    TransactionMode, TransactionOps, TransactionOptions,
 };
+pub use retry::{RetryPolicy, retry_transaction};
 pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
 pub use field::{
     Column, Field, FieldInfo, InheritanceInfo, InheritanceStrategy, ReferentialAction,

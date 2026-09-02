@@ -56,6 +56,125 @@ impl IsolationLevel {
     }
 }
 
+/// How a transaction acquires its locks or snapshot when it starts.
+///
+/// [`IsolationLevel`] says what a transaction may observe; `TransactionMode`
+/// says how the database admits it. The distinction matters most for the
+/// SQLite family, where `BEGIN` has several locking forms and FrankenSQLite
+/// adds `BEGIN CONCURRENT` (page-level MVCC with Serializable Snapshot
+/// Isolation) so several writers can proceed at once.
+///
+/// | Mode | FrankenSQLite | C SQLite | PostgreSQL / MySQL |
+/// |------|---------------|----------|--------------------|
+/// | `Default` | isolation-level mapping (`BEGIN IMMEDIATE`/`EXCLUSIVE`/`DEFERRED`) | same | `BEGIN` (+ isolation) |
+/// | `Concurrent` | `BEGIN CONCURRENT` | unsupported (error) | native MVCC, same as `Default` |
+/// | `Immediate` | `BEGIN IMMEDIATE` | `BEGIN IMMEDIATE` | unsupported (error) |
+/// | `Exclusive` | `BEGIN EXCLUSIVE` | `BEGIN EXCLUSIVE` | unsupported (error) |
+/// | `Deferred` | `BEGIN DEFERRED` | `BEGIN DEFERRED` | unsupported (error) |
+///
+/// Drivers advertise what they accept through
+/// [`Connection::supports_transaction_mode`]; asking for an unsupported mode
+/// returns [`crate::TransactionErrorKind::UnsupportedMode`] instead of silently
+/// downgrading. Concurrent transactions can fail at commit with a retryable
+/// serialization error (`Error::is_retryable()`); callers are expected to retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransactionMode {
+    /// The driver's default form of `BEGIN` for the requested isolation level.
+    #[default]
+    Default,
+    /// Optimistic concurrent writer (FrankenSQLite `BEGIN CONCURRENT`; the
+    /// native MVCC behavior on PostgreSQL and MySQL).
+    Concurrent,
+    /// SQLite `BEGIN IMMEDIATE`: take the write lock up front.
+    Immediate,
+    /// SQLite `BEGIN EXCLUSIVE`: take the exclusive lock up front.
+    Exclusive,
+    /// SQLite `BEGIN DEFERRED`: take no lock until the first statement.
+    Deferred,
+}
+
+impl TransactionMode {
+    /// The `BEGIN ...` statement that starts a transaction in this mode on the
+    /// given dialect, or `None` when the dialect has no such form.
+    ///
+    /// For `Default` this returns the plain `BEGIN`; drivers that map
+    /// isolation levels to SQLite locking forms do so before consulting this.
+    /// `Concurrent` on [`Dialect::Sqlite`] returns `BEGIN CONCURRENT`, which
+    /// only FrankenSQLite executes; check
+    /// [`Connection::supports_transaction_mode`] first when the connection is
+    /// not known to be FrankenSQLite.
+    #[must_use]
+    pub const fn begin_statement(self, dialect: Dialect) -> Option<&'static str> {
+        match (self, dialect) {
+            (TransactionMode::Default, _) => Some("BEGIN"),
+            (TransactionMode::Concurrent, Dialect::Sqlite) => Some("BEGIN CONCURRENT"),
+            (TransactionMode::Concurrent, Dialect::Postgres | Dialect::Mysql) => Some("BEGIN"),
+            (TransactionMode::Immediate, Dialect::Sqlite) => Some("BEGIN IMMEDIATE"),
+            (TransactionMode::Exclusive, Dialect::Sqlite) => Some("BEGIN EXCLUSIVE"),
+            (TransactionMode::Deferred, Dialect::Sqlite) => Some("BEGIN DEFERRED"),
+            (
+                TransactionMode::Immediate | TransactionMode::Exclusive | TransactionMode::Deferred,
+                Dialect::Postgres | Dialect::Mysql,
+            ) => None,
+        }
+    }
+
+    /// Human-readable name used in error messages.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            TransactionMode::Default => "default",
+            TransactionMode::Concurrent => "concurrent",
+            TransactionMode::Immediate => "immediate",
+            TransactionMode::Exclusive => "exclusive",
+            TransactionMode::Deferred => "deferred",
+        }
+    }
+}
+
+/// Everything a caller can specify about how a transaction starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransactionOptions {
+    /// What the transaction may observe.
+    pub isolation: IsolationLevel,
+    /// How the database admits it (locking form / MVCC mode).
+    pub mode: TransactionMode,
+}
+
+impl TransactionOptions {
+    /// Default isolation, default mode.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            isolation: IsolationLevel::ReadCommitted,
+            mode: TransactionMode::Default,
+        }
+    }
+
+    /// Default isolation with [`TransactionMode::Concurrent`].
+    #[must_use]
+    pub const fn concurrent() -> Self {
+        Self {
+            isolation: IsolationLevel::ReadCommitted,
+            mode: TransactionMode::Concurrent,
+        }
+    }
+
+    /// Set the isolation level.
+    #[must_use]
+    pub const fn with_isolation(mut self, isolation: IsolationLevel) -> Self {
+        self.isolation = isolation;
+        self
+    }
+
+    /// Set the transaction mode.
+    #[must_use]
+    pub const fn with_mode(mut self, mode: TransactionMode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
 /// A prepared statement for repeated execution.
 ///
 /// Prepared statements are pre-compiled by the database, allowing efficient
@@ -273,6 +392,39 @@ pub trait Connection: Send + Sync {
         cx: &Cx,
         isolation: IsolationLevel,
     ) -> impl Future<Output = Outcome<Self::Tx<'_>, crate::Error>> + Send;
+
+    /// Whether this connection can start transactions in `mode`.
+    ///
+    /// The default accepts only [`TransactionMode::Default`]. Drivers override
+    /// this to advertise their locking forms (SQLite family) or that their
+    /// native transactions are already MVCC-concurrent (PostgreSQL, MySQL).
+    fn supports_transaction_mode(&self, mode: TransactionMode) -> bool {
+        matches!(mode, TransactionMode::Default)
+    }
+
+    /// Begin a transaction with explicit [`TransactionOptions`].
+    ///
+    /// The default implementation refuses any mode the connection does not
+    /// advertise via [`Connection::supports_transaction_mode`] (returning
+    /// [`crate::TransactionErrorKind::UnsupportedMode`]) and otherwise
+    /// delegates to [`Connection::begin_with`]. Drivers whose supported modes
+    /// change the `BEGIN` statement (FrankenSQLite `BEGIN CONCURRENT`, SQLite
+    /// `BEGIN IMMEDIATE`/`EXCLUSIVE`/`DEFERRED`) override it.
+    fn begin_with_options(
+        &self,
+        cx: &Cx,
+        options: TransactionOptions,
+    ) -> impl Future<Output = Outcome<Self::Tx<'_>, crate::Error>> + Send {
+        async move {
+            if !self.supports_transaction_mode(options.mode) {
+                return Outcome::Err(crate::Error::unsupported_transaction_mode(
+                    options.mode,
+                    self.dialect(),
+                ));
+            }
+            self.begin_with(cx, options.isolation).await
+        }
+    }
 
     /// Prepare a statement for repeated execution.
     ///

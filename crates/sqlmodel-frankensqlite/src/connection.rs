@@ -21,7 +21,8 @@ use crate::value::{sqlite_to_value, value_to_sqlite};
 use fsqlite::compat::OpenFlags;
 use fsqlite_types::value::SqliteValue;
 use sqlmodel_core::{
-    Connection, Cx, IsolationLevel, Outcome, PreparedStatement, Row, TransactionOps, Value,
+    Connection, Cx, IsolationLevel, Outcome, PreparedStatement, Row, TransactionMode,
+    TransactionOps, TransactionOptions, Value,
     error::{ConnectionError, ConnectionErrorKind, Error, QueryError, QueryErrorKind},
     row::ColumnInfo,
 };
@@ -583,8 +584,45 @@ impl FrankenConnection {
         Ok(self.last_insert_rowid())
     }
 
-    /// Begin a transaction.
+    /// Begin a transaction, mapping the isolation level onto SQLite's locking forms.
     fn begin_sync(&self, isolation: IsolationLevel) -> Result<(), Error> {
+        let begin_sql = match isolation {
+            IsolationLevel::Serializable => "BEGIN EXCLUSIVE",
+            IsolationLevel::RepeatableRead | IsolationLevel::ReadCommitted => "BEGIN IMMEDIATE",
+            IsolationLevel::ReadUncommitted => "BEGIN DEFERRED",
+        };
+        self.begin_statement_sync(begin_sql)
+    }
+
+    /// Begin a transaction with explicit [`TransactionOptions`].
+    ///
+    /// `Concurrent` issues `BEGIN CONCURRENT`, FrankenSQLite's page-level MVCC
+    /// mode in which several connections may write to the same database at
+    /// once; conflicting writers fail at `COMMIT` with a retryable error
+    /// (`Error::is_retryable()` is true). `Immediate`/`Exclusive`/`Deferred`
+    /// select SQLite's locking forms directly; `Default` uses the
+    /// isolation-level mapping of [`Connection::begin_with`].
+    fn begin_options_sync(&self, options: TransactionOptions) -> Result<(), Error> {
+        match options.mode {
+            TransactionMode::Default => self.begin_sync(options.isolation),
+            TransactionMode::Concurrent => self.begin_statement_sync("BEGIN CONCURRENT"),
+            TransactionMode::Immediate => self.begin_statement_sync("BEGIN IMMEDIATE"),
+            TransactionMode::Exclusive => self.begin_statement_sync("BEGIN EXCLUSIVE"),
+            TransactionMode::Deferred => self.begin_statement_sync("BEGIN DEFERRED"),
+        }
+    }
+
+    /// Begin a `BEGIN CONCURRENT` transaction synchronously.
+    ///
+    /// Synchronous counterpart of `Connection::begin_with_options(cx,
+    /// TransactionOptions::concurrent())` for callers using the sync helper
+    /// family (`execute_sync`, `query_sync`, `commit_sync`, `rollback_sync`).
+    pub fn begin_concurrent_sync(&self) -> Result<(), Error> {
+        self.begin_statement_sync("BEGIN CONCURRENT")
+    }
+
+    /// Issue the given `BEGIN ...` statement and mark the connection as in a transaction.
+    fn begin_statement_sync(&self, begin_sql: &str) -> Result<(), Error> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.in_transaction {
             return Err(Error::Query(QueryError {
@@ -598,12 +636,6 @@ impl FrankenConnection {
                 source: None,
             }));
         }
-
-        let begin_sql = match isolation {
-            IsolationLevel::Serializable => "BEGIN EXCLUSIVE",
-            IsolationLevel::RepeatableRead | IsolationLevel::ReadCommitted => "BEGIN IMMEDIATE",
-            IsolationLevel::ReadUncommitted => "BEGIN DEFERRED",
-        };
 
         inner
             .conn
@@ -971,6 +1003,23 @@ impl Connection for FrankenConnection {
     ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
         let result = self
             .begin_sync(isolation)
+            .map(|()| FrankenTransaction::new(self));
+        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+    }
+
+    /// FrankenSQLite supports every mode: the three SQLite locking forms and
+    /// `BEGIN CONCURRENT` (page-level MVCC).
+    fn supports_transaction_mode(&self, _mode: TransactionMode) -> bool {
+        true
+    }
+
+    fn begin_with_options(
+        &self,
+        _cx: &Cx,
+        options: TransactionOptions,
+    ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
+        let result = self
+            .begin_options_sync(options)
             .map(|()| FrankenTransaction::new(self));
         async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
     }

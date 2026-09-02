@@ -74,23 +74,77 @@ allow = [
     "OpenSSL",
     "BSL-1.0",
     "Unlicense",
+    # webpki-roots ships Mozilla's root store under CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
+    # The SQLModel workspace crates and the FrankenSQLite crates (same author)
+    # use "MIT License (with OpenAI/Anthropic Rider)"; see LICENSE.
+    "LicenseRef-MIT-OpenAI-Anthropic-Rider",
 ]
-# The workspace crates use a custom rider on MIT (see LICENSE); accept our own
-# SPDX LicenseRef so cargo-deny does not flag the workspace itself.
-exceptions = [
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-core" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-macros" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-query" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-schema" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-session" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-pool" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-console" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-postgres" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-mysql" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-sqlite" },
-    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-frankensqlite" },
-]
+
+# The fsqlite crates do not set `license` in their manifests (their repository
+# LICENSE is the same MIT-with-rider text this workspace uses). Clarify them so
+# cargo-deny does not report them as unlicensed; drop these when upstream adds
+# the field.
+[[licenses.clarify]]
+crate = "fsqlite"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-ast"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-btree"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-core"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-error"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-func"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-mvcc"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-observability"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-pager"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-parser"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-planner"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-types"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-vdbe"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-vfs"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
+[[licenses.clarify]]
+crate = "fsqlite-wal"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = []
 
 [[licenses.clarify]]
 crate = "ring"

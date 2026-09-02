@@ -95,7 +95,10 @@
 //! - **`console` feature**: Enable rich terminal output via `sqlmodel-console`
 
 // Re-export all public types from sub-crates
-pub use sqlmodel_core::connection::{ConnectionConfig, SslMode, Transaction};
+pub use sqlmodel_core::connection::{
+    ConnectionConfig, IsolationLevel, SslMode, Transaction, TransactionMode, TransactionOptions,
+};
+pub use sqlmodel_core::{RetryPolicy, retry_transaction};
 pub use sqlmodel_core::{
     // asupersync re-exports
     Budget,
@@ -645,6 +648,7 @@ pub mod prelude {
         FieldsSet,
         GetOptions,
         Hybrid,
+        IsolationLevel,
         Join,
         JoinType,
         Migration,
@@ -666,6 +670,8 @@ pub mod prelude {
         PoolConfig,
         RegionId,
         Result,
+        // Retry-on-conflict for MVCC transactions
+        RetryPolicy,
         Row,
         Select,
         // ORM Session (unit of work / identity map)
@@ -675,6 +681,9 @@ pub mod prelude {
         SqlModelValidate,
         TaskId,
         TrackedModel,
+        // Transaction start options (BEGIN CONCURRENT etc.)
+        TransactionMode,
+        TransactionOptions,
         ValidateInput,
         ValidateOptions,
         ValidateResult,
@@ -684,6 +693,7 @@ pub mod prelude {
         // Macros
         delete,
         insert,
+        retry_transaction,
         select,
         update,
     };

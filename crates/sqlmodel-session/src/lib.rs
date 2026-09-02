@@ -55,7 +55,7 @@ pub use unit_of_work::{PendingCounts, UnitOfWork, UowError};
 
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
-use sqlmodel_core::{Connection, Error, Lazy, LazyLoader, Model, Value};
+use sqlmodel_core::{Connection, Error, Lazy, LazyLoader, Model, TransactionMode, Value};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
@@ -141,6 +141,18 @@ pub struct SessionConfig {
     pub auto_flush: bool,
     /// Whether to expire objects after commit (reload from DB on next access).
     pub expire_on_commit: bool,
+    /// How the session's transactions are started.
+    ///
+    /// [`TransactionMode::Concurrent`] enables FrankenSQLite's `BEGIN CONCURRENT`
+    /// (page-level MVCC, several writers at once) and is the native behavior on
+    /// PostgreSQL/MySQL; the SQLite locking forms (`Immediate`, `Exclusive`,
+    /// `Deferred`) are available on both SQLite drivers. A mode the connection
+    /// does not support fails `begin()` with
+    /// [`sqlmodel_core::TransactionErrorKind::UnsupportedMode`] rather than
+    /// silently downgrading. Concurrent transactions can fail at commit with a
+    /// retryable serialization error; see [`Session::commit`] and
+    /// [`sqlmodel_core::Error::is_retryable`].
+    pub transaction_mode: TransactionMode,
 }
 
 impl Default for SessionConfig {
@@ -149,7 +161,17 @@ impl Default for SessionConfig {
             auto_begin: true,
             auto_flush: false,
             expire_on_commit: true,
+            transaction_mode: TransactionMode::Default,
         }
+    }
+}
+
+impl SessionConfig {
+    /// Start every session transaction with the given mode.
+    #[must_use]
+    pub fn with_transaction_mode(mut self, mode: TransactionMode) -> Self {
+        self.transaction_mode = mode;
+        self
     }
 }
 
@@ -1291,13 +1313,27 @@ impl<C: Connection> Session<C> {
     // Transaction Management
     // ========================================================================
 
-    /// Begin a transaction.
+    /// Begin a transaction in the session's configured [`TransactionMode`].
+    ///
+    /// The statement is chosen per dialect (`BEGIN`, `BEGIN CONCURRENT`,
+    /// `BEGIN IMMEDIATE`, ...). A mode the connection does not advertise via
+    /// [`Connection::supports_transaction_mode`] is refused with
+    /// [`sqlmodel_core::TransactionErrorKind::UnsupportedMode`].
     pub async fn begin(&mut self, cx: &Cx) -> Outcome<(), Error> {
         if self.in_transaction {
             return Outcome::Ok(());
         }
 
-        match self.connection.execute(cx, "BEGIN", &[]).await {
+        let mode = self.config.transaction_mode;
+        let dialect = self.connection.dialect();
+        if !self.connection.supports_transaction_mode(mode) {
+            return Outcome::Err(Error::unsupported_transaction_mode(mode, dialect));
+        }
+        let Some(begin_sql) = mode.begin_statement(dialect) else {
+            return Outcome::Err(Error::unsupported_transaction_mode(mode, dialect));
+        };
+
+        match self.connection.execute(cx, begin_sql, &[]).await {
             Outcome::Ok(_) => {
                 self.in_transaction = true;
                 Outcome::Ok(())
@@ -4203,6 +4239,7 @@ mod tests {
                 auto_begin: false,
                 auto_flush: false,
                 expire_on_commit: true,
+                transaction_mode: TransactionMode::Default,
             },
         );
 
@@ -4264,6 +4301,7 @@ mod tests {
                 auto_begin: false,
                 auto_flush: false,
                 expire_on_commit: true,
+                transaction_mode: TransactionMode::Default,
             },
         );
 
@@ -4319,6 +4357,7 @@ mod tests {
                 auto_begin: false,
                 auto_flush: false,
                 expire_on_commit: true,
+                transaction_mode: TransactionMode::Default,
             },
         );
 
@@ -4416,6 +4455,7 @@ mod tests {
                 auto_begin: false,
                 auto_flush: false,
                 expire_on_commit: true,
+                transaction_mode: TransactionMode::Default,
             },
         );
 
@@ -4587,6 +4627,7 @@ mod tests {
                 auto_begin: false,
                 auto_flush: false,
                 expire_on_commit: true,
+                transaction_mode: TransactionMode::Default,
             },
         );
 
@@ -4661,6 +4702,7 @@ mod tests {
                 auto_begin: false,
                 auto_flush: false,
                 expire_on_commit: true,
+                transaction_mode: TransactionMode::Default,
             },
         );
 
