@@ -133,6 +133,34 @@ facade tests, and the driver integration suites run against live Docker database
   read back wrong through the other and SQLite's own date functions could not use FrankenSQLite's
   columns. FrankenSQLite now writes the same ISO text; the `chrono` conversions additionally accept
   the integer forms so existing FrankenSQLite databases keep reading.
+- **MySQL silently corrupted large floats bound through the text protocol.** `1e300` was written as
+  its 301-digit decimal expansion, which MySQL reads as an exact numeric literal capped at 65 digits,
+  so the column stored `1e65`. Float and double literals now use exponent form (`1e300`, `-5e-1`).
+- **MySQL rejected every date, time, or timestamp bound through the text protocol.** When the
+  driver inlines parameters into the statement it rendered `Value::Date`/`Time`/`Timestamp` as their
+  raw integer payloads (`'-25567'` for 1900-01-01), so `insert!` of a model with a `NaiveDate` field
+  failed with "Incorrect date value". They now render as ISO literals.
+- **`Session::get` / `get_with_options` never worked on MySQL.** They built
+  `SELECT * FROM "table" WHERE "id" = $1` with ANSI quotes and PostgreSQL placeholders regardless of
+  dialect. Both now use the connection's dialect for quoting and placeholders (`FOR UPDATE` row
+  locking through the session now works on MySQL too).
+- **Unique, indexed, primary-key, and foreign-key `String` columns could not be created on
+  MySQL**: `String` maps to `TEXT`, which MySQL refuses to put in a key without a prefix length.
+  Such columns are declared `VARCHAR(255)` on MySQL; plain `String` columns stay `TEXT`.
+- **INSERT/UPDATE/DELETE emitted unquoted column names**, so a model with a column named `real`,
+  `double`, `blob`, `order`, or `user` failed with a syntax error (MySQL rejects reserved words;
+  the other dialects have their own). Column names in these statements, in `ON CONFLICT` targets and
+  `DO UPDATE` / `ON DUPLICATE KEY UPDATE` assignments are now quoted for the dialect, matching the
+  `Expr` columns in WHERE. Table names are still emitted bare (tracked separately).
+- **Decimals lost precision on SQLite.** A `DECIMAL(p, s)` column has NUMERIC affinity, which turns
+  the bound text into a REAL and keeps 15 significant digits, so a 20-digit `rust_decimal::Decimal`
+  came back rounded; FrankenSQLite additionally bound decimals as floats. Decimal and numeric
+  columns are now declared `TEXT` on SQLite (exact; SQL-side ordering and arithmetic on them are
+  textual) and both SQLite drivers bind `Value::Decimal` as text.
+- **FrankenSQLite lost column names for `SELECT *, expr AS alias FROM t`.** The star-projection
+  schema lookup only handled a bare `*`, so the session's one-to-many loader (`SELECT *, fk AS
+  __parent_pk ...`) got placeholder names and found no children. Extra select items are now named by
+  their alias or column and appended after the table's columns.
 - **A cancelled `Cx` still executed statements.** AGENTS.md and the README promised that every
   database operation honours cancellation, but the C SQLite, FrankenSQLite, and MySQL drivers
   never looked at the `Cx` (PostgreSQL only through its connection mutex), and `Session::flush`
