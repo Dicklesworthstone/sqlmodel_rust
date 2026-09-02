@@ -121,8 +121,8 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 | Get exactly one | `.one()` | `.one()` (errors on 0 or >1 rows) | ✅ Complete |
 | Get one or none | `.one_or_none()` | `.one_or_none()` | ✅ Complete |
 | Execute non-query | `session.execute()` | `conn.execute()` | ✅ Complete |
-| Raw SQL query | `text("...")` | `raw_query!()` | ✅ Complete |
-| Raw SQL execute | `text("...")` | `raw_execute!()` | ✅ Complete |
+| Raw SQL query | `text("...")` | `raw_query(cx, conn, sql, params)` | ✅ Complete |
+| Raw SQL execute | `text("...")` | `raw_execute(cx, conn, sql, params)` | ✅ Complete |
 
 ---
 
@@ -297,29 +297,35 @@ This project has **no exclusions** (see `bd-162`). Items previously listed here 
 
 ## Test Coverage
 
-| Crate | Unit Tests | Integration Tests | Coverage |
-|-------|------------|-------------------|----------|
-| sqlmodel-core | ✅ | - | Good |
-| sqlmodel-macros | ✅ | - | Good |
-| sqlmodel-query | ✅ | - | Good |
-| sqlmodel-schema | ✅ | ⚠️ Via postgres/mysql driver integration suites | Improving |
-| sqlmodel-pool | ✅ | - | Good |
-| sqlmodel-mysql | ✅ 58+ tests | ✅ | Excellent |
-| sqlmodel-sqlite | ✅ | - | Good |
-| sqlmodel-postgres | ✅ | ✅ | Good |
+Counts are `#[test]` functions in the tree at cc8e564 (2026-09-02). "Real DB" means the crate's behavior is exercised against an actual database rather than a mock connection.
+
+| Crate | Unit tests | Real DB | Notes |
+|-------|-----------:|---------|-------|
+| sqlmodel-core | 325 | - | Pure types/traits |
+| sqlmodel-macros | 161 | - | Codegen; compile-checked |
+| sqlmodel-query | 220 | via facade | SQL-string tests; facade SQLite e2e covers execution |
+| sqlmodel-schema | 197 | ⚠️ none | DDL/diff/introspection asserted as SQL strings; `MigrationRunner` end-to-end is bd-slot.7 / bd-slot.8 |
+| sqlmodel-session | 144 | ⚠️ mock only | Unit of work / identity map / loaders on `MockConnection`; real-driver e2e is bd-slot.5 |
+| sqlmodel-pool | 71 | ⚠️ mock only | Real-connection e2e is bd-slot.6 |
+| sqlmodel-sqlite | 38 | ✅ in-memory | Plus 7 facade e2e files (inheritance, introspection, select semantics) |
+| sqlmodel-frankensqlite | 78 | ✅ own suite | Not yet exercised through the ORM layers (bd-slot.2 / bd-slot.9) |
+| sqlmodel-postgres | 66 | ✅ integration suite | Env-gated; runs in CI's `integration` job against Postgres 16 |
+| sqlmodel-mysql | 109 | ✅ integration suite | Env-gated; runs in CI's `integration` job against MySQL 8.4 and MariaDB 11 |
+| sqlmodel-console | 528 | n/a | Includes e2e output tests and a bench |
+| sqlmodel (facade) | 47 | ✅ in-memory SQLite | `c-sqlite-tests` feature |
 
 ---
 
 ## Conclusion
 
-The Rust SQLModel implementation covers the core ORM functionality (Model derive, query building, CRUD operations, transactions, connection pooling, validation). Remaining parity work is tracked in Beads under `bd-162`.
+The Rust SQLModel implementation covers the core ORM functionality (Model derive, query building, CRUD operations, transactions, connection pooling, validation, migrations, four drivers). Remaining parity work is tracked in Beads under `bd-162`; the 2026-09 reality check added the proof and hardening epics listed there.
 
-### Fully Production-Ready
+### Implemented and unit-tested (end-to-end proof status per crate above)
 
-1. **All 3 database drivers** - PostgreSQL, MySQL, SQLite fully functional
+1. **Four database drivers** - PostgreSQL, MySQL, SQLite (C), FrankenSQLite (pure Rust)
 2. **Complete query builder** - SELECT, INSERT, UPDATE, DELETE with all operators
 3. **Full transaction support** - Isolation levels, savepoints, auto-rollback
-4. **Connection pooling** - All configuration options, health checks, statistics
+4. **Connection pooling** - All configuration options, health checks, statistics, cancel-correct `close_and_drain`
 5. **TLS/SSL** - Implemented for MySQL and PostgreSQL via rustls
 6. **Prepared statements** - MySQL binary protocol, PostgreSQL named statements
 7. **Validate derive macro** - Numeric/string constraints, custom validators
@@ -328,7 +334,7 @@ The Rust SQLModel implementation covers the core ORM functionality (Model derive
 
 ### Remaining Work
 
-All missing/partial features must be represented as explicit Beads tasks under `bd-162`. This document should not list exclusions.
+All missing/partial features must be represented as explicit Beads tasks under `bd-162`. This document should not list exclusions. Known open items as of 2026-09-02: table-inheritance completion (bd-kzp1.1-.7), `exclude_unset` without the `TrackedModel` wrapper (bd-3twt), real-database proof for schema/session/pool (bd-slot), and the type-mapping adapters for chrono/uuid/decimal (bd-7wal.1).
 
 ---
 
@@ -389,4 +395,4 @@ The Rust implementation includes a complete type-safe expression system:
 
 ---
 
-*Last verified: 2026-01-27*
+*Last verified: 2026-09-02 (against commit cc8e564; gates: 1960 tests passing, fmt and clippy -D warnings clean)*

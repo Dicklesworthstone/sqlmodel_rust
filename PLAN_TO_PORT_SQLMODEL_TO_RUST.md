@@ -149,14 +149,19 @@ SQLModel Rust depends on asupersync for:
 
 ### Current asupersync Status
 
+asupersync 0.4.x (workspace requirement `^0.4.9`, lock at 0.4.10 as of 2026-09-02) provides everything this plan depended on:
+
 | Component | Status | Impact on SQLModel |
 |-----------|--------|-------------------|
-| Scheduler | ✅ Done | Can run async ops |
-| Cx context | ✅ Done | Core integration |
+| Scheduler | ✅ Done | Runs all async ops |
+| Cx context | ✅ Done | Threaded through every async API |
 | Channels | ✅ Done | Pool implementation |
-| TCP/IO | 🔜 Phase 2 | Database drivers blocked |
+| TCP/IO | ✅ Done | Postgres and MySQL wire drivers ship on it |
+| LabRuntime (virtual time, DPOR) | ✅ Available | Not yet used by this workspace's tests; adopting it is bd-x6jl |
 
 ## Phased Implementation
+
+All six phases below are implemented (crate in parentheses). What remains is proof and hardening, tracked in Beads under `bd-162`.
 
 ### Phase 0: Foundation (COMPLETE)
 - Workspace setup
@@ -164,47 +169,49 @@ SQLModel Rust depends on asupersync for:
 - Query builder skeleton
 - asupersync integration patterns
 
-### Phase 1: Core Operations
+### Phase 1: Core Operations (COMPLETE — `sqlmodel-macros`, `sqlmodel-query`, `sqlmodel-core`)
 1. Model derive macro (full implementation)
 2. SELECT with type conversion
 3. INSERT/UPDATE/DELETE
 4. Transaction support
 
-### Phase 2: Schema
+### Phase 2: Schema (COMPLETE — `sqlmodel-schema`; end-to-end runner proof is bd-slot.7)
 1. CREATE TABLE generation
 2. Migration tracking table
 3. Migration execution
 4. Database introspection
 
-### Phase 3: Pooling
+### Phase 3: Pooling (COMPLETE — `sqlmodel-pool`)
 1. Connection pool using asupersync channels
 2. Health checks
 3. Connection recycling
 
-### Phase 4: Validation
+### Phase 4: Validation (COMPLETE — `#[derive(Validate)]`)
 1. Validate derive macro
 2. Constraint checking
 3. Error message generation
 
-### Phase 5: SQLite Driver
+### Phase 5: SQLite Driver (COMPLETE — `sqlmodel-sqlite` (C) and `sqlmodel-frankensqlite` (pure Rust))
 1. SQLite protocol implementation
 2. Type mapping
 3. Zero-copy optimizations
 
-### Phase 6: PostgreSQL Driver
+### Phase 6: PostgreSQL Driver (COMPLETE — `sqlmodel-postgres`; MySQL followed as `sqlmodel-mysql`)
 1. PostgreSQL protocol
 2. Binary format support
 3. Array types
 
 ## Success Criteria
 
-| Metric | Target |
-|--------|--------|
-| Code size | 10-20x smaller than Python SQLModel |
-| Binary size | < 5MB with LTO |
-| Startup time | < 10ms |
-| Query latency | Competitive with native drivers |
-| Type safety | 100% compile-time checked |
+None of the quantitative targets has been measured yet; measuring them is bd-4ttf (benches, CI size/startup job). Until then the table records targets only.
+
+| Metric | Target | Measured |
+|--------|--------|----------|
+| Code size | 10-20x smaller than Python SQLModel | Not measured (the workspace is ~93k lines of Rust; the claim is likely false and will be recorded honestly) |
+| Binary size | < 5MB with LTO | Not measured (bd-4ttf.2) |
+| Startup time | < 10ms | Not measured (bd-4ttf.2) |
+| Query latency | Competitive with native drivers | Not measured (bd-4ttf.1) |
+| Type safety | 100% compile-time checked | Holds by construction for models and builders; raw SQL escape hatches are runtime-checked |
 
 ## Example API (Target)
 

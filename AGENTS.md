@@ -83,10 +83,9 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `rsa` | MySQL RSA authentication (`caching_sha2_password`/`sha256_password`) |
 | `rustls` + `webpki-roots` | Optional TLS for PostgreSQL and MySQL |
 | `rich_rust` | Optional rich terminal output (sqlmodel-console) |
-| `fsqlite` + `fsqlite-core` + `fsqlite-types` | FrankenSQLite pure-Rust SQLite driver |
-| `thiserror` | Ergonomic error type derivation |
+| `fsqlite` + `fsqlite-core` + `fsqlite-types` + `fsqlite-error` | FrankenSQLite pure-Rust SQLite driver |
 
-**NOT allowed**: `tokio`, `sqlx`, `diesel`, `sea-orm`, or any ORM/database crate.
+**NOT allowed**: `tokio`, `sqlx`, `diesel`, `sea-orm`, or any ORM/database crate. This list is enforced mechanically by `deny.toml` (`cargo deny check bans`, run in CI's Security job), not only by this document.
 
 ### Release Profile
 
@@ -164,7 +163,7 @@ Every component crate includes inline `#[cfg(test)]` unit tests alongside the im
 - Edge cases (empty input, max values, boundary conditions)
 - Error conditions
 
-Cross-component integration tests live in the workspace `tests/` directory.
+Cross-component integration tests live in `crates/sqlmodel/tests/` (in-memory C SQLite, behind the facade's `c-sqlite-tests` feature) and in the drivers' `tests/` directories (Postgres and MySQL suites, env-gated on `SQLMODEL_TEST_POSTGRES_URL` / `SQLMODEL_TEST_MYSQL_URL`; CI's `integration` job provides live services). There is no workspace-level `tests/` directory. An all-driver end-to-end crate (`crates/sqlmodel-e2e`, publish = false) is tracked as bd-slot.2.
 
 ### Unit Tests
 
@@ -271,8 +270,10 @@ sqlmodel_rust/
 │   ├── sqlmodel-frankensqlite/        # FrankenSQLite pure-Rust SQLite driver
 │   ├── sqlmodel-postgres/             # PostgreSQL driver (wire protocol)
 │   ├── sqlmodel-mysql/                # MySQL driver (wire protocol)
-│   └── sqlmodel-console/             # Rich terminal output (agent-aware)
-└── tests/                             # Cross-component integration tests
+│   ├── sqlmodel-console/              # Rich terminal output (agent-aware)
+│   └── sqlmodel/tests/                # Facade end-to-end tests (in-memory C SQLite)
+├── deny.toml                          # cargo-deny: banned crates (no tokio), advisories, licenses
+└── .cargo/audit.toml                  # cargo-audit ignores, each with rationale + review date
 ```
 
 ### Key Files by Crate
@@ -627,7 +628,7 @@ rch status                    # Overview of current state
 rch queue                     # See active/waiting builds
 ```
 
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
+If rch or its workers are unavailable, it fails open — builds run locally as normal. Exception observed 2026-09-01: when the global RCH config has `force_remote = true` and no worker is admissible (pressure-blocked fleet), the PreToolUse hook refuses plain `cargo test|check|clippy|doc` with "remote required; refusing local fallback". Invoking the same command explicitly as `rch exec -- cargo <cmd>` is admitted and runs (remotely when a worker is available, locally otherwise). Do not flip `force_remote` to work around it.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 

@@ -194,10 +194,15 @@ Design intent:
 
 ## 9. Current Known Gaps / Follow-ups
 
-At the time of writing, remaining architectural follow-ups are tracked in beads.
+Remaining architectural follow-ups are tracked in beads (updated 2026-09-02; the earlier `bd-3bmd` reference pointed at a bead that no longer exists — its implementation landed in `d9ed0a9` and the missing end-to-end proof is now `bd-kzp1.6`).
 
-- `bd-3bmd`:
-  Joined-table inheritance DML semantics for explicit `WHERE`/`SET` builder usage and ON CONFLICT edge behavior.
+- `bd-kzp1.6`:
+  End-to-end coverage for joined-table inheritance DML with explicit `WHERE`/`SET`, ON CONFLICT, and RETURNING.
+- `bd-kzp1.1` / `bd-kzp1.2` / `bd-kzp1.3` / `bd-kzp1.4` / `bd-kzp1.5`:
+  Single-table inheritance end-to-end, concrete-table polymorphic queries, N-ary polymorphic joined selects, joined auto-increment upsert, and the multi-level joined-inheritance decision.
+- `bd-7wal.3` / `bd-7wal.4`:
+  `TransactionOptions`/`TransactionMode` on the `Connection` contract (exposes FrankenSQLite `BEGIN CONCURRENT`) and a cancel-correct `retry_transaction` combinator for serialization failures. Once landed, §3.2 gains a `begin_with_options` default method and §10 gains the invariant "retries never follow a cancelled attempt".
+- Invariant 1 audit (all async DB APIs return `Outcome`): `rg -n 'pub async fn .*-> (sqlmodel_core::)?Result<' crates/sqlmodel-{postgres,mysql,sqlite,frankensqlite,session,pool}/src` must print only `close_*` methods. `Connection::close(self, cx)` deliberately returns `Result<()>`: closing is a best-effort teardown that must run to completion even under cancellation, so a `Cancelled` outcome would be meaningless there (decided 2026-09-02, bd-7wal.5).
 
 - `bd-162`:
   Epic umbrella for full SQLModel parity tracking.

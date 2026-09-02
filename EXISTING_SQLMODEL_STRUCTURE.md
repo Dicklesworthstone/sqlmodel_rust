@@ -583,46 +583,41 @@ pub enum Error {
 
 ---
 
-## 12. Explicit Exclusions
+## 12. Design Differences (not exclusions)
 
-The following Python SQLModel features are **intentionally NOT ported** to Rust:
+The project policy (bd-162) is feature-for-feature parity with no exclusions. Earlier drafts of this section listed several Python behaviors as "intentionally not ported"; all of them are now implemented, in a Rust-shaped form. This section records how each Python mechanism maps, so readers know what to reach for.
 
 ### 12.1 Runtime Type Introspection
 - Python uses `__annotations__`, `get_type_hints()` at runtime
-- Rust uses proc macros for compile-time code generation
+- Rust: `#[derive(Model)]` generates `Model::fields()`, `COLUMN_NAMES`, `inheritance()`, and row conversion at compile time (`sqlmodel-macros`); no runtime reflection exists or is needed
 
 ### 12.2 Lazy Loading Relationships
-- Python SQLAlchemy supports automatic lazy loading
-- Rust requires explicit eager loading with JOINs
+- Python SQLAlchemy loads relationships implicitly on attribute access
+- Rust: explicit and cancel-correct — `Lazy<T>` + `Session::load_lazy`, batch loaders `Session::{load_many, load_one_to_many, load_many_to_many}` (and `_pk` composite-key variants), eager `JOIN`s via `select!(...).eager(...)`. No hidden N+1; the N+1 detector flags accidental per-row loads
 
-### 12.3 Pydantic BaseModel Features
-- `__init_subclass__`
-- `__get_validators__`
-- `__modify_schema__`
-- `__private_attributes__`
-- These are replaced by Rust's type system and serde
+### 12.3 Pydantic BaseModel Hooks
+- `__init_subclass__`, `__get_validators__`, `__modify_schema__`, `__private_attributes__`
+- Rust: `#[derive(Validate)]` (field/model validators, constraints, patterns, custom fns), serde for (de)serialization, `#[sqlmodel(skip)]` for non-persisted fields, `ModelConfig` for model-level configuration
 
 ### 12.4 SQLAlchemy Session Patterns
-- Unit of Work pattern
-- Identity Map
-- Automatic dirty tracking
-- Rust uses explicit operations
+- Unit of Work, Identity Map, automatic dirty tracking
+- Rust: all three exist in `sqlmodel-session` — `Session` tracks new/dirty/deleted objects and flushes in dependency order; the identity map holds `Arc<RwLock<M>>` so two loads of one PK are the same object (reference identity); change tracking drives column-limited UPDATEs
 
 ### 12.5 Generic Models
-- `SQLModel[T]` is not supported
-- Use concrete types or trait bounds
+- `SQLModel[T]`
+- Rust: generic structs with trait bounds derive `Model` (see the facade tests in `crates/sqlmodel/src/lib.rs`)
 
 ### 12.6 Computed Fields
-- `@computed_field` decorator
-- Use regular methods instead
+- `@computed_field`, hybrid properties
+- Rust: `#[sqlmodel(computed)]` and `Hybrid<T>` (bd-1fs)
 
-### 12.7 Discriminated Unions
-- Complex inheritance patterns
-- Use enums or composition
+### 12.7 Discriminated Unions / Inheritance
+- Python: polymorphic identity on a discriminator column
+- Rust: single-table, joined-table, and concrete-table inheritance metadata (`InheritanceInfo`), implicit discriminator filters for STI children, `polymorphic_joined{,2,3}` selects hydrating an enum; N-ary and concrete polymorphic queries are bd-kzp1.3 / bd-kzp1.2
 
-### 12.8 Field Aliases for DB
-- `sa_column_args`, `sa_column_kwargs`
-- Use explicit attributes instead
+### 12.8 Column Construction Arguments
+- `sa_column`, `sa_column_args`, `sa_column_kwargs`
+- Rust: explicit attributes (`column`, `sql_type`, `default`, `unique`, `index`, `foreign_key`, `on_delete`, `on_update`, `max_length`, `max_digits`, `decimal_places`) plus `sa_column`-style full override support (bd-176, bd-27h)
 
 ---
 
@@ -656,7 +651,7 @@ The following Python SQLModel features are **intentionally NOT ported** to Rust:
 | `model_validate()` | ✅ `ModelValidate` / `SqlModelValidate` | Alias-aware validation helpers |
 | Connection pooling | ✅ `sqlmodel-pool` | Complete |
 | CREATE TABLE | ✅ `create_table::<M>()` | Complete |
-| Migrations | ⚠️ Basic support | No auto-generation |
+| Migrations | ✅ `schema_diff` + `MigrationWriter` + `MigrationRunner` | Diff-based generation, version tracking, dialect-aware DDL incl. SQLite table recreation |
 
 ---
 
