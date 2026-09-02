@@ -152,6 +152,8 @@ impl Scenario for Types {
             }
             Dialect::Sqlite => {
                 assert!(create.contains("\"blob\" BLOB"), "{create}");
+                // NUMERIC affinity would round the 20-digit decimal to 15 digits.
+                assert!(create.contains("\"amount\" TEXT"), "{create}");
             }
         }
         for stmt in &ddl {

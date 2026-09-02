@@ -15,16 +15,9 @@ pub fn value_to_sqlite(v: &Value) -> SqliteValue {
         Value::BigInt(i) => SqliteValue::Integer(*i),
         Value::Float(f) => SqliteValue::Float(f64::from(*f)),
         Value::Double(f) => SqliteValue::Float(*f),
-        Value::Decimal(s) => {
-            // Try integer first, then float, then text
-            if let Ok(i) = s.parse::<i64>() {
-                SqliteValue::Integer(i)
-            } else if let Ok(f) = s.parse::<f64>() {
-                SqliteValue::Float(f)
-            } else {
-                SqliteValue::Text(s.clone().into())
-            }
-        }
+        // Decimals stay text, exactly as the C SQLite driver binds them: parsing
+        // to a float would round anything beyond 15 significant digits.
+        Value::Decimal(s) => SqliteValue::Text(s.clone().into()),
         Value::Text(s) => SqliteValue::Text(s.clone().into()),
         Value::Bytes(b) => SqliteValue::Blob(b.clone().into()),
         // Same ISO-8601 text the C SQLite driver writes, so one database file
@@ -133,15 +126,16 @@ mod tests {
     }
 
     #[test]
-    fn decimal_string_to_integer() {
-        let sv = value_to_sqlite(&Value::Decimal("42".into()));
-        assert_eq!(sv, SqliteValue::Integer(42));
-    }
-
-    #[test]
-    fn decimal_string_to_float() {
-        let sv = value_to_sqlite(&Value::Decimal("3.14".into()));
-        assert!(matches!(sv, SqliteValue::Float(_)));
+    fn decimals_bind_as_exact_text() {
+        // Parsing to a float would round anything beyond 15 significant digits.
+        assert_eq!(
+            value_to_sqlite(&Value::Decimal("42".into())),
+            SqliteValue::Text("42".into())
+        );
+        assert_eq!(
+            value_to_sqlite(&Value::Decimal("12345678901234.567891".into())),
+            SqliteValue::Text("12345678901234.567891".into())
+        );
     }
 
     #[test]

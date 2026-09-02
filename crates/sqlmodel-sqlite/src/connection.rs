@@ -944,24 +944,23 @@ impl Connection for SqliteConnection {
         cx: &Cx,
         statements: &[(String, Vec<Value>)],
     ) -> impl Future<Output = Outcome<Vec<u64>, Error>> + Send {
-        let outcome = match sqlmodel_core::cancel_requested(cx) {
-            Some(reason) => Outcome::Cancelled(reason),
-            None => {
-                let mut results = Vec::with_capacity(statements.len());
-                let mut error = None;
-                for (sql, params) in statements {
-                    match self.execute_sync(sql, params) {
-                        Ok(n) => results.push(n),
-                        Err(e) => {
-                            error = Some(e);
-                            break;
-                        }
+        let outcome = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            let mut results = Vec::with_capacity(statements.len());
+            let mut error = None;
+            for (sql, params) in statements {
+                match self.execute_sync(sql, params) {
+                    Ok(n) => results.push(n),
+                    Err(e) => {
+                        error = Some(e);
+                        break;
                     }
                 }
-                match error {
-                    Some(e) => Outcome::Err(e),
-                    None => Outcome::Ok(results),
-                }
+            }
+            match error {
+                Some(e) => Outcome::Err(e),
+                None => Outcome::Ok(results),
             }
         };
         async move { outcome }

@@ -315,6 +315,26 @@ impl FieldInfo {
         if let Some(override_str) = self.sql_type_override {
             return override_str.to_string();
         }
+        // MySQL cannot put a TEXT column in a key (primary, unique, index, or
+        // foreign key) without a prefix length, so keyed strings become VARCHAR.
+        if matches!(dialect, crate::connection::Dialect::Mysql)
+            && matches!(self.sql_type, SqlType::Text)
+            && (self.primary_key
+                || self.unique
+                || self.index.is_some()
+                || self.foreign_key.is_some())
+        {
+            return "VARCHAR(255)".to_string();
+        }
+        // SQLite: exact decimals need TEXT affinity regardless of precision/scale.
+        if matches!(dialect, crate::connection::Dialect::Sqlite)
+            && matches!(
+                self.sql_type,
+                SqlType::Decimal { .. } | SqlType::Numeric { .. }
+            )
+        {
+            return self.sql_type.sql_name_for(dialect);
+        }
         if let (SqlType::Decimal { .. } | SqlType::Numeric { .. }, Some(p), Some(s)) =
             (&self.sql_type, self.precision, self.scale)
         {

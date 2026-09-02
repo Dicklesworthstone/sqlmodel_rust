@@ -765,10 +765,12 @@ impl<C: Connection> Session<C> {
 
         // Query from database
         let pk_col = M::PRIMARY_KEY.first().unwrap_or(&"id");
+        let dialect = self.connection.dialect();
         let sql = format!(
-            "SELECT * FROM \"{}\" WHERE \"{}\" = $1 LIMIT 1",
-            M::TABLE_NAME,
-            pk_col
+            "SELECT * FROM {} WHERE {} = {} LIMIT 1",
+            dialect.quote_identifier(M::TABLE_NAME),
+            dialect.quote_identifier(pk_col),
+            dialect.placeholder(1)
         );
 
         let rows = match self.connection.query(cx, &sql, &[pk_value]).await {
@@ -894,15 +896,22 @@ impl<C: Connection> Session<C> {
             )));
         }
 
+        let dialect = self.connection.dialect();
         let where_parts: Vec<String> = pk_columns
             .iter()
             .enumerate()
-            .map(|(i, col)| format!("\"{}\" = ${}", col, i + 1))
+            .map(|(i, col)| {
+                format!(
+                    "{} = {}",
+                    dialect.quote_identifier(col),
+                    dialect.placeholder(i + 1)
+                )
+            })
             .collect();
 
         let mut sql = format!(
-            "SELECT * FROM \"{}\" WHERE {} LIMIT 1",
-            M::TABLE_NAME,
+            "SELECT * FROM {} WHERE {} LIMIT 1",
+            dialect.quote_identifier(M::TABLE_NAME),
             where_parts.join(" AND ")
         );
 

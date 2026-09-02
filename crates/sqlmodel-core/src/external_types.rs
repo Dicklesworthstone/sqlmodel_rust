@@ -7,7 +7,7 @@
 //! [`Value::Decimal`] is the decimal's text form. The derive macro already maps
 //! the type *names* `chrono::NaiveDate`, `chrono::NaiveDateTime`, `uuid::Uuid`,
 //! and `rust_decimal::Decimal` to the right [`crate::SqlType`]; this module adds
-//! the `From` / `TryFrom` / [`FromValue`] impls that make such fields actually
+//! the `From` / `TryFrom` / [`FromValue`](crate::row::FromValue) impls that make such fields actually
 //! compile in `#[derive(Model)]` structs.
 //!
 //! Enable per type with the sqlmodel-core features `chrono`, `uuid`, `decimal`
@@ -45,6 +45,7 @@ fn parse_error(expected: &'static str, text: &str, rust_type: &'static str) -> E
 
 #[cfg(feature = "chrono")]
 mod chrono_impls {
+    #[allow(clippy::wildcard_imports)] // glue module over the private helpers above
     use super::*;
     use chrono::{DateTime, Days, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 
@@ -60,8 +61,9 @@ mod chrono_impls {
         /// Days since 1970-01-01 (negative before the epoch).
         fn from(d: NaiveDate) -> Self {
             let days = d.signed_duration_since(epoch_date()).num_days();
-            // NaiveDate's year range (±262,143) keeps this well inside i32.
-            Value::Date(days as i32)
+            // NaiveDate's year range (±262,143) keeps this well inside i32; the
+            // saturation only exists to make the conversion infallible on paper.
+            Value::Date(i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX }))
         }
     }
 
@@ -101,10 +103,11 @@ mod chrono_impls {
 
     fn date_from_days(days: i32) -> Result<NaiveDate, Error> {
         let epoch = epoch_date();
+        let magnitude = Days::new(u64::from(days.unsigned_abs()));
         let result = if days >= 0 {
-            epoch.checked_add_days(Days::new(days as u64))
+            epoch.checked_add_days(magnitude)
         } else {
-            epoch.checked_sub_days(Days::new(days.unsigned_abs() as u64))
+            epoch.checked_sub_days(magnitude)
         };
         result.ok_or_else(|| {
             Error::Type(TypeError {
@@ -282,6 +285,7 @@ mod chrono_impls {
 
 #[cfg(feature = "uuid")]
 mod uuid_impls {
+    #[allow(clippy::wildcard_imports)] // glue module over the private helpers above
     use super::*;
     use uuid::Uuid;
 
@@ -316,6 +320,7 @@ mod uuid_impls {
 
 #[cfg(feature = "decimal")]
 mod decimal_impls {
+    #[allow(clippy::wildcard_imports)] // glue module over the private helpers above
     use super::*;
     use rust_decimal::Decimal;
     use rust_decimal::prelude::FromPrimitive;
@@ -359,10 +364,12 @@ mod decimal_impls {
 #[cfg(test)]
 mod tests {
     #![allow(unused_imports)]
+    #[allow(clippy::wildcard_imports)] // glue module over the private helpers above
     use super::*;
 
     #[cfg(feature = "chrono")]
     mod chrono_tests {
+        #[allow(clippy::wildcard_imports)] // glue module over the private helpers above
         use super::*;
         use chrono::{
             DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc,
@@ -516,6 +523,7 @@ mod tests {
 
     #[cfg(feature = "uuid")]
     mod uuid_tests {
+        #[allow(clippy::wildcard_imports)] // glue module over the private helpers above
         use super::*;
         use uuid::Uuid;
 
@@ -551,6 +559,7 @@ mod tests {
 
     #[cfg(feature = "decimal")]
     mod decimal_tests {
+        #[allow(clippy::wildcard_imports)] // glue module over the private helpers above
         use super::*;
         use rust_decimal::Decimal;
         use std::str::FromStr;

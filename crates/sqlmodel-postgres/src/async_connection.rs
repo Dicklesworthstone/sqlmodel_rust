@@ -1367,6 +1367,9 @@ impl SharedPgConnection {
         cx: &Cx,
         isolation: Option<IsolationLevel>,
     ) -> Outcome<SharedPgTransaction<'_>, Error> {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Outcome::Cancelled(reason);
+        }
         let inner = Arc::clone(&self.inner);
         let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
             return Outcome::Err(connection_error("Failed to acquire connection lock"));

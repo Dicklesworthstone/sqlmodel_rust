@@ -2205,6 +2205,9 @@ impl SharedMySqlConnection {
         cx: &Cx,
         isolation: Option<IsolationLevel>,
     ) -> Outcome<SharedMySqlTransaction<'_>, Error> {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Outcome::Cancelled(reason);
+        }
         let inner = Arc::clone(&self.inner);
 
         // Acquire lock

@@ -330,7 +330,7 @@ fn build_update_sql_for_table_pk_in(
     for (col, value) in set_pairs {
         set_clauses.push(format!(
             "{} = {}",
-            col,
+            dialect.quote_identifier(col),
             dialect.placeholder(params.len() + 1)
         ));
         params.push(value.clone());
@@ -433,6 +433,15 @@ fn rewrite_insert_as_ignore(sql: &mut String) {
     }
 }
 
+/// Render a column list with every name quoted for `dialect`.
+fn quoted_list(dialect: Dialect, columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|c| dialect.quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn append_on_conflict_clause(
     dialect: Dialect,
     sql: &mut String,
@@ -466,7 +475,10 @@ fn append_on_conflict_clause(
                 sql.push_str(
                     &update_cols
                         .iter()
-                        .map(|c| format!("{c} = VALUES({c})"))
+                        .map(|c| {
+                            let q = dialect.quote_identifier(c);
+                            format!("{q} = VALUES({q})")
+                        })
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -494,7 +506,13 @@ fn append_on_conflict_clause(
             }
 
             sql.push_str(" (");
-            sql.push_str(&effective_target.join(", "));
+            sql.push_str(
+                &effective_target
+                    .iter()
+                    .map(|c| dialect.quote_identifier(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
             sql.push(')');
 
             let update_cols: Vec<String> = if columns.is_empty() {
@@ -516,7 +534,10 @@ fn append_on_conflict_clause(
             sql.push_str(
                 &update_cols
                     .iter()
-                    .map(|c| format!("{c} = EXCLUDED.{c}"))
+                    .map(|c| {
+                        let q = dialect.quote_identifier(c);
+                        format!("{q} = EXCLUDED.{q}")
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
             );
@@ -571,7 +592,7 @@ fn build_insert_sql_for_table_with_columns(
         format!(
             "INSERT INTO {} ({}) VALUES ({})",
             table,
-            columns.join(", "),
+            quoted_list(dialect, &columns),
             placeholders.join(", ")
         )
     };
@@ -608,7 +629,7 @@ fn build_update_sql_for_table(
     for (col, value) in set_pairs {
         set_clauses.push(format!(
             "{} = {}",
-            col,
+            dialect.quote_identifier(col),
             dialect.placeholder(params.len() + 1)
         ));
         params.push(value.clone());
@@ -925,10 +946,12 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
         let mut sql = if columns.is_empty() {
             format!("INSERT INTO {} DEFAULT VALUES", M::TABLE_NAME)
         } else {
+            // Column names are quoted (like `Expr` columns in WHERE) so reserved
+            // words such as `real`, `double`, `order`, or `user` work everywhere.
             format!(
                 "INSERT INTO {} ({}) VALUES ({})",
                 M::TABLE_NAME,
-                columns.join(", "),
+                quoted_list(dialect, &columns),
                 placeholders.join(", ")
             )
         };
@@ -1725,7 +1748,7 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
         let mut sql = format!(
             "INSERT INTO {} ({}) VALUES {}",
             M::TABLE_NAME,
-            insert_columns.join(", "),
+            quoted_list(dialect, &insert_columns),
             value_groups.join(", ")
         );
 
@@ -2112,11 +2135,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
         let mut params = Vec::new();
         let mut set_clauses = Vec::new();
 
-        // First, add explicit SET clauses
+        // First, add explicit SET clauses. Column names are quoted like the
+        // `Expr` columns in WHERE already are, so reserved words (`real`,
+        // `order`, `user`) work on every dialect.
         for set in &self.explicit_sets {
             set_clauses.push(format!(
                 "{} = {}",
-                set.column,
+                dialect.quote_identifier(&set.column),
                 dialect.placeholder(params.len() + 1)
             ));
             params.push(set.value.clone());
@@ -2149,7 +2174,7 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
             for (name, value) in update_fields {
                 set_clauses.push(format!(
                     "{} = {}",
-                    name,
+                    dialect.quote_identifier(name),
                     dialect.placeholder(params.len() + 1)
                 ));
                 params.push(value.clone());
@@ -2187,7 +2212,11 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                 .zip(pk_values.iter())
                 .enumerate()
                 .map(|(i, (col, _))| {
-                    format!("{} = {}", col, dialect.placeholder(params.len() + i + 1))
+                    format!(
+                        "{} = {}",
+                        dialect.quote_identifier(col),
+                        dialect.placeholder(params.len() + i + 1)
+                    )
                 })
                 .collect();
 
@@ -2868,7 +2897,13 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
                 .iter()
                 .zip(pk_values.iter())
                 .enumerate()
-                .map(|(i, (col, _))| format!("{} = {}", col, dialect.placeholder(i + 1)))
+                .map(|(i, (col, _))| {
+                    format!(
+                        "{} = {}",
+                        dialect.quote_identifier(col),
+                        dialect.placeholder(i + 1)
+                    )
+                })
                 .collect();
 
             if !pk_conditions.is_empty() {
@@ -3321,10 +3356,11 @@ mod tests {
         };
         let (sql, params) = InsertBuilder::new(&hero).build();
 
-        // Auto-increment column with None gets DEFAULT, other columns get placeholders
+        // Auto-increment column with None gets DEFAULT, other columns get placeholders.
+        // Column names are quoted so reserved words work on every dialect.
         assert_eq!(
             sql,
-            "INSERT INTO heroes (id, name, age) VALUES (DEFAULT, $1, $2)"
+            "INSERT INTO heroes (\"id\", \"name\", \"age\") VALUES (DEFAULT, $1, $2)"
         );
         assert_eq!(params.len(), 2);
     }
@@ -3364,9 +3400,9 @@ mod tests {
             .on_conflict_do_update(&["name", "age"])
             .build();
 
-        assert!(sql.contains("ON CONFLICT (id) DO UPDATE SET"));
-        assert!(sql.contains("name = EXCLUDED.name"));
-        assert!(sql.contains("age = EXCLUDED.age"));
+        assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET"));
+        assert!(sql.contains("\"name\" = EXCLUDED.\"name\""));
+        assert!(sql.contains("\"age\" = EXCLUDED.\"age\""));
     }
 
     #[test]
@@ -3396,8 +3432,8 @@ mod tests {
             .build_with_dialect(Dialect::Mysql);
 
         assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
-        assert!(sql.contains("name = VALUES(name)"));
-        assert!(sql.contains("age = VALUES(age)"));
+        assert!(sql.contains("`name` = VALUES(`name`)"));
+        assert!(sql.contains("`age` = VALUES(`age`)"));
         assert!(!sql.contains("ON CONFLICT"));
     }
 
@@ -3420,7 +3456,7 @@ mod tests {
             .build_with_dialect(Dialect::Mysql);
 
         assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
-        assert!(sql.contains("name = VALUES(name)"));
+        assert!(sql.contains("`name` = VALUES(`name`)"));
         assert!(!sql.contains("ON CONFLICT"));
         assert_eq!(params.len(), 4);
     }
@@ -3442,7 +3478,7 @@ mod tests {
         let (sql, params) = InsertManyBuilder::new(&heroes).build();
 
         // Auto-increment columns with None get DEFAULT, other columns get placeholders
-        assert!(sql.starts_with("INSERT INTO heroes (id, name, age) VALUES"));
+        assert!(sql.starts_with("INSERT INTO heroes (\"id\", \"name\", \"age\") VALUES"));
         assert!(sql.contains("(DEFAULT, $1, $2), (DEFAULT, $3, $4)"));
         assert_eq!(params.len(), 4);
     }
@@ -3456,7 +3492,10 @@ mod tests {
         };
         let (sql, params) = InsertBuilder::new(&hero).build_with_dialect(Dialect::Sqlite);
 
-        assert_eq!(sql, "INSERT INTO heroes (name, age) VALUES (?1, ?2)");
+        assert_eq!(
+            sql,
+            "INSERT INTO heroes (\"name\", \"age\") VALUES (?1, ?2)"
+        );
         assert_eq!(params.len(), 2);
     }
 
@@ -3543,7 +3582,7 @@ mod tests {
         let (sql, params) = UpdateBuilder::new(&hero).build();
 
         assert!(sql.starts_with("UPDATE heroes SET"));
-        assert!(sql.contains("WHERE id = "));
+        assert!(sql.contains("WHERE \"id\" = "));
         assert!(params.len() >= 2); // At least name, age, and id
     }
 
@@ -3554,7 +3593,7 @@ mod tests {
             .filter(Expr::col("id").eq(1))
             .build_with_dialect(Dialect::Postgres);
 
-        assert_eq!(sql, "UPDATE heroes SET age = $1 WHERE \"id\" = $2");
+        assert_eq!(sql, "UPDATE heroes SET \"age\" = $1 WHERE \"id\" = $2");
         assert_eq!(params.len(), 2);
     }
 
@@ -3588,7 +3627,7 @@ mod tests {
         };
         let (sql, params) = DeleteBuilder::from_model(&hero).build();
 
-        assert!(sql.contains("WHERE id = $1"));
+        assert!(sql.contains("WHERE \"id\" = $1"));
         assert_eq!(params.len(), 1);
     }
 

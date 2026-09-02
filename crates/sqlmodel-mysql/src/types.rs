@@ -1318,6 +1318,9 @@ pub fn format_value_for_sql(value: &Value) -> String {
         Value::SmallInt(i) => i.to_string(),
         Value::Int(i) => i.to_string(),
         Value::BigInt(i) => i.to_string(),
+        // Exponent form (`1e300`, `-5e-1`): a plain decimal expansion such as
+        // `1000...000` (301 digits for 1e300) is an *exact* numeric literal to
+        // MySQL, which caps it at DECIMAL's 65 digits and stored 1e65.
         Value::Float(f) => {
             if f.is_nan() {
                 "NULL".to_string()
@@ -1328,7 +1331,7 @@ pub fn format_value_for_sql(value: &Value) -> String {
                     "-1e308".to_string()
                 }
             } else {
-                f.to_string()
+                format!("{f:e}")
             }
         }
         Value::Double(f) => {
@@ -1341,16 +1344,24 @@ pub fn format_value_for_sql(value: &Value) -> String {
                     "-1e308".to_string()
                 }
             } else {
-                f.to_string()
+                format!("{f:e}")
             }
         }
         Value::Decimal(s) => s.clone(),
         Value::Text(s) => escape_string(s),
         Value::Bytes(b) => escape_bytes(b),
         Value::Json(j) => escape_string(&j.to_string()),
-        Value::Date(d) => format!("'{}'", d), // ISO date format
-        Value::Time(t) => format!("'{}'", t), // microseconds as-is for now
-        Value::Timestamp(t) | Value::TimestampTz(t) => format!("'{}'", t),
+        // Temporal payloads are integers (days / microseconds); MySQL needs the
+        // ISO text form. Rendering the raw integer made every DATE insert through
+        // the text protocol fail with "Incorrect date value: '-25567'".
+        Value::Date(d) => format!("'{}'", sqlmodel_core::value::iso_date(*d)),
+        Value::Time(t) => format!("'{}'", sqlmodel_core::value::iso_time(*t)),
+        Value::Timestamp(t) | Value::TimestampTz(t) => {
+            format!(
+                "'{}'",
+                sqlmodel_core::value::iso_timestamp(*t).replacen('T', " ", 1)
+            )
+        }
         Value::Uuid(u) => escape_bytes(u),
         Value::Array(arr) => {
             // MySQL doesn't have native arrays, encode as JSON
@@ -1465,6 +1476,33 @@ mod tests {
 
     /// `utf8mb4_0900_ai_ci`, the MySQL 8 default collation.
     const UTF8MB4: u16 = 255;
+
+    #[test]
+    fn temporal_values_render_as_iso_literals_in_text_protocol() {
+        assert_eq!(format_value_for_sql(&Value::Date(-25_567)), "'1900-01-01'");
+        assert_eq!(
+            format_value_for_sql(&Value::Time(86_399_999_999)),
+            "'23:59:59.999999'"
+        );
+        assert_eq!(
+            format_value_for_sql(&Value::Timestamp(1_710_498_030_123_456)),
+            "'2024-03-15 10:20:30.123456'"
+        );
+        assert_eq!(
+            format_value_for_sql(&Value::TimestampTz(0)),
+            "'1970-01-01 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn float_literals_use_exponent_form_so_mysql_keeps_them_approximate() {
+        // 1e300 written out is a 301-digit exact literal, which MySQL caps at 65 digits.
+        assert_eq!(format_value_for_sql(&Value::Double(1e300)), "1e300");
+        assert_eq!(format_value_for_sql(&Value::Double(-2.25)), "-2.25e0");
+        assert_eq!(format_value_for_sql(&Value::Float(-0.5)), "-5e-1");
+        assert_eq!(format_value_for_sql(&Value::Double(0.0)), "0e0");
+        assert_eq!(format_value_for_sql(&Value::Double(f64::NAN)), "NULL");
+    }
 
     #[test]
     fn text_and_blob_are_told_apart_by_charset_not_wire_type() {

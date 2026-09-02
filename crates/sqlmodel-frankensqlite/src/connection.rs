@@ -965,24 +965,23 @@ impl Connection for FrankenConnection {
         cx: &Cx,
         statements: &[(String, Vec<Value>)],
     ) -> impl Future<Output = Outcome<Vec<u64>, Error>> + Send {
-        let outcome = match sqlmodel_core::cancel_requested(cx) {
-            Some(reason) => Outcome::Cancelled(reason),
-            None => {
-                let mut results = Vec::with_capacity(statements.len());
-                let mut error = None;
-                for (sql, params) in statements {
-                    match self.execute_sync(sql, params) {
-                        Ok(n) => results.push(n),
-                        Err(e) => {
-                            error = Some(e);
-                            break;
-                        }
+        let outcome = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            let mut results = Vec::with_capacity(statements.len());
+            let mut error = None;
+            for (sql, params) in statements {
+                match self.execute_sync(sql, params) {
+                    Ok(n) => results.push(n),
+                    Err(e) => {
+                        error = Some(e);
+                        break;
                     }
                 }
-                match error {
-                    Some(e) => Outcome::Err(e),
-                    None => Outcome::Ok(results),
-                }
+            }
+            match error {
+                Some(e) => Outcome::Err(e),
+                None => Outcome::Ok(results),
             }
         };
         async move { outcome }
@@ -1447,11 +1446,11 @@ fn infer_returning_columns(sql: &str) -> Vec<String> {
 /// or `SELECT t.*` over a single table (no JOIN); anything else returns `None`
 /// and falls back to text inference.
 fn star_columns_from_schema(sql: &str, inner: &FrankenInner) -> Option<Vec<String>> {
-    let table_name = extract_table_name_for_star_projection(sql)?;
+    let (table_name, extra_columns) = extract_star_projection(sql)?;
     let pragma_sql = format!("PRAGMA table_info({})", quote_pragma_table(&table_name));
     let pragma_rows = inner.conn.query_sync(&pragma_sql).ok()?;
     // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-    let columns: Vec<String> = pragma_rows
+    let mut columns: Vec<String> = pragma_rows
         .iter()
         .filter_map(|row| {
             row.values().get(1).and_then(|v| match v {
@@ -1461,10 +1460,12 @@ fn star_columns_from_schema(sql: &str, inner: &FrankenInner) -> Option<Vec<Strin
         })
         .collect();
     if columns.is_empty() {
-        None
-    } else {
-        Some(columns)
+        return None;
     }
+    // `SELECT *, fk AS __parent_pk FROM t` (the session's one-to-many loader):
+    // the extra items follow the table's columns in the result.
+    columns.extend(extra_columns);
+    Some(columns)
 }
 
 fn quote_pragma_table(table: &str) -> String {
@@ -1475,40 +1476,54 @@ fn quote_pragma_table(table: &str) -> String {
     }
 }
 
-/// The single source table of a statement whose result projection is `*`.
+/// The single source table of a statement whose result projection is `*`
+/// (test helper over [`extract_star_projection`]).
+#[cfg(test)]
 fn extract_table_name_for_star_projection(sql: &str) -> Option<String> {
-    let upper = sql.to_uppercase();
-    if upper.contains(" RETURNING *") || upper.ends_with("RETURNING *") {
-        return extract_table_name_for_returning(sql);
-    }
-    extract_table_name_for_select_star(sql)
+    extract_star_projection(sql).map(|(table, _)| table)
 }
 
-/// `SELECT [DISTINCT|ALL] * FROM <table> ...` or `SELECT <table>.* FROM <table> ...`
-/// over exactly one table (no JOIN, no comma-separated FROM list).
-fn extract_table_name_for_select_star(sql: &str) -> Option<String> {
+/// The single source table of a statement whose projection starts with `*`
+/// (or `<table>.*`), plus the result names of any select items that follow the
+/// star (`SELECT *, fk AS __parent_pk FROM t`).
+fn extract_star_projection(sql: &str) -> Option<(String, Vec<String>)> {
+    let upper = sql.to_uppercase();
+    if upper.contains(" RETURNING *") || upper.ends_with("RETURNING *") {
+        return extract_table_name_for_returning(sql).map(|table| (table, Vec::new()));
+    }
+    extract_select_star_projection(sql)
+}
+
+/// `SELECT [DISTINCT|ALL] *[, item...] FROM <table> ...` or
+/// `SELECT <table>.*[, item...] FROM <table> ...` over exactly one table (no
+/// JOIN, no comma-separated FROM list). Extra items are named by their alias
+/// (`expr AS name`) or by the last identifier of the expression.
+fn extract_select_star_projection(sql: &str) -> Option<(String, Vec<String>)> {
     let trimmed = sql.trim().trim_start_matches('(');
     let upper = trimmed.to_uppercase();
     let rest = upper.strip_prefix("SELECT")?;
     let rest = rest.trim_start();
-    let (rest, skipped) = if let Some(r) = rest.strip_prefix("DISTINCT ") {
-        (r, "DISTINCT ".len())
+    let rest = if let Some(r) = rest.strip_prefix("DISTINCT ") {
+        r
     } else if let Some(r) = rest.strip_prefix("ALL ") {
-        (r, "ALL ".len())
+        r
     } else {
-        (rest, 0)
+        rest
     };
     let projection_start = trimmed.len() - rest.len();
-    let _ = skipped;
     let from_pos = rest.find(" FROM ")?;
     let projection = trimmed[projection_start..projection_start + from_pos].trim();
-    let projection_is_star = projection == "*"
-        || projection
-            .rsplit_once('.')
-            .is_some_and(|(_, tail)| tail == "*" && !projection.contains(','));
-    if !projection_is_star {
-        return None;
-    }
+    let items = split_top_level_commas(projection);
+    let (star, extras) = items.split_first()?;
+    let star = star.trim();
+    let star_qualifier = if star == "*" {
+        None
+    } else {
+        match star.rsplit_once('.') {
+            Some((qualifier, "*")) => Some(qualifier.trim_matches('"').to_string()),
+            _ => return None,
+        }
+    };
     let after_from = &trimmed[projection_start + from_pos + " FROM ".len()..];
     let table = extract_identifier(after_from);
     if table.is_empty() {
@@ -1523,13 +1538,58 @@ fn extract_table_name_for_select_star(sql: &str) -> Option<String> {
     {
         return None;
     }
-    if let Some((qualifier, _)) = projection.rsplit_once('.') {
-        let qualifier = qualifier.trim_matches('"');
-        if !qualifier.eq_ignore_ascii_case(&table) {
-            return None;
+    if let Some(qualifier) = star_qualifier
+        && !qualifier.eq_ignore_ascii_case(&table)
+    {
+        return None;
+    }
+    let extra_names = extras
+        .iter()
+        .map(|item| select_item_result_name(item.trim()))
+        .collect::<Option<Vec<String>>>()?;
+    Some((table, extra_names))
+}
+
+/// Split a select list on commas that are not inside parentheses or quotes.
+fn split_top_level_commas(projection: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    for (i, c) in projection.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                items.push(&projection[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
     }
-    Some(table)
+    items.push(&projection[start..]);
+    items
+}
+
+/// The result column name of one select item: its `AS` alias, or the last
+/// identifier of a plain column reference. Expressions without an alias are
+/// not named (the caller falls back to text inference).
+fn select_item_result_name(item: &str) -> Option<String> {
+    let upper = item.to_uppercase();
+    if let Some(pos) = upper.rfind(" AS ") {
+        let alias = item[pos + " AS ".len()..].trim();
+        return Some(alias.trim_matches(|c| c == '"' || c == '`').to_string());
+    }
+    let last = item.rsplit('.').next()?.trim();
+    let bare = last.trim_matches(|c| c == '"' || c == '`');
+    if !bare.is_empty() && bare.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Some(bare.to_string())
+    } else {
+        None
+    }
 }
 
 fn extract_table_name_for_returning(sql: &str) -> Option<String> {
@@ -2168,13 +2228,31 @@ mod tests {
             ("SELECT count(*) FROM t", None),
             ("SELECT u.* FROM t", None),
             ("PRAGMA table_info(t)", None),
+            (
+                "SELECT *, author_id AS __parent_pk FROM books WHERE author_id IN (?1)",
+                Some("books"),
+            ),
         ] {
             assert_eq!(
-                extract_table_name_for_select_star(sql).as_deref(),
+                extract_table_name_for_star_projection(sql).as_deref(),
                 expected,
                 "{sql}"
             );
         }
+
+        // Extra select items after the star are named after the table's columns
+        // (the session's one-to-many loader depends on `__parent_pk`).
+        let (table, extras) = extract_star_projection(
+            "SELECT *, \"author_id\" AS __parent_pk FROM \"books\" WHERE \"author_id\" IN (?1)",
+        )
+        .expect("star projection with an aliased extra item");
+        assert_eq!(table, "books");
+        assert_eq!(extras, vec!["__parent_pk".to_string()]);
+        let (_, extras) =
+            extract_star_projection("SELECT t.*, t.x, upper(name) AS up, y FROM t").unwrap();
+        assert_eq!(extras, vec!["x".to_string(), "up".into(), "y".into()]);
+        // An unaliased expression has no derivable name: fall back to inference.
+        assert!(extract_star_projection("SELECT *, count(*) FROM t").is_none());
     }
 
     #[test]

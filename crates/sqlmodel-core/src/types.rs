@@ -113,6 +113,13 @@ impl SqlType {
     pub fn sql_name_for(&self, dialect: crate::connection::Dialect) -> String {
         use crate::connection::Dialect;
         match (dialect, self) {
+            // SQLite has no exact decimal type and `DECIMAL(p, s)` gets NUMERIC
+            // affinity, which converts the text to a REAL and keeps only 15
+            // significant digits. TEXT affinity keeps the digits exactly (SQL
+            // arithmetic and ordering on the column are then textual).
+            (Dialect::Sqlite, SqlType::Decimal { .. } | SqlType::Numeric { .. }) => {
+                "TEXT".to_string()
+            }
             (Dialect::Postgres, SqlType::TinyInt) => "SMALLINT".to_string(),
             (Dialect::Postgres, SqlType::Binary(_) | SqlType::VarBinary(_) | SqlType::Blob) => {
                 "BYTEA".to_string()
