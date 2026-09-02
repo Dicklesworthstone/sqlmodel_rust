@@ -1245,7 +1245,17 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             return Outcome::Ok(id);
         }
 
-        let (sql, params) = self.build_with_dialect(conn.dialect());
+        let dialect = conn.dialect();
+        let wants_returning = self.returning;
+        let (mut sql, params) = self.build_with_dialect(dialect);
+        // PostgreSQL has no last-insert-id: the driver reads the id from the first
+        // column of the result, so ask for the primary key explicitly. Without this,
+        // `insert!(model).execute()` never worked on PostgreSQL (found by the e2e
+        // smoke test against a live server).
+        if matches!(dialect, Dialect::Postgres) && !wants_returning && M::PRIMARY_KEY.len() == 1 {
+            sql.push_str(" RETURNING ");
+            sql.push_str(&dialect.quote_identifier(M::PRIMARY_KEY[0]));
+        }
         conn.insert(cx, &sql, &params).await
     }
 
@@ -2153,8 +2163,18 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
 
         let mut sql = format!("UPDATE {} SET {}", M::TABLE_NAME, set_clauses.join(", "));
 
+        // Single-table inheritance child models always carry their implicit
+        // discriminator predicate so an UPDATE can never touch sibling kinds.
+        let sti = crate::select::sti_discriminator_filter::<M>();
+        let where_clause = match (&self.where_clause, &sti) {
+            (Some(w), Some(d)) => Some(w.clone().and(d.clone())),
+            (Some(w), None) => Some(w.clone()),
+            (None, Some(d)) if self.model.is_none() => Some(Where::new(d.clone())),
+            _ => None,
+        };
+
         // Add WHERE clause
-        if let Some(where_clause) = &self.where_clause {
+        if let Some(where_clause) = where_clause {
             let (where_sql, where_params) = where_clause.build_with_dialect(dialect, params.len());
             sql.push_str(" WHERE ");
             sql.push_str(&where_sql);
@@ -2175,6 +2195,12 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                 sql.push_str(" WHERE ");
                 sql.push_str(&pk_conditions.join(" AND "));
                 params.extend(pk_values);
+                if let Some(d) = sti {
+                    let (d_sql, d_params) = Where::new(d).build_with_dialect(dialect, params.len());
+                    sql.push_str(" AND ");
+                    sql.push_str(&d_sql);
+                    params.extend(d_params);
+                }
             }
         }
 
@@ -2810,11 +2836,26 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
     }
 
     /// Build the DELETE SQL and parameters with specific dialect.
+    ///
+    /// Single-table inheritance child models always carry their implicit
+    /// discriminator predicate, so `delete!(Manager).filter(...)` (or an
+    /// unfiltered `DeleteBuilder::<Manager>::new()`) can never remove rows of a
+    /// sibling kind that shares the physical table.
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
         let mut sql = format!("DELETE FROM {}", M::TABLE_NAME);
         let mut params = Vec::new();
+        let sti = crate::select::sti_discriminator_filter::<M>();
 
-        if let Some(where_clause) = &self.where_clause {
+        // Explicit filter (with the discriminator folded in), or, for STI children
+        // without any filter, the discriminator alone.
+        let where_clause = match (&self.where_clause, &sti) {
+            (Some(w), Some(d)) => Some(w.clone().and(d.clone())),
+            (Some(w), None) => Some(w.clone()),
+            (None, Some(d)) if self.model.is_none() => Some(Where::new(d.clone())),
+            _ => None,
+        };
+
+        if let Some(where_clause) = where_clause {
             let (where_sql, where_params) = where_clause.build_with_dialect(dialect, 0);
             sql.push_str(" WHERE ");
             sql.push_str(&where_sql);
@@ -2834,6 +2875,12 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
                 sql.push_str(" WHERE ");
                 sql.push_str(&pk_conditions.join(" AND "));
                 params.extend(pk_values);
+                if let Some(d) = sti {
+                    let (d_sql, d_params) = Where::new(d).build_with_dialect(dialect, params.len());
+                    sql.push_str(" AND ");
+                    sql.push_str(&d_sql);
+                    params.extend(d_params);
+                }
             }
         }
 

@@ -98,7 +98,6 @@
 pub use sqlmodel_core::connection::{
     ConnectionConfig, IsolationLevel, SslMode, Transaction, TransactionMode, TransactionOptions,
 };
-pub use sqlmodel_core::{RetryPolicy, retry_transaction};
 pub use sqlmodel_core::{
     // asupersync re-exports
     Budget,
@@ -134,6 +133,7 @@ pub use sqlmodel_core::{
     ValidateResult,
     Value,
 };
+pub use sqlmodel_core::{RetryPolicy, retry_transaction};
 
 pub use sqlmodel_macros::{Model, SqlEnum, Validate};
 

@@ -84,7 +84,10 @@ fn migration_runner_applies_records_is_idempotent_and_rolls_back_on_sqlite() {
 
         // init creates the tracking table.
         unwrap_outcome(runner.init(&cx, &conn).await);
-        assert!(table_exists(&cx, &conn, tracking).await, "tracking table created");
+        assert!(
+            table_exists(&cx, &conn, tracking).await,
+            "tracking table created"
+        );
 
         // Everything pending before the first run.
         let status = unwrap_outcome(runner.status(&cx, &conn).await);
@@ -95,13 +98,21 @@ fn migration_runner_applies_records_is_idempotent_and_rolls_back_on_sqlite() {
         let applied = unwrap_outcome(runner.migrate(&cx, &conn).await);
         assert_eq!(
             applied,
-            vec!["0001_create_widgets", "0002_seed_widgets", "0003_create_gadgets"]
+            vec![
+                "0001_create_widgets",
+                "0002_seed_widgets",
+                "0003_create_gadgets"
+            ]
         );
         assert!(table_exists(&cx, &conn, "widgets").await);
         assert!(table_exists(&cx, &conn, "gadgets").await);
         assert_eq!(
             recorded_ids(&cx, &conn, tracking).await,
-            vec!["0001_create_widgets", "0002_seed_widgets", "0003_create_gadgets"],
+            vec![
+                "0001_create_widgets",
+                "0002_seed_widgets",
+                "0003_create_gadgets"
+            ],
             "every applied migration has a tracking row (raw SQL check)"
         );
         let seeded = unwrap_outcome(
@@ -114,21 +125,32 @@ fn migration_runner_applies_records_is_idempotent_and_rolls_back_on_sqlite() {
         let status = unwrap_outcome(runner.status(&cx, &conn).await);
         for (_, s) in &status {
             match s {
-                MigrationStatus::Applied { at } => assert!(*at > 1_600_000_000, "unix seconds: {at}"),
+                MigrationStatus::Applied { at } => {
+                    assert!(*at > 1_600_000_000, "unix seconds: {at}")
+                }
                 other => panic!("expected Applied, got {other:?}"),
             }
         }
 
         // Idempotent: a second run applies nothing and adds no rows.
         let applied_again = unwrap_outcome(runner.migrate(&cx, &conn).await);
-        assert!(applied_again.is_empty(), "nothing pending on the second run");
+        assert!(
+            applied_again.is_empty(),
+            "nothing pending on the second run"
+        );
         assert_eq!(recorded_ids(&cx, &conn, tracking).await.len(), 3);
 
         // rollback reverts the most recent migration and removes its record.
         let rolled = unwrap_outcome(runner.rollback(&cx, &conn).await);
         assert_eq!(rolled.as_deref(), Some("0003_create_gadgets"));
-        assert!(!table_exists(&cx, &conn, "gadgets").await, "down SQL executed");
-        assert!(table_exists(&cx, &conn, "widgets").await, "earlier migrations untouched");
+        assert!(
+            !table_exists(&cx, &conn, "gadgets").await,
+            "down SQL executed"
+        );
+        assert!(
+            table_exists(&cx, &conn, "widgets").await,
+            "earlier migrations untouched"
+        );
         assert_eq!(
             recorded_ids(&cx, &conn, tracking).await,
             vec!["0001_create_widgets", "0002_seed_widgets"]
@@ -168,7 +190,11 @@ fn failing_migration_is_not_recorded_and_earlier_ones_stay_applied() {
         // The three good migrations were applied and recorded; the broken one was not.
         assert_eq!(
             recorded_ids(&cx, &conn, "_sqlmodel_migrations").await,
-            vec!["0001_create_widgets", "0002_seed_widgets", "0003_create_gadgets"]
+            vec![
+                "0001_create_widgets",
+                "0002_seed_widgets",
+                "0003_create_gadgets"
+            ]
         );
         let status = unwrap_outcome(runner.status(&cx, &conn).await);
         let broken = status

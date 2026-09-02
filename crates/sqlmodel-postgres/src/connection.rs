@@ -470,14 +470,15 @@ impl PgConnection {
                     self.send_message(&FrontendMessage::PasswordMessage(hash))?;
                 }
                 BackendMessage::AuthenticationSASL(mechanisms) => {
-                    if mechanisms.contains(&"SCRAM-SHA-256".to_string()) {
-                        self.scram_auth()?;
-                    } else {
+                    if !mechanisms.contains(&"SCRAM-SHA-256".to_string()) {
                         return Err(auth_error(format!(
                             "Unsupported SASL mechanisms: {:?}",
                             mechanisms
                         )));
                     }
+                    // `scram_auth` consumes the server's AuthenticationOk itself; looping
+                    // again would misread the following ParameterStatus as an auth message.
+                    return self.scram_auth();
                 }
                 BackendMessage::ErrorResponse(e) => {
                     self.state = ConnectionState::Error;

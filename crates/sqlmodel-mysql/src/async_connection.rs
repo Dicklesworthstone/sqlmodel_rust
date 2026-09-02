@@ -1150,7 +1150,17 @@ impl MySqlAsyncConnection {
     }
 
     /// Handle additional auth data asynchronously.
+    ///
+    /// `data` is the whole packet payload. For `caching_sha2_password` the server
+    /// frames the status as an AuthMoreData packet: `[0x01, 0x03]` (fast auth
+    /// succeeded, an OK packet follows) or `[0x01, 0x04]` (perform full
+    /// authentication). The `0x01` marker must be stripped before the status
+    /// byte is interpreted; matching on the marker itself made every
+    /// `caching_sha2_password` login against a live MySQL 8 server fail with
+    /// "Unknown additional auth response: 01" (found by the integration suite,
+    /// not by the unit tests, which fed the status byte directly).
     async fn handle_additional_auth_async(&mut self, data: &[u8]) -> Outcome<(), Error> {
+        let data = auth::strip_auth_more_data_marker(data);
         if data.is_empty() {
             return Outcome::Err(protocol_error("Empty additional auth data"));
         }
@@ -1197,12 +1207,8 @@ impl MySqlAsyncConnection {
                         return Outcome::Err(protocol_error("Empty public key response"));
                     }
 
-                    // Some servers wrap the PEM in an AuthMoreData packet (0x01 prefix).
-                    let public_key = if payload[0] == 0x01 {
-                        &payload[1..]
-                    } else {
-                        &payload[..]
-                    };
+                    // The PEM arrives wrapped in an AuthMoreData packet (0x01 prefix).
+                    let public_key = auth::strip_auth_more_data_marker(&payload);
 
                     let use_oaep = mysql_server_uses_oaep(&server_version);
                     let encrypted =
@@ -1459,7 +1465,7 @@ impl MySqlAsyncConnection {
                 values.push(Value::Null);
             } else if let Some(data) = reader.read_lenenc_bytes() {
                 let is_unsigned = col.is_unsigned();
-                let value = decode_text_value(col.column_type, &data, is_unsigned);
+                let value = decode_text_value(col.column_type, &data, is_unsigned, col.charset);
                 values.push(value);
             } else {
                 values.push(Value::Null);
@@ -1864,8 +1870,12 @@ impl MySqlAsyncConnection {
                 values.push(Value::Null);
             } else {
                 let is_unsigned = col.flags & 0x20 != 0; // UNSIGNED_FLAG
-                let (value, consumed) =
-                    decode_binary_value_with_len(&data[pos..], col.column_type, is_unsigned);
+                let (value, consumed) = decode_binary_value_with_len(
+                    &data[pos..],
+                    col.column_type,
+                    is_unsigned,
+                    col.charset,
+                );
                 values.push(value);
                 pos += consumed;
             }
@@ -2357,7 +2367,7 @@ impl Connection for SharedMySqlConnection {
     }
 
     /// InnoDB transactions are MVCC-concurrent by nature, so
-    /// [`TransactionMode::Concurrent`] is the same as the default; the SQLite
+    /// [`TransactionMode::Concurrent`](sqlmodel_core::TransactionMode::Concurrent) is the same as the default; the SQLite
     /// locking forms have no equivalent.
     fn supports_transaction_mode(&self, mode: sqlmodel_core::TransactionMode) -> bool {
         use sqlmodel_core::TransactionMode;

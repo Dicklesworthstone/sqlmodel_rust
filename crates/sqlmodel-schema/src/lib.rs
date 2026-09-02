@@ -36,7 +36,7 @@ pub use introspect::{
 pub use migrate::{Migration, MigrationFormat, MigrationRunner, MigrationStatus, MigrationWriter};
 
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Model, quote_ident};
+use sqlmodel_core::{Connection, Model};
 
 /// Create a table for a model type.
 ///
@@ -85,23 +85,23 @@ pub async fn drop_table<C: Connection>(
     table_name: &str,
     if_exists: bool,
 ) -> Outcome<(), sqlmodel_core::Error> {
-    let sql = if if_exists {
-        format!("DROP TABLE IF EXISTS {}", quote_ident(table_name))
-    } else {
-        format!("DROP TABLE {}", quote_ident(table_name))
-    };
-
+    let sql = drop_table_sql(conn.dialect(), table_name, if_exists);
     conn.execute(cx, &sql, &[]).await.map(|_| ())
 }
 
-/// Generate DROP TABLE SQL (for testing/inspection).
+/// Generate DROP TABLE SQL for `dialect` (for testing/inspection).
 ///
-/// This is the same SQL that `drop_table` would execute.
-pub fn drop_table_sql(table_name: &str, if_exists: bool) -> String {
+/// This is the same SQL that `drop_table` executes.
+pub fn drop_table_sql(
+    dialect: sqlmodel_core::Dialect,
+    table_name: &str,
+    if_exists: bool,
+) -> String {
+    let table = dialect.quote_identifier(table_name);
     if if_exists {
-        format!("DROP TABLE IF EXISTS {}", quote_ident(table_name))
+        format!("DROP TABLE IF EXISTS {table}")
     } else {
-        format!("DROP TABLE {}", quote_ident(table_name))
+        format!("DROP TABLE {table}")
     }
 }
 
@@ -115,74 +115,74 @@ mod tests {
 
     #[test]
     fn test_drop_table_sql_simple() {
-        let sql = drop_table_sql("users", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "users", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"users\"");
 
-        let sql = drop_table_sql("heroes", false);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "heroes", false);
         assert_eq!(sql, "DROP TABLE \"heroes\"");
     }
 
     #[test]
     fn test_drop_table_sql_with_keyword_name() {
         // SQL keywords must be quoted
-        let sql = drop_table_sql("order", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "order", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"order\"");
 
-        let sql = drop_table_sql("select", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "select", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"select\"");
 
-        let sql = drop_table_sql("user", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "user", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"user\"");
     }
 
     #[test]
     fn test_drop_table_sql_with_embedded_quotes() {
         // Embedded quotes must be doubled
-        let sql = drop_table_sql("my\"table", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "my\"table", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"my\"\"table\"");
 
-        let sql = drop_table_sql("test\"\"name", false);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "test\"\"name", false);
         assert_eq!(sql, "DROP TABLE \"test\"\"\"\"name\"");
 
         // Just a quote
-        let sql = drop_table_sql("\"", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "\"", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"\"\"\"");
     }
 
     #[test]
     fn test_drop_table_sql_with_spaces() {
-        let sql = drop_table_sql("my table", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "my table", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"my table\"");
     }
 
     #[test]
     fn test_drop_table_sql_with_unicode() {
-        let sql = drop_table_sql("用户", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "用户", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"用户\"");
 
-        let sql = drop_table_sql("tâble_émoji_🦀", false);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "tâble_émoji_🦀", false);
         assert_eq!(sql, "DROP TABLE \"tâble_émoji_🦀\"");
     }
 
     #[test]
     fn test_drop_table_sql_edge_cases() {
         // Empty table name (unusual but should be quoted)
-        let sql = drop_table_sql("", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"\"");
 
         // Single character
-        let sql = drop_table_sql("x", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "x", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"x\"");
 
         // Numbers at start (not valid unquoted identifier in most DBs)
-        let sql = drop_table_sql("123table", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "123table", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"123table\"");
 
         // Special characters
-        let sql = drop_table_sql("table-with-dashes", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "table-with-dashes", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"table-with-dashes\"");
 
-        let sql = drop_table_sql("table.with.dots", true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, "table.with.dots", true);
         assert_eq!(sql, "DROP TABLE IF EXISTS \"table.with.dots\"");
     }
 
@@ -190,7 +190,7 @@ mod tests {
     fn test_drop_table_sql_sql_injection_attempt_neutralized() {
         // SQL injection attempt - the quote_ident should neutralize it
         let malicious = "users\"; DROP TABLE secrets; --";
-        let sql = drop_table_sql(malicious, true);
+        let sql = drop_table_sql(sqlmodel_core::Dialect::Sqlite, malicious, true);
         // The embedded quote should be doubled, neutralizing the injection
         assert_eq!(
             sql,

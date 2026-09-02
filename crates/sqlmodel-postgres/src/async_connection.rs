@@ -467,13 +467,9 @@ impl PgAsyncConnection {
                 QueryErrorKind::Database,
             ));
         };
-        match id_value.as_i64() {
-            Some(v) => Outcome::Ok(v),
-            None => Outcome::Err(query_error_msg(
-                "INSERT returned non-integer id",
-                QueryErrorKind::Database,
-            )),
-        }
+        // A non-integer key (uuid, text) has no "inserted id"; report 0 like the
+        // MySQL/SQLite drivers do for tables without an integer key.
+        Outcome::Ok(id_value.as_i64().unwrap_or(0))
     }
 
     /// Ping the server.
@@ -535,6 +531,10 @@ impl PgAsyncConnection {
 
         let mut param_type_oids: Option<Vec<u32>> = None;
         let mut columns: Option<Vec<String>> = None;
+        // After an ErrorResponse the server discards everything up to our Sync and
+        // then sends ReadyForQuery. Keep reading until then, or the next request
+        // would consume this stale ReadyForQuery and return an empty result.
+        let mut failure: Option<Error> = None;
 
         loop {
             let msg = match self.receive_message(cx).await {
@@ -561,16 +561,22 @@ impl PgAsyncConnection {
                     break;
                 }
                 BackendMessage::ErrorResponse(e) => {
-                    self.state = ConnectionState::Error;
-                    return Outcome::Err(error_from_fields(&e));
+                    failure.get_or_insert_with(|| error_from_fields(&e));
                 }
                 BackendMessage::NoticeResponse(_notice) => {}
+                // Anything else that arrives after ErrorResponse is discarded until
+                // ReadyForQuery, as the protocol specifies.
+                _ if failure.is_some() => {}
                 other => {
                     return Outcome::Err(protocol_error(format!(
                         "Unexpected message during prepare: {other:?}"
                     )));
                 }
             }
+        }
+
+        if let Some(e) = failure {
+            return Outcome::Err(e);
         }
 
         let param_type_oids = param_type_oids.unwrap_or_default();
@@ -677,6 +683,11 @@ impl PgAsyncConnection {
         let mut columns: Option<Arc<ColumnInfo>> = None;
         let mut rows: Vec<Row> = Vec::new();
         let mut command_tag: Option<String> = None;
+        // An ErrorResponse is always followed (after the server discards messages up
+        // to our Sync) by ReadyForQuery. Returning early left that ReadyForQuery in
+        // the stream, and the *next* statement consumed it as its own terminator and
+        // came back empty -- the migration runner then re-applied every migration.
+        let mut failure: Option<Error> = None;
 
         loop {
             let msg = match self.receive_message(cx).await {
@@ -694,6 +705,14 @@ impl PgAsyncConnection {
                 | BackendMessage::NoData
                 | BackendMessage::PortalSuspended
                 | BackendMessage::EmptyQueryResponse => {}
+                BackendMessage::ErrorResponse(e) => {
+                    failure.get_or_insert_with(|| error_from_fields(&e));
+                }
+                BackendMessage::ReadyForQuery(status) => {
+                    self.state = ConnectionState::Ready(TransactionStatusState::from(status));
+                    break;
+                }
+                _ if failure.is_some() => {}
                 BackendMessage::RowDescription(desc) => {
                     let names: Vec<String> = desc.iter().map(|f| f.name.clone()).collect();
                     columns = Some(Arc::new(ColumnInfo::new(names)));
@@ -736,19 +755,14 @@ impl PgAsyncConnection {
                 BackendMessage::CommandComplete(tag) => {
                     command_tag = Some(tag);
                 }
-                BackendMessage::ReadyForQuery(status) => {
-                    self.state = ConnectionState::Ready(TransactionStatusState::from(status));
-                    break;
-                }
-                BackendMessage::ErrorResponse(e) => {
-                    self.state = ConnectionState::Error;
-                    return Outcome::Err(error_from_fields(&e));
-                }
                 BackendMessage::NoticeResponse(_notice) => {}
                 _ => {}
             }
         }
 
+        if let Some(e) = failure {
+            return Outcome::Err(e);
+        }
         Outcome::Ok(PgQueryResult { rows, command_tag })
     }
 
@@ -1072,19 +1086,17 @@ impl PgAsyncConnection {
                     }
                 }
                 BackendMessage::AuthenticationSASL(mechanisms) => {
-                    if mechanisms.contains(&"SCRAM-SHA-256".to_string()) {
-                        match self.scram_auth().await {
-                            Outcome::Ok(()) => {}
-                            Outcome::Err(e) => return Outcome::Err(e),
-                            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                            Outcome::Panicked(p) => return Outcome::Panicked(p),
-                        }
-                    } else {
+                    if !mechanisms.contains(&"SCRAM-SHA-256".to_string()) {
                         return Outcome::Err(auth_error(format!(
                             "Unsupported SASL mechanisms: {:?}",
                             mechanisms
                         )));
                     }
+                    // `scram_auth` consumes the server's AuthenticationOk itself, so the
+                    // exchange is complete here. Looping again would read the
+                    // ParameterStatus that follows and reject it as an auth message
+                    // (this made every SCRAM-SHA-256 login fail against Postgres 14+).
+                    return self.scram_auth().await;
                 }
                 BackendMessage::ErrorResponse(e) => {
                     self.state = ConnectionState::Error;
@@ -1545,7 +1557,7 @@ impl Connection for SharedPgConnection {
     }
 
     /// PostgreSQL transactions are MVCC-concurrent by nature, so
-    /// [`TransactionMode::Concurrent`] is the same as the default; the SQLite
+    /// [`TransactionMode::Concurrent`](sqlmodel_core::TransactionMode::Concurrent) is the same as the default; the SQLite
     /// locking forms have no equivalent.
     fn supports_transaction_mode(&self, mode: sqlmodel_core::TransactionMode) -> bool {
         use sqlmodel_core::TransactionMode;

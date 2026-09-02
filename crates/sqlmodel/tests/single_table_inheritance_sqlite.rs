@@ -85,7 +85,10 @@ fn sti_models_share_one_table_and_children_are_discriminated() {
         assert_eq!(<Engineer as Model>::TABLE_NAME, "employees");
         assert_eq!(Manager::inheritance().discriminator_column, Some("kind"));
         assert_eq!(Manager::inheritance().discriminator_value, Some("manager"));
-        assert_eq!(Engineer::inheritance().discriminator_value, Some("engineer"));
+        assert_eq!(
+            Engineer::inheritance().discriminator_value,
+            Some("engineer")
+        );
 
         // DDL: exactly one CREATE TABLE plus ALTER TABLE ADD COLUMN for each child-only column.
         let stmts = SchemaBuilder::new()
@@ -97,7 +100,10 @@ fn sti_models_share_one_table_and_children_are_discriminated() {
             .iter()
             .filter(|s| s.starts_with("CREATE TABLE"))
             .count();
-        assert_eq!(creates, 1, "STI children must not create their own table: {stmts:?}");
+        assert_eq!(
+            creates, 1,
+            "STI children must not create their own table: {stmts:?}"
+        );
         assert!(
             stmts
                 .iter()
@@ -159,8 +165,12 @@ fn sti_models_share_one_table_and_children_are_discriminated() {
         assert_eq!(count_where(&cx, &conn, "1 = 1").await, 4);
 
         // SELECT on a child model is implicitly filtered by its discriminator.
-        let managers: Vec<Manager> =
-            unwrap_outcome(select!(Manager).order_by(Expr::col("id").asc()).all(&cx, &conn).await);
+        let managers: Vec<Manager> = unwrap_outcome(
+            select!(Manager)
+                .order_by(Expr::col("id").asc())
+                .all(&cx, &conn)
+                .await,
+        );
         assert_eq!(
             managers.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![2, 4],
@@ -184,8 +194,12 @@ fn sti_models_share_one_table_and_children_are_discriminated() {
         assert_eq!(named[0].id, 4);
 
         // SELECT on the base model sees every row, with the discriminator column populated.
-        let everyone: Vec<Employee> =
-            unwrap_outcome(select!(Employee).order_by(Expr::col("id").asc()).all(&cx, &conn).await);
+        let everyone: Vec<Employee> = unwrap_outcome(
+            select!(Employee)
+                .order_by(Expr::col("id").asc())
+                .all(&cx, &conn)
+                .await,
+        );
         assert_eq!(everyone.len(), 4);
         assert_eq!(
             everyone.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
@@ -204,7 +218,12 @@ fn sti_models_share_one_table_and_children_are_discriminated() {
         );
         assert_eq!(updated, 1);
         assert_eq!(
-            count_where(&cx, &conn, "id = 2 AND kind = 'manager' AND name = 'Mia Renamed'").await,
+            count_where(
+                &cx,
+                &conn,
+                "id = 2 AND kind = 'manager' AND name = 'Mia Renamed'"
+            )
+            .await,
             1
         );
 

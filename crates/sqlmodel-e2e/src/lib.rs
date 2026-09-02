@@ -61,17 +61,34 @@ impl DriverUnderTest {
             Self::CSqliteFile(temp_db_path("csqlite")),
             Self::Franken(temp_db_path("franken")),
         ];
-        match std::env::var(POSTGRES_URL_ENV).ok().and_then(|u| parse_postgres_url(&u)) {
+        match std::env::var(POSTGRES_URL_ENV)
+            .ok()
+            .and_then(|u| parse_postgres_url(&u))
+        {
             Some(cfg) => drivers.push(Self::Postgres(cfg)),
-            None => eprintln!("sqlmodel-e2e: PostgreSQL not exercised ({POSTGRES_URL_ENV} unset or unparsable)"),
+            None => eprintln!(
+                "sqlmodel-e2e: PostgreSQL not exercised ({POSTGRES_URL_ENV} unset or unparsable)"
+            ),
         }
-        match std::env::var(MYSQL_URL_ENV).ok().and_then(|u| parse_mysql_url(&u)) {
+        match std::env::var(MYSQL_URL_ENV)
+            .ok()
+            .and_then(|u| parse_mysql_url(&u))
+        {
             Some(cfg) => drivers.push(Self::MySql(cfg)),
-            None => eprintln!("sqlmodel-e2e: MySQL not exercised ({MYSQL_URL_ENV} unset or unparsable)"),
+            None => {
+                eprintln!(
+                    "sqlmodel-e2e: MySQL not exercised ({MYSQL_URL_ENV} unset or unparsable)"
+                );
+            }
         }
-        match std::env::var(MARIADB_URL_ENV).ok().and_then(|u| parse_mysql_url(&u)) {
+        match std::env::var(MARIADB_URL_ENV)
+            .ok()
+            .and_then(|u| parse_mysql_url(&u))
+        {
             Some(cfg) => drivers.push(Self::MariaDb(cfg)),
-            None => eprintln!("sqlmodel-e2e: MariaDB not exercised ({MARIADB_URL_ENV} unset or unparsable)"),
+            None => eprintln!(
+                "sqlmodel-e2e: MariaDB not exercised ({MARIADB_URL_ENV} unset or unparsable)"
+            ),
         }
         drivers
     }
@@ -225,8 +242,14 @@ pub fn open_connection_pair(
         }),
         DriverUnderTest::MySql(cfg) | DriverUnderTest::MariaDb(cfg) => rt.block_on(async {
             ConnectionPair::MySql(
-                expect_outcome(SharedMySqlConnection::connect(cx, cfg.clone()).await, "mysql a"),
-                expect_outcome(SharedMySqlConnection::connect(cx, cfg.clone()).await, "mysql b"),
+                expect_outcome(
+                    SharedMySqlConnection::connect(cx, cfg.clone()).await,
+                    "mysql a",
+                ),
+                expect_outcome(
+                    SharedMySqlConnection::connect(cx, cfg.clone()).await,
+                    "mysql b",
+                ),
             )
         }),
     })
@@ -277,7 +300,9 @@ pub fn temp_db_path(prefix: &str) -> PathBuf {
 /// FrankenSQLite's additional sidecars) that shares its stem.
 pub fn remove_db_family(path: &Path) {
     let Some(dir) = path.parent() else { return };
-    let Some(stem) = path.file_name().and_then(|s| s.to_str()) else { return };
+    let Some(stem) = path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -301,7 +326,10 @@ pub fn parse_postgres_url(url: &str) -> Option<PgConfig> {
         None => (auth, None),
     };
     let (host_port, db) = host_and_path.split_once('/')?;
-    let db = db.split_once('?').map_or(db, |(left, _)| left).trim_matches('/');
+    let db = db
+        .split_once('?')
+        .map_or(db, |(left, _)| left)
+        .trim_matches('/');
     if db.is_empty() {
         return None;
     }
@@ -326,7 +354,10 @@ pub fn parse_mysql_url(url: &str) -> Option<MySqlConfig> {
         None => (auth, None),
     };
     let (host_port, db) = host_and_path.split_once('/')?;
-    let db = db.split_once('?').map_or(db, |(left, _)| left).trim_matches('/');
+    let db = db
+        .split_once('?')
+        .map_or(db, |(left, _)| left)
+        .trim_matches('/');
     if db.is_empty() {
         return None;
     }
@@ -354,7 +385,9 @@ fn parse_host_port(input: &str, default_port: u16) -> Option<(&str, u16)> {
         return Some((host, port));
     }
     match input.rsplit_once(':') {
-        Some((host, port_str)) if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) => {
+        Some((host, port_str))
+            if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) =>
+        {
             Some((host, port_str.parse::<u16>().ok()?))
         }
         _ => Some((input, default_port)),
@@ -367,18 +400,28 @@ mod tests {
 
     #[test]
     fn url_parsers_accept_the_ci_shapes() {
-        let pg = parse_postgres_url("postgres://sqlmodel:pw@127.0.0.1:55432/sqlmodel_test").unwrap();
+        let pg =
+            parse_postgres_url("postgres://sqlmodel:pw@127.0.0.1:55432/sqlmodel_test").unwrap();
         assert_eq!(pg.database, "sqlmodel_test");
-        assert!(parse_postgres_url("postgres://u@h:1/").is_none(), "database required");
+        assert!(
+            parse_postgres_url("postgres://u@h:1/").is_none(),
+            "database required"
+        );
 
         let my = parse_mysql_url("mysql://root:pw@127.0.0.1:53306/sqlmodel_test?x=1").unwrap();
         assert_eq!(my.database.as_deref(), Some("sqlmodel_test"));
-        assert!(parse_mysql_url("mysql://root@h/").is_none(), "database required");
+        assert!(
+            parse_mysql_url("mysql://root@h/").is_none(),
+            "database required"
+        );
     }
 
     #[test]
     fn sqlite_drivers_are_always_available() {
-        let names: Vec<_> = DriverUnderTest::available().iter().map(DriverUnderTest::name).collect();
+        let names: Vec<_> = DriverUnderTest::available()
+            .iter()
+            .map(DriverUnderTest::name)
+            .collect();
         assert!(names.contains(&"c-sqlite(memory)"));
         assert!(names.contains(&"c-sqlite(file)"));
         assert!(names.contains(&"frankensqlite"));

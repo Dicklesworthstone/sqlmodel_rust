@@ -435,7 +435,10 @@ impl Error {
         dialect: crate::connection::Dialect,
     ) -> Self {
         let hint = match (mode, dialect) {
-            (crate::connection::TransactionMode::Concurrent, crate::connection::Dialect::Sqlite) => {
+            (
+                crate::connection::TransactionMode::Concurrent,
+                crate::connection::Dialect::Sqlite,
+            ) => {
                 " (BEGIN CONCURRENT needs the pure-Rust FrankenSQLite driver, sqlmodel-frankensqlite; C SQLite has no concurrent-writer mode)"
             }
             (_, crate::connection::Dialect::Postgres | crate::connection::Dialect::Mysql) => {

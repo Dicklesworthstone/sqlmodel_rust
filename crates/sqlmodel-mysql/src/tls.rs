@@ -897,7 +897,10 @@ G1euYZaoD1WUYYMQFMsBgnsGSrkeNSAnXGNEEWqweFLwSzZ6jUGAT95IEodL7J9j
         // rustls-pki-types does not decrypt keys; an ENCRYPTED PRIVATE KEY
         // section must not be silently accepted as a usable key.
         let result = read_pem_private_key(&mut cursor(ENCRYPTED_PKCS8_KEY));
-        assert!(result.is_err(), "encrypted key must not parse as a private key");
+        assert!(
+            result.is_err(),
+            "encrypted key must not parse as a private key"
+        );
     }
 
     #[test]
@@ -914,12 +917,16 @@ G1euYZaoD1WUYYMQFMsBgnsGSrkeNSAnXGNEEWqweFLwSzZ6jUGAT95IEodL7J9j
         // The PEM layer decodes base64 and does not validate DER (rustls does
         // that when the certificate is used), so the malformed input here has
         // to be malformed at the base64 level.
-        let garbage = "-----BEGIN CERTIFICATE-----\nMIIB!!!not*base64$$$\n-----END CERTIFICATE-----\n";
+        let garbage =
+            "-----BEGIN CERTIFICATE-----\nMIIB!!!not*base64$$$\n-----END CERTIFICATE-----\n";
         let err = read_pem_certificates(&mut cursor(garbage)).expect_err("invalid base64");
         assert!(matches!(err, PemError::Base64Decode(_)), "got {err:?}");
 
         let unterminated = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIU\n";
         let err = read_pem_certificates(&mut cursor(unterminated)).expect_err("missing END line");
-        assert!(matches!(err, PemError::MissingSectionEnd { .. }), "got {err:?}");
+        assert!(
+            matches!(err, PemError::MissingSectionEnd { .. }),
+            "got {err:?}"
+        );
     }
 }

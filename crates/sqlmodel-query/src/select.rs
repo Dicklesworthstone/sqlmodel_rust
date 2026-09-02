@@ -13,7 +13,11 @@ use std::marker::PhantomData;
 
 type ParentFieldsFn = fn() -> &'static [sqlmodel_core::FieldInfo];
 
-fn sti_discriminator_filter<M: Model>() -> Option<Expr> {
+/// The implicit `table.discriminator = value` predicate for a single-table
+/// inheritance child model, or `None` for base/non-STI models. Applied by
+/// SELECT, UPDATE, and DELETE builders so a child model never reads or writes
+/// rows of a sibling kind.
+pub(crate) fn sti_discriminator_filter<M: Model>() -> Option<Expr> {
     let inh = M::inheritance();
     match (inh.discriminator_column, inh.discriminator_value) {
         (Some(col), Some(val)) => Some(Expr::qualified(M::TABLE_NAME, col).eq(val)),

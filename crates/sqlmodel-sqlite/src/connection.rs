@@ -742,9 +742,10 @@ impl SqliteConnection {
             TransactionMode::Immediate => self.begin_statement_sync("BEGIN IMMEDIATE"),
             TransactionMode::Exclusive => self.begin_statement_sync("BEGIN EXCLUSIVE"),
             TransactionMode::Deferred => self.begin_statement_sync("BEGIN DEFERRED"),
-            TransactionMode::Concurrent => {
-                Err(Error::unsupported_transaction_mode(options.mode, Dialect::Sqlite))
-            }
+            TransactionMode::Concurrent => Err(Error::unsupported_transaction_mode(
+                options.mode,
+                Dialect::Sqlite,
+            )),
         }
     }
 

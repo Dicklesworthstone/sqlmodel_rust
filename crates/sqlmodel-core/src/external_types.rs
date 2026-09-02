@@ -185,7 +185,9 @@ mod chrono_impls {
                     NaiveTime::parse_from_str(t, "%H:%M:%S%.f")
                         .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M:%S"))
                         .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M"))
-                        .map_err(|_| parse_error("time (HH:MM[:SS[.ffffff]])", s, "chrono::NaiveTime"))
+                        .map_err(|_| {
+                            parse_error("time (HH:MM[:SS[.ffffff]])", s, "chrono::NaiveTime")
+                        })
                 }
                 other => Err(type_error("time", other, "chrono::NaiveTime")),
             }
@@ -200,7 +202,9 @@ mod chrono_impls {
                 Value::Timestamp(us) | Value::TimestampTz(us) => {
                     datetime_from_micros(*us, "chrono::NaiveDateTime").map(|dt| dt.naive_utc())
                 }
-                Value::Date(days) => date_from_days(*days).map(|d| d.and_hms_opt(0, 0, 0).expect("midnight")),
+                Value::Date(days) => {
+                    date_from_days(*days).map(|d| d.and_hms_opt(0, 0, 0).expect("midnight"))
+                }
                 Value::Text(s) => parse_naive_datetime(s)
                     .ok_or_else(|| parse_error("timestamp (ISO 8601)", s, "chrono::NaiveDateTime")),
                 other => Err(type_error("timestamp", other, "chrono::NaiveDateTime")),
@@ -229,8 +233,13 @@ mod chrono_impls {
 
         fn try_from(value: Value) -> Result<Self, Error> {
             match &value {
-                Value::Text(s) => DateTime::parse_from_rfc3339(s.trim())
-                    .map_err(|_| parse_error("timestamp (RFC 3339 with offset)", s, "chrono::DateTime<FixedOffset>")),
+                Value::Text(s) => DateTime::parse_from_rfc3339(s.trim()).map_err(|_| {
+                    parse_error(
+                        "timestamp (RFC 3339 with offset)",
+                        s,
+                        "chrono::DateTime<FixedOffset>",
+                    )
+                }),
                 _ => DateTime::<Utc>::try_from(value).map(|dt| dt.fixed_offset()),
             }
         }
@@ -280,9 +289,8 @@ mod uuid_impls {
         fn try_from(value: Value) -> Result<Self, Error> {
             match &value {
                 Value::Uuid(bytes) => Ok(Uuid::from_bytes(*bytes)),
-                Value::Bytes(b) if b.len() == 16 => {
-                    Uuid::from_slice(b).map_err(|_| type_error("16 uuid bytes", &value, "uuid::Uuid"))
-                }
+                Value::Bytes(b) if b.len() == 16 => Uuid::from_slice(b)
+                    .map_err(|_| type_error("16 uuid bytes", &value, "uuid::Uuid")),
                 Value::Text(s) => {
                     Uuid::parse_str(s.trim()).map_err(|_| parse_error("uuid text", s, "uuid::Uuid"))
                 }
@@ -348,11 +356,19 @@ mod tests {
     #[cfg(feature = "chrono")]
     mod chrono_tests {
         use super::*;
-        use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+        use chrono::{
+            DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc,
+        };
 
         #[test]
         fn date_round_trips_including_pre_epoch_and_far_future() {
-            for (y, m, d, days) in [(1970, 1, 1, 0), (1970, 1, 2, 1), (1969, 12, 31, -1), (2000, 2, 29, 11_016), (9999, 12, 31, 2_932_896)] {
+            for (y, m, d, days) in [
+                (1970, 1, 1, 0),
+                (1970, 1, 2, 1),
+                (1969, 12, 31, -1),
+                (2000, 2, 29, 11_016),
+                (9999, 12, 31, 2_932_896),
+            ] {
                 let date = NaiveDate::from_ymd_opt(y, m, d).unwrap();
                 let v = Value::from(date);
                 assert_eq!(v, Value::Date(days), "{date}");
@@ -366,11 +382,17 @@ mod tests {
                 NaiveDate::try_from(Value::Text(" 2024-03-15 ".into())).unwrap(),
                 NaiveDate::from_ymd_opt(2024, 3, 15).unwrap()
             );
-            let ts = NaiveDate::from_ymd_opt(2024, 3, 15).unwrap().and_hms_opt(23, 59, 59).unwrap();
+            let ts = NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap();
             assert_eq!(NaiveDate::try_from(Value::from(ts)).unwrap(), ts.date());
             assert!(NaiveDate::try_from(Value::Text("15/03/2024".into())).is_err());
             assert!(NaiveDate::try_from(Value::Bool(true)).is_err());
-            assert!(NaiveDate::try_from(Value::Date(i32::MAX)).is_err(), "out of range is an error, not a clamp");
+            assert!(
+                NaiveDate::try_from(Value::Date(i32::MAX)).is_err(),
+                "out of range is an error, not a clamp"
+            );
         }
 
         #[test]
@@ -381,23 +403,48 @@ mod tests {
             assert_eq!(NaiveTime::try_from(v).unwrap(), t);
 
             let with_nanos = NaiveTime::from_hms_nano_opt(1, 2, 3, 123_456_789).unwrap();
-            assert_eq!(Value::from(with_nanos), Value::Time(3_723_123_456), "nanoseconds truncated to micros");
+            assert_eq!(
+                Value::from(with_nanos),
+                Value::Time(3_723_123_456),
+                "nanoseconds truncated to micros"
+            );
 
-            assert_eq!(NaiveTime::try_from(Value::Text("07:08:09.5".into())).unwrap(), NaiveTime::from_hms_milli_opt(7, 8, 9, 500).unwrap());
-            assert_eq!(NaiveTime::try_from(Value::Text("07:08".into())).unwrap(), NaiveTime::from_hms_opt(7, 8, 0).unwrap());
-            assert!(NaiveTime::try_from(Value::Time(86_400_000_000)).is_err(), "24:00 is out of range");
+            assert_eq!(
+                NaiveTime::try_from(Value::Text("07:08:09.5".into())).unwrap(),
+                NaiveTime::from_hms_milli_opt(7, 8, 9, 500).unwrap()
+            );
+            assert_eq!(
+                NaiveTime::try_from(Value::Text("07:08".into())).unwrap(),
+                NaiveTime::from_hms_opt(7, 8, 0).unwrap()
+            );
+            assert!(
+                NaiveTime::try_from(Value::Time(86_400_000_000)).is_err(),
+                "24:00 is out of range"
+            );
             assert!(NaiveTime::try_from(Value::Time(-1)).is_err());
         }
 
         #[test]
         fn naive_datetime_round_trips_and_parses_common_text_forms() {
-            let dt = NaiveDate::from_ymd_opt(2024, 3, 15).unwrap().and_hms_micro_opt(10, 20, 30, 400_500).unwrap();
+            let dt = NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_micro_opt(10, 20, 30, 400_500)
+                .unwrap();
             let v = Value::from(dt);
             assert_eq!(v, Value::Timestamp(1_710_498_030_400_500));
             assert_eq!(NaiveDateTime::try_from(v).unwrap(), dt);
 
-            for text in ["2024-03-15 10:20:30.4005", "2024-03-15T10:20:30.400500", "2024-03-15T10:20:30.4005Z", "2024-03-15T12:20:30.4005+02:00"] {
-                assert_eq!(NaiveDateTime::try_from(Value::Text(text.into())).unwrap(), dt, "{text}");
+            for text in [
+                "2024-03-15 10:20:30.4005",
+                "2024-03-15T10:20:30.400500",
+                "2024-03-15T10:20:30.4005Z",
+                "2024-03-15T12:20:30.4005+02:00",
+            ] {
+                assert_eq!(
+                    NaiveDateTime::try_from(Value::Text(text.into())).unwrap(),
+                    dt,
+                    "{text}"
+                );
             }
             assert_eq!(
                 NaiveDateTime::try_from(Value::Text("2024-03-15 10:20:30".into())).unwrap(),
@@ -405,7 +452,10 @@ mod tests {
             );
             assert_eq!(
                 NaiveDateTime::try_from(Value::Date(0)).unwrap(),
-                NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap()
+                NaiveDate::from_ymd_opt(1970, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
             );
             assert!(NaiveDateTime::try_from(Value::Text("yesterday".into())).is_err());
         }
@@ -417,26 +467,42 @@ mod tests {
             assert_eq!(v, Value::TimestampTz(1_710_498_030_000_000));
             assert_eq!(DateTime::<Utc>::try_from(v.clone()).unwrap(), utc);
 
-            let plus_two: DateTime<FixedOffset> = DateTime::parse_from_rfc3339("2024-03-15T12:20:30+02:00").unwrap();
+            let plus_two: DateTime<FixedOffset> =
+                DateTime::parse_from_rfc3339("2024-03-15T12:20:30+02:00").unwrap();
             assert_eq!(Value::from(plus_two), v, "offset applied, not stored");
-            let back = DateTime::<FixedOffset>::try_from(Value::Text("2024-03-15T12:20:30+02:00".into())).unwrap();
+            let back =
+                DateTime::<FixedOffset>::try_from(Value::Text("2024-03-15T12:20:30+02:00".into()))
+                    .unwrap();
             assert_eq!(back, plus_two);
-            assert_eq!(back.offset().local_minus_utc(), 7200, "text keeps its offset");
+            assert_eq!(
+                back.offset().local_minus_utc(),
+                7200,
+                "text keeps its offset"
+            );
             // A Timestamp (no zone) is read as UTC.
-            assert_eq!(DateTime::<Utc>::try_from(Value::Timestamp(0)).unwrap(), Utc.timestamp_opt(0, 0).unwrap());
+            assert_eq!(
+                DateTime::<Utc>::try_from(Value::Timestamp(0)).unwrap(),
+                Utc.timestamp_opt(0, 0).unwrap()
+            );
         }
 
         #[test]
         fn option_fields_map_null_both_ways() {
             let none: Option<NaiveDate> = None;
             assert_eq!(Value::from(none), Value::Null);
-            assert_eq!(Value::from(Some(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())), Value::Date(0));
+            assert_eq!(
+                Value::from(Some(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())),
+                Value::Date(0)
+            );
         }
 
         #[test]
         fn from_value_trait_matches_try_from() {
             let v = Value::Date(19_797);
-            assert_eq!(<NaiveDate as FromValue>::from_value(&v).unwrap(), NaiveDate::try_from(v).unwrap());
+            assert_eq!(
+                <NaiveDate as FromValue>::from_value(&v).unwrap(),
+                NaiveDate::try_from(v).unwrap()
+            );
         }
     }
 
@@ -451,14 +517,27 @@ mod tests {
             let v = Value::from(u);
             assert_eq!(v, Value::Uuid(*u.as_bytes()));
             assert_eq!(Uuid::try_from(v).unwrap(), u);
-            assert_eq!(Uuid::try_from(Value::Text(" 6BA7B810-9DAD-11D1-80B4-00C04FD430C8 ".into())).unwrap(), u);
-            assert_eq!(Uuid::try_from(Value::Text(u.simple().to_string())).unwrap(), u);
-            assert_eq!(Uuid::try_from(Value::Bytes(u.as_bytes().to_vec())).unwrap(), u);
+            assert_eq!(
+                Uuid::try_from(Value::Text(" 6BA7B810-9DAD-11D1-80B4-00C04FD430C8 ".into()))
+                    .unwrap(),
+                u
+            );
+            assert_eq!(
+                Uuid::try_from(Value::Text(u.simple().to_string())).unwrap(),
+                u
+            );
+            assert_eq!(
+                Uuid::try_from(Value::Bytes(u.as_bytes().to_vec())).unwrap(),
+                u
+            );
             assert_eq!(Uuid::try_from(Value::Uuid([0; 16])).unwrap(), Uuid::nil());
             assert!(Uuid::try_from(Value::Text("not-a-uuid".into())).is_err());
             assert!(Uuid::try_from(Value::Bytes(vec![1, 2, 3])).is_err());
             assert!(Uuid::try_from(Value::BigInt(1)).is_err());
-            assert_eq!(<Uuid as FromValue>::from_value(&Value::Uuid(*u.as_bytes())).unwrap(), u);
+            assert_eq!(
+                <Uuid as FromValue>::from_value(&Value::Uuid(*u.as_bytes())).unwrap(),
+                u
+            );
         }
     }
 
@@ -475,16 +554,29 @@ mod tests {
             assert_eq!(v, Value::Decimal("12.50".into()), "scale preserved");
             assert_eq!(Decimal::try_from(v).unwrap(), d);
 
-            assert_eq!(Decimal::try_from(Value::Text("-0.0001".into())).unwrap(), Decimal::from_str("-0.0001").unwrap());
-            assert_eq!(Decimal::try_from(Value::BigInt(-42)).unwrap(), Decimal::from(-42));
+            assert_eq!(
+                Decimal::try_from(Value::Text("-0.0001".into())).unwrap(),
+                Decimal::from_str("-0.0001").unwrap()
+            );
+            assert_eq!(
+                Decimal::try_from(Value::BigInt(-42)).unwrap(),
+                Decimal::from(-42)
+            );
             assert_eq!(Decimal::try_from(Value::Int(7)).unwrap(), Decimal::from(7));
-            assert_eq!(Decimal::try_from(Value::Double(2.5)).unwrap(), Decimal::from_str("2.5").unwrap());
+            assert_eq!(
+                Decimal::try_from(Value::Double(2.5)).unwrap(),
+                Decimal::from_str("2.5").unwrap()
+            );
             assert!(Decimal::try_from(Value::Double(f64::NAN)).is_err());
             assert!(Decimal::try_from(Value::Text("12,50".into())).is_err());
             assert!(Decimal::try_from(Value::Bool(true)).is_err());
 
             let big = Decimal::from_str("79228162514264337593543950335").unwrap();
-            assert_eq!(Decimal::try_from(Value::from(big)).unwrap(), big, "28-digit maximum round trips");
+            assert_eq!(
+                Decimal::try_from(Value::from(big)).unwrap(),
+                big,
+                "28-digit maximum round trips"
+            );
         }
     }
 }

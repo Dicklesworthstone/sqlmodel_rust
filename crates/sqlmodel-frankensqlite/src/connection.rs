@@ -483,7 +483,7 @@ impl FrankenConnection {
         enforce_profile_sql(self.profile, sql)?;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
-        let schema_columns = self.get_returning_star_columns(sql, &inner);
+        let schema_columns = star_columns_from_schema(sql, &inner);
 
         let franken_rows = if sqlite_params.is_empty() {
             inner.conn.query_sync(sql)
@@ -497,43 +497,6 @@ impl FrankenConnection {
             sql,
             schema_columns.as_deref(),
         ))
-    }
-
-    /// Get column names for RETURNING * from the table schema.
-    fn get_returning_star_columns(&self, sql: &str, inner: &FrankenInner) -> Option<Vec<String>> {
-        let upper = sql.to_uppercase();
-
-        // Check if this is a RETURNING * query
-        if !upper.contains(" RETURNING *") && !upper.ends_with("RETURNING *") {
-            return None;
-        }
-
-        // Extract table name
-        let table_name = extract_table_name_for_returning(sql)?;
-
-        // Query PRAGMA table_info to get column names
-        let pragma_sql = format!("PRAGMA table_info({})", table_name);
-        let Ok(pragma_rows) = inner.conn.query_sync(&pragma_sql) else {
-            return None;
-        };
-
-        // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-        // Column index 1 is the name
-        let columns: Vec<String> = pragma_rows
-            .iter()
-            .filter_map(|row| {
-                row.values().get(1).and_then(|v| match v {
-                    SqliteValue::Text(s) => Some(s.to_string()),
-                    _ => None,
-                })
-            })
-            .collect();
-
-        if columns.is_empty() {
-            None
-        } else {
-            Some(columns)
-        }
     }
 
     /// Prepare and execute a statement synchronously, returning rows affected.
@@ -851,13 +814,18 @@ impl FrankenExclusiveTransaction<'_> {
         enforce_profile_sql(self.profile, sql)?;
         let sqlite_params: Vec<SqliteValue> = params.iter().map(value_to_sqlite).collect();
         let inner = &*self.inner;
+        let schema_columns = star_columns_from_schema(sql, inner);
         let rows = if sqlite_params.is_empty() {
             inner.conn.query_sync(sql)
         } else {
             inner.conn.query_with_params_sync(sql, &sqlite_params)
         }
         .map_err(|error| franken_to_query_error(&error, sql))?;
-        Ok(convert_rows_with_schema(&rows, sql, None))
+        Ok(convert_rows_with_schema(
+            &rows,
+            sql,
+            schema_columns.as_deref(),
+        ))
     }
 
     /// Execute a parameterized statement inside the transaction.
@@ -1420,6 +1388,104 @@ fn infer_returning_columns(sql: &str) -> Vec<String> {
 }
 
 /// Extract the table name from INSERT INTO, UPDATE, or DELETE FROM for RETURNING.
+/// Result column names for statements whose projection is a bare `*`, taken from
+/// the table schema (`PRAGMA table_info`) instead of guessed from the SQL text.
+///
+/// fsqlite's async facade returns rows without column labels, and the text-based
+/// inference in [`infer_column_names`] cannot expand `*`. Without this, every
+/// `select!(Model)` (which emits `SELECT * FROM table ...`) hydrated rows with
+/// placeholder names and `from_row` failed with "column not found" — the first
+/// ORM-level run through this driver found exactly that.
+///
+/// Handles `INSERT/UPDATE/DELETE ... RETURNING *` and `SELECT [DISTINCT|ALL] *`
+/// or `SELECT t.*` over a single table (no JOIN); anything else returns `None`
+/// and falls back to text inference.
+fn star_columns_from_schema(sql: &str, inner: &FrankenInner) -> Option<Vec<String>> {
+    let table_name = extract_table_name_for_star_projection(sql)?;
+    let pragma_sql = format!("PRAGMA table_info({})", quote_pragma_table(&table_name));
+    let pragma_rows = inner.conn.query_sync(&pragma_sql).ok()?;
+    // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+    let columns: Vec<String> = pragma_rows
+        .iter()
+        .filter_map(|row| {
+            row.values().get(1).and_then(|v| match v {
+                SqliteValue::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+        })
+        .collect();
+    if columns.is_empty() {
+        None
+    } else {
+        Some(columns)
+    }
+}
+
+fn quote_pragma_table(table: &str) -> String {
+    if table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        table.to_string()
+    } else {
+        format!("\"{}\"", table.replace('"', "\"\""))
+    }
+}
+
+/// The single source table of a statement whose result projection is `*`.
+fn extract_table_name_for_star_projection(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    if upper.contains(" RETURNING *") || upper.ends_with("RETURNING *") {
+        return extract_table_name_for_returning(sql);
+    }
+    extract_table_name_for_select_star(sql)
+}
+
+/// `SELECT [DISTINCT|ALL] * FROM <table> ...` or `SELECT <table>.* FROM <table> ...`
+/// over exactly one table (no JOIN, no comma-separated FROM list).
+fn extract_table_name_for_select_star(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_start_matches('(');
+    let upper = trimmed.to_uppercase();
+    let rest = upper.strip_prefix("SELECT")?;
+    let rest = rest.trim_start();
+    let (rest, skipped) = if let Some(r) = rest.strip_prefix("DISTINCT ") {
+        (r, "DISTINCT ".len())
+    } else if let Some(r) = rest.strip_prefix("ALL ") {
+        (r, "ALL ".len())
+    } else {
+        (rest, 0)
+    };
+    let projection_start = trimmed.len() - rest.len();
+    let _ = skipped;
+    let from_pos = rest.find(" FROM ")?;
+    let projection = trimmed[projection_start..projection_start + from_pos].trim();
+    let projection_is_star = projection == "*"
+        || projection
+            .rsplit_once('.')
+            .is_some_and(|(_, tail)| tail == "*" && !projection.contains(','));
+    if !projection_is_star {
+        return None;
+    }
+    let after_from = &trimmed[projection_start + from_pos + " FROM ".len()..];
+    let table = extract_identifier(after_from);
+    if table.is_empty() {
+        return None;
+    }
+    // Anything that widens the row shape disqualifies the schema lookup.
+    let tail_upper = after_from.to_uppercase();
+    if tail_upper.contains(" JOIN ")
+        || tail_upper[table.len().min(tail_upper.len())..]
+            .trim_start()
+            .starts_with(',')
+    {
+        return None;
+    }
+    if let Some((qualifier, _)) = projection.rsplit_once('.') {
+        let qualifier = qualifier.trim_matches('"');
+        if !qualifier.eq_ignore_ascii_case(&table) {
+            return None;
+        }
+    }
+    Some(table)
+}
+
 fn extract_table_name_for_returning(sql: &str) -> Option<String> {
     let upper = sql.to_uppercase();
 
@@ -1667,6 +1733,16 @@ fn franken_to_query_error(e: &fsqlite_error::FrankenError, sql: &str) -> Error {
         FrankenError::WriteConflict { .. } | FrankenError::SerializationFailure { .. } => {
             QueryErrorKind::Deadlock
         }
+        // A `BEGIN CONCURRENT` transaction whose write set overlaps a commit that
+        // landed after its snapshot (SQLITE_BUSY_SNAPSHOT), or whose snapshot was
+        // garbage-collected: the transaction must be retried from the start.
+        FrankenError::BusySnapshot { .. } | FrankenError::SnapshotTooOld { .. } => {
+            QueryErrorKind::Serialization
+        }
+        // Classic SQLITE_BUSY: another connection holds the lock right now; also
+        // transient. Classified as a lock-wait timeout so `Error::is_retryable()`
+        // is true.
+        FrankenError::Busy | FrankenError::BusyRecovery => QueryErrorKind::Timeout,
         FrankenError::SyntaxError { .. } => QueryErrorKind::Syntax,
         FrankenError::QueryReturnedNoRows => QueryErrorKind::NotFound,
         _ => QueryErrorKind::Database,
@@ -2026,6 +2102,64 @@ mod tests {
     }
 
     #[test]
+    fn select_star_table_extraction_handles_orm_shapes() {
+        for (sql, expected) in [
+            ("SELECT * FROM gadgets", Some("gadgets")),
+            (
+                "SELECT * FROM gadgets WHERE weight > ?1 ORDER BY id LIMIT 5",
+                Some("gadgets"),
+            ),
+            (
+                "SELECT DISTINCT * FROM \"e2e_smoke_gadgets\" WHERE x IS NULL",
+                Some("e2e_smoke_gadgets"),
+            ),
+            ("select * from t", Some("t")),
+            ("SELECT t.* FROM t WHERE 1", Some("t")),
+            ("SELECT \"t\".* FROM \"t\"", Some("t")),
+            ("SELECT id, name FROM t", None),
+            ("SELECT * FROM a JOIN b ON a.id = b.a_id", None),
+            ("SELECT * FROM a, b", None),
+            ("SELECT count(*) FROM t", None),
+            ("SELECT u.* FROM t", None),
+            ("PRAGMA table_info(t)", None),
+        ] {
+            assert_eq!(
+                extract_table_name_for_select_star(sql).as_deref(),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_star_rows_carry_real_column_names() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE gadgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL, weight INTEGER)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO gadgets VALUES (1, 'gear', 120), (2, 'spring', NULL)")
+            .unwrap();
+
+        let rows = conn
+            .query_sync(
+                "SELECT * FROM gadgets WHERE weight > ?1",
+                &[Value::BigInt(100)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "gear");
+        assert_eq!(rows[0].get_named::<i64>("weight").unwrap(), 120);
+
+        let rows = conn
+            .query_sync("SELECT DISTINCT * FROM gadgets WHERE weight IS NULL", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "spring");
+        assert!(rows[0].get_named::<i64>("weight").is_err(), "NULL weight");
+    }
+
+    #[test]
     fn infer_select_column_names() {
         let names = infer_column_names("SELECT id, name AS username, count(*) AS total FROM t");
         assert_eq!(names, vec!["id", "username", "total"]);
@@ -2161,16 +2295,23 @@ mod tests {
         )
         .unwrap();
         conn.commit_sync().unwrap();
-        let rows = conn.query_sync("SELECT val FROM t WHERE id = 7", &[]).unwrap();
+        let rows = conn
+            .query_sync("SELECT val FROM t WHERE id = 7", &[])
+            .unwrap();
         assert_eq!(rows[0].get(0), Some(&Value::Text("via helper".into())));
     }
 
     #[test]
-    fn two_concurrent_writers_on_disjoint_rows_both_commit() {
+    fn two_concurrent_writers_on_disjoint_pages_both_commit() {
         use sqlmodel_core::Cx;
+        // MVCC conflict detection is page-level: two rows of one tiny table share
+        // a page and would conflict, so give each writer its own table (its own
+        // B-tree root page). Same-page conflicts are covered by the next test.
         let path = concurrent_test_db("disjoint");
         let a = FrankenConnection::open_file(&path).unwrap();
-        a.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        a.execute_raw("CREATE TABLE ta (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        a.execute_raw("CREATE TABLE tb (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
         let b = FrankenConnection::open_file(&path).unwrap();
 
@@ -2188,25 +2329,26 @@ mod tests {
                 .into_result()
                 .expect("begin concurrent on b while a is open");
 
-            TransactionOps::execute(&tx_a, &cx, "INSERT INTO t VALUES (1, 'from a')", &[])
+            TransactionOps::execute(&tx_a, &cx, "INSERT INTO ta VALUES (1, 'from a')", &[])
                 .await
                 .into_result()
                 .unwrap();
-            TransactionOps::execute(&tx_b, &cx, "INSERT INTO t VALUES (2, 'from b')", &[])
+            TransactionOps::execute(&tx_b, &cx, "INSERT INTO tb VALUES (2, 'from b')", &[])
                 .await
                 .into_result()
                 .unwrap();
 
             tx_a.commit(&cx).await.into_result().expect("commit a");
-            tx_b.commit(&cx).await.into_result().expect("commit b: disjoint pages, no conflict");
+            tx_b.commit(&cx)
+                .await
+                .into_result()
+                .expect("commit b: disjoint pages, no conflict");
         });
 
-        let rows = a
-            .query_sync("SELECT id, val FROM t ORDER BY id", &[])
-            .unwrap();
-        assert_eq!(rows.len(), 2, "both concurrent writers landed");
-        assert_eq!(rows[0].get(1), Some(&Value::Text("from a".into())));
-        assert_eq!(rows[1].get(1), Some(&Value::Text("from b".into())));
+        let rows_a = a.query_sync("SELECT val FROM ta", &[]).unwrap();
+        let rows_b = a.query_sync("SELECT val FROM tb", &[]).unwrap();
+        assert_eq!(rows_a[0].get(0), Some(&Value::Text("from a".into())));
+        assert_eq!(rows_b[0].get(0), Some(&Value::Text("from b".into())));
 
         drop(a);
         drop(b);
@@ -2244,15 +2386,14 @@ mod tests {
             // The conflicting write may be detected at the statement or at commit,
             // depending on the engine's conflict-detection point; either is a
             // retryable failure for the second writer.
-            let stmt_b = TransactionOps::execute(
-                &tx_b,
-                &cx,
-                "UPDATE t SET val = val + 1 WHERE id = 1",
-                &[],
-            )
-            .await;
+            let stmt_b =
+                TransactionOps::execute(&tx_b, &cx, "UPDATE t SET val = val + 1 WHERE id = 1", &[])
+                    .await;
 
-            tx_a.commit(&cx).await.into_result().expect("first writer commits");
+            tx_a.commit(&cx)
+                .await
+                .into_result()
+                .expect("first writer commits");
             match stmt_b {
                 Outcome::Err(e) => {
                     let _ = tx_b.rollback(&cx).await;

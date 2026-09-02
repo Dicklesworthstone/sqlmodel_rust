@@ -15,7 +15,9 @@ use asupersync::{Cx, Outcome};
 use sqlmodel::prelude::*;
 use sqlmodel_core::TransactionOps;
 use sqlmodel_core::error::TransactionErrorKind;
-use sqlmodel_e2e::{ConnectionPair, DriverUnderTest, expect_outcome, open_connection_pair, unique_table};
+use sqlmodel_e2e::{
+    ConnectionPair, DriverUnderTest, expect_outcome, open_connection_pair, unique_table,
+};
 
 const INCREMENTS_PER_WRITER: u32 = 25;
 
@@ -56,12 +58,31 @@ fn run_pair<C: Connection + Sync>(a: &C, b: &C, table: &str, quoted: &str) -> (u
     let cx = Cx::for_testing();
     let rt = RuntimeBuilder::current_thread().build().expect("runtime");
     rt.block_on(async {
-        expect_outcome(a.execute(&cx, &format!("DROP TABLE IF EXISTS {quoted}"), &[]).await, "drop stale");
         expect_outcome(
-            a.execute(&cx, &format!("CREATE TABLE {quoted} (id INTEGER PRIMARY KEY, counter INTEGER NOT NULL)"), &[]).await,
+            a.execute(&cx, &format!("DROP TABLE IF EXISTS {quoted}"), &[])
+                .await,
+            "drop stale",
+        );
+        expect_outcome(
+            a.execute(
+                &cx,
+                &format!(
+                    "CREATE TABLE {quoted} (id INTEGER PRIMARY KEY, counter INTEGER NOT NULL)"
+                ),
+                &[],
+            )
+            .await,
             "create",
         );
-        expect_outcome(a.execute(&cx, &format!("INSERT INTO {quoted} (id, counter) VALUES (1, 0)"), &[]).await, "seed");
+        expect_outcome(
+            a.execute(
+                &cx,
+                &format!("INSERT INTO {quoted} (id, counter) VALUES (1, 0)"),
+                &[],
+            )
+            .await,
+            "seed",
+        );
     });
 
     let bodies = std::thread::scope(|s| {
@@ -72,11 +93,19 @@ fn run_pair<C: Connection + Sync>(a: &C, b: &C, table: &str, quoted: &str) -> (u
 
     let final_value = rt.block_on(async {
         let rows = expect_outcome(
-            a.query(&cx, &format!("SELECT counter FROM {quoted} WHERE id = 1"), &[]).await,
+            a.query(
+                &cx,
+                &format!("SELECT counter FROM {quoted} WHERE id = 1"),
+                &[],
+            )
+            .await,
             "read final",
         );
         let v = rows[0].get_as::<i64>(0).unwrap();
-        expect_outcome(a.execute(&cx, &format!("DROP TABLE {quoted}"), &[]).await, "drop");
+        expect_outcome(
+            a.execute(&cx, &format!("DROP TABLE {quoted}"), &[]).await,
+            "drop",
+        );
         v
     });
     (bodies, final_value)
@@ -91,18 +120,36 @@ fn two_writers_never_lose_an_update_and_conflicts_are_retried() {
     for driver in DriverUnderTest::available_multi_connection() {
         let table = unique_table("e2e_counter");
         let quoted = driver.dialect().quote_identifier(&table);
-        let Some(pair) = open_connection_pair(&cx, &rt, &driver) else { continue };
+        let Some(pair) = open_connection_pair(&cx, &rt, &driver) else {
+            continue;
+        };
 
         if !driver.supports_concurrent_transactions() {
             // C SQLite: the mode must be refused explicitly, not downgraded.
-            let ConnectionPair::CSqlite(a, _) = &pair else { unreachable!() };
-            let out = rt.block_on(Connection::begin_with_options(a, &cx, TransactionOptions::concurrent()));
+            let ConnectionPair::CSqlite(a, _) = &pair else {
+                unreachable!()
+            };
+            let out = rt.block_on(Connection::begin_with_options(
+                a,
+                &cx,
+                TransactionOptions::concurrent(),
+            ));
             match out {
                 Outcome::Err(Error::Transaction(t)) => {
-                    assert_eq!(t.kind, TransactionErrorKind::UnsupportedMode, "{}", driver.name());
+                    assert_eq!(
+                        t.kind,
+                        TransactionErrorKind::UnsupportedMode,
+                        "{}",
+                        driver.name()
+                    );
                 }
-                Outcome::Err(e) => panic!("{}: expected UnsupportedMode, got error {e}", driver.name()),
-                Outcome::Ok(_) => panic!("{}: Concurrent mode was accepted but C SQLite has no such mode", driver.name()),
+                Outcome::Err(e) => {
+                    panic!("{}: expected UnsupportedMode, got error {e}", driver.name())
+                }
+                Outcome::Ok(_) => panic!(
+                    "{}: Concurrent mode was accepted but C SQLite has no such mode",
+                    driver.name()
+                ),
                 Outcome::Cancelled(r) => panic!("{}: unexpected cancellation {r:?}", driver.name()),
                 Outcome::Panicked(p) => panic!("{}: unexpected panic {p:?}", driver.name()),
             }
@@ -118,7 +165,8 @@ fn two_writers_never_lose_an_update_and_conflicts_are_retried() {
         };
         let expected = i64::from(INCREMENTS_PER_WRITER) * 2;
         assert_eq!(
-            final_value, expected,
+            final_value,
+            expected,
             "{}: every increment must land exactly once (bodies run: {bodies})",
             driver.name()
         );

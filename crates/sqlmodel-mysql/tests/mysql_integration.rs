@@ -311,12 +311,16 @@ fn mysql_introspection_reports_check_constraints_and_table_comment() {
         let conn = unwrap_outcome(SharedMySqlConnection::connect(&cx, cfg).await);
 
         let table = test_table_name("sqlmodel_intro");
+        // CHECK constraint names are schema-global in MySQL, so a table left behind by
+        // an aborted earlier run must not collide with this one.
+        let chk_non_negative = format!("chk_nonneg_{}", &table["sqlmodel_intro_".len()..]);
+        let chk_max = format!("chk_max_{}", &table["sqlmodel_intro_".len()..]);
         let create_sql = format!(
             "CREATE TABLE `{table}` (\
              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,\
              age INT NOT NULL,\
-             CONSTRAINT chk_age_non_negative CHECK (age >= 0),\
-             CONSTRAINT chk_age_max CHECK (age <= 150)\
+             CONSTRAINT {chk_non_negative} CHECK (age >= 0),\
+             CONSTRAINT {chk_max} CHECK (age <= 150)\
              ) COMMENT='hero table comment'"
         );
         let drop_sql = format!("DROP TABLE IF EXISTS `{table}`");
@@ -341,10 +345,10 @@ fn mysql_introspection_reports_check_constraints_and_table_comment() {
         let named_check = table_info
             .check_constraints
             .iter()
-            .find(|c| c.name.as_deref() == Some("chk_age_non_negative"));
+            .find(|c| c.name.as_deref() == Some(chk_non_negative.as_str()));
         assert!(
             named_check.is_some(),
-            "missing chk_age_non_negative check in {:?}",
+            "missing {chk_non_negative} check in {:?}",
             table_info
                 .check_constraints
                 .iter()

@@ -317,11 +317,35 @@ impl ColumnDef {
     }
 }
 
+/// Character set number MySQL uses for binary strings (`BINARY`, `VARBINARY`,
+/// `*BLOB`).
+pub const BINARY_CHARSET: u16 = 63;
+
+/// TEXT and BLOB travel on the same wire types (`MYSQL_TYPE_BLOB` and friends),
+/// as do CHAR/VARCHAR and BINARY/VARBINARY; only the column's character set
+/// tells them apart. Decoding by wire type alone turned every TEXT column into
+/// `Value::Bytes` (found by the MySQL integration suite: `name TEXT` read back
+/// as BLOB, and `information_schema.CHECK_CONSTRAINTS.CHECK_CLAUSE` was dropped).
+fn text_or_bytes(data: &[u8], charset: u16) -> Value {
+    if charset == BINARY_CHARSET {
+        Value::Bytes(data.to_vec())
+    } else {
+        Value::Text(String::from_utf8_lossy(data).into_owned())
+    }
+}
+
 /// Decode a text protocol value to a sqlmodel Value.
 ///
 /// In text protocol, all values are transmitted as strings.
-/// This function parses the string based on the column type.
-pub fn decode_text_value(field_type: FieldType, data: &[u8], is_unsigned: bool) -> Value {
+/// This function parses the string based on the column type; `charset` is the
+/// column's character set number and decides text versus bytes for string and
+/// blob wire types.
+pub fn decode_text_value(
+    field_type: FieldType,
+    data: &[u8],
+    is_unsigned: bool,
+    charset: u16,
+) -> Value {
     let text = String::from_utf8_lossy(data);
 
     match field_type {
@@ -385,13 +409,17 @@ pub fn decode_text_value(field_type: FieldType, data: &[u8], is_unsigned: bool) 
         // Decimal (keep as text to preserve precision)
         FieldType::Decimal | FieldType::NewDecimal => Value::Text(text.into_owned()),
 
-        // Binary/blob types
+        // TEXT/BLOB and CHAR/VARCHAR/BINARY/VARBINARY: the charset decides.
         FieldType::TinyBlob
         | FieldType::MediumBlob
         | FieldType::LongBlob
         | FieldType::Blob
-        | FieldType::Geometry
-        | FieldType::Bit => Value::Bytes(data.to_vec()),
+        | FieldType::VarChar
+        | FieldType::VarString
+        | FieldType::String
+        | FieldType::Enum
+        | FieldType::Set => text_or_bytes(data, charset),
+        FieldType::Geometry | FieldType::Bit => Value::Bytes(data.to_vec()),
 
         // JSON
         FieldType::Json => {
@@ -409,9 +437,6 @@ pub fn decode_text_value(field_type: FieldType, data: &[u8], is_unsigned: bool) 
         | FieldType::Timestamp
         | FieldType::DateTime2
         | FieldType::Timestamp2 => decode_text_datetime_or_timestamp(text.as_ref()),
-
-        // All other types (strings, dates, times) as text
-        _ => Value::Text(text.into_owned()),
     }
 }
 
@@ -700,7 +725,12 @@ fn parse_4_digits(bytes: &[u8], offset: usize) -> Option<u32> {
 /// Decode a binary protocol value to a sqlmodel Value.
 ///
 /// In binary protocol, values are encoded in type-specific binary formats.
-pub fn decode_binary_value(field_type: FieldType, data: &[u8], is_unsigned: bool) -> Value {
+pub fn decode_binary_value(
+    field_type: FieldType,
+    data: &[u8],
+    is_unsigned: bool,
+    charset: u16,
+) -> Value {
     match field_type {
         // TINY (1 byte)
         FieldType::Tiny => {
@@ -767,13 +797,17 @@ pub fn decode_binary_value(field_type: FieldType, data: &[u8], is_unsigned: bool
             Value::Double(val)
         }
 
-        // Binary types
+        // TEXT/BLOB and CHAR/VARCHAR/BINARY/VARBINARY: the charset decides.
         FieldType::TinyBlob
         | FieldType::MediumBlob
         | FieldType::LongBlob
         | FieldType::Blob
-        | FieldType::Geometry
-        | FieldType::Bit => Value::Bytes(data.to_vec()),
+        | FieldType::VarChar
+        | FieldType::VarString
+        | FieldType::String
+        | FieldType::Enum
+        | FieldType::Set => text_or_bytes(data, charset),
+        FieldType::Geometry | FieldType::Bit => Value::Bytes(data.to_vec()),
 
         // JSON
         FieldType::Json => {
@@ -796,8 +830,7 @@ pub fn decode_binary_value(field_type: FieldType, data: &[u8], is_unsigned: bool
             Value::Text(String::from_utf8_lossy(data).into_owned())
         }
 
-        // String types
-        _ => Value::Text(String::from_utf8_lossy(data).into_owned()),
+        FieldType::Null => Value::Null,
     }
 }
 
@@ -1026,6 +1059,7 @@ pub fn decode_binary_value_with_len(
     data: &[u8],
     field_type: FieldType,
     _is_unsigned: bool,
+    charset: u16,
 ) -> (Value, usize) {
     match field_type {
         // Fixed-size integer types
@@ -1154,12 +1188,17 @@ pub fn decode_binary_value_with_len(
             }
             let str_data = &data[prefix_len..total_len];
             let value = match field_type {
+                // TEXT/BLOB and CHAR/VARCHAR/BINARY/VARBINARY: the charset decides.
                 FieldType::TinyBlob
                 | FieldType::MediumBlob
                 | FieldType::LongBlob
                 | FieldType::Blob
-                | FieldType::Geometry
-                | FieldType::Bit => Value::Bytes(str_data.to_vec()),
+                | FieldType::VarChar
+                | FieldType::VarString
+                | FieldType::String
+                | FieldType::Enum
+                | FieldType::Set => text_or_bytes(str_data, charset),
+                FieldType::Geometry | FieldType::Bit => Value::Bytes(str_data.to_vec()),
                 FieldType::Json => {
                     let text = String::from_utf8_lossy(str_data);
                     serde_json::from_str(&text)
@@ -1424,6 +1463,58 @@ pub fn interpolate_params(sql: &str, params: &[Value]) -> String {
 mod tests {
     use super::*;
 
+    /// `utf8mb4_0900_ai_ci`, the MySQL 8 default collation.
+    const UTF8MB4: u16 = 255;
+
+    #[test]
+    fn text_and_blob_are_told_apart_by_charset_not_wire_type() {
+        // TEXT columns arrive as MYSQL_TYPE_BLOB with a text charset.
+        assert_eq!(
+            decode_text_value(FieldType::Blob, b"hero", false, UTF8MB4),
+            Value::Text("hero".into())
+        );
+        assert_eq!(
+            decode_binary_value(FieldType::LongBlob, b"CHECK (age >= 0)", false, UTF8MB4),
+            Value::Text("CHECK (age >= 0)".into())
+        );
+        // A real BLOB has the binary charset and must stay bytes, even if it is
+        // valid UTF-8.
+        assert_eq!(
+            decode_text_value(FieldType::Blob, b"hero", false, BINARY_CHARSET),
+            Value::Bytes(b"hero".to_vec())
+        );
+        // VARBINARY is MYSQL_TYPE_VAR_STRING + binary charset; VARCHAR is text.
+        assert_eq!(
+            decode_binary_value(
+                FieldType::VarString,
+                &[0xFF, 0x00, 0x7F],
+                false,
+                BINARY_CHARSET
+            ),
+            Value::Bytes(vec![0xFF, 0x00, 0x7F])
+        );
+        assert_eq!(
+            decode_text_value(FieldType::VarString, b"Alice", false, UTF8MB4),
+            Value::Text("Alice".into())
+        );
+        // Length-prefixed binary-protocol row values follow the same rule.
+        let mut frame = vec![4u8];
+        frame.extend_from_slice(b"hero");
+        assert_eq!(
+            decode_binary_value_with_len(&frame, FieldType::Blob, false, UTF8MB4),
+            (Value::Text("hero".into()), 5)
+        );
+        assert_eq!(
+            decode_binary_value_with_len(&frame, FieldType::Blob, false, BINARY_CHARSET),
+            (Value::Bytes(b"hero".to_vec()), 5)
+        );
+        // Geometry and BIT are bytes regardless of charset.
+        assert_eq!(
+            decode_text_value(FieldType::Bit, &[0b0000_0101], false, UTF8MB4),
+            Value::Bytes(vec![0b0000_0101])
+        );
+    }
+
     #[test]
     fn test_escape_string() {
         assert_eq!(escape_string("hello"), "'hello'");
@@ -1507,50 +1598,50 @@ mod tests {
 
     #[test]
     fn test_decode_text_integer() {
-        let val = decode_text_value(FieldType::Long, b"42", false);
+        let val = decode_text_value(FieldType::Long, b"42", false, UTF8MB4);
         assert!(matches!(val, Value::Int(42)));
 
-        let val = decode_text_value(FieldType::LongLong, b"-100", false);
+        let val = decode_text_value(FieldType::LongLong, b"-100", false, UTF8MB4);
         assert!(matches!(val, Value::BigInt(-100)));
     }
 
     #[test]
     #[allow(clippy::approx_constant)]
     fn test_decode_text_float() {
-        let val = decode_text_value(FieldType::Double, b"3.14", false);
+        let val = decode_text_value(FieldType::Double, b"3.14", false, UTF8MB4);
         assert!(matches!(val, Value::Double(f) if (f - 3.14).abs() < 0.001));
     }
 
     #[test]
     fn test_decode_text_string() {
-        let val = decode_text_value(FieldType::VarChar, b"hello", false);
+        let val = decode_text_value(FieldType::VarChar, b"hello", false, UTF8MB4);
         assert!(matches!(val, Value::Text(s) if s == "hello"));
     }
 
     #[test]
     fn test_decode_text_date_to_value_date() {
-        let val = decode_text_value(FieldType::Date, b"2024-02-29", false);
+        let val = decode_text_value(FieldType::Date, b"2024-02-29", false, UTF8MB4);
         let expected_days = ymd_to_days_since_unix_epoch(2024, 2, 29).unwrap();
         assert_eq!(val, Value::Date(expected_days));
     }
 
     #[test]
     fn test_decode_text_date_zero_preserved_as_text() {
-        let val = decode_text_value(FieldType::Date, b"0000-00-00", false);
+        let val = decode_text_value(FieldType::Date, b"0000-00-00", false, UTF8MB4);
         assert_eq!(val, Value::Text("0000-00-00".to_string()));
     }
 
     #[test]
     fn test_decode_text_time_to_value_time() {
         // 25:00:00.000001 (text protocol can emit hours > 23)
-        let val = decode_text_value(FieldType::Time, b"25:00:00.000001", false);
+        let val = decode_text_value(FieldType::Time, b"25:00:00.000001", false, UTF8MB4);
         let expected = (25_i64 * 3600_i64) * 1_000_000_i64 + 1;
         assert_eq!(val, Value::Time(expected));
     }
 
     #[test]
     fn test_decode_text_time_negative_to_value_time() {
-        let val = decode_text_value(FieldType::Time, b"-01:02:03.4", false);
+        let val = decode_text_value(FieldType::Time, b"-01:02:03.4", false, UTF8MB4);
         // Fractional seconds are right-padded to 6 digits: ".4" -> 400_000 us.
         let expected = -(((3600_i64 + 2 * 60 + 3) * 1_000_000_i64) + 400_000_i64);
         assert_eq!(val, Value::Time(expected));
@@ -1558,13 +1649,18 @@ mod tests {
 
     #[test]
     fn test_decode_text_time_zero_preserved_as_text() {
-        let val = decode_text_value(FieldType::Time, b"00:00:00", false);
+        let val = decode_text_value(FieldType::Time, b"00:00:00", false, UTF8MB4);
         assert_eq!(val, Value::Text("00:00:00".to_string()));
     }
 
     #[test]
     fn test_decode_text_datetime_to_value_timestamp() {
-        let val = decode_text_value(FieldType::DateTime, b"2020-01-02 03:04:05.000006", false);
+        let val = decode_text_value(
+            FieldType::DateTime,
+            b"2020-01-02 03:04:05.000006",
+            false,
+            UTF8MB4,
+        );
 
         let days = i64::from(ymd_to_days_since_unix_epoch(2020, 1, 2).unwrap());
         let tod_us = ((3_i64 * 3600 + 4 * 60 + 5) * 1_000_000) + 6;
@@ -1574,25 +1670,25 @@ mod tests {
 
     #[test]
     fn test_decode_text_timestamp_zero_preserved_as_text() {
-        let val = decode_text_value(FieldType::Timestamp, b"0000-00-00 00:00:00", false);
+        let val = decode_text_value(FieldType::Timestamp, b"0000-00-00 00:00:00", false, UTF8MB4);
         assert_eq!(val, Value::Text("0000-00-00 00:00:00".to_string()));
     }
 
     #[test]
     fn test_decode_binary_tiny() {
-        let val = decode_binary_value(FieldType::Tiny, &[42], false);
+        let val = decode_binary_value(FieldType::Tiny, &[42], false, UTF8MB4);
         assert!(matches!(val, Value::TinyInt(42)));
 
-        let val = decode_binary_value(FieldType::Tiny, &[255u8], true);
+        let val = decode_binary_value(FieldType::Tiny, &[255u8], true, UTF8MB4);
         assert!(matches!(val, Value::TinyInt(-1))); // 255u8 as i8 = -1
 
-        let val = decode_binary_value(FieldType::Tiny, &[255], false);
+        let val = decode_binary_value(FieldType::Tiny, &[255], false, UTF8MB4);
         assert!(matches!(val, Value::TinyInt(-1)));
     }
 
     #[test]
     fn test_decode_binary_long() {
-        let val = decode_binary_value(FieldType::Long, &[0x2A, 0x00, 0x00, 0x00], false);
+        let val = decode_binary_value(FieldType::Long, &[0x2A, 0x00, 0x00, 0x00], false, UTF8MB4);
         assert!(matches!(val, Value::Int(42)));
     }
 
@@ -1600,7 +1696,7 @@ mod tests {
     #[allow(clippy::approx_constant)]
     fn test_decode_binary_double() {
         let pi_bytes = 3.14159_f64.to_le_bytes();
-        let val = decode_binary_value(FieldType::Double, &pi_bytes, false);
+        let val = decode_binary_value(FieldType::Double, &pi_bytes, false, UTF8MB4);
         assert!(matches!(val, Value::Double(f) if (f - 3.14159).abs() < 0.00001));
     }
 
@@ -1613,7 +1709,7 @@ mod tests {
         buf.push(2);
         buf.push(29);
 
-        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::Date, false);
+        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::Date, false, UTF8MB4);
         assert_eq!(consumed, 5);
 
         let expected_days = ymd_to_days_since_unix_epoch(2024, 2, 29).unwrap();
@@ -1632,7 +1728,7 @@ mod tests {
         buf.push(4);
         buf.extend_from_slice(&5_u32.to_le_bytes());
 
-        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::Time, false);
+        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::Time, false, UTF8MB4);
         assert_eq!(consumed, 13);
 
         let total_seconds = (24_i64 + 2) * 3600 + 3 * 60 + 4;
@@ -1653,7 +1749,8 @@ mod tests {
         buf.push(5);
         buf.extend_from_slice(&6_u32.to_le_bytes());
 
-        let (val, consumed) = decode_binary_value_with_len(&buf, FieldType::DateTime, false);
+        let (val, consumed) =
+            decode_binary_value_with_len(&buf, FieldType::DateTime, false, UTF8MB4);
         assert_eq!(consumed, 12);
 
         let days = i64::from(ymd_to_days_since_unix_epoch(2020, 1, 2).unwrap());

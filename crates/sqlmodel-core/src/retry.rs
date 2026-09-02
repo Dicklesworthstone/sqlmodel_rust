@@ -120,7 +120,10 @@ impl RetryPolicy {
     /// retries itself).
     #[must_use]
     pub fn immediate() -> Self {
-        Self::default().base_delay(Duration::ZERO).max_delay(Duration::ZERO).jitter(false)
+        Self::default()
+            .base_delay(Duration::ZERO)
+            .max_delay(Duration::ZERO)
+            .jitter(false)
     }
 
     /// Delay to wait after `failed_attempt` (1-based) failed, before the next
@@ -146,8 +149,9 @@ impl RetryPolicy {
         x ^= x << 25;
         x ^= x >> 27;
         let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        let nanos = scaled.as_nanos() as u64;
-        Duration::from_nanos(r % (nanos + 1))
+        // `scaled` is capped at `max_delay`, so this only saturates on absurd policies.
+        let nanos = u64::try_from(scaled.as_nanos()).unwrap_or(u64::MAX);
+        Duration::from_nanos(r % nanos.saturating_add(1))
     }
 
     fn should_retry(&self, error: &Error, attempt: u32) -> bool {
@@ -228,7 +232,9 @@ where
                 }
                 match backoff(cx, policy.delay_after(attempt, seed(cx, attempt))).await {
                     Backoff::Waited => continue,
-                    Backoff::BudgetExceeded => return Outcome::Err(Error::retries_exhausted(attempt, &e)),
+                    Backoff::BudgetExceeded => {
+                        return Outcome::Err(Error::retries_exhausted(attempt, &e));
+                    }
                 }
             }
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
@@ -395,7 +401,8 @@ mod tests {
             self.commits.fetch_add(1, Ordering::SeqCst);
             let remaining = self.commit_failures_remaining.load(Ordering::SeqCst);
             if remaining > 0 {
-                self.commit_failures_remaining.store(remaining - 1, Ordering::SeqCst);
+                self.commit_failures_remaining
+                    .store(remaining - 1, Ordering::SeqCst);
                 return Outcome::Err(serialization_failure());
             }
             Outcome::Ok(())
@@ -505,15 +512,16 @@ mod tests {
             &policy,
             async |cx, tx| {
                 body_calls.fetch_add(1, Ordering::SeqCst);
-                match tx.execute(cx, "UPDATE t SET v = v + 1", &[]).await {
-                    Outcome::Ok(n) => Outcome::Ok(n),
-                    other => other,
-                }
+                tx.execute(cx, "UPDATE t SET v = v + 1", &[]).await
             },
         ));
 
         assert!(matches!(out, Outcome::Ok(1)), "{out:?}");
-        assert_eq!(body_calls.load(Ordering::SeqCst), 3, "body runs once per attempt");
+        assert_eq!(
+            body_calls.load(Ordering::SeqCst),
+            3,
+            "body runs once per attempt"
+        );
         assert_eq!(conn.begins.load(Ordering::SeqCst), 3);
         assert_eq!(conn.commits.load(Ordering::SeqCst), 3);
         // Commit consumed the tx on failure; no explicit rollback is issued after a failed commit.
@@ -591,7 +599,11 @@ mod tests {
         ));
 
         assert!(matches!(out, Outcome::Cancelled(_)), "{out:?}");
-        assert_eq!(conn.begins.load(Ordering::SeqCst), 1, "no retry after cancellation");
+        assert_eq!(
+            conn.begins.load(Ordering::SeqCst),
+            1,
+            "no retry after cancellation"
+        );
         assert_eq!(conn.rollbacks.load(Ordering::SeqCst), 1);
     }
 
@@ -636,7 +648,11 @@ mod tests {
             }
             other => panic!("expected UnsupportedMode, got {other:?}"),
         }
-        assert_eq!(conn.begins.load(Ordering::SeqCst), 0, "begin_with is never reached");
+        assert_eq!(
+            conn.begins.load(Ordering::SeqCst),
+            0,
+            "begin_with is never reached"
+        );
     }
 
     #[test]
@@ -649,13 +665,24 @@ mod tests {
         assert_eq!(policy.delay_after(2, 0), Duration::from_millis(20));
         assert_eq!(policy.delay_after(3, 0), Duration::from_millis(40));
         assert_eq!(policy.delay_after(4, 0), Duration::from_millis(80));
-        assert_eq!(policy.delay_after(5, 0), Duration::from_millis(100), "capped");
-        assert_eq!(policy.delay_after(40, 0), Duration::from_millis(100), "no overflow");
+        assert_eq!(
+            policy.delay_after(5, 0),
+            Duration::from_millis(100),
+            "capped"
+        );
+        assert_eq!(
+            policy.delay_after(40, 0),
+            Duration::from_millis(100),
+            "no overflow"
+        );
 
         let jittered = policy.clone().jitter(true);
         for seed in 0..1000u64 {
             let d = jittered.delay_after(3, seed);
-            assert!(d <= Duration::from_millis(40), "jitter never exceeds the computed delay");
+            assert!(
+                d <= Duration::from_millis(40),
+                "jitter never exceeds the computed delay"
+            );
         }
         assert_eq!(
             jittered.delay_after(3, 42),

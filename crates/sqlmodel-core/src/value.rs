@@ -452,20 +452,36 @@ impl TryFrom<Value> for bool {
     }
 }
 
+/// Narrow an integer-carrying `Value` to a smaller integer type: accepted when
+/// the value fits, refused (never truncated) when it does not. Drivers differ in
+/// which variant they report — C SQLite yields `Int` for values that fit `i32`,
+/// FrankenSQLite yields `BigInt` for every INTEGER — so typed fields must accept
+/// any of them.
+#[allow(clippy::result_large_err)]
+fn narrow_int_value<T: TryFrom<i64>>(value: &Value, expected: &'static str) -> Result<T, Error> {
+    let v = value.as_i64().ok_or_else(|| {
+        Error::Type(TypeError {
+            expected,
+            actual: value.type_name().to_string(),
+            column: None,
+            rust_type: None,
+        })
+    })?;
+    T::try_from(v).map_err(|_| {
+        Error::Type(TypeError {
+            expected,
+            actual: format!("value {} out of range", v),
+            column: None,
+            rust_type: None,
+        })
+    })
+}
+
 impl TryFrom<Value> for i8 {
     type Error = Error;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        match value {
-            Value::TinyInt(v) => Ok(v),
-            Value::Bool(v) => Ok(if v { 1 } else { 0 }),
-            other => Err(Error::Type(TypeError {
-                expected: "i8",
-                actual: other.type_name().to_string(),
-                column: None,
-                rust_type: None,
-            })),
-        }
+        narrow_int_value(&value, "i8")
     }
 }
 
@@ -473,28 +489,28 @@ impl TryFrom<Value> for i16 {
     type Error = Error;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        match value {
-            Value::TinyInt(v) => Ok(i16::from(v)),
-            Value::SmallInt(v) => Ok(v),
-            Value::Bool(v) => Ok(if v { 1 } else { 0 }),
-            other => Err(Error::Type(TypeError {
-                expected: "i16",
-                actual: other.type_name().to_string(),
-                column: None,
-                rust_type: None,
-            })),
-        }
+        narrow_int_value(&value, "i16")
     }
 }
 
 impl TryFrom<Value> for i32 {
     type Error = Error;
 
+    /// Accepts any integer variant whose value fits `i32` (drivers differ in
+    /// which variant they report for a column); refuses out-of-range values.
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::TinyInt(v) => Ok(i32::from(v)),
             Value::SmallInt(v) => Ok(i32::from(v)),
             Value::Int(v) => Ok(v),
+            Value::BigInt(v) => i32::try_from(v).map_err(|_| {
+                Error::Type(TypeError {
+                    expected: "i32",
+                    actual: format!("value {} out of range", v),
+                    column: None,
+                    rust_type: None,
+                })
+            }),
             Value::Bool(v) => Ok(if v { 1 } else { 0 }),
             other => Err(Error::Type(TypeError {
                 expected: "i32",

@@ -260,51 +260,47 @@ impl FromValue for bool {
     }
 }
 
+/// Narrow any integer-carrying `Value` to a smaller Rust integer, accepting the
+/// value when it fits and refusing it (with the offending value in the message)
+/// when it does not. Drivers differ in which variant they use for a column —
+/// C SQLite yields `Int` for values that fit `i32` while FrankenSQLite yields
+/// `BigInt` for every INTEGER — so a typed `i32` field must accept both, and
+/// must still never truncate.
+#[allow(clippy::result_large_err)]
+fn narrow_int<T: TryFrom<i64>>(value: &Value, expected: &'static str) -> Result<T> {
+    let v = value.as_i64().ok_or_else(|| {
+        Error::Type(TypeError {
+            expected,
+            actual: value.type_name().to_string(),
+            column: None,
+            rust_type: None,
+        })
+    })?;
+    T::try_from(v).map_err(|_| {
+        Error::Type(TypeError {
+            expected,
+            actual: format!("value {} out of range", v),
+            column: None,
+            rust_type: None,
+        })
+    })
+}
+
 impl FromValue for i8 {
     fn from_value(value: &Value) -> Result<Self> {
-        match value {
-            Value::TinyInt(v) => Ok(*v),
-            Value::Bool(v) => Ok(if *v { 1 } else { 0 }),
-            _ => Err(Error::Type(TypeError {
-                expected: "i8",
-                actual: value.type_name().to_string(),
-                column: None,
-                rust_type: None,
-            })),
-        }
+        narrow_int(value, "i8")
     }
 }
 
 impl FromValue for i16 {
     fn from_value(value: &Value) -> Result<Self> {
-        match value {
-            Value::TinyInt(v) => Ok(i16::from(*v)),
-            Value::SmallInt(v) => Ok(*v),
-            Value::Bool(v) => Ok(if *v { 1 } else { 0 }),
-            _ => Err(Error::Type(TypeError {
-                expected: "i16",
-                actual: value.type_name().to_string(),
-                column: None,
-                rust_type: None,
-            })),
-        }
+        narrow_int(value, "i16")
     }
 }
 
 impl FromValue for i32 {
     fn from_value(value: &Value) -> Result<Self> {
-        match value {
-            Value::TinyInt(v) => Ok(i32::from(*v)),
-            Value::SmallInt(v) => Ok(i32::from(*v)),
-            Value::Int(v) => Ok(*v),
-            Value::Bool(v) => Ok(if *v { 1 } else { 0 }),
-            _ => Err(Error::Type(TypeError {
-                expected: "i32",
-                actual: value.type_name().to_string(),
-                column: None,
-                rust_type: None,
-            })),
-        }
+        narrow_int(value, "i32")
     }
 }
 
@@ -945,6 +941,43 @@ mod tests {
         let over = (F32_MAX_EXACT + 1) as i32;
         let result = f32::from_value(&Value::Int(over));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn integer_narrowing_accepts_any_variant_that_fits_and_refuses_overflow() {
+        // FrankenSQLite reports every INTEGER as BigInt; C SQLite uses Int when it
+        // fits. A typed field must accept both without ever truncating.
+        assert_eq!(i32::from_value(&Value::BigInt(120)).unwrap(), 120);
+        assert_eq!(
+            i32::from_value(&Value::BigInt(-2_147_483_648)).unwrap(),
+            i32::MIN
+        );
+        assert_eq!(i16::from_value(&Value::Int(-32_768)).unwrap(), i16::MIN);
+        assert_eq!(i16::from_value(&Value::BigInt(32_767)).unwrap(), i16::MAX);
+        assert_eq!(i8::from_value(&Value::SmallInt(-128)).unwrap(), i8::MIN);
+        assert_eq!(i8::from_value(&Value::BigInt(127)).unwrap(), 127);
+        assert_eq!(i32::from_value(&Value::Bool(true)).unwrap(), 1);
+
+        let err = i32::from_value(&Value::BigInt(i64::from(i32::MAX) + 1)).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+        assert!(i16::from_value(&Value::Int(40_000)).is_err());
+        assert!(i8::from_value(&Value::SmallInt(200)).is_err());
+        assert!(
+            i32::from_value(&Value::Text("7".into())).is_err(),
+            "text is not an integer"
+        );
+        assert!(
+            i32::from_value(&Value::Double(7.0)).is_err(),
+            "floats are not narrowed"
+        );
+
+        // Option<T> propagates the same rule; only NULL becomes None.
+        assert_eq!(
+            <Option<i32>>::from_value(&Value::BigInt(5)).unwrap(),
+            Some(5)
+        );
+        assert_eq!(<Option<i32>>::from_value(&Value::Null).unwrap(), None);
+        assert!(<Option<i32>>::from_value(&Value::BigInt(i64::MAX)).is_err());
     }
 
     #[test]

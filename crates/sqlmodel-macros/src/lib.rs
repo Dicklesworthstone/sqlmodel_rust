@@ -587,9 +587,15 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
         let column_name = &field.column_name;
 
         if parse::is_option_type(&field.ty) {
-            // For Option<T> fields, handle NULL gracefully
+            // For Option<T> fields: a NULL value or an absent column (partial
+            // projections) hydrates as None, but a value of the wrong type is a
+            // real error and must not be silently turned into None.
             field_extractions.push(quote::quote! {
-                #field_name: #row_ident.get_named(#column_name).ok()
+                #field_name: if #row_ident.contains_column(#column_name) {
+                    #row_ident.get_named(#column_name)?
+                } else {
+                    None
+                }
             });
         } else {
             // For required fields, propagate errors

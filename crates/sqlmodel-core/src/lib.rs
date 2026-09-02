@@ -36,11 +36,11 @@ pub mod hybrid;
 pub mod identifiers;
 pub mod model;
 pub mod relationship;
+pub mod retry;
 pub mod row;
 pub mod tracked;
 pub mod types;
 pub mod validate;
-pub mod retry;
 pub mod value;
 
 /// Optional `From`/`TryFrom`/`FromValue` impls for chrono, uuid, and rust_decimal
@@ -52,8 +52,9 @@ pub use connection::{
     Connection, Dialect, IsolationLevel, PreparedStatement, Transaction, TransactionInternal,
     TransactionMode, TransactionOps, TransactionOptions,
 };
-pub use retry::{RetryPolicy, retry_transaction};
-pub use error::{Error, FieldValidationError, Result, ValidationError, ValidationErrorKind};
+pub use error::{
+    Error, FieldValidationError, Result, TransactionErrorKind, ValidationError, ValidationErrorKind,
+};
 pub use field::{
     Column, Field, FieldInfo, InheritanceInfo, InheritanceStrategy, ReferentialAction,
 };
@@ -68,6 +69,7 @@ pub use relationship::{
     Lazy, LazyLoader, LinkTableInfo, PassiveDeletes, Related, RelatedMany, RelationshipInfo,
     RelationshipKind, find_back_relationship, find_relationship, validate_back_populates,
 };
+pub use retry::{RetryPolicy, retry_transaction};
 pub use row::Row;
 pub use tracked::TrackedModel;
 pub use types::{SqlEnum, SqlType, TypeInfo};

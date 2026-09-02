@@ -1,22 +1,37 @@
 //! CREATE TABLE statement builder.
 
-use sqlmodel_core::{FieldInfo, InheritanceStrategy, Model, quote_ident};
+#[cfg(test)]
+use sqlmodel_core::quote_ident;
+use sqlmodel_core::{Dialect, FieldInfo, InheritanceStrategy, Model};
 use std::marker::PhantomData;
 
 /// Builder for CREATE TABLE statements.
+///
+/// Output is generated for a [`Dialect`]: identifier quoting and the spelling of
+/// an auto-increment primary key differ per engine. The default is SQLite (the
+/// historical behaviour of this builder); call [`Self::dialect`] with
+/// `conn.dialect()` for PostgreSQL or MySQL.
 #[derive(Debug)]
 pub struct CreateTable<M: Model> {
     if_not_exists: bool,
+    dialect: Dialect,
     _marker: PhantomData<M>,
 }
 
 impl<M: Model> CreateTable<M> {
-    /// Create a new CREATE TABLE builder.
+    /// Create a new CREATE TABLE builder (SQLite dialect).
     pub fn new() -> Self {
         Self {
             if_not_exists: false,
+            dialect: Dialect::Sqlite,
             _marker: PhantomData,
         }
+    }
+
+    /// Generate SQL for `dialect` (identifier quoting, auto-increment form).
+    pub fn dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// Add IF NOT EXISTS clause.
@@ -34,6 +49,7 @@ impl<M: Model> CreateTable<M> {
     /// - **Concrete Table Inheritance**: Each model gets independent table (normal behavior)
     pub fn build(&self) -> String {
         let inheritance = M::inheritance();
+        let q = |name: &str| self.dialect.quote_identifier(name);
 
         // Single table inheritance: child models don't create their own table
         // They share the parent's table and are distinguished by the discriminator column
@@ -52,7 +68,7 @@ impl<M: Model> CreateTable<M> {
             sql.push_str("IF NOT EXISTS ");
         }
 
-        sql.push_str(&quote_ident(M::TABLE_NAME));
+        sql.push_str(&q(M::TABLE_NAME));
         sql.push_str(" (\n");
 
         let fields = M::fields();
@@ -86,8 +102,8 @@ impl<M: Model> CreateTable<M> {
                 let constraint_name = format!("uk_{}_{}", M::TABLE_NAME, field.column_name);
                 let constraint = format!(
                     "CONSTRAINT {} UNIQUE ({})",
-                    quote_ident(&constraint_name),
-                    quote_ident(field.column_name)
+                    q(&constraint_name),
+                    q(field.column_name)
                 );
                 constraints.push(constraint);
             }
@@ -98,10 +114,10 @@ impl<M: Model> CreateTable<M> {
                     let constraint_name = format!("fk_{}_{}", M::TABLE_NAME, field.column_name);
                     let mut fk_sql = format!(
                         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({})",
-                        quote_ident(&constraint_name),
-                        quote_ident(field.column_name),
-                        quote_ident(parts[0]),
-                        quote_ident(parts[1])
+                        q(&constraint_name),
+                        q(field.column_name),
+                        q(parts[0]),
+                        q(parts[1])
                     );
 
                     // Add ON DELETE action if specified
@@ -129,15 +145,14 @@ impl<M: Model> CreateTable<M> {
             // to the parent table's primary key columns (same column names).
             let pk_cols = M::PRIMARY_KEY;
             if !pk_cols.is_empty() {
-                let quoted_child_cols: Vec<String> =
-                    pk_cols.iter().map(|c| quote_ident(c)).collect();
+                let quoted_child_cols: Vec<String> = pk_cols.iter().map(|c| q(c)).collect();
                 let quoted_parent_cols = quoted_child_cols.clone();
                 let constraint_name = format!("fk_{}_parent", M::TABLE_NAME);
                 let fk_sql = format!(
                     "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE CASCADE",
-                    quote_ident(&constraint_name),
+                    q(&constraint_name),
                     quoted_child_cols.join(", "),
-                    quote_ident(parent_table),
+                    q(parent_table),
                     quoted_parent_cols.join(", ")
                 );
                 constraints.push(fk_sql);
@@ -149,7 +164,7 @@ impl<M: Model> CreateTable<M> {
         if !pk_cols.is_empty() {
             let embedded = embedded_autoinc_pk.is_some_and(|pk| pk_cols == [pk]);
             if !embedded {
-                let quoted_pk: Vec<String> = pk_cols.iter().map(|c| quote_ident(c)).collect();
+                let quoted_pk: Vec<String> = pk_cols.iter().map(|c| q(c)).collect();
                 let mut constraint = String::new();
                 constraint.push_str("PRIMARY KEY (");
                 constraint.push_str(&quoted_pk.join(", "));
@@ -180,21 +195,37 @@ impl<M: Model> CreateTable<M> {
     }
 
     fn column_definition(&self, field: &FieldInfo, embed_primary_key: bool) -> String {
-        let sql_type = if embed_primary_key {
-            // Required by SQLite for rowid-backed autoincrement behavior.
-            "INTEGER".to_string()
-        } else {
-            field.effective_sql_type()
-        };
         let mut def = String::from("  ");
-        def.push_str(&quote_ident(field.column_name));
+        def.push_str(&self.dialect.quote_identifier(field.column_name));
         def.push(' ');
-        def.push_str(&sql_type);
 
         if embed_primary_key {
-            def.push_str(" PRIMARY KEY");
-        } else if !field.nullable && !field.auto_increment {
-            def.push_str(" NOT NULL");
+            // A single-column auto-increment primary key; every engine spells it
+            // differently, and getting this wrong silently yields a key that never
+            // auto-assigns (which is what happened on PostgreSQL and MySQL before the
+            // builder knew its dialect).
+            let sql_type = field.effective_sql_type();
+            match self.dialect {
+                // Only `INTEGER PRIMARY KEY` is rowid-backed and auto-assigning in SQLite.
+                Dialect::Sqlite => def.push_str("INTEGER PRIMARY KEY"),
+                Dialect::Postgres => {
+                    def.push_str(&sql_type);
+                    def.push_str(" PRIMARY KEY");
+                    // A user-specified SERIAL/BIGSERIAL already auto-assigns.
+                    if !sql_type.to_ascii_uppercase().contains("SERIAL") {
+                        def.push_str(" GENERATED BY DEFAULT AS IDENTITY");
+                    }
+                }
+                Dialect::Mysql => {
+                    def.push_str(&sql_type);
+                    def.push_str(" NOT NULL AUTO_INCREMENT PRIMARY KEY");
+                }
+            }
+        } else {
+            def.push_str(&field.effective_sql_type());
+            if !field.nullable && !field.auto_increment {
+                def.push_str(" NOT NULL");
+            }
         }
 
         if let Some(default) = field.default {
@@ -254,6 +285,37 @@ mod tests {
         fn is_new(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn create_table_is_dialect_aware() {
+        let mysql = CreateTable::<TestHero>::new()
+            .dialect(Dialect::Mysql)
+            .build();
+        assert!(mysql.contains("CREATE TABLE `heroes`"), "{mysql}");
+        assert!(
+            mysql.contains("`id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"),
+            "{mysql}"
+        );
+        assert!(!mysql.contains('"'), "{mysql}");
+
+        let pg = CreateTable::<TestHero>::new()
+            .dialect(Dialect::Postgres)
+            .build();
+        assert!(
+            pg.contains("\"id\" BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY"),
+            "{pg}"
+        );
+
+        // Default (SQLite) output is unchanged: rowid-backed INTEGER PRIMARY KEY.
+        let sqlite = CreateTable::<TestHero>::new().build();
+        assert!(sqlite.contains("\"id\" INTEGER PRIMARY KEY"), "{sqlite}");
+
+        let idx = SchemaBuilder::new()
+            .dialect(Dialect::Mysql)
+            .create_index("ix_heroes_name", "heroes", &["name"], false)
+            .build();
+        assert_eq!(idx[0], "CREATE INDEX `ix_heroes_name` ON `heroes` (`name`)");
     }
 
     #[test]
@@ -1214,15 +1276,37 @@ mod tests {
 }
 
 /// Builder for multiple schema operations.
-#[derive(Debug, Default)]
+///
+/// Statements are generated for a [`Dialect`] (identifier quoting and the
+/// auto-increment primary-key form differ per engine). The default is SQLite,
+/// which also matches the double-quoted output this builder produced before it
+/// became dialect-aware; pass `conn.dialect()` for anything else.
+#[derive(Debug)]
 pub struct SchemaBuilder {
     statements: Vec<String>,
+    dialect: Dialect,
+}
+
+impl Default for SchemaBuilder {
+    fn default() -> Self {
+        Self {
+            statements: Vec::new(),
+            dialect: Dialect::Sqlite,
+        }
+    }
 }
 
 impl SchemaBuilder {
-    /// Create a new schema builder.
+    /// Create a new schema builder (SQLite dialect; see [`Self::dialect`]).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Generate statements for `dialect` (identifier quoting, auto-increment form,
+    /// `IF NOT EXISTS` support on indexes).
+    pub fn dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// Add a CREATE TABLE statement.
@@ -1254,13 +1338,17 @@ impl SchemaBuilder {
                     continue;
                 }
                 self.statements
-                    .push(alter_table_add_column(parent_table, field));
+                    .push(alter_table_add_column(self.dialect, parent_table, field));
             }
             return self;
         }
 
-        self.statements
-            .push(CreateTable::<M>::new().if_not_exists().build());
+        self.statements.push(
+            CreateTable::<M>::new()
+                .dialect(self.dialect)
+                .if_not_exists()
+                .build(),
+        );
         self
     }
 
@@ -1273,12 +1361,22 @@ impl SchemaBuilder {
     /// Add an index creation statement.
     pub fn create_index(mut self, name: &str, table: &str, columns: &[&str], unique: bool) -> Self {
         let unique_str = if unique { "UNIQUE " } else { "" };
-        let quoted_cols: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+        // MySQL has no `CREATE INDEX IF NOT EXISTS`.
+        let if_not_exists = if matches!(self.dialect, Dialect::Mysql) {
+            ""
+        } else {
+            "IF NOT EXISTS "
+        };
+        let quoted_cols: Vec<String> = columns
+            .iter()
+            .map(|c| self.dialect.quote_identifier(c))
+            .collect();
         let stmt = format!(
-            "CREATE {}INDEX IF NOT EXISTS {} ON {} ({})",
+            "CREATE {}INDEX {}{} ON {} ({})",
             unique_str,
-            quote_ident(name),
-            quote_ident(table),
+            if_not_exists,
+            self.dialect.quote_identifier(name),
+            self.dialect.quote_identifier(table),
             quoted_cols.join(", ")
         );
         self.statements.push(stmt);
@@ -1291,12 +1389,12 @@ impl SchemaBuilder {
     }
 }
 
-fn alter_table_add_column(table: &str, field: &FieldInfo) -> String {
+fn alter_table_add_column(dialect: Dialect, table: &str, field: &FieldInfo) -> String {
     let sql_type = field.effective_sql_type();
     let mut stmt = format!(
         "ALTER TABLE {} ADD COLUMN {} {}",
-        quote_ident(table),
-        quote_ident(field.column_name),
+        dialect.quote_identifier(table),
+        dialect.quote_identifier(field.column_name),
         sql_type
     );
 

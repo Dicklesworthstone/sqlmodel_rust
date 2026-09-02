@@ -44,12 +44,34 @@ pub mod plugins {
 
 /// Response codes for caching_sha2_password protocol.
 pub mod caching_sha2 {
+    /// First byte of every AuthMoreData packet the server sends during
+    /// `caching_sha2_password` / `sha256_password` continuation (the status
+    /// byte or the RSA public key follows it).
+    pub const AUTH_MORE_DATA: u8 = 0x01;
     /// Request for public key (client should send 0x02)
     pub const REQUEST_PUBLIC_KEY: u8 = 0x02;
     /// Fast auth success
     pub const FAST_AUTH_SUCCESS: u8 = 0x03;
     /// Full auth needed (switch to secure channel or RSA)
     pub const PERFORM_FULL_AUTH: u8 = 0x04;
+}
+
+/// Strip the AuthMoreData marker (`0x01`) that MySQL prepends to
+/// `caching_sha2_password` / `sha256_password` continuation payloads.
+///
+/// A live MySQL 8 server frames the fast-auth status as `[0x01, 0x03]` (fast
+/// auth succeeded, an OK packet follows) or `[0x01, 0x04]` (perform full
+/// authentication), and the RSA public key as `[0x01, <PEM bytes>]`. The
+/// status bytes (`0x03`/`0x04`), a PEM key (`-`), an OK packet (`0x00`) and an
+/// EOF packet (`0xFE`) never start with `0x01`, so a payload that does not
+/// begin with the marker is returned unchanged. A lone `[0x01]` becomes empty,
+/// which callers report as a protocol error.
+#[must_use]
+pub fn strip_auth_more_data_marker(payload: &[u8]) -> &[u8] {
+    match payload {
+        [caching_sha2::AUTH_MORE_DATA, rest @ ..] => rest,
+        _ => payload,
+    }
 }
 
 /// Compute mysql_native_password authentication response.
@@ -238,6 +260,50 @@ pub fn xor_password_with_seed(password: &str, seed: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_more_data_marker_is_stripped_from_live_server_frames() {
+        // Exactly what MySQL 8.4 sends after a cached caching_sha2 login.
+        assert_eq!(
+            strip_auth_more_data_marker(&[
+                caching_sha2::AUTH_MORE_DATA,
+                caching_sha2::FAST_AUTH_SUCCESS
+            ]),
+            &[caching_sha2::FAST_AUTH_SUCCESS]
+        );
+        assert_eq!(
+            strip_auth_more_data_marker(&[
+                caching_sha2::AUTH_MORE_DATA,
+                caching_sha2::PERFORM_FULL_AUTH
+            ]),
+            &[caching_sha2::PERFORM_FULL_AUTH]
+        );
+        // RSA public key frame: marker followed by PEM.
+        let mut frame = vec![caching_sha2::AUTH_MORE_DATA];
+        frame.extend_from_slice(b"-----BEGIN PUBLIC KEY-----\n");
+        assert_eq!(
+            strip_auth_more_data_marker(&frame),
+            b"-----BEGIN PUBLIC KEY-----\n"
+        );
+    }
+
+    #[test]
+    fn auth_more_data_marker_stripping_leaves_other_frames_alone() {
+        // Already-unwrapped status bytes pass through untouched.
+        assert_eq!(
+            strip_auth_more_data_marker(&[caching_sha2::FAST_AUTH_SUCCESS]),
+            &[caching_sha2::FAST_AUTH_SUCCESS]
+        );
+        // OK (0x00) and EOF (0xFE) packets are not AuthMoreData.
+        assert_eq!(
+            strip_auth_more_data_marker(&[0x00, 0x00, 0x00]),
+            &[0x00, 0x00, 0x00]
+        );
+        assert_eq!(strip_auth_more_data_marker(&[0xFE, 0x00]), &[0xFE, 0x00]);
+        // Degenerate frames: a lone marker becomes empty; empty stays empty.
+        assert!(strip_auth_more_data_marker(&[caching_sha2::AUTH_MORE_DATA]).is_empty());
+        assert!(strip_auth_more_data_marker(&[]).is_empty());
+    }
 
     #[test]
     fn test_mysql_native_password_empty() {

@@ -498,8 +498,13 @@ impl MySqlConnection {
     }
 
     /// Handle additional auth data (e.g., caching_sha2_password responses).
+    ///
+    /// `data` is the whole packet payload; the server frames the status as an
+    /// AuthMoreData packet (`[0x01, 0x03]` / `[0x01, 0x04]`), so the marker is
+    /// stripped before the status byte is interpreted.
     #[allow(clippy::result_large_err)]
     fn handle_additional_auth(&mut self, data: &[u8]) -> Result<(), Error> {
+        let data = auth::strip_auth_more_data_marker(data);
         if data.is_empty() {
             return Err(protocol_error("Empty additional auth data"));
         }
@@ -531,12 +536,8 @@ impl MySqlConnection {
                     return Err(protocol_error("Empty public key response"));
                 }
 
-                // Some servers wrap the PEM in an AuthMoreData packet (0x01 prefix).
-                let public_key = if payload[0] == 0x01 {
-                    &payload[1..]
-                } else {
-                    &payload[..]
-                };
+                // The PEM arrives wrapped in an AuthMoreData packet (0x01 prefix).
+                let public_key = auth::strip_auth_more_data_marker(&payload);
 
                 let use_oaep = mysql_server_uses_oaep(&server_version);
                 let encrypted = auth::sha256_password_rsa(&password, &seed, public_key, use_oaep)
@@ -888,7 +889,7 @@ impl MySqlConnection {
                 values.push(Value::Null);
             } else if let Some(data) = reader.read_lenenc_bytes() {
                 let is_unsigned = col.is_unsigned();
-                let value = decode_text_value(col.column_type, &data, is_unsigned);
+                let value = decode_text_value(col.column_type, &data, is_unsigned, col.charset);
                 values.push(value);
             } else {
                 values.push(Value::Null);

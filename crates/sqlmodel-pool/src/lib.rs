@@ -1043,7 +1043,11 @@ impl<C: Connection> Pool<C> {
                     continue;
                 }
             };
-            let cx = Cx::for_testing();
+            // Runtime-owned request context with no deadline: retirement must not be
+            // cut short, and `Cx::for_testing` only exists behind asupersync's
+            // `test-internals` feature (it compiled here purely through dev-dependency
+            // feature unification, and broke `cargo doc`).
+            let cx = runtime.request_cx_with_budget(Budget::INFINITE);
             let _ = runtime.block_on(guard.close(&cx, context));
         }
     }
