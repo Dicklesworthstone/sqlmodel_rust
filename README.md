@@ -347,9 +347,10 @@ cargo run -p sqlmodel-console --example schema_visualization
           │Conn pooling │           │Rich output      │
           └─────────────┘           └─────────────────┘
                  │
-       ┌─────────┼─────────┬─────────┐
-       ▼         ▼         ▼         ▼
-sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite (drivers)
+       ┌─────────┼─────────┬─────────┬──────────────────┐
+       ▼         ▼         ▼         ▼                  ▼
+sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite sqlmodel-frankensqlite (drivers)
+                                     (C SQLite, FFI)    (pure Rust, MVCC; nightly)
 ```
 
 ### Crate Responsibilities
@@ -365,7 +366,8 @@ sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite (drivers)
 | `sqlmodel-pool` | Connection pooling with asupersync channels |
 | `sqlmodel-postgres` | PostgreSQL wire protocol implementation |
 | `sqlmodel-mysql` | MySQL wire protocol implementation |
-| `sqlmodel-sqlite` | SQLite driver (FFI) |
+| `sqlmodel-sqlite` | SQLite driver (C SQLite via bundled `libsqlite3-sys`) |
+| `sqlmodel-frankensqlite` | Pure-Rust SQLite driver ([FrankenSQLite](https://github.com/Dicklesworthstone/frankensqlite), page-level MVCC, `BEGIN CONCURRENT`); nightly-only |
 | `sqlmodel-console` | Optional rich console output for humans and agents |
 
 ---
@@ -499,13 +501,18 @@ cargo tree -i asupersync     # find who requires the conflicting version
 cargo build
 ```
 
-### "error[E0658]: edition 2024 is unstable"
+### "feature `core_intrinsics` is unstable" / `-Z threads` rejected on stable
+
+Only two things in this repository need nightly: `sqlmodel-frankensqlite` (its `fsqlite-pager`
+dependency enables `core_intrinsics` on x86_64) and the workspace's own `.cargo/config.toml`, which
+passes `-Z threads=4` to rustc. Building the repository uses the pinned toolchain automatically:
 
 ```bash
-# Ensure you're on nightly
-rustup default nightly
-rustup update nightly
+rustup show   # installs nightly-2026-08-25 from rust-toolchain.toml on first use
 ```
+
+Consumers of the published crates on stable Rust 1.95+ are unaffected unless they depend on
+`sqlmodel-frankensqlite`.
 
 ### Clippy warnings about `unsafe_code`
 
