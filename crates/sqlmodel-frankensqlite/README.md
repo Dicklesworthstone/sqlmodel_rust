@@ -22,8 +22,26 @@ Pure-Rust SQLite driver for SQLModel Rust, backed by [FrankenSQLite](https://git
 | `open_schema_only(path)` | Schema inspection without loading data pages. |
 | `open_strict_durable_control_plane_file(path)` | Control-plane profile: verifies file identity, installs and checks the strict-durability pragmas, and refuses to proceed if they cannot be enforced. Pair with `with_exclusive_transaction[_result]` for exclusive, typed-failure transactions. |
 
-## Transactions
-`Connection::begin_with(cx, IsolationLevel)` maps `Serializable` to `BEGIN EXCLUSIVE`, `RepeatableRead`/`ReadCommitted` to `BEGIN IMMEDIATE`, and `ReadUncommitted` to `BEGIN DEFERRED`. Concurrent MVCC transactions use `TransactionMode::Concurrent` (`BEGIN CONCURRENT`); see the crate docs for `begin_with_options` and the `Session` configuration once bd-7wal.3 lands. Write conflicts between concurrent writers surface as `Error::Query` with a serialization-failure kind, for which `Error::is_retryable()` returns true; retry the transaction (bd-7wal.4 adds `retry_transaction`).
+## Transactions and concurrent writers
+`Connection::begin_with(cx, IsolationLevel)` maps `Serializable` to `BEGIN EXCLUSIVE`, `RepeatableRead`/`ReadCommitted` to `BEGIN IMMEDIATE`, and `ReadUncommitted` to `BEGIN DEFERRED`.
+
+Concurrent MVCC writers use `TransactionMode::Concurrent`, which issues `BEGIN CONCURRENT`:
+
+```rust
+use sqlmodel_core::{Connection, TransactionOps, TransactionOptions, RetryPolicy, retry_transaction, Value};
+
+// One transaction, started concurrently:
+let tx = conn.begin_with_options(&cx, TransactionOptions::concurrent()).await.into_result()?;
+tx.execute(&cx, "UPDATE accounts SET balance = balance - 10 WHERE id = ?1", &[Value::BigInt(1)]).await.into_result()?;
+tx.commit(&cx).await.into_result()?;
+
+// The same, retried automatically when two writers conflict:
+retry_transaction(&cx, &conn, TransactionOptions::concurrent(), &RetryPolicy::default(), async |cx, tx| {
+    tx.execute(cx, "UPDATE accounts SET balance = balance - 10 WHERE id = ?1", &[Value::BigInt(1)]).await
+}).await;
+```
+
+`Session` users set `SessionConfig::default().with_transaction_mode(TransactionMode::Concurrent)`. Two connections writing disjoint rows both commit; writers that touch the same page fail with a serialization error for which `Error::is_retryable()` is true. `retry_transaction` re-runs the whole transaction with jittered exponential backoff, never past the `Cx` budget deadline, and never after a cancellation. The sync helper family has `begin_concurrent_sync()` for the same purpose. C SQLite (`sqlmodel-sqlite`) rejects `TransactionMode::Concurrent` with `TransactionErrorKind::UnsupportedMode` rather than silently downgrading.
 
 ## Differences from C SQLite
 - Triggers and direct `sqlite_master` queries still require `sqlmodel-sqlite` (C SQLite).

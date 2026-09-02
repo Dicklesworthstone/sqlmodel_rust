@@ -2116,6 +2116,213 @@ mod tests {
         assert_eq!(rows[0].get(0), Some(&Value::BigInt(0)));
     }
 
+    // ── TransactionMode through the Connection trait ─────────────────────
+    //
+    // These are the first tests that reach `BEGIN CONCURRENT` through the
+    // `sqlmodel_core::Connection` API rather than raw SQL: this is the path
+    // `Session`, `Pool` users, and the query builders take.
+
+    fn concurrent_test_db(name: &str) -> String {
+        let dir = std::env::temp_dir().join("sqlmodel_franken_concurrent_mode_tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}_{}.db", std::process::id()));
+        let path_str = path.to_string_lossy().into_owned();
+        remove_db_family(&path_str);
+        path_str
+    }
+
+    #[test]
+    fn supports_every_transaction_mode() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        for mode in [
+            TransactionMode::Default,
+            TransactionMode::Concurrent,
+            TransactionMode::Immediate,
+            TransactionMode::Exclusive,
+            TransactionMode::Deferred,
+        ] {
+            assert!(conn.supports_transaction_mode(mode), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn begin_concurrent_sync_helper_round_trips() {
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.begin_concurrent_sync().unwrap();
+        assert!(
+            conn.begin_concurrent_sync().is_err(),
+            "nested begin is refused like the other begin helpers"
+        );
+        conn.execute_sync(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[Value::BigInt(7), Value::Text("via helper".into())],
+        )
+        .unwrap();
+        conn.commit_sync().unwrap();
+        let rows = conn.query_sync("SELECT val FROM t WHERE id = 7", &[]).unwrap();
+        assert_eq!(rows[0].get(0), Some(&Value::Text("via helper".into())));
+    }
+
+    #[test]
+    fn two_concurrent_writers_on_disjoint_rows_both_commit() {
+        use sqlmodel_core::Cx;
+        let path = concurrent_test_db("disjoint");
+        let a = FrankenConnection::open_file(&path).unwrap();
+        a.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        let b = FrankenConnection::open_file(&path).unwrap();
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let tx_a = Connection::begin_with_options(&a, &cx, TransactionOptions::concurrent())
+                .await
+                .into_result()
+                .expect("begin concurrent on a");
+            let tx_b = Connection::begin_with_options(&b, &cx, TransactionOptions::concurrent())
+                .await
+                .into_result()
+                .expect("begin concurrent on b while a is open");
+
+            TransactionOps::execute(&tx_a, &cx, "INSERT INTO t VALUES (1, 'from a')", &[])
+                .await
+                .into_result()
+                .unwrap();
+            TransactionOps::execute(&tx_b, &cx, "INSERT INTO t VALUES (2, 'from b')", &[])
+                .await
+                .into_result()
+                .unwrap();
+
+            tx_a.commit(&cx).await.into_result().expect("commit a");
+            tx_b.commit(&cx).await.into_result().expect("commit b: disjoint pages, no conflict");
+        });
+
+        let rows = a
+            .query_sync("SELECT id, val FROM t ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both concurrent writers landed");
+        assert_eq!(rows[0].get(1), Some(&Value::Text("from a".into())));
+        assert_eq!(rows[1].get(1), Some(&Value::Text("from b".into())));
+
+        drop(a);
+        drop(b);
+        remove_db_family(&path);
+    }
+
+    #[test]
+    fn conflicting_concurrent_writers_surface_a_retryable_error() {
+        use sqlmodel_core::Cx;
+        let path = concurrent_test_db("conflict");
+        let a = FrankenConnection::open_file(&path).unwrap();
+        a.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        a.execute_raw("INSERT INTO t VALUES (1, 0)").unwrap();
+        let b = FrankenConnection::open_file(&path).unwrap();
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+        let conflict = rt.block_on(async {
+            let tx_a = Connection::begin_with_options(&a, &cx, TransactionOptions::concurrent())
+                .await
+                .into_result()
+                .unwrap();
+            let tx_b = Connection::begin_with_options(&b, &cx, TransactionOptions::concurrent())
+                .await
+                .into_result()
+                .unwrap();
+
+            TransactionOps::execute(&tx_a, &cx, "UPDATE t SET val = val + 1 WHERE id = 1", &[])
+                .await
+                .into_result()
+                .unwrap();
+            // The conflicting write may be detected at the statement or at commit,
+            // depending on the engine's conflict-detection point; either is a
+            // retryable failure for the second writer.
+            let stmt_b = TransactionOps::execute(
+                &tx_b,
+                &cx,
+                "UPDATE t SET val = val + 1 WHERE id = 1",
+                &[],
+            )
+            .await;
+
+            tx_a.commit(&cx).await.into_result().expect("first writer commits");
+            match stmt_b {
+                Outcome::Err(e) => {
+                    let _ = tx_b.rollback(&cx).await;
+                    Some(e)
+                }
+                Outcome::Ok(_) => match tx_b.commit(&cx).await {
+                    Outcome::Err(e) => Some(e),
+                    Outcome::Ok(()) => None,
+                    Outcome::Cancelled(r) => panic!("unexpected cancellation: {r:?}"),
+                    Outcome::Panicked(p) => panic!("unexpected panic: {p:?}"),
+                },
+                Outcome::Cancelled(r) => panic!("unexpected cancellation: {r:?}"),
+                Outcome::Panicked(p) => panic!("unexpected panic: {p:?}"),
+            }
+        });
+
+        let err = conflict.expect("second writer must fail on the same row");
+        assert!(
+            err.is_retryable(),
+            "write conflict must be classified retryable so retry_transaction can handle it: {err}"
+        );
+
+        let rows = a.query_sync("SELECT val FROM t WHERE id = 1", &[]).unwrap();
+        assert_eq!(
+            rows[0].get(0),
+            Some(&Value::BigInt(1)),
+            "exactly one increment survived; no lost update"
+        );
+
+        drop(a);
+        drop(b);
+        remove_db_family(&path);
+    }
+
+    #[test]
+    fn explicit_locking_modes_map_to_their_begin_forms() {
+        use sqlmodel_core::Cx;
+        let conn = FrankenConnection::open_memory().unwrap();
+        conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+        for mode in [
+            TransactionMode::Immediate,
+            TransactionMode::Exclusive,
+            TransactionMode::Deferred,
+            TransactionMode::Default,
+        ] {
+            rt.block_on(async {
+                let tx = Connection::begin_with_options(
+                    &conn,
+                    &cx,
+                    TransactionOptions::new().with_mode(mode),
+                )
+                .await
+                .into_result()
+                .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+                TransactionOps::execute(&tx, &cx, "INSERT INTO t DEFAULT VALUES", &[])
+                    .await
+                    .into_result()
+                    .unwrap();
+                tx.commit(&cx).await.into_result().unwrap();
+            });
+        }
+        let rows = conn.query_sync("SELECT count(*) FROM t", &[]).unwrap();
+        assert_eq!(rows[0].get(0), Some(&Value::BigInt(4)));
+    }
+
     #[test]
     fn begin_concurrent_with_params() {
         let conn = FrankenConnection::open_memory().unwrap();

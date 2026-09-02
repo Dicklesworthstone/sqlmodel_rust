@@ -1238,9 +1238,19 @@ impl SchemaBuilder {
             };
 
             let pk_cols = M::PRIMARY_KEY;
+            // Columns the base model already declares live on the base table; a child
+            // that redeclares them (the natural way to give a child model access to
+            // inherited columns such as `name`) must not try to ADD them again.
+            let parent_columns: &[FieldInfo] = inheritance.parent_fields_fn.map_or(&[], |f| f());
             for field in M::fields() {
                 // Avoid trying to re-add PK columns that are expected to be on the base table.
                 if field.primary_key || pk_cols.contains(&field.column_name) {
+                    continue;
+                }
+                if parent_columns
+                    .iter()
+                    .any(|p| p.column_name == field.column_name)
+                {
                     continue;
                 }
                 self.statements

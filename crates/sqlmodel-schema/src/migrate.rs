@@ -370,12 +370,16 @@ impl MigrationRunner {
     }
 
     /// Ensure the migrations tracking table exists.
+    ///
+    /// The `id` column is `VARCHAR(255)` rather than `TEXT`: MySQL refuses a
+    /// `TEXT` primary key without a key length, while SQLite and PostgreSQL treat
+    /// `VARCHAR(255)` as text. Migration ids are short (timestamps or slugs).
     pub async fn init<C: Connection>(&self, cx: &Cx, conn: &C) -> Outcome<(), Error> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {} (
-                id TEXT PRIMARY KEY,
+                id VARCHAR(255) PRIMARY KEY,
                 description TEXT NOT NULL,
-                applied_at INTEGER NOT NULL
+                applied_at BIGINT NOT NULL
             )",
             self.table_name
         );
@@ -458,10 +462,16 @@ impl MigrationRunner {
                     Outcome::Panicked(p) => return Outcome::Panicked(p),
                 }
 
-                // Record the migration
+                // Record the migration. Placeholders must follow the connection's
+                // dialect: MySQL rejects `$1`, and SQLite only accepted it by treating
+                // `$1` as a named parameter.
+                let dialect = conn.dialect();
                 let record_sql = format!(
-                    "INSERT INTO {} (id, description, applied_at) VALUES ($1, $2, $3)",
-                    self.table_name
+                    "INSERT INTO {} (id, description, applied_at) VALUES ({}, {}, {})",
+                    self.table_name,
+                    dialect.placeholder(1),
+                    dialect.placeholder(2),
+                    dialect.placeholder(3)
                 );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -537,8 +547,12 @@ impl MigrationRunner {
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         }
 
-        // Remove the migration record
-        let delete_sql = format!("DELETE FROM {} WHERE id = $1", self.table_name);
+        // Remove the migration record (dialect-correct placeholder; see `migrate`).
+        let delete_sql = format!(
+            "DELETE FROM {} WHERE id = {}",
+            self.table_name,
+            conn.dialect().placeholder(1)
+        );
         match conn
             .execute(cx, &delete_sql, &[Value::Text(id.clone())])
             .await

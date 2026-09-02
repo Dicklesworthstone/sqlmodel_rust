@@ -2423,6 +2423,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlmodel-e2e"
+version = "0.4.2"
+dependencies = [
+ "asupersync",
+ "serde",
+ "sqlmodel",
+ "sqlmodel-core",
+ "sqlmodel-frankensqlite",
+ "sqlmodel-mysql",
+ "sqlmodel-pool",
+ "sqlmodel-postgres",
+ "sqlmodel-query",
+ "sqlmodel-schema",
+ "sqlmodel-session",
+ "sqlmodel-sqlite",
+]
+
+[[package]]
 name = "sqlmodel-frankensqlite"
 version = "0.4.2"
 dependencies = [

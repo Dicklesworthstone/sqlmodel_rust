@@ -43,6 +43,11 @@ pub mod validate;
 pub mod retry;
 pub mod value;
 
+/// Optional `From`/`TryFrom`/`FromValue` impls for chrono, uuid, and rust_decimal
+/// types (features `chrono`, `uuid`, `decimal`).
+#[cfg(any(feature = "chrono", feature = "uuid", feature = "decimal"))]
+pub mod external_types;
+
 pub use connection::{
     Connection, Dialect, IsolationLevel, PreparedStatement, Transaction, TransactionInternal,
     TransactionMode, TransactionOps, TransactionOptions,

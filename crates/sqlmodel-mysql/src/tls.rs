@@ -910,9 +910,16 @@ G1euYZaoD1WUYYMQFMsBgnsGSrkeNSAnXGNEEWqweFLwSzZ6jUGAT95IEodL7J9j
     }
 
     #[test]
-    fn truncated_base64_is_a_parse_error_not_a_panic() {
-        let truncated = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIU\n-----END CERTIFICATE-----\n";
-        let result = read_pem_certificates(&mut cursor(truncated));
-        assert!(result.is_err());
+    fn invalid_base64_is_a_parse_error_not_a_panic() {
+        // The PEM layer decodes base64 and does not validate DER (rustls does
+        // that when the certificate is used), so the malformed input here has
+        // to be malformed at the base64 level.
+        let garbage = "-----BEGIN CERTIFICATE-----\nMIIB!!!not*base64$$$\n-----END CERTIFICATE-----\n";
+        let err = read_pem_certificates(&mut cursor(garbage)).expect_err("invalid base64");
+        assert!(matches!(err, PemError::Base64Decode(_)), "got {err:?}");
+
+        let unterminated = "-----BEGIN CERTIFICATE-----\nMIIBizCCATGgAwIBAgIU\n";
+        let err = read_pem_certificates(&mut cursor(unterminated)).expect_err("missing END line");
+        assert!(matches!(err, PemError::MissingSectionEnd { .. }), "got {err:?}");
     }
 }

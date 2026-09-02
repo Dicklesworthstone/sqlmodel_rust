@@ -15,12 +15,24 @@ categories = ["database", "database-implementations"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# Model fields of type chrono::{NaiveDate, NaiveTime, NaiveDateTime, DateTime<Utc|FixedOffset>}
+chrono = ["dep:chrono"]
+# Model fields of type uuid::Uuid
+uuid = ["dep:uuid"]
+# Model fields of type rust_decimal::Decimal
+decimal = ["dep:rust_decimal"]
+
 [dependencies]
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
 tracing.workspace = true
+chrono = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+rust_decimal = { workspace = true, optional = true }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }

@@ -878,6 +878,57 @@ mod tests {
     }
 
     #[test]
+    fn transaction_mode_begin_statements_per_dialect() {
+        use TransactionMode::*;
+        // SQLite family: every mode has a BEGIN form (Concurrent is FrankenSQLite-only,
+        // which drivers gate via supports_transaction_mode).
+        assert_eq!(Default.begin_statement(Dialect::Sqlite), Some("BEGIN"));
+        assert_eq!(Concurrent.begin_statement(Dialect::Sqlite), Some("BEGIN CONCURRENT"));
+        assert_eq!(Immediate.begin_statement(Dialect::Sqlite), Some("BEGIN IMMEDIATE"));
+        assert_eq!(Exclusive.begin_statement(Dialect::Sqlite), Some("BEGIN EXCLUSIVE"));
+        assert_eq!(Deferred.begin_statement(Dialect::Sqlite), Some("BEGIN DEFERRED"));
+        // MVCC servers: Concurrent is their default; the SQLite locking forms do not exist.
+        for dialect in [Dialect::Postgres, Dialect::Mysql] {
+            assert_eq!(Default.begin_statement(dialect), Some("BEGIN"));
+            assert_eq!(Concurrent.begin_statement(dialect), Some("BEGIN"));
+            assert_eq!(Immediate.begin_statement(dialect), None);
+            assert_eq!(Exclusive.begin_statement(dialect), None);
+            assert_eq!(Deferred.begin_statement(dialect), None);
+        }
+    }
+
+    #[test]
+    fn transaction_options_builders() {
+        let opts = TransactionOptions::new();
+        assert_eq!(opts.isolation, IsolationLevel::ReadCommitted);
+        assert_eq!(opts.mode, TransactionMode::Default);
+        assert_eq!(TransactionOptions::default(), opts);
+
+        let concurrent = TransactionOptions::concurrent();
+        assert_eq!(concurrent.mode, TransactionMode::Concurrent);
+
+        let custom = TransactionOptions::new()
+            .with_isolation(IsolationLevel::Serializable)
+            .with_mode(TransactionMode::Immediate);
+        assert_eq!(custom.isolation, IsolationLevel::Serializable);
+        assert_eq!(custom.mode, TransactionMode::Immediate);
+    }
+
+    #[test]
+    fn unsupported_transaction_mode_error_names_mode_and_hint() {
+        let err = crate::Error::unsupported_transaction_mode(TransactionMode::Concurrent, Dialect::Sqlite);
+        let text = err.to_string();
+        assert!(text.contains("concurrent"), "{text}");
+        assert!(text.contains("frankensqlite"), "points at the driver that supports it: {text}");
+        match err {
+            crate::Error::Transaction(t) => {
+                assert_eq!(t.kind, crate::error::TransactionErrorKind::UnsupportedMode);
+            }
+            other => panic!("expected transaction error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_connection_config_builder() {
         let config = ConnectionConfig::new("postgres://localhost/test")
             .connect_timeout(5000)

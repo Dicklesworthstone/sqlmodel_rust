@@ -1,0 +1,32 @@
+[package]
+name = "sqlmodel-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "End-to-end tests that run the SQLModel ORM stack against every driver (not published)"
+publish = false
+
+[lints]
+workspace = true
+
+# The one place in the workspace where every driver is a dependency at once.
+# Nightly-only because sqlmodel-frankensqlite is; the CI MSRV job excludes it.
+[dependencies]
+sqlmodel.workspace = true
+sqlmodel-core.workspace = true
+sqlmodel-query.workspace = true
+sqlmodel-schema.workspace = true
+sqlmodel-session.workspace = true
+sqlmodel-pool.workspace = true
+sqlmodel-sqlite.workspace = true
+sqlmodel-frankensqlite.workspace = true
+sqlmodel-postgres.workspace = true
+sqlmodel-mysql.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }

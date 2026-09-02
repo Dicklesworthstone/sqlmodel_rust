@@ -418,12 +418,20 @@ nJq18jG+sttI+3AnzQhXtR2Adq9LKVdNRQIDAQAB\n\
             include_str!("async_connection.rs"),
             include_str!("tls.rs"),
         ];
+        // Assembled with concat! so this test's own source never contains the
+        // forbidden tokens verbatim (it scans itself, too).
+        let forbidden_tokens = [
+            concat!("RsaPriv", "ateKey"),
+            concat!(".decr", "ypt("),
+            concat!("Signing", "Key"),
+            concat!(".si", "gn("),
+            concat!("DecodePriv", "ateKey"),
+        ];
         for (name, src) in ["auth.rs", "connection.rs", "async_connection.rs", "tls.rs"]
             .iter()
             .zip(sources)
         {
-            for forbidden in ["RsaPrivateKey", ".decrypt(", "SigningKey", ".sign(", "DecodePrivateKey"] {
-                // The docs of this very test mention the names; skip doc-comment lines.
+            for forbidden in forbidden_tokens {
                 let hit = src
                     .lines()
                     .filter(|l| !l.trim_start().starts_with("//"))

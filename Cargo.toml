@@ -13,6 +13,8 @@ members = [
     "crates/sqlmodel-mysql",
     "crates/sqlmodel-console",
     "crates/sqlmodel-frankensqlite",
+    # Not published: all-driver end-to-end tests (nightly-only via frankensqlite).
+    "crates/sqlmodel-e2e",
 ]
 
 [workspace.package]
@@ -77,6 +79,13 @@ tracing = "0.1"
 
 # Rich console output (optional, used by sqlmodel-console)
 rich_rust = "0.2.3"
+
+# Optional external value types (sqlmodel-core features `chrono`, `uuid`, `decimal`).
+# The wire format stays i64 microseconds / [u8; 16] / decimal text; these only add
+# From/TryFrom conversions so the types can be model fields.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = { version = "1", default-features = false, features = ["std"] }
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 # Internal crates
 sqlmodel = { path = "crates/sqlmodel", version = "0.4.2" }
