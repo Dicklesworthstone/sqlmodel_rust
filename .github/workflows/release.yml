@@ -32,11 +32,6 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Clone asupersync dependency
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:

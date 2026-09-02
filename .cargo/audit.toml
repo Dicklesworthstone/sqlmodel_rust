@@ -1,0 +1,23 @@
+# cargo-audit configuration (read by `cargo audit` and mirrored in deny.toml).
+#
+# Every ignore here must carry: the reason it is not exploitable or not fixable
+# today, the bead that owns the follow-up, and a review date. Ignores without a
+# review date are not allowed. CI runs `cargo audit --deny warnings`, so an
+# advisory that is not listed here fails the build.
+
+[advisories]
+ignore = [
+    # rsa 0.10.0-rc.x — RUSTSEC-2023-0071 "Marvin Attack" (timing side channel,
+    # medium 5.9, no fixed upstream version).
+    # Why it does not apply: Marvin recovers the PRIVATE key by timing PKCS#1 v1.5
+    # DECRYPTION on the party that holds the private key. sqlmodel-mysql uses the
+    # rsa crate only to ENCRYPT the scrambled password with the MySQL server's
+    # PUBLIC key during caching_sha2_password / sha256_password full authentication
+    # on a non-TLS connection (crates/sqlmodel-mysql/src/auth.rs,
+    # `sha256_password_rsa`). The client never holds a private key and never
+    # decrypts or signs; a test in auth.rs asserts no private-key API is referenced.
+    # TLS connections (SslMode::Required or stronger) never take this path at all.
+    # Follow-up: bd-j7wt.1 (this analysis), bd-j7wt.2 (feature-gate the RSA path).
+    # Review: 2026-12-01, or when rsa 0.10 stable ships (then re-run cargo audit).
+    "RUSTSEC-2023-0071",
+]

@@ -1,5 +1,11 @@
 name: CI
 
+# Toolchain note: rust-toolchain.toml pins nightly-2026-08-25 and rustup honors
+# it in every job below; the dtolnay action is used only to add components and
+# targets. All dependencies resolve from crates.io (no local clones since 0.4.0)
+# and libsqlite3-sys is built with the bundled amalgamation, so no job installs
+# SQLite or clones sibling repositories.
+
 on:
   push:
     branches: [main, master]
@@ -25,12 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Clone dependencies
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -45,6 +45,25 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Version lines agree (Cargo.toml vs README vs CHANGELOG)
+        # The 0.4.2 release was half-published while README already advertised
+        # it. This step keeps the three places that state a version in lockstep
+        # so a mismatch is visible before anything is tagged. Bead bd-jeof.4.
+        run: |
+          set -euo pipefail
+          ws=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="sqlmodel") | .version')
+          echo "workspace version: $ws"
+          fail=0
+          while IFS= read -r line; do
+            v=$(echo "$line" | sed -nE 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p')
+            if [ -n "$v" ] && [ "$v" != "$ws" ]; then echo "README version mismatch: $line"; fail=1; fi
+          done < <(grep -E '^(# )?sqlmodel[a-z-]* = (\{ version = )?"[0-9]+\.[0-9]+\.[0-9]+"' README.md || true)
+          lockstep=$(grep -oE 'lockstep at the same version \(([0-9]+\.[0-9]+\.[0-9]+)\)' README.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          if [ -n "$lockstep" ] && [ "$lockstep" != "$ws" ]; then echo "README lockstep sentence says $lockstep"; fail=1; fi
+          top=$(grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          if [ -n "$top" ] && [ "$top" != "$ws" ]; then echo "CHANGELOG top entry is $top, workspace is $ws"; fail=1; fi
+          exit $fail
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -55,37 +74,6 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-
-      - name: Clone dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
-
-      - name: Clone dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync 2>$null
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust 2>$null
-          if (-not $?) { Write-Host "Dependencies already exist or clone failed" }
-
-      - name: Install SQLite (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          vcpkg integrate install
-          vcpkg install sqlite3:x64-windows
-          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          $libDir = "$vcpkgRoot\installed\x64-windows\lib"
-          echo "SQLITE3_LIB_DIR=$libDir" >> $env:GITHUB_ENV
-          echo "SQLITE3_INCLUDE_DIR=$vcpkgRoot\installed\x64-windows\include" >> $env:GITHUB_ENV
-          # Add to LIB for MSVC linker to find sqlite3.lib
-          echo "LIB=$libDir;$env:LIB" >> $env:GITHUB_ENV
-          # Add to PATH for runtime DLL
-          echo "$vcpkgRoot\installed\x64-windows\bin" >> $env:GITHUB_PATH
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -104,27 +92,96 @@ jobs:
       - name: Run doc tests
         run: cargo test --workspace --doc
 
-  security:
-    name: Security Audit
+  integration:
+    # Postgres and MySQL end-to-end suites. Until this job existed the
+    # integration tests were env-gated and silently skipped on every run
+    # (bead bd-slot.1). The final step fails the job if a suite skipped.
+    name: Integration (Postgres 16 · MySQL 8.4 · MariaDB 11)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sqlmodel
+          POSTGRES_PASSWORD: sqlmodel
+          POSTGRES_DB: sqlmodel_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sqlmodel -d sqlmodel_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: sqlmodel
+          MYSQL_DATABASE: sqlmodel_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -psqlmodel"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: sqlmodel
+          MARIADB_DATABASE: sqlmodel_test
+        ports: ["3307:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      SQLMODEL_TEST_POSTGRES_URL: postgres://sqlmodel:sqlmodel@127.0.0.1:5432/sqlmodel_test
+      SQLMODEL_TEST_MYSQL_URL: mysql://root:sqlmodel@127.0.0.1:3306/sqlmodel_test
+      SQLMODEL_TEST_MARIADB_URL: mysql://root:sqlmodel@127.0.0.1:3307/sqlmodel_test
+      RUST_LOG: sqlmodel=debug
     steps:
       - uses: actions/checkout@v7
-
-      - name: Clone dependencies
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integration
 
-      - name: Run security audit
-        run: cargo audit || true  # Don't fail CI on advisories, just report
+      - name: Run driver integration suites against live services
+        run: |
+          set -o pipefail
+          cargo test -p sqlmodel-postgres -p sqlmodel-mysql --tests -- --nocapture 2>&1 | tee integration.log
+
+      - name: Run end-to-end crate against every available driver
+        run: |
+          set -o pipefail
+          if cargo metadata --format-version 1 --no-deps | jq -e '.packages[] | select(.name=="sqlmodel-e2e")' >/dev/null; then
+            cargo test -p sqlmodel-e2e -- --nocapture 2>&1 | tee -a integration.log
+          else
+            echo "sqlmodel-e2e crate not present yet (bd-slot.2)"
+          fi
+
+      - name: Fail if any suite skipped instead of running
+        run: |
+          if grep -q "skipping .* integration tests" integration.log; then
+            echo "A suite skipped although services are available:"; grep "skipping" integration.log; exit 1
+          fi
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-audit and cargo-deny
+        run: cargo install cargo-audit cargo-deny --locked
+
+      - name: cargo audit (ignores must be justified in .cargo/audit.toml)
+        run: cargo audit --deny warnings
+
+      - name: cargo deny (advisories, banned crates, licenses, sources)
+        run: cargo deny check advisories bans licenses sources
 
   docs:
     name: Documentation
@@ -132,12 +189,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-
-      - name: Clone dependencies
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -153,15 +204,9 @@ jobs:
   msrv:
     name: MSRV Check
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-
-      - name: Clone dependencies
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
 
       - name: Install Rust toolchain (MSRV)
         uses: dtolnay/rust-toolchain@master
@@ -171,17 +216,24 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Check MSRV compilation
+      - name: Check and test on the declared floor
         # RUSTFLAGS="" overrides the nightly-only `-Z threads=4` in .cargo/config.toml.
-        # sqlmodel-frankensqlite is excluded: fsqlite-pager enables
-        # `feature(core_intrinsics)` on x86_64, so that driver is nightly-only.
+        # sqlmodel-frankensqlite (and the e2e crate that depends on it) are
+        # excluded: fsqlite-pager enables `feature(core_intrinsics)` on x86_64,
+        # so that driver is nightly-only.
         env:
           RUSTFLAGS: ""
-        run: cargo check --workspace --exclude sqlmodel-frankensqlite
+        run: |
+          excl="--exclude sqlmodel-frankensqlite"
+          if cargo metadata --format-version 1 --no-deps | jq -e '.packages[] | select(.name=="sqlmodel-e2e")' >/dev/null; then
+            excl="$excl --exclude sqlmodel-e2e"
+          fi
+          cargo check --workspace $excl
+          cargo test --workspace $excl
 
   build:
     name: Build (${{ matrix.target }})
-    needs: [lint, test]
+    needs: [lint, test, security]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -198,37 +250,6 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7
-
-      - name: Clone dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync || true
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
-
-      - name: Clone dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cd ..
-          git clone https://github.com/Dicklesworthstone/asupersync.git asupersync 2>$null
-          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust 2>$null
-          if (-not $?) { Write-Host "Dependencies already exist or clone failed" }
-
-      - name: Install SQLite (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          vcpkg integrate install
-          vcpkg install sqlite3:x64-windows
-          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          $libDir = "$vcpkgRoot\installed\x64-windows\lib"
-          echo "SQLITE3_LIB_DIR=$libDir" >> $env:GITHUB_ENV
-          echo "SQLITE3_INCLUDE_DIR=$vcpkgRoot\installed\x64-windows\include" >> $env:GITHUB_ENV
-          # Add to LIB for MSVC linker to find sqlite3.lib
-          echo "LIB=$libDir;$env:LIB" >> $env:GITHUB_ENV
-          # Add to PATH for runtime DLL
-          echo "$vcpkgRoot\installed\x64-windows\bin" >> $env:GITHUB_PATH
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly

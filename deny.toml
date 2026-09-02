@@ -1,0 +1,103 @@
+# cargo-deny configuration.
+#
+# This file turns two rules that used to live only in prose into gates:
+#   * AGENTS.md "Async Runtime: asupersync (MANDATORY — NO TOKIO)" — the banned
+#     crate list below fails the build if any of them enters the graph, even
+#     transitively.
+#   * The security baseline — advisories fail the build unless ignored with a
+#     rationale and review date in `.cargo/audit.toml` (mirrored here; keep the
+#     two lists identical).
+#
+# Run locally with `cargo deny check`. CI runs it in the Security job.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Keep in sync with .cargo/audit.toml (that file carries the full rationale).
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack targets private-key decryption; sqlmodel-mysql only encrypts with the server's public key (auth.rs). Review 2026-12-01. Beads bd-j7wt.1 / bd-j7wt.2." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; replaced by rustls::pki_types::pem in bd-j7wt.3. Remove this entry when the dependency is gone." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1 via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to decode untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2026-11-01." },
+    { id = "RUSTSEC-2024-0320", reason = "yaml-rust via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to parse untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2026-11-01." },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # AGENTS.md forbidden async/HTTP stack — asupersync is the only runtime.
+    { crate = "tokio", reason = "AGENTS.md: asupersync exclusively; tokio and its ecosystem are forbidden" },
+    { crate = "tokio-util", reason = "tokio ecosystem" },
+    { crate = "tokio-stream", reason = "tokio ecosystem" },
+    { crate = "hyper", reason = "AGENTS.md forbidden (tokio-based HTTP)" },
+    { crate = "reqwest", reason = "AGENTS.md forbidden; use asupersync::http" },
+    { crate = "axum", reason = "AGENTS.md forbidden" },
+    { crate = "tower", reason = "AGENTS.md forbidden (tokio adapter)" },
+    { crate = "async-std", reason = "AGENTS.md forbidden alternative runtime" },
+    { crate = "smol", reason = "AGENTS.md forbidden alternative runtime" },
+    # AGENTS.md forbidden ORM/database stacks — we build our own drivers.
+    { crate = "sqlx", reason = "AGENTS.md: no ORM/database crates; native drivers only" },
+    { crate = "diesel", reason = "AGENTS.md: no ORM/database crates" },
+    { crate = "sea-orm", reason = "AGENTS.md: no ORM/database crates" },
+    { crate = "rusqlite", reason = "AGENTS.md: no database crates; sqlmodel-sqlite talks to libsqlite3-sys directly (allowed as a dev-dependency baseline only in benches — see bd-4ttf.1 before relaxing)" },
+]
+# Known, accepted duplicate versions (each carries the reason it exists).
+skip = [
+    { crate = "syn@2", reason = "syn 2 is pulled by serde_derive/thiserror-impl and other proc-macro deps; sqlmodel-macros uses syn 3" },
+    { crate = "rand@0.8", reason = "rand 0.8 line is a transitive dependency of asupersync/fsqlite internals; sqlmodel drivers use rand 0.10" },
+    { crate = "sha2@0.10", reason = "sha2 0.10 is used by transitive crates on the digest 0.10 line; sqlmodel auth uses sha2 0.11" },
+    { crate = "getrandom@0.2", reason = "rand 0.8 line" },
+    { crate = "base64@0.22", reason = "transitive; sqlmodel-postgres uses base64 0.23" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses present in the lockfile. Add to this list deliberately
+# (cargo deny prints the crate and its license when something new appears).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    "OpenSSL",
+    "BSL-1.0",
+    "Unlicense",
+]
+# The workspace crates use a custom rider on MIT (see LICENSE); accept our own
+# SPDX LicenseRef so cargo-deny does not flag the workspace itself.
+exceptions = [
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-core" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-macros" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-query" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-schema" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-session" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-pool" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-console" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-postgres" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-mysql" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-sqlite" },
+    { allow = ["LicenseRef-MIT-OpenAI-Anthropic-Rider"], crate = "sqlmodel-frankensqlite" },
+]
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
