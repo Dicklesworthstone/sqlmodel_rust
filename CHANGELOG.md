@@ -73,7 +73,12 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
 - **`crates/sqlmodel-e2e`** (workspace member, `publish = false`): an all-driver end-to-end harness
   (`DriverUnderTest`, `Scenario`, `run_on_every_driver`) that runs the same ORM scenarios on
   C SQLite (memory and file), FrankenSQLite, and, when `SQLMODEL_TEST_{POSTGRES,MYSQL,MARIADB}_URL`
-  are set, PostgreSQL/MySQL/MariaDB. Scenarios: model CRUD smoke, `MigrationRunner`, and two OS
+  are set, PostgreSQL/MySQL/MariaDB. Scenarios: model CRUD smoke (including a table named `order`
+  with columns `user` and `select`), every `Expr` family through `select!` (comparisons, NULL
+  tests, LIKE, IN, BETWEEN, boolean composition, string/numeric/conditional functions, GROUP BY
+  with HAVING, DISTINCT, paging, EXISTS; `ILIKE` is reported as skipped off PostgreSQL), type
+  round-trips, `MigrationRunner`, `Session` (unit of work, one-to-many, many-to-many through a link
+  table, lazy many-to-one, lifecycle events, `merge`, session-side cascades), the pool, and two OS
   threads of concurrent writers with `retry_transaction` (no lost updates; C SQLite asserts the
   `UnsupportedMode` refusal).
 - New facade tests: `single_table_inheritance_sqlite.rs` (first STI run against a database) and
@@ -158,6 +163,22 @@ facade tests, and the driver integration suites run against live Docker database
   quote table names through the new `Dialect::quote_table` (schema-qualified names are quoted per
   segment; already-quoted names pass through). The e2e smoke scenario now round-trips a table
   called `order` with columns `user` and `select` on every driver.
+- **`Expr` ignored operator precedence when rendering.** `a.or(b).and(c)` rendered
+  `a OR b AND c`, which every database reads as `a OR (b AND c)`, so any filter that combined an
+  `or` with a later `and` (including `.filter(x.or(y)).filter(z)`) returned the wrong rows. Children
+  that bind looser than their parent (or as tightly, on the right of `-`, `/`, `%`) are now
+  parenthesized, and `NOT` wraps a binary operand. Found by the new e2e expression scenario.
+- **FrankenSQLite lost every column name for `SELECT * FROM "order"`.** The driver names star
+  projections from `PRAGMA table_info(<table>)`, emitted unquoted; a reserved-word table name made
+  the pragma a syntax error and the row came back nameless. The table is now always quoted.
+- **`Session::merge` onto an expired object was lost.** Every tracked object is expired after
+  `commit`; merging a detached copy onto one replaced its values but never marked it dirty, so the
+  following flush issued no `UPDATE` and the change silently vanished. The merged object is now
+  persistent and dirty again. Found by the e2e Session scenario on a real database.
+- **`Session::load_many_to_many` resolved zero links on FrankenSQLite.** The loader selected
+  `child.*` across a JOIN, which that driver cannot name from the schema, so no row's parent key or
+  columns could be read. The loader now projects the child's columns explicitly, which every driver
+  names identically.
 - **Decimals lost precision on SQLite.** A `DECIMAL(p, s)` column has NUMERIC affinity, which turns
   the bound text into a REAL and keeps 15 significant digits, so a 20-digit `rust_decimal::Decimal`
   came back rounded; FrankenSQLite additionally bound decimals as floats. Decimal and numeric
