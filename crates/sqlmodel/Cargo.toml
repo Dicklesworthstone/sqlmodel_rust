@@ -19,6 +19,10 @@ workspace = true
 default = []
 console = ["dep:sqlmodel-console"]
 c-sqlite-tests = ["dep:sqlmodel-sqlite"]
+# Model fields of external value types (see sqlmodel-core's features of the same name).
+chrono = ["sqlmodel-core/chrono"]
+uuid = ["sqlmodel-core/uuid"]
+decimal = ["sqlmodel-core/decimal"]
 
 [dependencies]
 sqlmodel-core.workspace = true
