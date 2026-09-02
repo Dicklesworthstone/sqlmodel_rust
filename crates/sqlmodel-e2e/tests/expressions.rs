@@ -57,14 +57,19 @@ async fn ids<C: Connection>(cx: &Cx, conn: &C, query: Select<Item>, label: &str)
 /// Integers come back as different `Value` widths (and MySQL returns
 /// `SUM(INT)` as a DECIMAL string); compare them numerically.
 fn as_i64(v: &Value) -> i64 {
+    // The aggregates here are small integers; rounding a float is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let rounded = |f: f64| f.round() as i64;
     match v {
-        Value::Text(s) | Value::Decimal(s) => s
-            .parse::<f64>()
-            .map(|f| f.round() as i64)
-            .unwrap_or_else(|_| panic!("not numeric: {s}")),
-        Value::Double(f) => f.round() as i64,
-        Value::Float(f) => f64::from(*f).round() as i64,
-        other => other.as_i64().unwrap_or_else(|| panic!("not numeric: {other:?}")),
+        Value::Text(s) | Value::Decimal(s) => rounded(
+            s.parse::<f64>()
+                .unwrap_or_else(|_| panic!("not numeric: {s}")),
+        ),
+        Value::Double(f) => rounded(*f),
+        Value::Float(f) => rounded(f64::from(*f)),
+        other => other
+            .as_i64()
+            .unwrap_or_else(|| panic!("not numeric: {other:?}")),
     }
 }
 
@@ -96,68 +101,144 @@ impl Scenario for Expressions {
 
         // Comparisons.
         let price = || Expr::col("price");
-        assert_eq!(ids(cx, conn, select!(Item).filter(price().eq(300)), "eq").await, [2], "{d}");
+        assert_eq!(
+            ids(cx, conn, select!(Item).filter(price().eq(300)), "eq").await,
+            [2],
+            "{d}"
+        );
         assert_eq!(
             ids(cx, conn, select!(Item).filter(price().ne(300)), "ne").await,
             [1, 3, 4, 5, 6],
             "{d}"
         );
-        assert_eq!(ids(cx, conn, select!(Item).filter(price().gt(100)), "gt").await, [1, 2, 5], "{d}");
-        assert_eq!(ids(cx, conn, select!(Item).filter(price().ge(120)), "ge").await, [1, 2, 5], "{d}");
-        assert_eq!(ids(cx, conn, select!(Item).filter(price().lt(50)), "lt").await, [3, 4], "{d}");
-        assert_eq!(ids(cx, conn, select!(Item).filter(price().le(60)), "le").await, [3, 4, 6], "{d}");
+        assert_eq!(
+            ids(cx, conn, select!(Item).filter(price().gt(100)), "gt").await,
+            [1, 2, 5],
+            "{d}"
+        );
+        assert_eq!(
+            ids(cx, conn, select!(Item).filter(price().ge(120)), "ge").await,
+            [1, 2, 5],
+            "{d}"
+        );
+        assert_eq!(
+            ids(cx, conn, select!(Item).filter(price().lt(50)), "lt").await,
+            [3, 4],
+            "{d}"
+        );
+        assert_eq!(
+            ids(cx, conn, select!(Item).filter(price().le(60)), "le").await,
+            [3, 4, 6],
+            "{d}"
+        );
 
         // NULL tests.
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("weight").is_null()), "is_null").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("weight").is_null()),
+                "is_null"
+            )
+            .await,
             [2, 4],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("weight").is_not_null()), "is_not_null").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("weight").is_not_null()),
+                "is_not_null"
+            )
+            .await,
             [1, 3, 5, 6],
             "{d}"
         );
 
         // Pattern matching.
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("name").like("g%")), "like").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("name").like("g%")),
+                "like"
+            )
+            .await,
             [1, 4, 6],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("name").starts_with("sp")), "starts_with").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("name").starts_with("sp")),
+                "starts_with"
+            )
+            .await,
             [2],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("name").contains("el")), "contains").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("name").contains("el")),
+                "contains"
+            )
+            .await,
             [6],
             "{d}"
         );
         if dialect == Dialect::Postgres {
             assert_eq!(
-                ids(cx, conn, select!(Item).filter(Expr::col("name").ilike("GA%")), "ilike").await,
+                ids(
+                    cx,
+                    conn,
+                    select!(Item).filter(Expr::col("name").ilike("GA%")),
+                    "ilike"
+                )
+                .await,
                 [4],
                 "{d}"
             );
         } else {
-            eprintln!("{d}: skipped ILIKE (PostgreSQL only; `Expr::ilike` is not translated for this dialect)");
+            eprintln!(
+                "{d}: skipped ILIKE (PostgreSQL only; `Expr::ilike` is not translated for this dialect)"
+            );
         }
 
         // Lists and ranges.
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("id").in_list(vec![1, 3, 5])), "in_list").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("id").in_list(vec![1, 3, 5])),
+                "in_list"
+            )
+            .await,
             [1, 3, 5],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(price().between(40, 130)), "between").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(price().between(40, 130)),
+                "between"
+            )
+            .await,
             [1, 4, 6],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(price().not_between(40, 130)), "not_between").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(price().not_between(40, 130)),
+                "not_between"
+            )
+            .await,
             [2, 3, 5],
             "{d}"
         );
@@ -175,29 +256,59 @@ impl Scenario for Expressions {
 
         // String functions.
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("name").upper().eq("OIL")), "upper").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("name").upper().eq("OIL")),
+                "upper"
+            )
+            .await,
             [5],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("category").lower().eq("fluids")), "lower").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("category").lower().eq("fluids")),
+                "lower"
+            )
+            .await,
             [5, 6],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("name").length().gt(4)), "length").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("name").length().gt(4)),
+                "length"
+            )
+            .await,
             [2, 4],
             "{d}"
         );
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("name").concat("!").eq("bolt!")), "concat").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("name").concat("!").eq("bolt!")),
+                "concat"
+            )
+            .await,
             [3],
             "{d}: string concatenation must not turn into a boolean OR"
         );
 
         // Numeric and conditional functions.
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(Expr::col("weight").abs().gt(5)), "abs").await,
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(Expr::col("weight").abs().gt(5)),
+                "abs"
+            )
+            .await,
             [1, 5],
             "{d}"
         );
@@ -205,7 +316,8 @@ impl Scenario for Expressions {
             ids(
                 cx,
                 conn,
-                select!(Item).filter(Expr::coalesce(vec![Expr::col("weight"), Expr::from(0)]).lt(5)),
+                select!(Item)
+                    .filter(Expr::coalesce(vec![Expr::col("weight"), Expr::from(0)]).lt(5)),
                 "coalesce"
             )
             .await,
@@ -231,7 +343,10 @@ impl Scenario for Expressions {
             .having(price().sum().gt(100))
             .order_by(Expr::col("category").asc())
             .build_with_dialect(dialect);
-        let rows = expect_outcome(conn.query(cx, &sql, &params).await, &format!("{d}: group by"));
+        let rows = expect_outcome(
+            conn.query(cx, &sql, &params).await,
+            &format!("{d}: group by"),
+        );
         let groups: Vec<(String, i64, i64)> = rows
             .iter()
             .map(|r| {
@@ -244,7 +359,10 @@ impl Scenario for Expressions {
             .collect();
         assert_eq!(
             groups,
-            vec![("fluids".to_string(), 2, 860), ("tools".to_string(), 2, 420)],
+            vec![
+                ("fluids".to_string(), 2, 860),
+                ("tools".to_string(), 2, 420)
+            ],
             "{d}: GROUP BY / HAVING"
         );
 
@@ -254,8 +372,14 @@ impl Scenario for Expressions {
             .columns(&["category"])
             .order_by(Expr::col("category").asc())
             .build_with_dialect(dialect);
-        let rows = expect_outcome(conn.query(cx, &sql, &params).await, &format!("{d}: distinct"));
-        let cats: Vec<String> = rows.iter().map(|r| r.get_as::<String>(0).unwrap()).collect();
+        let rows = expect_outcome(
+            conn.query(cx, &sql, &params).await,
+            &format!("{d}: distinct"),
+        );
+        let cats: Vec<String> = rows
+            .iter()
+            .map(|r| r.get_as::<String>(0).unwrap())
+            .collect();
         assert_eq!(cats, ["fluids", "hardware", "tools"], "{d}");
 
         // ORDER BY DESC + LIMIT/OFFSET.
@@ -275,12 +399,18 @@ impl Scenario for Expressions {
 
         // Result-shape helpers.
         let one: Item = expect_outcome(
-            select!(Item).filter(Expr::col("id").eq(3)).one(cx, conn).await,
+            select!(Item)
+                .filter(Expr::col("id").eq(3))
+                .one(cx, conn)
+                .await,
             &format!("{d}: one"),
         );
         assert_eq!(one.name, "bolt", "{d}");
         let none: Option<Item> = expect_outcome(
-            select!(Item).filter(Expr::col("id").eq(99)).one_or_none(cx, conn).await,
+            select!(Item)
+                .filter(Expr::col("id").eq(99))
+                .one_or_none(cx, conn)
+                .await,
             &format!("{d}: one_or_none"),
         );
         assert!(none.is_none(), "{d}");
@@ -303,19 +433,24 @@ impl Scenario for Expressions {
         assert_eq!(n, 2, "{d}: count()");
 
         // EXISTS subquery.
-        let any_expensive = Select::<Item>::new()
-            .filter(price().gt(700))
-            .into_exists();
+        let any_expensive = Select::<Item>::new().filter(price().gt(700)).into_exists();
         assert_eq!(
-            ids(cx, conn, select!(Item).filter(any_expensive), "exists").await.len(),
+            ids(cx, conn, select!(Item).filter(any_expensive), "exists")
+                .await
+                .len(),
             6,
             "{d}: EXISTS true keeps every row"
         );
-        let none_that_expensive = Select::<Item>::new()
-            .filter(price().gt(9000))
-            .into_exists();
+        let none_that_expensive = Select::<Item>::new().filter(price().gt(9000)).into_exists();
         assert!(
-            ids(cx, conn, select!(Item).filter(none_that_expensive), "not exists").await.is_empty(),
+            ids(
+                cx,
+                conn,
+                select!(Item).filter(none_that_expensive),
+                "not exists"
+            )
+            .await
+            .is_empty(),
             "{d}: EXISTS false removes every row"
         );
 

@@ -1714,8 +1714,26 @@ impl Expr {
             Expr::Placeholder(idx) => dialect.placeholder(*idx),
 
             Expr::Binary { left, op, right } => {
-                let left_sql = left.build_with_dialect(dialect, params, offset);
-                let right_sql = right.build_with_dialect(dialect, params, offset);
+                // A child that binds looser than this operator (or as tightly,
+                // on the right of a non-associative one) must be parenthesized
+                // or the database regroups it: `a OR b AND c` is `a OR (b AND c)`.
+                let needs_parens = |child: &Expr, rhs: bool| match child {
+                    Expr::Binary { op: child_op, .. } => {
+                        child_op.precedence() < op.precedence()
+                            || (rhs
+                                && child_op.precedence() == op.precedence()
+                                && matches!(op, BinaryOp::Sub | BinaryOp::Div | BinaryOp::Mod))
+                    }
+                    _ => false,
+                };
+                let mut left_sql = left.build_with_dialect(dialect, params, offset);
+                if needs_parens(left, false) {
+                    left_sql = format!("({left_sql})");
+                }
+                let mut right_sql = right.build_with_dialect(dialect, params, offset);
+                if needs_parens(right, true) {
+                    right_sql = format!("({right_sql})");
+                }
                 if *op == BinaryOp::Concat && dialect == Dialect::Mysql {
                     format!("CONCAT({left_sql}, {right_sql})")
                 } else {
@@ -1724,7 +1742,11 @@ impl Expr {
             }
 
             Expr::Unary { op, expr } => {
-                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                let mut expr_sql = expr.build_with_dialect(dialect, params, offset);
+                if matches!(**expr, Expr::Binary { .. }) {
+                    // `NOT a AND b` is `(NOT a) AND b`; the operand is one unit.
+                    expr_sql = format!("({expr_sql})");
+                }
                 match op {
                     UnaryOp::Not => format!("NOT {expr_sql}"),
                     UnaryOp::Neg => format!("-{expr_sql}"),
@@ -2655,6 +2677,47 @@ mod tests {
         let mut params = Vec::new();
         let sql = expr.build(&mut params, 0);
         assert_eq!(sql, "NOT \"active\"");
+    }
+
+    /// Found by the e2e expression scenario (2026-09): `a.or(b).and(c)`
+    /// rendered `a OR b AND c`, which every database reads as `a OR (b AND c)`.
+    #[test]
+    fn looser_binding_children_are_parenthesized() {
+        let expr = Expr::col("a")
+            .eq(1)
+            .or(Expr::col("b").eq(2))
+            .and(Expr::col("c").eq(3));
+        let mut params = Vec::new();
+        let sql = expr.build(&mut params, 0);
+        assert_eq!(sql, "(\"a\" = $1 OR \"b\" = $2) AND \"c\" = $3");
+
+        // Same precedence on the left never needs parentheses.
+        let expr = Expr::col("a")
+            .eq(1)
+            .and(Expr::col("b").eq(2))
+            .and(Expr::col("c").eq(3));
+        let mut params = Vec::new();
+        assert_eq!(
+            expr.build(&mut params, 0),
+            "\"a\" = $1 AND \"b\" = $2 AND \"c\" = $3"
+        );
+
+        // A looser child on the right, and a same-precedence right child of a
+        // non-associative operator.
+        let expr = Expr::col("a").mul(Expr::col("b").add(1));
+        let mut params = Vec::new();
+        assert_eq!(expr.build(&mut params, 0), "\"a\" * (\"b\" + $1)");
+        let expr = Expr::col("a").sub(Expr::col("b").sub(1));
+        let mut params = Vec::new();
+        assert_eq!(expr.build(&mut params, 0), "\"a\" - (\"b\" - $1)");
+
+        // NOT applies to the whole binary operand.
+        let expr = Expr::col("a").eq(1).and(Expr::col("b").eq(2)).not();
+        let mut params = Vec::new();
+        assert_eq!(
+            expr.build(&mut params, 0),
+            "NOT (\"a\" = $1 AND \"b\" = $2)"
+        );
     }
 
     // ==================== Null Tests ====================

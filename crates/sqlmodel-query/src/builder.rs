@@ -1812,7 +1812,7 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
         } else {
             format!(
                 "INSERT INTO {table_q} ({}) VALUES {}",
-                quoted_list(dialect, &columns),
+                quoted_list(dialect, columns),
                 value_groups.join(", ")
             )
         };
