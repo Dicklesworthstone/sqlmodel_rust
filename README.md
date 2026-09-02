@@ -541,7 +541,11 @@ Control. We need deep integration with asupersync's capability context for cance
 
 ### Is this production-ready?
 
-Nearly. Core functionality is complete: query execution, connection pooling, transactions, and drivers for PostgreSQL, MySQL, and SQLite all work. However, the API may still change before 1.0, and test coverage for edge cases is ongoing.
+Not yet, and the README tries not to overstate it. Every core path exists and is unit-tested (about
+2,000 tests): query execution, connection pooling, transactions, migrations, and drivers for
+PostgreSQL, MySQL, SQLite, and FrankenSQLite. End-to-end coverage against live PostgreSQL and MySQL
+runs in CI's integration job; the pre-1.0 API may still change, and the tracker (`bv --robot-triage`)
+lists the remaining proof and hardening work honestly.
 
 ### Does it work with tokio?
 
