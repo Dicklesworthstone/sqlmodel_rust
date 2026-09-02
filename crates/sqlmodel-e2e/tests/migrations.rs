@@ -88,6 +88,55 @@ impl Scenario for Migrations {
         let reapplied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: re-apply"));
         assert_eq!(reapplied, vec!["0003_gadgets"], "{d}");
 
+        // the recorded checksum is the migration's own fingerprint
+        let recorded = expect_outcome(
+            conn.query(
+                cx,
+                &format!("SELECT checksum FROM {tracking} WHERE id = '0002_seed'"),
+                &[],
+            )
+            .await,
+            &format!("{d}: read checksum"),
+        );
+        let seed = &runner_migrations(&widgets, &gadgets, &q)[1];
+        assert_eq!(
+            recorded[0].get_as::<String>(0).unwrap(),
+            seed.checksum(),
+            "{d}: checksum recorded on apply"
+        );
+
+        // drift: editing an applied migration's SQL is reported and blocks the runner
+        let drifted_runner = MigrationRunner::new({
+            let mut all = runner_migrations(&widgets, &gadgets, &q);
+            all[1].up.push_str(" -- edited after it was applied");
+            all
+        })
+        .table_name(&tracking);
+        let status = expect_outcome(
+            drifted_runner.status(cx, conn).await,
+            &format!("{d}: status with drift"),
+        );
+        assert!(
+            matches!(&status[1], (id, MigrationStatus::Drifted { .. }) if id == "0002_seed"),
+            "{d}: {status:?}"
+        );
+        assert!(
+            matches!(&status[0], (_, MigrationStatus::Applied { .. })),
+            "{d}: unedited migrations stay Applied: {status:?}"
+        );
+        match drifted_runner.migrate(cx, conn).await {
+            Outcome::Err(e) => assert!(
+                e.to_string().contains("0002_seed"),
+                "{d}: drift error must name the migration: {e}"
+            ),
+            other => panic!("{d}: migrate must refuse on drift, got {other:?}"),
+        }
+        assert_eq!(
+            recorded_ids(cx, conn, &tracking).await.len(),
+            3,
+            "{d}: drift changed nothing"
+        );
+
         // a failing migration is not recorded and earlier ones stay applied
         let mut broken = vec![Migration::new(
             "0004_broken",
