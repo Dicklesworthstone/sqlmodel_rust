@@ -89,8 +89,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose
 
-      - name: Run doc tests
-        run: cargo test --workspace --doc
+      - name: Run doc tests (README doctests need the nightly-try feature)
+        run: cargo test --workspace --doc --features sqlmodel/nightly-try
 
   integration:
     # Postgres and MySQL end-to-end suites. Until this job existed the

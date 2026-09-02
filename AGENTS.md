@@ -163,7 +163,9 @@ Every component crate includes inline `#[cfg(test)]` unit tests alongside the im
 - Edge cases (empty input, max values, boundary conditions)
 - Error conditions
 
-Cross-component integration tests live in `crates/sqlmodel/tests/` (in-memory C SQLite, behind the facade's `c-sqlite-tests` feature) and in the drivers' `tests/` directories (Postgres and MySQL suites, env-gated on `SQLMODEL_TEST_POSTGRES_URL` / `SQLMODEL_TEST_MYSQL_URL`; CI's `integration` job provides live services). There is no workspace-level `tests/` directory. An all-driver end-to-end crate (`crates/sqlmodel-e2e`, publish = false) is tracked as bd-slot.2.
+Cross-component integration tests live in `crates/sqlmodel/tests/` (in-memory C SQLite, behind the facade's `c-sqlite-tests` feature) and in the drivers' `tests/` directories (Postgres and MySQL suites, env-gated on `SQLMODEL_TEST_POSTGRES_URL` / `SQLMODEL_TEST_MYSQL_URL`; CI's `integration` job provides live services). There is no workspace-level `tests/` directory.
+
+The all-driver end-to-end crate `crates/sqlmodel-e2e` (publish = false) runs one ORM-level scenario per file (`smoke`, `types`, `migrations`, `session`, `pool`, `concurrent_writers`) on C SQLite (memory and file), FrankenSQLite, and — when the URL variables above are set — PostgreSQL, MySQL, and MariaDB (`SQLMODEL_TEST_MARIADB_URL`). Absent network drivers are reported, never skipped silently. Run it with `cargo test -p sqlmodel-e2e`; against local Docker databases it must run on this machine (see the RCH escape hatch below). Every "first run on a real database" so far has found driver defects that unit tests could not see, so a change to a driver, the query builder, or the schema builder is not done until this crate is green on the affected drivers.
 
 ### Unit Tests
 
@@ -360,7 +362,7 @@ console = ["dep:sqlmodel-console"]   # Console support for SQLite
 - **FrankenSQLite adapter** — pure-Rust SQLite with MVCC (BEGIN CONCURRENT); C SQLite still needed for triggers and `sqlite_master`
 - **Connection trait** — all drivers implement the same `Connection` trait with `query()`, `execute()`, `prepare()`
 - **asupersync exclusively** — NO tokio/reqwest/hyper. All async via `Cx` + structured concurrency
-- **Cancel-correct lifecycle** — all database operations support cancellation via `cx.checkpoint()` and budget/timeout via `cx.budget()`
+- **Cancel-correct lifecycle** — every `Connection` operation in every driver checks `sqlmodel_core::cancel_requested(cx)` before touching the database and returns `Outcome::Cancelled` for an already-cancelled context; the network drivers also stop at their cancel-aware connection lock, and `retry_transaction` / `Session::with_retry` respect `cx.budget()` deadlines. The two SQLite drivers run statements synchronously, so a statement that has started cannot be interrupted there. (The e2e Session scenario proved in 2026-09 that this had been claimed but not implemented in the drivers.)
 - **LabRuntime for deterministic tests** — virtual time, DPOR schedule exploration, correctness oracles
 
 ### Legacy Code Reference
