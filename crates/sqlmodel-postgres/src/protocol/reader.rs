@@ -91,9 +91,9 @@ impl MessageReader {
 
     /// Append raw bytes to the internal buffer without parsing.
     ///
-    /// Use this when the caller will drive parsing via [`next_message()`] in
+    /// Use this when the caller will drive parsing via [`Self::next_message`] in
     /// its own loop (e.g. `receive_message_no_cx`). This avoids the
-    /// consume-then-discard bug where [`feed()`] parses and returns messages
+    /// consume-then-discard bug where [`Self::feed`] parses and returns messages
     /// that the caller never inspects.
     pub fn push(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
