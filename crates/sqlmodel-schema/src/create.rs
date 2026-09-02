@@ -204,7 +204,7 @@ impl<M: Model> CreateTable<M> {
             // differently, and getting this wrong silently yields a key that never
             // auto-assigns (which is what happened on PostgreSQL and MySQL before the
             // builder knew its dialect).
-            let sql_type = field.effective_sql_type();
+            let sql_type = field.effective_sql_type_for(self.dialect);
             match self.dialect {
                 // Only `INTEGER PRIMARY KEY` is rowid-backed and auto-assigning in SQLite.
                 Dialect::Sqlite => def.push_str("INTEGER PRIMARY KEY"),
@@ -222,7 +222,7 @@ impl<M: Model> CreateTable<M> {
                 }
             }
         } else {
-            def.push_str(&field.effective_sql_type());
+            def.push_str(&field.effective_sql_type_for(self.dialect));
             if !field.nullable && !field.auto_increment {
                 def.push_str(" NOT NULL");
             }
@@ -1390,7 +1390,7 @@ impl SchemaBuilder {
 }
 
 fn alter_table_add_column(dialect: Dialect, table: &str, field: &FieldInfo) -> String {
-    let sql_type = field.effective_sql_type();
+    let sql_type = field.effective_sql_type_for(dialect);
     let mut stmt = format!(
         "ALTER TABLE {} ADD COLUMN {} {}",
         dialect.quote_identifier(table),

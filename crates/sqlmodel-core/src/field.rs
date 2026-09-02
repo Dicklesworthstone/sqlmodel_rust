@@ -307,6 +307,27 @@ impl FieldInfo {
         self.sql_type.sql_name()
     }
 
+    /// The DDL type for `dialect`: the explicit `sql_type` override if any,
+    /// otherwise the precision-aware name, adapted to the dialect via
+    /// [`SqlType::sql_name_for`] (for example `BYTEA` instead of `BLOB` on
+    /// PostgreSQL, `BINARY(16)` instead of `UUID` on MySQL).
+    pub fn effective_sql_type_for(&self, dialect: crate::connection::Dialect) -> String {
+        if let Some(override_str) = self.sql_type_override {
+            return override_str.to_string();
+        }
+        if let (SqlType::Decimal { .. } | SqlType::Numeric { .. }, Some(p), Some(s)) =
+            (&self.sql_type, self.precision, self.scale)
+        {
+            let type_name = if matches!(self.sql_type, SqlType::Decimal { .. }) {
+                "DECIMAL"
+            } else {
+                "NUMERIC"
+            };
+            return format!("{type_name}({p}, {s})");
+        }
+        self.sql_type.sql_name_for(dialect)
+    }
+
     /// Set nullable flag.
     pub const fn nullable(mut self, value: bool) -> Self {
         self.nullable = value;

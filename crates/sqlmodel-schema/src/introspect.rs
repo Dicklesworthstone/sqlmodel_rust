@@ -283,17 +283,12 @@ pub struct Introspector {
     dialect: Dialect,
 }
 
-/// Supported database dialects.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Dialect {
-    /// SQLite
-    #[default]
-    Sqlite,
-    /// PostgreSQL
-    Postgres,
-    /// MySQL/MariaDB
-    Mysql,
-}
+/// The database dialect: the same type the drivers report from
+/// [`sqlmodel_core::Connection::dialect`], so an introspector or schema can be
+/// built directly from a connection (`Introspector::new(conn.dialect())`).
+/// This crate used to define its own identical-looking enum here, which could
+/// not be passed where the core type was expected.
+pub use sqlmodel_core::Dialect;
 
 impl Introspector {
     /// Create a new introspector for the given dialect.

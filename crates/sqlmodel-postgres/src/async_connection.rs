@@ -1456,6 +1456,9 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1473,6 +1476,9 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1496,6 +1502,9 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1513,6 +1522,9 @@ impl Connection for SharedPgConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1528,6 +1540,9 @@ impl Connection for SharedPgConnection {
         let inner = Arc::clone(&self.inner);
         let statements = statements.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1572,6 +1587,9 @@ impl Connection for SharedPgConnection {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1589,6 +1607,9 @@ impl Connection for SharedPgConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1606,6 +1627,9 @@ impl Connection for SharedPgConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1616,6 +1640,9 @@ impl Connection for SharedPgConnection {
     fn ping(&self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1660,6 +1687,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1677,6 +1707,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1700,6 +1733,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1715,6 +1751,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
                 return Outcome::Err(e);
             }
             let sql = format!("SAVEPOINT {}", name);
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1730,6 +1769,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
                 return Outcome::Err(e);
             }
             let sql = format!("ROLLBACK TO SAVEPOINT {}", name);
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1745,6 +1787,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
                 return Outcome::Err(e);
             }
             let sql = format!("RELEASE SAVEPOINT {}", name);
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1757,6 +1802,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
     fn commit(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -1772,6 +1820,9 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
     fn rollback(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };

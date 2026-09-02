@@ -2261,6 +2261,9 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2278,6 +2281,9 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2301,6 +2307,9 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2318,6 +2327,9 @@ impl Connection for SharedMySqlConnection {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2338,6 +2350,9 @@ impl Connection for SharedMySqlConnection {
         let inner = Arc::clone(&self.inner);
         let statements = statements.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2382,6 +2397,9 @@ impl Connection for SharedMySqlConnection {
         let inner = Arc::clone(&self.inner);
         let sql = sql.to_string();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2399,6 +2417,9 @@ impl Connection for SharedMySqlConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2416,6 +2437,9 @@ impl Connection for SharedMySqlConnection {
         let stmt = stmt.clone();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2426,6 +2450,9 @@ impl Connection for SharedMySqlConnection {
     fn ping(&self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2465,6 +2492,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2482,6 +2512,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2505,6 +2538,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2521,6 +2557,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             // Return validation error if name was invalid
             if let Err(e) = validation_result {
                 return Outcome::Err(e);
+            }
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
             }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
@@ -2544,6 +2583,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             if let Err(e) = validation_result {
                 return Outcome::Err(e);
             }
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2565,6 +2607,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
             // Return validation error if name was invalid
             if let Err(e) = validation_result {
                 return Outcome::Err(e);
+            }
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
             }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));

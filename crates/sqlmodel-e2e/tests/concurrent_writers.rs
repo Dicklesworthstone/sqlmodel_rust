@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
+use serde::{Deserialize, Serialize};
 use sqlmodel::prelude::*;
+use sqlmodel::{Session, SessionConfig, TransactionMode};
 use sqlmodel_core::TransactionOps;
 use sqlmodel_core::error::TransactionErrorKind;
 use sqlmodel_e2e::{
@@ -20,6 +22,117 @@ use sqlmodel_e2e::{
 };
 
 const INCREMENTS_PER_WRITER: u32 = 25;
+
+/// The counter row as a model, for the `Session::with_retry` variant.
+#[derive(sqlmodel::Model, Debug, Clone, Serialize, Deserialize)]
+#[sqlmodel(table = "e2e_session_counter")]
+struct SessionCounter {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    counter: i64,
+}
+
+/// The same increments through the unit of work: `Session::with_retry` around
+/// a read-modify-write of the counter row (`get` + `mark_dirty` + commit).
+/// FrankenSQLite detects the conflicting page at commit and the session
+/// retries; PostgreSQL/MySQL take a row lock (`SELECT ... FOR UPDATE`) so the
+/// read-modify-write serializes instead of losing updates. Returns the number
+/// of attempts and hands the connection back.
+fn hammer_session<C: Connection>(conn: C, for_update: bool) -> (u32, C) {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let cx = Cx::for_testing();
+    let mut session = Session::with_config(
+        conn,
+        SessionConfig::default().with_transaction_mode(TransactionMode::Concurrent),
+    );
+    let policy = RetryPolicy::default()
+        .max_attempts(50)
+        .base_delay(Duration::from_millis(2))
+        .max_delay(Duration::from_millis(40));
+    let options = GetOptions::new().with_for_update(for_update);
+    let attempts = AtomicU32::new(0);
+    for i in 0..INCREMENTS_PER_WRITER {
+        let out = rt.block_on(session.with_retry(&cx, &policy, async |cx, s| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            let mut row: SessionCounter =
+                match s.get_with_options(cx, &[Value::BigInt(1)], &options).await {
+                    Outcome::Ok(Some(row)) => row,
+                    Outcome::Ok(None) => {
+                        return Outcome::Err(Error::Custom("counter row missing".into()));
+                    }
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+            row.counter += 1;
+            s.mark_dirty(&row);
+            Outcome::Ok(())
+        }));
+        expect_outcome(out, &format!("session increment {i}"));
+    }
+    (attempts.load(Ordering::Relaxed), session.into_connection())
+}
+
+fn run_pair_sessions<C: Connection>(a: C, b: C, for_update: bool) -> (u32, i64) {
+    let cx = Cx::for_testing();
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let quoted = a
+        .dialect()
+        .quote_identifier(<SessionCounter as Model>::TABLE_NAME);
+    rt.block_on(async {
+        expect_outcome(
+            a.execute(&cx, &format!("DROP TABLE IF EXISTS {quoted}"), &[])
+                .await,
+            "drop stale session counter",
+        );
+        expect_outcome(
+            a.execute(
+                &cx,
+                &format!("CREATE TABLE {quoted} (id BIGINT PRIMARY KEY, counter BIGINT NOT NULL)"),
+                &[],
+            )
+            .await,
+            "create session counter",
+        );
+        expect_outcome(
+            a.execute(
+                &cx,
+                &format!("INSERT INTO {quoted} (id, counter) VALUES (1, 0)"),
+                &[],
+            )
+            .await,
+            "seed session counter",
+        );
+    });
+
+    let ((attempts_a, a), (attempts_b, _b)) = std::thread::scope(|s| {
+        let ta = s.spawn(move || hammer_session(a, for_update));
+        let tb = s.spawn(move || hammer_session(b, for_update));
+        (
+            ta.join().expect("session writer a"),
+            tb.join().expect("session writer b"),
+        )
+    });
+
+    let final_value = rt.block_on(async {
+        let rows = expect_outcome(
+            a.query(
+                &cx,
+                &format!("SELECT counter FROM {quoted} WHERE id = 1"),
+                &[],
+            )
+            .await,
+            "read final session counter",
+        );
+        let v = rows[0].get_as::<i64>(0).unwrap();
+        expect_outcome(
+            a.execute(&cx, &format!("DROP TABLE {quoted}"), &[]).await,
+            "drop session counter",
+        );
+        v
+    });
+    (attempts_a + attempts_b, final_value)
+}
 
 /// Run `INCREMENTS_PER_WRITER` retried increments on `conn` from one thread.
 /// Returns the number of retry-loop bodies executed (>= increments; the excess
@@ -175,6 +288,26 @@ fn two_writers_never_lose_an_update_and_conflicts_are_retried() {
             "sqlmodel-e2e: {} final={final_value} bodies={bodies} retried={}",
             driver.name(),
             bodies - INCREMENTS_PER_WRITER * 2
+        );
+
+        // The same contention through `Session::with_retry`.
+        let for_update = matches!(driver.dialect(), Dialect::Postgres | Dialect::Mysql);
+        let (attempts, final_value) = match pair {
+            ConnectionPair::Franken(a, b) => run_pair_sessions(a, b, for_update),
+            ConnectionPair::Postgres(a, b) => run_pair_sessions(a, b, for_update),
+            ConnectionPair::MySql(a, b) => run_pair_sessions(a, b, for_update),
+            ConnectionPair::CSqlite(..) => unreachable!("handled above"),
+        };
+        assert_eq!(
+            final_value,
+            expected,
+            "{}: Session::with_retry must land every increment exactly once (attempts: {attempts})",
+            driver.name()
+        );
+        eprintln!(
+            "sqlmodel-e2e: {} session final={final_value} attempts={attempts} retried={}",
+            driver.name(),
+            attempts - INCREMENTS_PER_WRITER * 2
         );
         exercised.push(driver.name().to_string());
         driver_cleanup(&driver);

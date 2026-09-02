@@ -167,6 +167,51 @@ enum Backoff {
 }
 
 /// Sleep for `delay` unless that would overrun the `Cx` budget deadline.
+/// What a caller running its own retry loop should do after a failed attempt.
+#[derive(Debug)]
+pub enum RetryDecision {
+    /// The error was retryable and the backoff delay has elapsed: run the next attempt.
+    Retry,
+    /// Stop and return this error (not retryable, attempts exhausted, or the
+    /// `Cx` deadline would pass during the backoff).
+    GiveUp(Error),
+}
+
+impl RetryPolicy {
+    /// Decide what to do after attempt number `attempt` (1-based) failed with
+    /// `error`, sleeping the jittered backoff first when the answer is
+    /// [`RetryDecision::Retry`]. Never sleeps past the `Cx` budget deadline;
+    /// in that case the decision is to give up with
+    /// [`crate::TransactionErrorKind::RetriesExhausted`].
+    ///
+    /// This is the building block [`retry_transaction`] and
+    /// `Session::with_retry` share; use it directly for a retry loop around
+    /// anything else.
+    pub async fn after_failure(&self, cx: &Cx, attempt: u32, error: Error) -> RetryDecision {
+        if !self.should_retry(&error, attempt) {
+            return RetryDecision::GiveUp(finalize_error(error, attempt));
+        }
+        tracing::debug!(
+            target: "sqlmodel_core::retry",
+            attempt,
+            max_attempts = self.max_attempts,
+            error = %error,
+            "attempt failed with a retryable error; backing off before retrying"
+        );
+        match backoff(cx, self.delay_after(attempt, seed(cx, attempt))).await {
+            Backoff::Waited => RetryDecision::Retry,
+            Backoff::BudgetExceeded => {
+                tracing::warn!(
+                    target: "sqlmodel_core::retry",
+                    attempt,
+                    "budget deadline too close for another backoff; giving up"
+                );
+                RetryDecision::GiveUp(Error::retries_exhausted(attempt, &error))
+            }
+        }
+    }
+}
+
 async fn backoff(cx: &Cx, delay: Duration) -> Backoff {
     if delay.is_zero() {
         return Backoff::Waited;
@@ -226,17 +271,10 @@ where
 
         let tx = match Connection::begin_with_options(conn, cx, options).await {
             Outcome::Ok(tx) => tx,
-            Outcome::Err(e) => {
-                if !policy.should_retry(&e, attempt) {
-                    return Outcome::Err(finalize_error(e, attempt));
-                }
-                match backoff(cx, policy.delay_after(attempt, seed(cx, attempt))).await {
-                    Backoff::Waited => continue,
-                    Backoff::BudgetExceeded => {
-                        return Outcome::Err(Error::retries_exhausted(attempt, &e));
-                    }
-                }
-            }
+            Outcome::Err(e) => match policy.after_failure(cx, attempt, e).await {
+                RetryDecision::Retry => continue,
+                RetryDecision::GiveUp(e) => return Outcome::Err(e),
+            },
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
@@ -264,26 +302,9 @@ where
             }
         };
 
-        if !policy.should_retry(&failure, attempt) {
-            return Outcome::Err(finalize_error(failure, attempt));
-        }
-        tracing::debug!(
-            target: "sqlmodel_core::retry",
-            attempt,
-            max_attempts = policy.max_attempts,
-            error = %failure,
-            "transaction attempt failed with a retryable error; retrying"
-        );
-        match backoff(cx, policy.delay_after(attempt, seed(cx, attempt))).await {
-            Backoff::Waited => {}
-            Backoff::BudgetExceeded => {
-                tracing::warn!(
-                    target: "sqlmodel_core::retry",
-                    attempt,
-                    "budget deadline too close for another backoff; giving up"
-                );
-                return Outcome::Err(Error::retries_exhausted(attempt, &failure));
-            }
+        match policy.after_failure(cx, attempt, failure).await {
+            RetryDecision::Retry => {}
+            RetryDecision::GiveUp(e) => return Outcome::Err(e),
         }
     }
 }

@@ -53,9 +53,11 @@ pub use identity_map::{IdentityMap, ModelReadGuard, ModelRef, ModelWriteGuard, W
 pub use n1_detection::{CallSite, N1DetectionScope, N1QueryTracker, N1Stats};
 pub use unit_of_work::{PendingCounts, UnitOfWork, UowError};
 
-use asupersync::{Cx, Outcome};
+use asupersync::{CancelReason, Cx, Outcome};
 use serde::{Deserialize, Serialize};
-use sqlmodel_core::{Connection, Error, Lazy, LazyLoader, Model, TransactionMode, Value};
+use sqlmodel_core::{
+    Connection, Error, Lazy, LazyLoader, Model, RetryDecision, RetryPolicy, TransactionMode, Value,
+};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
@@ -269,17 +271,23 @@ fn hash_values(values: &[Value]) -> u64 {
                 1u8.hash(&mut hasher);
                 b.hash(&mut hasher);
             }
+            // Every integer width hashes as the same i64: drivers report the
+            // same column as `Int` or `BigInt` depending on the value or the
+            // declared type (C SQLite returns `Int` for anything that fits i32),
+            // and a key built from `BigInt(2)` must still find the row whose
+            // `__parent_pk` came back as `Int(2)`. Distinguishing the widths made
+            // `load_one_to_many` return zero children on C SQLite.
             Value::TinyInt(i) => {
-                2u8.hash(&mut hasher);
-                i.hash(&mut hasher);
+                5u8.hash(&mut hasher);
+                i64::from(*i).hash(&mut hasher);
             }
             Value::SmallInt(i) => {
-                3u8.hash(&mut hasher);
-                i.hash(&mut hasher);
+                5u8.hash(&mut hasher);
+                i64::from(*i).hash(&mut hasher);
             }
             Value::Int(i) => {
-                4u8.hash(&mut hasher);
-                i.hash(&mut hasher);
+                5u8.hash(&mut hasher);
+                i64::from(*i).hash(&mut hasher);
             }
             Value::BigInt(i) => {
                 5u8.hash(&mut hasher);
@@ -524,6 +532,12 @@ impl<C: Connection> Session<C> {
     }
 
     /// Get a reference to the underlying connection.
+    /// Give the connection back, discarding the session's tracking state. A
+    /// transaction the session left open stays open on the connection.
+    pub fn into_connection(self) -> C {
+        self.connection
+    }
+
     pub fn connection(&self) -> &C {
         &self.connection
     }
@@ -1323,6 +1337,12 @@ impl<C: Connection> Session<C> {
         if self.in_transaction {
             return Outcome::Ok(());
         }
+        if cx.is_cancel_requested() {
+            return Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("Session::begin cancelled")),
+            );
+        }
 
         let mode = self.config.transaction_mode;
         let dialect = self.connection.dialect();
@@ -1348,6 +1368,16 @@ impl<C: Connection> Session<C> {
     ///
     /// This executes INSERT, UPDATE, and DELETE statements but does NOT commit.
     pub async fn flush(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        // A flush requested under an already-cancelled `Cx` must not touch the
+        // database: the pending changes stay pending so a later flush with a
+        // live `Cx` (or a rollback) can decide what happens to them.
+        if cx.is_cancel_requested() {
+            return Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("Session::flush cancelled")),
+            );
+        }
+
         // Fire before_flush event
         if let Err(e) = self.event_callbacks.fire(SessionEvent::BeforeFlush) {
             return Outcome::Err(e);
@@ -2064,6 +2094,107 @@ impl<C: Connection> Session<C> {
     }
 
     /// Rollback the current transaction.
+    /// Run `work` against this session and commit, retrying the whole unit of
+    /// work when a flush or the commit fails with a retryable error (a
+    /// serialization failure, deadlock, or busy-snapshot conflict under
+    /// [`TransactionMode::Concurrent`], for example).
+    ///
+    /// Between attempts the open transaction is rolled back and the identity
+    /// map is cleared, so `work` must re-`add` / re-`get` everything it needs;
+    /// nothing from a failed attempt survives into the next one. The policy's
+    /// backoff respects the `Cx` budget deadline, and a cancelled `Cx` is never
+    /// retried. On give-up the returned error is the last failure, or
+    /// [`sqlmodel_core::TransactionErrorKind::RetriesExhausted`] when the
+    /// attempts ran out.
+    ///
+    /// ```ignore
+    /// let moved = session
+    ///     .with_retry(cx, &RetryPolicy::default(), async |cx, session| {
+    ///         let mut from: Account = session.get(cx, 1i64).await?.expect("account 1");
+    ///         from.balance -= 10;
+    ///         session.mark_dirty(&from);
+    ///         Outcome::Ok(10)
+    ///     })
+    ///     .await?;
+    /// ```
+    pub async fn with_retry<T, F>(
+        &mut self,
+        cx: &Cx,
+        policy: &RetryPolicy,
+        mut work: F,
+    ) -> Outcome<T, Error>
+    where
+        F: AsyncFnMut(&Cx, &mut Self) -> Outcome<T, Error>,
+    {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            if cx.is_cancel_requested() {
+                return Outcome::Cancelled(CancelReason::user("Session::with_retry cancelled"));
+            }
+
+            // Open the transaction before `work` runs, so raw statements issued
+            // through `self.connection()` inside the closure are part of the
+            // retried unit (auto-begin would otherwise only start it at flush).
+            if !self.in_transaction {
+                match self.begin(cx).await {
+                    Outcome::Ok(()) => {}
+                    Outcome::Err(e) => match policy.after_failure(cx, attempt, e).await {
+                        RetryDecision::Retry => continue,
+                        RetryDecision::GiveUp(e) => return Outcome::Err(e),
+                    },
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                }
+            }
+
+            let failure = match work(cx, self).await {
+                Outcome::Ok(value) => match self.commit(cx).await {
+                    Outcome::Ok(()) => return Outcome::Ok(value),
+                    Outcome::Err(e) => e,
+                    Outcome::Cancelled(r) => {
+                        self.reset_after_failed_attempt(cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        self.reset_after_failed_attempt(cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                },
+                Outcome::Err(e) => e,
+                Outcome::Cancelled(r) => {
+                    self.reset_after_failed_attempt(cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    self.reset_after_failed_attempt(cx).await;
+                    return Outcome::Panicked(p);
+                }
+            };
+
+            self.reset_after_failed_attempt(cx).await;
+            match policy.after_failure(cx, attempt, failure).await {
+                RetryDecision::Retry => {}
+                RetryDecision::GiveUp(e) => return Outcome::Err(e),
+            }
+        }
+    }
+
+    /// Roll back whatever a failed attempt left open and forget every tracked
+    /// object, so the next attempt (or the caller) starts from a clean session.
+    async fn reset_after_failed_attempt(&mut self, cx: &Cx) {
+        if self.in_transaction {
+            // The connection may already have discarded the transaction; either
+            // way the session must not believe it is still inside one.
+            let _ = self.connection.execute(cx, "ROLLBACK", &[]).await;
+            self.in_transaction = false;
+        }
+        self.identity_map.clear();
+        self.pending_new.clear();
+        self.pending_delete.clear();
+        self.pending_dirty.clear();
+    }
+
     pub async fn rollback(&mut self, cx: &Cx) -> Outcome<(), Error> {
         if self.in_transaction {
             match self.connection.execute(cx, "ROLLBACK", &[]).await {

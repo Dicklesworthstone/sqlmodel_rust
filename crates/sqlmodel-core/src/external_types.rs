@@ -151,6 +151,12 @@ mod chrono_impls {
         fn try_from(value: Value) -> Result<Self, Error> {
             match &value {
                 Value::Date(days) => date_from_days(*days),
+                // Drivers without a date type store `Value::Date` as its integer payload
+                // (days since 1970-01-01) and report it back as a plain integer.
+                Value::Int(days) => date_from_days(*days),
+                Value::BigInt(days) => i32::try_from(*days)
+                    .map_err(|_| type_error("date", &value, "chrono::NaiveDate"))
+                    .and_then(date_from_days),
                 Value::Timestamp(us) | Value::TimestampTz(us) => {
                     datetime_from_micros(*us, "chrono::NaiveDate").map(|dt| dt.date_naive())
                 }
@@ -166,7 +172,8 @@ mod chrono_impls {
 
         fn try_from(value: Value) -> Result<Self, Error> {
             match &value {
-                Value::Time(us) if *us >= 0 => {
+                // `BigInt` is the integer wire form of `Value::Time` (microseconds since midnight).
+                Value::Time(us) | Value::BigInt(us) if *us >= 0 => {
                     let secs = u32::try_from(us / MICROS_PER_SECOND).ok();
                     let nanos = u32::try_from((us % MICROS_PER_SECOND) * 1_000).ok();
                     secs.zip(nanos)
@@ -199,7 +206,8 @@ mod chrono_impls {
 
         fn try_from(value: Value) -> Result<Self, Error> {
             match &value {
-                Value::Timestamp(us) | Value::TimestampTz(us) => {
+                // `BigInt` is the integer wire form of a timestamp (microseconds since the epoch).
+                Value::Timestamp(us) | Value::TimestampTz(us) | Value::BigInt(us) => {
                     datetime_from_micros(*us, "chrono::NaiveDateTime").map(|dt| dt.naive_utc())
                 }
                 Value::Date(days) => {
@@ -217,7 +225,7 @@ mod chrono_impls {
 
         fn try_from(value: Value) -> Result<Self, Error> {
             match &value {
-                Value::TimestampTz(us) | Value::Timestamp(us) => {
+                Value::TimestampTz(us) | Value::Timestamp(us) | Value::BigInt(us) => {
                     datetime_from_micros(*us, "chrono::DateTime<Utc>")
                 }
                 Value::Text(s) => parse_naive_datetime(s)

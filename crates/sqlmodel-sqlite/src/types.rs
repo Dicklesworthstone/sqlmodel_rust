@@ -230,92 +230,18 @@ pub unsafe fn column_name(stmt: *mut ffi::sqlite3_stmt, index: c_int) -> Option<
 }
 
 /// Convert days since Unix epoch to ISO-8601 date string.
+// The ISO-8601 text forms are shared with the FrankenSQLite driver through
+// sqlmodel-core so both SQLite drivers write identical, microsecond-exact text.
 fn days_to_date(days: i32) -> String {
-    // Simple calculation - for a proper implementation, use a date library
-    // This is a naive implementation for basic testing
-    let epoch = 719_528; // Days from year 0 to 1970-01-01
-    let total_days = days + epoch;
-
-    // Calculate year, month, day from total days
-    let (year, month, day) = days_to_ymd(total_days);
-    format!("{:04}-{:02}-{:02}", year, month, day)
+    sqlmodel_core::value::iso_date(days)
 }
 
-/// Convert total days since year 0 to year/month/day.
-fn days_to_ymd(days: i32) -> (i32, u32, u32) {
-    // Simplified algorithm - good enough for testing
-    let mut remaining = days;
-    let mut year = 0i32;
-
-    // Find year
-    while remaining >= days_in_year(year) {
-        remaining -= days_in_year(year);
-        year += 1;
-    }
-    while remaining < 0 {
-        year -= 1;
-        remaining += days_in_year(year);
-    }
-
-    // Find month
-    let mut month = 1u32;
-    while remaining >= days_in_month(year, month) as i32 {
-        remaining -= days_in_month(year, month) as i32;
-        month += 1;
-    }
-
-    let day = (remaining + 1) as u32;
-    (year, month, day)
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-fn days_in_year(year: i32) -> i32 {
-    if is_leap_year(year) { 366 } else { 365 }
-}
-
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 30,
-    }
-}
-
-/// Convert microseconds since midnight to ISO-8601 time string.
 fn micros_to_time(micros: i64) -> String {
-    let total_secs = micros / 1_000_000;
-    let hours = (total_secs / 3600) % 24;
-    let minutes = (total_secs / 60) % 60;
-    let seconds = total_secs % 60;
-    let millis = (micros % 1_000_000) / 1000;
-
-    if millis > 0 {
-        format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
-    } else {
-        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-    }
+    sqlmodel_core::value::iso_time(micros)
 }
 
-/// Convert microseconds since Unix epoch to ISO-8601 timestamp.
 fn micros_to_timestamp(micros: i64) -> String {
-    let secs = micros / 1_000_000;
-    let days = (secs / 86400) as i32;
-    let time_of_day = (micros % 86_400_000_000).unsigned_abs() as i64;
-
-    let date = days_to_date(days);
-    let time = micros_to_time(time_of_day);
-
-    format!("{}T{}", date, time)
+    sqlmodel_core::value::iso_timestamp(micros)
 }
 
 /// Convert a Value to a serde_json::Value for array serialization.
@@ -412,7 +338,13 @@ mod tests {
     fn test_micros_to_time() {
         assert_eq!(micros_to_time(0), "00:00:00");
         assert_eq!(micros_to_time(3_600_000_000), "01:00:00");
-        assert_eq!(micros_to_time(3_661_123_000), "01:01:01.123");
+        // Full microsecond precision: the old three-digit fraction lost data.
+        assert_eq!(micros_to_time(3_661_123_000), "01:01:01.123000");
+        assert_eq!(micros_to_time(3_661_123_456), "01:01:01.123456");
+        assert_eq!(
+            micros_to_timestamp(-2_208_988_800_000_000),
+            "1900-01-01T00:00:00"
+        );
     }
 
     #[test]

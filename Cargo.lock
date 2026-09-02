@@ -2527,7 +2527,10 @@ name = "sqlmodel-e2e"
 version = "0.4.2"
 dependencies = [
  "asupersync",
+ "chrono",
+ "rust_decimal",
  "serde",
+ "serde_json",
  "sqlmodel",
  "sqlmodel-core",
  "sqlmodel-frankensqlite",
@@ -2538,6 +2541,7 @@ dependencies = [
  "sqlmodel-schema",
  "sqlmodel-session",
  "sqlmodel-sqlite",
+ "uuid",
 ]
 
 [[package]]

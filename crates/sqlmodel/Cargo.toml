@@ -23,6 +23,8 @@ c-sqlite-tests = ["dep:sqlmodel-sqlite"]
 chrono = ["sqlmodel-core/chrono"]
 uuid = ["sqlmodel-core/uuid"]
 decimal = ["sqlmodel-core/decimal"]
+# `?` on `Outcome` (nightly toolchain); the README examples rely on it.
+nightly-try = ["sqlmodel-core/nightly-try"]
 
 [dependencies]
 sqlmodel-core.workspace = true

@@ -873,70 +873,98 @@ impl Connection for SqliteConnection {
         sqlmodel_core::Dialect::Sqlite
     }
 
+    // The C SQLite FFI is synchronous, so every operation runs to completion
+    // before its future is returned. Cancellation is therefore honoured at one
+    // point: a `Cx` that is already cancelled never reaches SQLite (the
+    // statement is not executed and `Outcome::Cancelled` is returned).
+
     fn query(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
-        let result = self.query_sync(sql, params);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => self
+                .query_sync(sql, params)
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        };
+        async move { outcome }
     }
 
     fn query_one(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
-        let result = self.query_sync(sql, params).map(|mut rows| rows.pop());
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => self
+                .query_sync(sql, params)
+                .map(|mut rows| rows.pop())
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        };
+        async move { outcome }
     }
 
     fn execute(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<u64, Error>> + Send {
-        let result = self.execute_sync(sql, params);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => self
+                .execute_sync(sql, params)
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        };
+        async move { outcome }
     }
 
     fn insert(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<i64, Error>> + Send {
-        let result = self.insert_sync(sql, params);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => self
+                .insert_sync(sql, params)
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        };
+        async move { outcome }
     }
 
     fn batch(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         statements: &[(String, Vec<Value>)],
     ) -> impl Future<Output = Outcome<Vec<u64>, Error>> + Send {
-        let mut results = Vec::with_capacity(statements.len());
-        let mut error = None;
-
-        for (sql, params) in statements {
-            match self.execute_sync(sql, params) {
-                Ok(n) => results.push(n),
-                Err(e) => {
-                    error = Some(e);
-                    break;
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => {
+                let mut results = Vec::with_capacity(statements.len());
+                let mut error = None;
+                for (sql, params) in statements {
+                    match self.execute_sync(sql, params) {
+                        Ok(n) => results.push(n),
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match error {
+                    Some(e) => Outcome::Err(e),
+                    None => Outcome::Ok(results),
                 }
             }
-        }
-
-        async move {
-            match error {
-                Some(e) => Outcome::Err(e),
-                None => Outcome::Ok(results),
-            }
-        }
+        };
+        async move { outcome }
     }
 
     fn begin(&self, cx: &Cx) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
@@ -945,13 +973,17 @@ impl Connection for SqliteConnection {
 
     fn begin_with(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         isolation: IsolationLevel,
     ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
-        let result = self
-            .begin_sync(isolation)
-            .map(|()| SqliteTransaction::new(self));
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => self
+                .begin_sync(isolation)
+                .map(|()| SqliteTransaction::new(self))
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        };
+        async move { outcome }
     }
 
     /// C SQLite offers the three locking forms but no concurrent-writer mode.
@@ -961,20 +993,27 @@ impl Connection for SqliteConnection {
 
     fn begin_with_options(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         options: TransactionOptions,
     ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
-        let result = self
-            .begin_options_sync(options)
-            .map(|()| SqliteTransaction::new(self));
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => self
+                .begin_options_sync(options)
+                .map(|()| SqliteTransaction::new(self))
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        };
+        async move { outcome }
     }
 
     fn prepare(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
     ) -> impl Future<Output = Outcome<PreparedStatement, Error>> + Send {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return std::future::ready(Outcome::Cancelled(reason));
+        }
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let result = prepare_stmt(inner.db, sql).map(|stmt| {
             // SAFETY: stmt is valid
@@ -996,7 +1035,7 @@ impl Connection for SqliteConnection {
             PreparedStatement::with_columns(id, sql.to_string(), param_count, columns)
         });
 
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        std::future::ready(result.map_or_else(Outcome::Err, Outcome::Ok))
     }
 
     fn query_prepared(
@@ -1019,10 +1058,16 @@ impl Connection for SqliteConnection {
         self.execute(cx, stmt.sql(), params)
     }
 
-    fn ping(&self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+    fn ping(&self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         // Simple ping: execute a trivial query
-        let result = self.query_sync("SELECT 1", &[]).map(|_| ());
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let outcome = match sqlmodel_core::cancel_requested(cx) {
+            Some(reason) => Outcome::Cancelled(reason),
+            None => self
+                .query_sync("SELECT 1", &[])
+                .map(|_| ())
+                .map_or_else(Outcome::Err, Outcome::Ok),
+        };
+        async move { outcome }
     }
 
     fn close(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {

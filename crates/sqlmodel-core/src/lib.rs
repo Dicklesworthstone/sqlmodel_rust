@@ -69,7 +69,29 @@ pub use relationship::{
     Lazy, LazyLoader, LinkTableInfo, PassiveDeletes, Related, RelatedMany, RelationshipInfo,
     RelationshipKind, find_back_relationship, find_relationship, validate_back_populates,
 };
-pub use retry::{RetryPolicy, retry_transaction};
+pub use retry::{RetryDecision, RetryPolicy, retry_transaction};
+
+/// The cancellation reason if `cx` has already been cancelled, else `None`.
+///
+/// Every driver calls this at the start of each `Connection` operation so a
+/// statement is never sent on behalf of a cancelled context:
+///
+/// ```ignore
+/// if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+///     return Outcome::Cancelled(reason);
+/// }
+/// ```
+#[must_use]
+pub fn cancel_requested(cx: &Cx) -> Option<asupersync::CancelReason> {
+    if cx.is_cancel_requested() {
+        Some(
+            cx.cancel_reason()
+                .unwrap_or_else(|| asupersync::CancelReason::user("operation cancelled")),
+        )
+    } else {
+        None
+    }
+}
 pub use row::Row;
 pub use tracked::TrackedModel;
 pub use types::{SqlEnum, SqlType, TypeInfo};

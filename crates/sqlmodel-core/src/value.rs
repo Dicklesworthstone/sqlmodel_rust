@@ -836,9 +836,102 @@ impl TryFrom<Value> for Vec<f64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ISO-8601 text forms of the temporal payloads
+//
+// Both SQLite drivers store `Value::Date` / `Value::Time` / `Value::Timestamp`
+// / `Value::TimestampTz` as ISO-8601 text (SQLite has no temporal types, and
+// text is what its date functions understand). The formatters live here so the
+// two drivers cannot drift apart again: FrankenSQLite used to write raw
+// integers while C SQLite wrote text with a three-digit fraction, so the same
+// file read differently through each driver and microseconds were lost.
+// ---------------------------------------------------------------------------
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// Proleptic-Gregorian `(year, month, day)` for a count of days since
+/// 1970-01-01 (negative for earlier dates). Howard Hinnant's `civil_from_days`.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // ranges proven by the algorithm
+pub fn civil_from_days(days: i32) -> (i32, u32, u32) {
+    let z = i64::from(days) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
+}
+
+/// `YYYY-MM-DD` for a `Value::Date` payload (days since 1970-01-01).
+#[must_use]
+pub fn iso_date(days: i32) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `HH:MM:SS` or `HH:MM:SS.ffffff` for a `Value::Time` payload (microseconds
+/// since midnight). The fraction is written with all six digits whenever it is
+/// non-zero, so no precision is lost.
+#[must_use]
+pub fn iso_time(micros: i64) -> String {
+    let micros = micros.rem_euclid(MICROS_PER_DAY);
+    let total_secs = micros / 1_000_000;
+    let (h, mi, s) = (total_secs / 3600, (total_secs / 60) % 60, total_secs % 60);
+    let frac = micros % 1_000_000;
+    if frac == 0 {
+        format!("{h:02}:{mi:02}:{s:02}")
+    } else {
+        format!("{h:02}:{mi:02}:{s:02}.{frac:06}")
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.ffffff]` for a `Value::Timestamp` /
+/// `Value::TimestampTz` payload (microseconds since the Unix epoch, UTC).
+/// Correct for pre-1970 instants (floor division, not truncation).
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // a day count that overflows i32 is ~5.8 million years out
+pub fn iso_timestamp(micros: i64) -> String {
+    let days = micros.div_euclid(MICROS_PER_DAY) as i32;
+    format!(
+        "{}T{}",
+        iso_date(days),
+        iso_time(micros.rem_euclid(MICROS_PER_DAY))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_formatters_are_exact_and_handle_pre_epoch_values() {
+        assert_eq!(iso_date(0), "1970-01-01");
+        assert_eq!(iso_date(-25_567), "1900-01-01");
+        assert_eq!(iso_date(19_782), "2024-02-29");
+        assert_eq!(iso_date(2_932_896), "9999-12-31");
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+
+        assert_eq!(iso_time(0), "00:00:00");
+        assert_eq!(iso_time(3_661_123_000), "01:01:01.123000");
+        assert_eq!(iso_time(45_296_500_000), "12:34:56.500000");
+        assert_eq!(iso_time(86_399_999_999), "23:59:59.999999");
+
+        assert_eq!(iso_timestamp(0), "1970-01-01T00:00:00");
+        assert_eq!(
+            iso_timestamp(1_710_498_030_123_456),
+            "2024-03-15T10:20:30.123456"
+        );
+        assert_eq!(iso_timestamp(-2_208_988_800_000_000), "1900-01-01T00:00:00");
+        assert_eq!(
+            iso_timestamp(-2_208_988_800_000_000 + 3_600_000_000),
+            "1900-01-01T01:00:00"
+        );
+        assert_eq!(iso_timestamp(-1), "1969-12-31T23:59:59.999999");
+    }
 
     #[test]
     fn test_from_bool() {

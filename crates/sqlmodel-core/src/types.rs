@@ -90,6 +90,50 @@ impl SqlType {
         }
     }
 
+    /// The DDL type name for a specific dialect.
+    ///
+    /// [`Self::sql_name`] returns the generic name, which SQLite accepts for
+    /// everything (it only derives an affinity from it). PostgreSQL and MySQL
+    /// each reject or reinterpret several of those names, so DDL generation
+    /// must use this instead:
+    ///
+    /// | `SqlType` | PostgreSQL | MySQL |
+    /// |-----------|------------|-------|
+    /// | `TinyInt` | `SMALLINT` (no 1-byte integer) | `TINYINT` |
+    /// | `Real` / `Double` | `REAL` / `DOUBLE PRECISION` | `FLOAT` / `DOUBLE` |
+    /// | `Binary`/`VarBinary`/`Blob` | `BYTEA` | as generic |
+    /// | `DateTime` / `Timestamp` | `TIMESTAMP` | `DATETIME(6)` (`TIMESTAMP` is 1970..2038 and zone-shifted) |
+    /// | `TimestampTz` | `TIMESTAMPTZ` | `TIMESTAMP(6)` |
+    /// | `Time` | `TIME` | `TIME(6)` |
+    /// | `Uuid` | `UUID` | `BINARY(16)` (the driver binds `Value::Uuid` as 16 bytes) |
+    /// | `Json` / `JsonB` | `JSON` / `JSONB` | `JSON` |
+    /// | `Array(_)` | `inner[]` | `JSON` (no array type) |
+    ///
+    /// `Custom` names are passed through untouched for every dialect.
+    pub fn sql_name_for(&self, dialect: crate::connection::Dialect) -> String {
+        use crate::connection::Dialect;
+        match (dialect, self) {
+            (Dialect::Postgres, SqlType::TinyInt) => "SMALLINT".to_string(),
+            (Dialect::Postgres, SqlType::Binary(_) | SqlType::VarBinary(_) | SqlType::Blob) => {
+                "BYTEA".to_string()
+            }
+            (Dialect::Postgres, SqlType::DateTime) => "TIMESTAMP".to_string(),
+            (Dialect::Postgres, SqlType::Array(inner)) => {
+                format!("{}[]", inner.sql_name_for(dialect))
+            }
+            (Dialect::Mysql, SqlType::Real) => "FLOAT".to_string(),
+            (Dialect::Mysql, SqlType::Double) => "DOUBLE".to_string(),
+            (Dialect::Mysql, SqlType::Time) => "TIME(6)".to_string(),
+            (Dialect::Mysql, SqlType::DateTime | SqlType::Timestamp) => "DATETIME(6)".to_string(),
+            (Dialect::Mysql, SqlType::TimestampTz) => "TIMESTAMP(6)".to_string(),
+            (Dialect::Mysql, SqlType::Uuid) => "BINARY(16)".to_string(),
+            (Dialect::Mysql, SqlType::Json | SqlType::JsonB | SqlType::Array(_)) => {
+                "JSON".to_string()
+            }
+            _ => self.sql_name(),
+        }
+    }
+
     /// Check if this type is numeric.
     pub const fn is_numeric(&self) -> bool {
         matches!(

@@ -149,6 +149,25 @@ pub trait Scenario {
     ) -> impl Future<Output = ()>;
 }
 
+/// A scenario that takes ownership of the connection (what `Session` and
+/// `Pool` need).
+pub trait OwnedScenario {
+    fn run<C: Connection + 'static>(
+        &self,
+        cx: &Cx,
+        conn: C,
+        driver: &DriverUnderTest,
+    ) -> impl Future<Output = ()>;
+}
+
+struct Borrowed<'a, S>(&'a S);
+
+impl<S: Scenario> OwnedScenario for Borrowed<'_, S> {
+    async fn run<C: Connection + 'static>(&self, cx: &Cx, conn: C, driver: &DriverUnderTest) {
+        self.0.run(cx, &conn, driver).await;
+    }
+}
+
 /// Run `scenario` once per available driver on a fresh connection each time,
 /// printing which drivers ran. Panics propagate from the scenario with the
 /// driver name in the message.
@@ -162,6 +181,20 @@ pub fn run_on_drivers(
     drivers: &[DriverUnderTest],
     scenario: &impl Scenario,
 ) -> Vec<&'static str> {
+    run_owned_on_drivers(cx, drivers, &Borrowed(scenario))
+}
+
+/// [`run_on_every_driver`] for scenarios that consume the connection.
+pub fn run_owned_on_every_driver(cx: &Cx, scenario: &impl OwnedScenario) -> Vec<&'static str> {
+    run_owned_on_drivers(cx, &DriverUnderTest::available(), scenario)
+}
+
+/// [`run_on_drivers`] for scenarios that consume the connection.
+pub fn run_owned_on_drivers(
+    cx: &Cx,
+    drivers: &[DriverUnderTest],
+    scenario: &impl OwnedScenario,
+) -> Vec<&'static str> {
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("asupersync runtime");
@@ -171,19 +204,17 @@ pub fn run_on_drivers(
         match driver {
             DriverUnderTest::CSqliteMemory => {
                 let conn = SqliteConnection::open_memory().expect("open :memory:");
-                rt.block_on(scenario.run(cx, &conn, driver));
+                rt.block_on(scenario.run(cx, conn, driver));
             }
             DriverUnderTest::CSqliteFile(path) => {
                 let conn = SqliteConnection::open_file(path.to_string_lossy().into_owned())
                     .expect("open sqlite file");
-                rt.block_on(scenario.run(cx, &conn, driver));
-                drop(conn);
+                rt.block_on(scenario.run(cx, conn, driver));
             }
             DriverUnderTest::Franken(path) => {
                 let conn = FrankenConnection::open_file(path.to_string_lossy().into_owned())
                     .expect("open frankensqlite file");
-                rt.block_on(scenario.run(cx, &conn, driver));
-                drop(conn);
+                rt.block_on(scenario.run(cx, conn, driver));
             }
             DriverUnderTest::Postgres(cfg) => {
                 rt.block_on(async {
@@ -191,7 +222,7 @@ pub fn run_on_drivers(
                         SharedPgConnection::connect(cx, cfg.clone()).await,
                         "connect to postgres",
                     );
-                    scenario.run(cx, &conn, driver).await;
+                    scenario.run(cx, conn, driver).await;
                 });
             }
             DriverUnderTest::MySql(cfg) | DriverUnderTest::MariaDb(cfg) => {
@@ -200,7 +231,7 @@ pub fn run_on_drivers(
                         SharedMySqlConnection::connect(cx, cfg.clone()).await,
                         "connect to mysql/mariadb",
                     );
-                    scenario.run(cx, &conn, driver).await;
+                    scenario.run(cx, conn, driver).await;
                 });
             }
         }

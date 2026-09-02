@@ -15,8 +15,14 @@ workspace = true
 # The one place in the workspace where every driver is a dependency at once.
 # Nightly-only because sqlmodel-frankensqlite is; the CI MSRV job excludes it.
 [dependencies]
-sqlmodel.workspace = true
+# The external value types are what the README's type table promises; the
+# round-trip scenario proves them on every driver.
+sqlmodel = { workspace = true, features = ["chrono", "uuid", "decimal"] }
 sqlmodel-core.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true
 sqlmodel-query.workspace = true
 sqlmodel-schema.workspace = true
 sqlmodel-session.workspace = true

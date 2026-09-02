@@ -96,7 +96,8 @@
 
 // Re-export all public types from sub-crates
 pub use sqlmodel_core::connection::{
-    ConnectionConfig, IsolationLevel, SslMode, Transaction, TransactionMode, TransactionOptions,
+    ConnectionConfig, IsolationLevel, SslMode, Transaction, TransactionMode, TransactionOps,
+    TransactionOptions,
 };
 pub use sqlmodel_core::{
     // asupersync re-exports
@@ -104,6 +105,7 @@ pub use sqlmodel_core::{
     // Core types
     Connection,
     Cx,
+    Dialect,
     DumpMode,
     DumpOptions,
     DumpResult,
@@ -119,6 +121,9 @@ pub use sqlmodel_core::{
     ModelDump,
     Outcome,
     RegionId,
+    // Relationship field types
+    Related,
+    RelatedMany,
     Result,
     Row,
     SqlEnum,
@@ -133,9 +138,19 @@ pub use sqlmodel_core::{
     ValidateResult,
     Value,
 };
-pub use sqlmodel_core::{RetryPolicy, retry_transaction};
+pub use sqlmodel_core::{RetryDecision, RetryPolicy, retry_transaction};
 
 pub use sqlmodel_macros::{Model, SqlEnum, Validate};
+
+/// Compiles every Rust code block in the repository README as a doctest, so
+/// the documented API cannot drift from the real one (blocks that are not
+/// runnable programs are marked `ignore` in the README itself). The README
+/// examples use `?` on `Outcome`, which needs the `nightly-try` feature, so the
+/// doctests exist only when it is enabled:
+/// `cargo test -p sqlmodel --doc --features nightly-try`.
+#[cfg(all(doctest, feature = "nightly-try"))]
+#[doc = include_str!("../../../README.md")]
+pub struct ReadmeDoctests;
 
 pub use sqlmodel_query::{
     BinaryOp, Expr, Join, JoinType, Limit, Offset, OrderBy, PolymorphicJoined, PolymorphicJoined2,
@@ -640,6 +655,7 @@ pub mod prelude {
         ConnectionSession,
         ConnectionSessionBuilder,
         Cx,
+        Dialect,
         DumpMode,
         DumpOptions,
         Error,
@@ -683,6 +699,8 @@ pub mod prelude {
         TrackedModel,
         // Transaction start options (BEGIN CONCURRENT etc.)
         TransactionMode,
+        // Transaction handles (`tx.execute(..)`, `tx.commit(..)`)
+        TransactionOps,
         TransactionOptions,
         ValidateInput,
         ValidateOptions,

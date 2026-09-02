@@ -23,6 +23,9 @@ chrono = ["dep:chrono"]
 uuid = ["dep:uuid"]
 # Model fields of type rust_decimal::Decimal
 decimal = ["dep:rust_decimal"]
+# `?` on `Outcome` (asupersync's `Try` impl). Needs a nightly toolchain, which this
+# workspace pins anyway; left off by default so the crates still build on the MSRV.
+nightly-try = ["asupersync/nightly-outcome-try"]
 
 [dependencies]
 asupersync.workspace = true
