@@ -66,7 +66,7 @@ let query = select!(Hero)
 let (sql, params) = query.build_with_dialect(Dialect::Postgres);
 assert_eq!(
     sql,
-    "SELECT * FROM heroes WHERE \"age\" > $1 ORDER BY \"name\" ASC LIMIT 10"
+    "SELECT * FROM \"heroes\" WHERE \"age\" > $1 ORDER BY \"name\" ASC LIMIT 10"
 );
 assert_eq!(params, vec![Value::Int(18)]);
 

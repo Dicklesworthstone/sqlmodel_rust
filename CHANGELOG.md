@@ -151,7 +151,13 @@ facade tests, and the driver integration suites run against live Docker database
   `double`, `blob`, `order`, or `user` failed with a syntax error (MySQL rejects reserved words;
   the other dialects have their own). Column names in these statements, in `ON CONFLICT` targets and
   `DO UPDATE` / `ON DUPLICATE KEY UPDATE` assignments are now quoted for the dialect, matching the
-  `Expr` columns in WHERE. Table names are still emitted bare (tracked separately).
+  `Expr` columns in WHERE.
+- **Table names were emitted bare by every builder**, so a table named `order`, `user`, or `group`
+  broke on every dialect. `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `JOIN` clauses, `EXISTS` subqueries,
+  eager-load joins, and the joined-inheritance projections (`"table"."col" AS "table__col"`) now
+  quote table names through the new `Dialect::quote_table` (schema-qualified names are quoted per
+  segment; already-quoted names pass through). The e2e smoke scenario now round-trips a table
+  called `order` with columns `user` and `select` on every driver.
 - **Decimals lost precision on SQLite.** A `DECIMAL(p, s)` column has NUMERIC affinity, which turns
   the bound text into a REAL and keeps 15 significant digits, so a 20-digit `rust_decimal::Decimal`
   came back rounded; FrankenSQLite additionally bound decimals as floats. Decimal and numeric
