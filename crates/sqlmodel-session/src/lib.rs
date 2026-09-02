@@ -2572,6 +2572,16 @@ impl<C: Connection> Session<C> {
         let child_table = dialect.quote_identifier(Child::TABLE_NAME);
         let link_table_q = dialect.quote_identifier(link_table.table_name);
 
+        // Explicit child columns rather than `child.*`: a star over a JOIN has
+        // no schema-derived names on FrankenSQLite, which made every row
+        // unreadable and the loader resolve zero links (e2e Session scenario,
+        // 2026-09). Explicit columns are named identically on every driver.
+        let child_select_parts: String = Child::fields()
+            .iter()
+            .map(|f| format!("{child_table}.{}", dialect.quote_identifier(f.column_name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
         let parent_select_parts: String = local_cols
             .iter()
             .enumerate()
@@ -2652,7 +2662,7 @@ impl<C: Connection> Session<C> {
         };
 
         let sql = format!(
-            "SELECT {child_table}.*, {parent_select_parts} FROM {child_table} \
+            "SELECT {child_select_parts}, {parent_select_parts} FROM {child_table} \
              JOIN {link_table_q} ON {join_parts} \
              WHERE {where_sql}"
         );
@@ -3314,9 +3324,20 @@ impl<C: Connection> Session<C> {
                 tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
                 tracked.pk_values.clone_from(&pk_values);
 
-                // If persistent, mark as dirty for UPDATE
-                if tracked.state == ObjectState::Persistent && !self.pending_dirty.contains(&key) {
-                    self.pending_dirty.push(key);
+                // A persistent object is now dirty. So is an expired one
+                // (every object is expired after `commit`): the merged values
+                // supersede the stale ones, so it is persistent again and flush
+                // must UPDATE it. Skipping it silently lost the merge (found by
+                // the e2e Session scenario, 2026-09).
+                if matches!(
+                    tracked.state,
+                    ObjectState::Persistent | ObjectState::Expired
+                ) {
+                    tracked.state = ObjectState::Persistent;
+                    tracked.expired_attributes = None;
+                    if !self.pending_dirty.contains(&key) {
+                        self.pending_dirty.push(key);
+                    }
                 }
 
                 // Return clone of the tracked object
@@ -5110,6 +5131,58 @@ mod tests {
             let info = session.debug_state();
             assert_eq!(info.tracked, 1);
         });
+    }
+
+    /// After `commit` every object is expired. Merging a detached copy onto an
+    /// expired object must still produce an UPDATE; until 2026-09 it silently
+    /// did nothing (found by the e2e Session scenario on a real database).
+    #[test]
+    fn test_merge_onto_expired_object_updates_database() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            session.add(&Team {
+                id: Some(1),
+                name: "Original".to_string(),
+            });
+            unwrap_outcome(session.flush(&cx).await);
+            session.expire_all();
+
+            let merged = unwrap_outcome(
+                session
+                    .merge(
+                        &cx,
+                        Team {
+                            id: Some(1),
+                            name: "Updated".to_string(),
+                        },
+                        false,
+                    )
+                    .await,
+            );
+            assert_eq!(merged.name, "Updated");
+            unwrap_outcome(session.flush(&cx).await);
+        });
+
+        let guard = state.lock().unwrap();
+        let updates: Vec<&(String, Vec<Value>)> = guard
+            .executed
+            .iter()
+            .filter(|(sql, _)| sql.starts_with("UPDATE"))
+            .collect();
+        assert_eq!(updates.len(), 1, "executed: {:?}", guard.executed);
+        assert!(
+            updates[0].1.contains(&Value::Text("Updated".into())),
+            "{:?}",
+            updates[0]
+        );
     }
 
     #[test]
