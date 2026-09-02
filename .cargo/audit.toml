@@ -20,4 +20,13 @@ ignore = [
     # Follow-up: bd-j7wt.1 (this analysis), bd-j7wt.2 (feature-gate the RSA path).
     # Review: 2026-12-01, or when rsa 0.10 stable ships (then re-run cargo audit).
     "RUSTSEC-2023-0071",
+
+    # bincode 1.3 (RUSTSEC-2025-0141) and yaml-rust 0.4 (RUSTSEC-2024-0320) are
+    # unmaintained. They reach this workspace only through syntect (default
+    # features) <- rich_rust <- sqlmodel-console with the `rich` feature, and are
+    # used for syntect's own bundled syntax/theme dumps, never to decode input
+    # SQLModel receives. The fix is in rich_rust (trim syntect features); tracked
+    # by bd-j7wt.4. Review: 2026-11-01.
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2024-0320",
 ]

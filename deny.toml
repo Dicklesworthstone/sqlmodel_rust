@@ -19,7 +19,6 @@ yanked = "deny"
 # Keep in sync with .cargo/audit.toml (that file carries the full rationale).
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack targets private-key decryption; sqlmodel-mysql only encrypts with the server's public key (auth.rs). Review 2026-12-01. Beads bd-j7wt.1 / bd-j7wt.2." },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; replaced by rustls::pki_types::pem in bd-j7wt.3. Remove this entry when the dependency is gone." },
     { id = "RUSTSEC-2025-0141", reason = "bincode 1 via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to decode untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2026-11-01." },
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to parse untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2026-11-01." },
 ]
