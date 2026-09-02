@@ -1,0 +1,68 @@
+name: Publish-set invariant
+
+# Why this exists: on 2026-08-31 the 0.4.2 release was half-published — two of
+# the twelve workspace crates reached crates.io, ten stayed at 0.4.1, and README
+# already told users to depend on 0.4.2. Nothing noticed for a day. This job
+# compares the crates.io index with the workspace and fails when the set drifts
+# (bead bd-jeof.2). It also proves the 0.4.2 fix from the registry side: no
+# published crate may enable asupersync's `test-internals` feature in a normal
+# dependency (bead bd-jeof.3, the "downstream constitution").
+#
+# Runs daily, on demand, and after the release workflow publishes.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  index-vs-workspace:
+    name: crates.io index matches the workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Compare published versions and normal-dependency features
+        shell: bash
+        run: |
+          set -euo pipefail
+          ua="sqlmodel_rust-publish-set-check (github actions)"
+          ws=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="sqlmodel") | .version')
+          crates=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.publish == null) | .name' | sort)
+          echo "workspace version: $ws"
+          printf '%-26s %-10s %-10s %s\n' crate published workspace asupersync-features
+          fail=0; versions=""
+          for c in $crates; do
+            json=$(curl -sf -A "$ua" "https://crates.io/api/v1/crates/$c" || echo '{}')
+            pub=$(echo "$json" | jq -r '.crate.max_version // "unpublished"')
+            feats="-"
+            if [ "$pub" != "unpublished" ]; then
+              feats=$(curl -sf -A "$ua" "https://crates.io/api/v1/crates/$c/$pub/dependencies" \
+                | jq -c '[.dependencies[] | select(.crate_id=="asupersync" and .kind=="normal") | .features] | flatten' || echo '[]')
+              if echo "$feats" | grep -q 'test-internals'; then
+                echo "::error::$c $pub enables asupersync test-internals in a normal dependency"; fail=1
+              fi
+            fi
+            printf '%-26s %-10s %-10s %s\n' "$c" "$pub" "$ws" "$feats"
+            versions="$versions $pub"
+            sleep 1  # crates.io asks for at most one request per second
+          done
+          distinct=$(echo $versions | tr ' ' '\n' | sort -u | wc -l)
+          if [ "$distinct" -ne 1 ]; then
+            echo "::error::published versions diverge across the crate set ($(echo $versions | tr ' ' '\n' | sort -u | tr '\n' ' ')) — the lockstep release is incomplete"; fail=1
+          fi
+          published=$(echo $versions | tr ' ' '\n' | sort -u | head -n1)
+          if [ "$distinct" -eq 1 ] && [ "$published" != "$ws" ]; then
+            echo "::warning::workspace is at $ws but the index is at $published — either an unreleased bump (fine while unreleased) or a forgotten publish"
+          fi
+          exit $fail

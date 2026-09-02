@@ -60,8 +60,11 @@ serde 1.0.229, serde_json 1.0.151, regex 1.13.1, tracing 0.1.44, rich_rust 0.2.3
 - chacha20 0.10.1 yank resolved by this refresh (0.10.2).
 - CI's Security job now fails on findings (`cargo audit --deny warnings` + `cargo deny check`) instead of `cargo audit || true`; it gates the release build job.
 
-### Post-refresh gates (see CHANGELOG for the release this lands in)
-Recorded at the end of the 2026-09-02 session in the CHANGELOG "Gate" block: fmt, clippy `-D warnings`, `cargo doc -D warnings`, `cargo test --workspace --no-fail-fast`, `cargo audit --deny warnings`, `cargo deny check`.
+### Post-refresh gates (final tree of the 2026-09-02 session)
+- `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps` clean.
+- `cargo test --workspace --no-fail-fast`: 61 suites, 2041 passed, 0 failed, 329 ignored (pre-existing); `cargo test --workspace --doc`: 52 passed.
+- `cargo audit --deny warnings` clean; `cargo deny check advisories bans licenses sources` all ok.
+- Live databases (local Docker): postgres:16 and mysql:8.4 integration suites 7/7 each; `sqlmodel-e2e` smoke/migrations/concurrent-writers green on C SQLite, FrankenSQLite, PostgreSQL, MySQL. The refreshed asupersync 0.4.10 / fsqlite 0.3.14 lockfile is what these ran on.
 
 ### Commands used
 ```bash
