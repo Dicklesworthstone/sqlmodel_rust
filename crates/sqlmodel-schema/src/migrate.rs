@@ -42,6 +42,21 @@ impl Migration {
         }
     }
 
+    /// Fingerprint of the `up` SQL (64-bit FNV-1a, 16 hex digits).
+    ///
+    /// Recorded in the tracking table when the migration is applied and
+    /// compared on every later run, so a migration edited after it ran is
+    /// reported as [`MigrationStatus::Drifted`] instead of silently trusted.
+    #[must_use]
+    pub fn checksum(&self) -> String {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.up.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("{hash:016x}")
+    }
+
     /// Generate a new migration version from the current timestamp.
     ///
     /// Format: YYYYMMDDHHMMSS
@@ -330,6 +345,14 @@ pub enum MigrationStatus {
     Pending,
     /// Migration has been applied
     Applied { at: i64 },
+    /// Applied, but its `up` SQL has changed since: the recorded checksum
+    /// differs from [`Migration::checksum`] of the current definition.
+    /// `migrate` refuses to run while any migration is in this state.
+    Drifted {
+        at: i64,
+        recorded: String,
+        current: String,
+    },
     /// Migration failed
     Failed { error: String },
 }
@@ -379,7 +402,8 @@ impl MigrationRunner {
             "CREATE TABLE IF NOT EXISTS {} (
                 id VARCHAR(255) PRIMARY KEY,
                 description TEXT NOT NULL,
-                applied_at BIGINT NOT NULL
+                applied_at BIGINT NOT NULL,
+                checksum VARCHAR(64) NOT NULL DEFAULT ''
             )",
             self.table_name
         );
@@ -402,7 +426,10 @@ impl MigrationRunner {
         }
 
         // Query applied migrations
-        let sql = format!("SELECT id, applied_at FROM {}", self.table_name);
+        let sql = format!(
+            "SELECT id, applied_at, checksum FROM {}",
+            self.table_name
+        );
         let rows = match conn.query(cx, &sql, &[]).await {
             Outcome::Ok(rows) => rows,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -410,13 +437,14 @@ impl MigrationRunner {
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        let mut applied: HashMap<String, i64> = HashMap::new();
+        let mut applied: HashMap<String, (i64, String)> = HashMap::new();
         for row in rows {
             if let (Ok(id), Ok(at)) = (
                 row.get_named::<String>("id"),
                 row.get_named::<i64>("applied_at"),
             ) {
-                applied.insert(id, at);
+                let recorded = row.get_named::<String>("checksum").unwrap_or_default();
+                applied.insert(id, (at, recorded));
             }
         }
 
@@ -424,10 +452,22 @@ impl MigrationRunner {
             .migrations
             .iter()
             .map(|m| {
-                let status = if let Some(&at) = applied.get(&m.id) {
-                    MigrationStatus::Applied { at }
-                } else {
-                    MigrationStatus::Pending
+                let status = match applied.get(&m.id) {
+                    None => MigrationStatus::Pending,
+                    Some((at, recorded)) => {
+                        let current = m.checksum();
+                        // An empty recorded checksum is a row written before
+                        // checksums existed; it cannot be verified.
+                        if recorded.is_empty() || *recorded == current {
+                            MigrationStatus::Applied { at: *at }
+                        } else {
+                            MigrationStatus::Drifted {
+                                at: *at,
+                                recorded: recorded.clone(),
+                                current,
+                            }
+                        }
+                    }
                 };
                 (m.id.clone(), status)
             })
@@ -444,6 +484,18 @@ impl MigrationRunner {
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
+
+        // Refuse to run anything while an applied migration no longer matches
+        // what was applied: the history is no longer trustworthy.
+        if let Some((id, MigrationStatus::Drifted { recorded, current, .. })) = status
+            .iter()
+            .find(|(_, s)| matches!(s, MigrationStatus::Drifted { .. }))
+        {
+            return Outcome::Err(Error::Custom(format!(
+                "migration `{id}` was modified after it was applied (recorded checksum \
+                 {recorded}, current {current}); refusing to run migrations"
+            )));
+        }
 
         let mut applied = Vec::new();
 
@@ -467,11 +519,12 @@ impl MigrationRunner {
                 // `$1` as a named parameter.
                 let dialect = conn.dialect();
                 let record_sql = format!(
-                    "INSERT INTO {} (id, description, applied_at) VALUES ({}, {}, {})",
+                    "INSERT INTO {} (id, description, applied_at, checksum) VALUES ({}, {}, {}, {})",
                     self.table_name,
                     dialect.placeholder(1),
                     dialect.placeholder(2),
-                    dialect.placeholder(3)
+                    dialect.placeholder(3),
+                    dialect.placeholder(4)
                 );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -485,6 +538,7 @@ impl MigrationRunner {
                             Value::Text(migration.id.clone()),
                             Value::Text(migration.description.clone()),
                             Value::BigInt(now),
+                            Value::Text(migration.checksum()),
                         ],
                     )
                     .await
@@ -519,7 +573,9 @@ impl MigrationRunner {
         let last_applied = status
             .iter()
             .filter_map(|(id, s)| {
-                if let MigrationStatus::Applied { at } = s {
+                // A drifted migration can still be rolled back; that is how
+                // drift gets resolved.
+                if let MigrationStatus::Applied { at } | MigrationStatus::Drifted { at, .. } = s {
                     Some((id.clone(), *at))
                 } else {
                     None
@@ -777,6 +833,17 @@ mod tests {
         let filename = writer.filename(&m);
         // Filename should be truncated to reasonable length
         assert!(filename.len() < 100);
+    }
+
+    #[test]
+    fn checksum_is_stable_and_tracks_the_up_sql_only() {
+        let a = Migration::new("0001", "create", "CREATE TABLE t (id INTEGER)", "DROP TABLE t");
+        let same = Migration::new("0001", "other description", "CREATE TABLE t (id INTEGER)", "");
+        let edited = Migration::new("0001", "create", "CREATE TABLE t (id BIGINT)", "DROP TABLE t");
+        assert_eq!(a.checksum().len(), 16);
+        assert_eq!(a.checksum(), same.checksum(), "id/description/down do not count");
+        assert_ne!(a.checksum(), edited.checksum(), "the up SQL does");
+        assert_eq!(a.checksum(), a.checksum(), "deterministic");
     }
 
     #[test]
