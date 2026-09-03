@@ -71,7 +71,7 @@ use asupersync::{
     runtime::RuntimeBuilder,
     sync::OnceCell,
 };
-use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind, PoolError, PoolErrorKind};
+use sqlmodel_core::error::{PoolError, PoolErrorKind};
 use sqlmodel_core::{Connection, Error};
 
 /// Connection pool configuration.
@@ -931,22 +931,25 @@ impl<C: Connection> Pool<C> {
     }
 
     /// Validate a connection and wrap it in a PooledConnection.
+    /// Ping (when asked) and hand out an idle connection. `Ok(None)` means the
+    /// ping failed and the connection has been closed; the caller picks
+    /// another.
     async fn validate_and_wrap(
         &self,
         cx: &Cx,
         meta: ConnectionMeta<C>,
         test_on_checkout: bool,
-    ) -> Outcome<PooledConnection<C>, Error> {
+    ) -> Outcome<Option<PooledConnection<C>>, Error> {
         let guard = ActiveConnectionGuard::new(Arc::clone(&self.shared), meta);
         if test_on_checkout {
             // Validate the connection
             match guard.connection().ping(cx).await {
                 Outcome::Ok(()) => {
                     self.shared.acquires.fetch_add(1, Ordering::Relaxed);
-                    Outcome::Ok(PooledConnection::new(
+                    Outcome::Ok(Some(PooledConnection::new(
                         guard.into_meta(),
                         Arc::downgrade(&self.shared),
-                    ))
+                    )))
                 }
                 Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => {
                     // Connection is invalid. Keep it active until explicit
@@ -962,20 +965,15 @@ impl<C: Connection> Pool<C> {
                         }
                         RetirementOutcome::Failed(error) => return Outcome::Err(error),
                     }
-                    // Return error - caller should retry
-                    Outcome::Err(Error::Connection(ConnectionError {
-                        kind: ConnectionErrorKind::Disconnected,
-                        message: "connection validation failed".to_string(),
-                        source: None,
-                    }))
+                    Outcome::Ok(None)
                 }
             }
         } else {
             self.shared.acquires.fetch_add(1, Ordering::Relaxed);
-            Outcome::Ok(PooledConnection::new(
+            Outcome::Ok(Some(PooledConnection::new(
                 guard.into_meta(),
                 Arc::downgrade(&self.shared),
-            ))
+            )))
         }
     }
 
@@ -2409,8 +2407,20 @@ mod tests {
         let acquired =
             runtime.block_on(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
 
-        assert!(matches!(acquired, Outcome::Err(_)));
+        // The dead idle connection is closed and the acquire moves on to a
+        // fresh one from the factory instead of failing (until 2026-09 it
+        // returned an error and left the caller to retry).
+        assert!(
+            matches!(acquired, Outcome::Ok(_)),
+            "acquire replaces the dead idle connection"
+        );
         assert_eq!(pool_close_calls.load(Ordering::Relaxed), 1);
+        let stats = pool.stats();
+        assert_eq!(stats.connections_closed, 1);
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.total_connections, 1);
+        drop(acquired);
+        assert_eq!(pool.stats().idle_connections, 1);
     }
 
     #[test]
