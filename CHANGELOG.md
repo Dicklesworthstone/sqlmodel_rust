@@ -415,6 +415,10 @@ fixpoint scenario (still through the local escape hatch):
 - Live databases (run 18): all eight `sqlmodel-e2e` scenarios (the seven above plus
   `schema_fixpoint`) pass on C SQLite (memory, file), FrankenSQLite, PostgreSQL 16, and MySQL 8.4;
   `sqlmodel-mysql` integration 9/9 including the two new regression tests.
+- Same day, after the runner lock, the SQLite rollback fix, and the FrankenSQLite commit fix:
+  `cargo clippy` clean for schema, frankensqlite, e2e; schema 206, frankensqlite 85 unit tests;
+  live run 19 all eight e2e scenarios green on the five drivers; the two-runner race applies each
+  migration exactly once on C SQLite (file), FrankenSQLite, PostgreSQL, and MySQL.
 
 ## [0.4.1] -- 2026-08-25
 
