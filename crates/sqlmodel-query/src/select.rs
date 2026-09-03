@@ -637,6 +637,18 @@ impl<M: Model> Select<M> {
         self.build_with_dialect(Dialect::default())
     }
 
+    /// The statement [`Self::all_eager`] runs for `dialect`: every column of
+    /// this model and of each included relationship aliased as
+    /// `table__column`, joined with `LEFT JOIN`s. Falls back to
+    /// [`Self::build_with_dialect`] when nothing is included.
+    pub fn build_eager_sql_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        if !self.eager_loader.as_ref().is_some_and(|e| e.has_includes()) {
+            return self.build_with_dialect(dialect);
+        }
+        let (sql, params, _) = self.build_eager_with_dialect(dialect);
+        (sql, params)
+    }
+
     /// Build the SQL query and parameters with a specific dialect.
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
         let mut sql = String::new();

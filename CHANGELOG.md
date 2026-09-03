@@ -159,6 +159,17 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   `INSERT ... RETURNING` (a successful `insert!` still reports the right id on both), and it
   stores `CREATE TABLE IF NOT EXISTS` verbatim in `sqlite_master` where C SQLite normalizes it.
   The report prints the C SQLite and fsqlite versions.
+- **Golden per-dialect SQL snapshots.** `crates/sqlmodel-e2e/golden/<dialect>/<op>.sql` holds
+  the statement every builder emits for PostgreSQL, SQLite, and MySQL (103 snapshots: DDL with
+  indexes, comments, and identity keys; every INSERT/upsert/RETURNING shape; filters, paging,
+  DISTINCT, GROUP BY/HAVING, joins, `IN (SELECT)`, EXISTS, FOR UPDATE, a window function; eager
+  `table__column` projections both ways; joined-inheritance child and polymorphic selects;
+  UPDATE/DELETE by model, filter, and subquery with RETURNING; CTEs including a recursive one;
+  UNION/EXCEPT; and the session's cascade-delete plan captured on SQLite). The `golden_sql` e2e
+  test compares byte for byte, prints a unified diff naming the op and dialect on a mismatch, and
+  rewrites the files only with `SQLMODEL_UPDATE_GOLDEN=1`. `Select::build_eager_sql_with_dialect`
+  exposes the eager statement; the facade now also re-exports `Cte`, `CteRef`, `WithQuery`,
+  `SetOperation`, and `SetOpType`, which were unreachable through `sqlmodel` before.
 - **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
   script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
   PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and

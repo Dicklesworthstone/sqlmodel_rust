@@ -157,11 +157,12 @@ pub use sqlmodel_macros::{Model, SqlEnum, Validate};
 pub struct ReadmeDoctests;
 
 pub use sqlmodel_query::{
-    BinaryOp, DeleteBuilder, EagerLoader, Expr, IncludePath, InsertBuilder, InsertManyBuilder,
-    Join, JoinType, Limit, Offset, OnConflict, OrderBy, PolymorphicJoined, PolymorphicJoined2,
-    PolymorphicJoined3, PolymorphicJoinedSelect, PolymorphicJoinedSelect2,
-    PolymorphicJoinedSelect3, QueryBuilder, Select, SelectQuery, UnaryOp, UpdateBuilder, Where,
-    delete, insert, insert_many, raw_execute, raw_query, select, update,
+    BinaryOp, Cte, CteRef, DeleteBuilder, EagerLoader, Expr, IncludePath, InsertBuilder,
+    InsertManyBuilder, Join, JoinType, Limit, Offset, OnConflict, OrderBy, PolymorphicJoined,
+    PolymorphicJoined2, PolymorphicJoined3, PolymorphicJoinedSelect, PolymorphicJoinedSelect2,
+    PolymorphicJoinedSelect3, QueryBuilder, Select, SelectQuery, SetOpType, SetOperation, UnaryOp,
+    UpdateBuilder, Where, WithQuery, delete, insert, insert_many, raw_execute, raw_query, select,
+    update,
 };
 
 pub use sqlmodel_schema::{
