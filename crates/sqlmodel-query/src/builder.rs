@@ -1523,7 +1523,53 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             return row_out;
         }
 
-        let (sql, params) = self.build_with_dialect(conn.dialect());
+        let dialect = conn.dialect();
+        if dialect == Dialect::Mysql {
+            // MySQL has no RETURNING: insert, then re-read the row by its
+            // primary key (the key given, or the generated id of a single
+            // auto-increment column).
+            self.returning = false;
+            let (sql, params) = self.build_with_dialect(dialect);
+            let id = match conn.insert(cx, &sql, &params).await {
+                Outcome::Ok(id) => id,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let pk_cols = M::PRIMARY_KEY;
+            let mut pk_values = self.model.primary_key_value();
+            if pk_cols.len() == 1 && pk_values.first().is_none_or(Value::is_null) {
+                pk_values = vec![Value::BigInt(id)];
+            }
+            if pk_cols.is_empty()
+                || pk_values.len() != pk_cols.len()
+                || pk_values.iter().any(Value::is_null)
+            {
+                return Outcome::Err(sqlmodel_core::Error::Custom(
+                    "RETURNING on MySQL re-reads the inserted row by primary key; this model has \
+                     no usable primary key"
+                        .to_string(),
+                ));
+            }
+            let conditions: Vec<String> = pk_cols
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    format!(
+                        "{} = {}",
+                        dialect.quote_identifier(col),
+                        dialect.placeholder(i + 1)
+                    )
+                })
+                .collect();
+            let select = format!(
+                "SELECT * FROM {} WHERE {}",
+                dialect.quote_table(M::TABLE_NAME),
+                conditions.join(" AND ")
+            );
+            return conn.query_one(cx, &select, &pk_values).await;
+        }
+        let (sql, params) = self.build_with_dialect(dialect);
         conn.query_one(cx, &sql, &params).await
     }
 }
@@ -2892,50 +2938,15 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
         let mut sql = format!("DELETE FROM {}", dialect.quote_table(M::TABLE_NAME));
         let mut params = Vec::new();
-        let sti = crate::select::sti_discriminator_filter::<M>();
-
         // Explicit filter (with the discriminator folded in), or, for STI children
-        // without any filter, the discriminator alone.
-        let where_clause = match (&self.where_clause, &sti) {
-            (Some(w), Some(d)) => Some(w.clone().and(d.clone())),
-            (Some(w), None) => Some(w.clone()),
-            (None, Some(d)) if self.model.is_none() => Some(Where::new(d.clone())),
-            _ => None,
-        };
-
-        if let Some(where_clause) = where_clause {
-            let (where_sql, where_params) = where_clause.build_with_dialect(dialect, 0);
+        // without any filter, the discriminator alone; a model instance without a
+        // filter is deleted by its primary key.
+        let (where_sql, where_params) =
+            dml_where_fragment::<M>(dialect, self.where_clause.as_ref(), self.model, 0);
+        if !where_sql.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_sql);
             params = where_params;
-        } else if let Some(model) = &self.model {
-            // Delete by primary key
-            let pk = M::PRIMARY_KEY;
-            let pk_values = model.primary_key_value();
-            let pk_conditions: Vec<_> = pk
-                .iter()
-                .zip(pk_values.iter())
-                .enumerate()
-                .map(|(i, (col, _))| {
-                    format!(
-                        "{} = {}",
-                        dialect.quote_identifier(col),
-                        dialect.placeholder(i + 1)
-                    )
-                })
-                .collect();
-
-            if !pk_conditions.is_empty() {
-                sql.push_str(" WHERE ");
-                sql.push_str(&pk_conditions.join(" AND "));
-                params.extend(pk_values);
-                if let Some(d) = sti {
-                    let (d_sql, d_params) = Where::new(d).build_with_dialect(dialect, params.len());
-                    sql.push_str(" AND ");
-                    sql.push_str(&d_sql);
-                    params.extend(d_params);
-                }
-            }
         }
 
         // Add RETURNING clause if requested
