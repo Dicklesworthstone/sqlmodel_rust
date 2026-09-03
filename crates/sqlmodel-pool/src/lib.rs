@@ -11,6 +11,17 @@
 //! - **Health checks**: validates connections before handing them out.
 //! - **Metrics**: exposes stats for pool sizing and tuning.
 //!
+//! # Health-check rule
+//!
+//! With `test_on_checkout` (the default) every idle connection is pinged before
+//! it is handed out; one that fails is closed and replaced transparently, so a
+//! server-side kill of an idle connection costs one reconnect, never an error.
+//! Returning a connection runs no check (a return is a synchronous `Drop`), so
+//! a lease whose statement failed with a connection error should be
+//! [`PooledConnection::detach`]ed rather than dropped back into the pool;
+//! dropped, it is handed out again and fails its next statement. The e2e pool
+//! scenario asserts both behaviours against PostgreSQL and MySQL.
+//!
 //! # Features
 //!
 //! - Generic over any `Connection` type
@@ -30,13 +41,13 @@
 //!     .min_connections(2)
 //!     .acquire_timeout(5000);
 //!
-//! let pool = Pool::new(config, || async {
-//!     // Factory function to create new connections
-//!     PgConnection::connect(&cx, &pg_config).await
-//! });
+//! let pool: Pool<PgConnection> = Pool::new(config);
 //!
-//! // Acquire a connection
-//! let conn = pool.acquire(&cx).await?;
+//! // Acquire a connection; the factory opens a new one when the pool has no
+//! // idle connection and is below its maximum.
+//! let conn = pool
+//!     .acquire(&cx, || async { PgConnection::connect(&cx, pg_config.clone()).await })
+//!     .await?;
 //!
 //! // Use the connection (automatically returned to pool on drop)
 //! conn.query(&cx, "SELECT 1", &[]).await?;
@@ -76,10 +87,9 @@ pub struct PoolConfig {
     pub acquire_timeout_ms: u64,
     /// Maximum lifetime of a connection in milliseconds
     pub max_lifetime_ms: u64,
-    /// Test connections before giving them out
+    /// Ping connections before giving them out; a failed ping closes the
+    /// connection and the acquire moves on to another (or a new) one.
     pub test_on_checkout: bool,
-    /// Test connections when returning them to the pool
-    pub test_on_return: bool,
 }
 
 impl Default for PoolConfig {
