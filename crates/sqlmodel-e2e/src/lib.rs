@@ -294,6 +294,179 @@ pub enum ConnectionPair {
     MySql(SharedMySqlConnection, SharedMySqlConnection),
 }
 
+/// A [`Connection`] that records every statement it runs, so a scenario can
+/// assert *what SQL* the ORM sent (which columns an UPDATE set, how many
+/// SELECTs a loader issued) and not only the resulting rows.
+///
+/// Statements run through a transaction obtained from `begin*` go to the
+/// wrapped driver's own transaction type and are not recorded; the session
+/// scenarios therefore assert on `flush` outside explicit transactions.
+/// Statements recorded by a [`CapturingConnection`]: SQL text and parameters.
+pub type StatementLog = Vec<(String, Vec<sqlmodel_core::Value>)>;
+
+#[derive(Debug, Clone)]
+pub struct CapturingConnection<C> {
+    inner: C,
+    log: std::sync::Arc<std::sync::Mutex<StatementLog>>,
+}
+
+impl<C> CapturingConnection<C> {
+    pub fn new(inner: C) -> Self {
+        Self {
+            inner,
+            log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Everything recorded so far, in execution order.
+    pub fn statements(&self) -> Vec<(String, Vec<sqlmodel_core::Value>)> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Forget what was recorded.
+    pub fn clear(&self) {
+        self.log.lock().unwrap().clear();
+    }
+
+    /// The wrapped driver connection.
+    pub fn inner(&self) -> &C {
+        &self.inner
+    }
+
+    fn record(&self, sql: &str, params: &[sqlmodel_core::Value]) {
+        self.log
+            .lock()
+            .unwrap()
+            .push((sql.to_string(), params.to_vec()));
+    }
+}
+
+impl<C: Connection> Connection for CapturingConnection<C> {
+    type Tx<'conn>
+        = C::Tx<'conn>
+    where
+        Self: 'conn;
+
+    fn dialect(&self) -> Dialect {
+        self.inner.dialect()
+    }
+
+    async fn query(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[sqlmodel_core::Value],
+    ) -> Outcome<Vec<sqlmodel_core::Row>, Error> {
+        self.record(sql, params);
+        self.inner.query(cx, sql, params).await
+    }
+
+    async fn query_one(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[sqlmodel_core::Value],
+    ) -> Outcome<Option<sqlmodel_core::Row>, Error> {
+        self.record(sql, params);
+        self.inner.query_one(cx, sql, params).await
+    }
+
+    async fn execute(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[sqlmodel_core::Value],
+    ) -> Outcome<u64, Error> {
+        self.record(sql, params);
+        self.inner.execute(cx, sql, params).await
+    }
+
+    async fn insert(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[sqlmodel_core::Value],
+    ) -> Outcome<i64, Error> {
+        self.record(sql, params);
+        self.inner.insert(cx, sql, params).await
+    }
+
+    async fn batch(
+        &self,
+        cx: &Cx,
+        statements: &[(String, Vec<sqlmodel_core::Value>)],
+    ) -> Outcome<Vec<u64>, Error> {
+        for (sql, params) in statements {
+            self.record(sql, params);
+        }
+        self.inner.batch(cx, statements).await
+    }
+
+    async fn begin(&self, cx: &Cx) -> Outcome<Self::Tx<'_>, Error> {
+        self.record("BEGIN", &[]);
+        self.inner.begin(cx).await
+    }
+
+    async fn begin_with(
+        &self,
+        cx: &Cx,
+        isolation: sqlmodel_core::IsolationLevel,
+    ) -> Outcome<Self::Tx<'_>, Error> {
+        self.record("BEGIN", &[]);
+        self.inner.begin_with(cx, isolation).await
+    }
+
+    fn supports_transaction_mode(&self, mode: sqlmodel_core::TransactionMode) -> bool {
+        self.inner.supports_transaction_mode(mode)
+    }
+
+    async fn begin_with_options(
+        &self,
+        cx: &Cx,
+        options: sqlmodel_core::TransactionOptions,
+    ) -> Outcome<Self::Tx<'_>, Error> {
+        self.record("BEGIN", &[]);
+        self.inner.begin_with_options(cx, options).await
+    }
+
+    async fn prepare(
+        &self,
+        cx: &Cx,
+        sql: &str,
+    ) -> Outcome<sqlmodel_core::PreparedStatement, Error> {
+        self.record(sql, &[]);
+        self.inner.prepare(cx, sql).await
+    }
+
+    async fn query_prepared(
+        &self,
+        cx: &Cx,
+        stmt: &sqlmodel_core::PreparedStatement,
+        params: &[sqlmodel_core::Value],
+    ) -> Outcome<Vec<sqlmodel_core::Row>, Error> {
+        self.record(stmt.sql(), params);
+        self.inner.query_prepared(cx, stmt, params).await
+    }
+
+    async fn execute_prepared(
+        &self,
+        cx: &Cx,
+        stmt: &sqlmodel_core::PreparedStatement,
+        params: &[sqlmodel_core::Value],
+    ) -> Outcome<u64, Error> {
+        self.record(stmt.sql(), params);
+        self.inner.execute_prepared(cx, stmt, params).await
+    }
+
+    async fn ping(&self, cx: &Cx) -> Outcome<(), Error> {
+        self.inner.ping(cx).await
+    }
+
+    async fn close(self, cx: &Cx) -> sqlmodel_core::Result<()> {
+        self.inner.close(cx).await
+    }
+}
+
 /// Unwrap an `Outcome`, panicking with context on anything but `Ok`.
 pub fn expect_outcome<T>(outcome: Outcome<T, Error>, what: &str) -> T {
     match outcome {

@@ -1980,14 +1980,26 @@ impl<C: Connection> Session<C> {
                     continue;
                 }
 
-                // Build UPDATE statement with all non-PK columns
+                // Build the UPDATE from the columns that changed since the
+                // snapshot. Setting every column resent every value and turned
+                // concurrent updates of different columns into lost updates
+                // (found 2026-09; SQLAlchemy only SETs changed attributes).
+                // Without a readable snapshot every non-key column is set.
+                let snapshot: Option<Vec<Value>> = tracked
+                    .original_state
+                    .as_deref()
+                    .and_then(|bytes| serde_json::from_slice(bytes).ok());
                 let mut set_parts = Vec::new();
                 let mut params = Vec::new();
                 let mut param_idx = 1;
 
                 for (i, col) in tracked.column_names.iter().enumerate() {
-                    // Skip primary key columns in SET clause
-                    if !tracked.pk_columns.contains(col) {
+                    let unchanged = snapshot
+                        .as_ref()
+                        .and_then(|before| before.get(i))
+                        .is_some_and(|before| *before == tracked.values[i]);
+                    // Skip primary key columns and unchanged columns in SET
+                    if !tracked.pk_columns.contains(col) && !unchanged {
                         set_parts.push(format!(
                             "{} = {}",
                             dialect.quote_identifier(col),
@@ -3679,6 +3691,49 @@ mod tests {
         }
     }
 
+    /// Two non-key columns, so a test can tell "the changed column" from
+    /// "every column".
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Widget {
+        id: Option<i64>,
+        name: String,
+        color: String,
+    }
+
+    impl Model for Widget {
+        const TABLE_NAME: &'static str = "widgets";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
+                ("name", Value::Text(self.name.clone())),
+                ("color", Value::Text(self.color.clone())),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(Self {
+                id: Some(row.get_named("id")?),
+                name: row.get_named("name")?,
+                color: row.get_named("color")?,
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Hero {
         id: Option<i64>,
@@ -5182,6 +5237,57 @@ mod tests {
             updates[0].1.contains(&Value::Text("Updated".into())),
             "{:?}",
             updates[0]
+        );
+    }
+
+    /// An UPDATE names only the columns that changed since the snapshot;
+    /// until 2026-09 every non-key column was set, which resent unchanged
+    /// values and turned concurrent edits of different columns into lost
+    /// updates.
+    #[test]
+    fn flush_updates_only_the_changed_columns() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            let widget = Widget {
+                id: Some(7),
+                name: "gear".to_string(),
+                color: "red".to_string(),
+            };
+            session.add(&widget);
+            unwrap_outcome(session.flush(&cx).await);
+
+            let mut recolored = widget.clone();
+            recolored.color = "blue".to_string();
+            session.mark_dirty(&recolored);
+            unwrap_outcome(session.flush(&cx).await);
+
+            // Nothing changed: no statement at all.
+            session.mark_dirty(&recolored);
+            unwrap_outcome(session.flush(&cx).await);
+        });
+
+        let guard = state.lock().unwrap();
+        let updates: Vec<&(String, Vec<Value>)> = guard
+            .executed
+            .iter()
+            .filter(|(sql, _)| sql.starts_with("UPDATE"))
+            .collect();
+        assert_eq!(updates.len(), 1, "executed: {:?}", guard.executed);
+        assert_eq!(
+            updates[0].0,
+            "UPDATE \"widgets\" SET \"color\" = $1 WHERE \"id\" = $2"
+        );
+        assert_eq!(
+            updates[0].1,
+            vec![Value::Text("blue".into()), Value::BigInt(7)]
         );
     }
 

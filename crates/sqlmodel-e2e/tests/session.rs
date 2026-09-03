@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use sqlmodel::prelude::*;
 use sqlmodel::{SchemaBuilder, Session};
 use sqlmodel_core::{Lazy, LinkTableInfo, RelatedMany};
-use sqlmodel_e2e::{DriverUnderTest, OwnedScenario, expect_outcome, run_owned_on_every_driver};
+use sqlmodel_e2e::{
+    CapturingConnection, DriverUnderTest, OwnedScenario, expect_outcome, run_owned_on_every_driver,
+};
 use std::sync::{Arc, Mutex};
 
 /// Author <-> Tag link table, seen from the author side.
@@ -174,7 +176,9 @@ impl OwnedScenario for SessionScenario {
             );
         }
 
-        let mut s = Session::new(conn);
+        // Every statement the session sends is recorded, so the scenario can
+        // assert the SQL shape (which columns an UPDATE sets), not only rows.
+        let mut s = Session::new(CapturingConnection::new(conn));
 
         // add -> flush -> visible inside the transaction; commit -> persisted; expired after.
         let ann = Author::new(1, "Ann", None);
@@ -234,6 +238,7 @@ impl OwnedScenario for SessionScenario {
         // Dirty tracking: only the changed column is written.
         let mut bob2 = loaded.clone();
         bob2.name = "Robert".into();
+        s.connection().clear();
         s.mark_dirty(&bob2);
         assert!(s.is_modified(&bob2), "{d}: mark_dirty records a change");
         let changed = s.modified_attributes(&bob2);
@@ -242,6 +247,20 @@ impl OwnedScenario for SessionScenario {
             "{d}: modified attributes {changed:?} must name `name`"
         );
         expect_outcome(s.commit(cx).await, &format!("{d}: commit update"));
+        let updates: Vec<String> = s
+            .connection()
+            .statements()
+            .into_iter()
+            .filter(|(sql, _)| sql.starts_with("UPDATE"))
+            .map(|(sql, _)| sql)
+            .collect();
+        assert_eq!(updates.len(), 1, "{d}: exactly one UPDATE: {updates:?}");
+        assert!(
+            updates[0].contains(&format!("SET {} = ", dialect.quote_identifier("name")))
+                && !updates[0].contains(&dialect.quote_identifier("email")),
+            "{d}: the UPDATE must set only the changed column: {}",
+            updates[0]
+        );
         let row = expect_outcome(
             s.connection()
                 .query(

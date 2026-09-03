@@ -71,7 +71,9 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   `TransactionErrorKind::RetriesExhausted` (`Error::retries_exhausted`). Uses async closures
   (`AsyncFnMut`).
 - **`crates/sqlmodel-e2e`** (workspace member, `publish = false`): an all-driver end-to-end harness
-  (`DriverUnderTest`, `Scenario`, `run_on_every_driver`) that runs the same ORM scenarios on
+  (`DriverUnderTest`, `Scenario`, `run_on_every_driver`, and `CapturingConnection`, a driver
+  wrapper that records every statement so scenarios can assert the SQL the ORM sent) that runs
+  the same ORM scenarios on
   C SQLite (memory and file), FrankenSQLite, and, when `SQLMODEL_TEST_{POSTGRES,MYSQL,MARIADB}_URL`
   are set, PostgreSQL/MySQL/MariaDB. Scenarios: model CRUD smoke (including a table named `order`
   with columns `user` and `select`), every `Expr` family through `select!` (comparisons, NULL
@@ -248,6 +250,12 @@ facade tests, and the driver integration suites run against live Docker database
 - **`Row::get_named` now matches column names case-insensitively** when no exact match exists and
   the match is unambiguous, since unquoted SQL identifiers are case-insensitive and servers report
   them in their own case (PostgreSQL lower, MySQL `information_schema` upper).
+- **`Session::flush` set every column on every UPDATE.** A dirty object was written back with
+  all of its non-key columns, which resent unchanged values on every save and turned two sessions
+  editing different columns of the same row into a lost update. The UPDATE now names only the
+  columns that differ from the object's snapshot, and an object whose values did not change
+  produces no statement. Proven with the new `CapturingConnection` in the e2e crate on every
+  driver.
 - **`Session::merge` onto an expired object was lost.** Every tracked object is expired after
   `commit`; merging a detached copy onto one replaced its values but never marked it dirty, so the
   following flush issued no `UPDATE` and the change silently vanished. The merged object is now
