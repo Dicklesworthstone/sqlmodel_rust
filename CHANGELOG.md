@@ -134,6 +134,14 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   `Com_stmt_close` counters: one prepare per distinct statement, one execute per call, closes on
   eviction. The whole e2e crate (types, attributes, operations, session, migrations, pool) runs
   MySQL on this path.
+- **Statement reuse stated per driver, from the servers' own counters.** The e2e `session`
+  scenario runs 20 `Session::get` calls on one connection and reads the server: MySQL shows one
+  `Com_stmt_prepare` and 20 `Com_stmt_execute` (the driver's cache), PostgreSQL leaves
+  `pg_prepared_statements` empty (the driver runs every query as the unnamed statement; named
+  statements exist only through `Connection::prepare`), and the SQLite drivers keep no statement
+  cache. The README's new "Prepared statements" row and the `sqlmodel_query::cache` docs say the
+  same; that module caches SQL text and is not connected to any driver. A PostgreSQL
+  named-statement cache is tracked as bd-vsyd.
 - **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
   script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
   PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and

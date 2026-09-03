@@ -720,7 +720,13 @@ async fn statement_counter<C: Connection>(
                     .await,
                 label,
             );
-            Some(rows[0].get_named::<String>("Value").unwrap().parse().unwrap())
+            Some(
+                rows[0]
+                    .get_named::<String>("Value")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            )
         }
         (Dialect::Mysql, StatementCounter::Executes) => {
             let rows = expect_outcome(
@@ -728,7 +734,13 @@ async fn statement_counter<C: Connection>(
                     .await,
                 label,
             );
-            Some(rows[0].get_named::<String>("Value").unwrap().parse().unwrap())
+            Some(
+                rows[0]
+                    .get_named::<String>("Value")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            )
         }
         (Dialect::Postgres, StatementCounter::Prepares) => {
             let rows = expect_outcome(
