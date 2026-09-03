@@ -429,3 +429,144 @@ fn mysql_introspection_preserves_composite_index_column_order() {
         let _ = conn.execute(&cx, &drop_sql, &[]).await;
     });
 }
+
+/// A table with a foreign key and a secondary index must introspect fully,
+/// and neither the prepared-statement foreign-key query nor `SHOW INDEX` may
+/// leave the connection desynchronized for the statement after it (found by
+/// the e2e schema fixpoint scenario on MySQL: "Protocol error: Invalid column
+/// count" on the query following the foreign-key lookup).
+#[test]
+fn mysql_introspection_reports_foreign_keys_and_indexes_without_desync() {
+    let Some(cfg) = mysql_test_config() else {
+        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
+        return;
+    };
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create asupersync runtime");
+    let cx = Cx::for_testing();
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedMySqlConnection::connect(&cx, cfg).await);
+
+        let parent = test_table_name("sqlmodel_fk_parent");
+        let child = test_table_name("sqlmodel_fk_child");
+        let _ = conn
+            .execute(&cx, &format!("DROP TABLE IF EXISTS `{child}`"), &[])
+            .await;
+        let _ = conn
+            .execute(&cx, &format!("DROP TABLE IF EXISTS `{parent}`"), &[])
+            .await;
+        unwrap_outcome(
+            conn.execute(
+                &cx,
+                &format!("CREATE TABLE `{parent}` (id BIGINT NOT NULL, PRIMARY KEY (id))"),
+                &[],
+            )
+            .await,
+        );
+        unwrap_outcome(
+            conn.execute(
+                &cx,
+                &format!(
+                    "CREATE TABLE `{child}` (\
+                     id BIGINT NOT NULL, parent_id BIGINT NOT NULL, name VARCHAR(64) NOT NULL,\
+                     PRIMARY KEY (id), FOREIGN KEY (parent_id) REFERENCES `{parent}`(id),\
+                     INDEX `{child}_name_idx` (name))"
+                ),
+                &[],
+            )
+            .await,
+        );
+
+        // The foreign-key lookup is a prepared statement with one row of result.
+        let fk_sql = "SELECT kcu.constraint_name, kcu.column_name, kcu.referenced_table_name, \
+                      kcu.referenced_column_name, rc.delete_rule, rc.update_rule \
+                      FROM information_schema.key_column_usage AS kcu \
+                      JOIN information_schema.referential_constraints AS rc \
+                        ON rc.constraint_name = kcu.constraint_name \
+                       AND rc.constraint_schema = kcu.constraint_schema \
+                      WHERE kcu.table_schema = DATABASE() AND kcu.table_name = ? \
+                        AND kcu.referenced_table_name IS NOT NULL";
+        let fk_rows = unwrap_outcome(conn.query(&cx, fk_sql, &[Value::Text(child.clone())]).await);
+        assert_eq!(fk_rows.len(), 1, "one foreign key: {fk_rows:?}");
+        // MySQL names these columns CONSTRAINT_NAME etc.; the introspector
+        // must not depend on the case the server picks.
+        assert!(
+            fk_rows[0].get_named::<String>("CONSTRAINT_NAME").is_ok(),
+            "server-cased name readable: {fk_rows:?}"
+        );
+        let probe = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(probe.len(), 1, "connection usable after the FK query");
+
+        let idx_rows = unwrap_outcome(
+            conn.query(&cx, &format!("SHOW INDEX FROM `{child}`"), &[])
+                .await,
+        );
+        assert!(
+            idx_rows.len() >= 3,
+            "PRIMARY + fk index + name index: {}",
+            idx_rows.len()
+        );
+        let probe = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(probe.len(), 1, "connection usable after SHOW INDEX");
+
+        let introspector = Introspector::new(Dialect::Mysql);
+        let info = unwrap_outcome(introspector.table_info(&cx, &conn, &child).await);
+        assert_eq!(info.primary_key, vec!["id".to_string()]);
+        assert_eq!(info.foreign_keys.len(), 1, "{:?}", info.foreign_keys);
+        assert_eq!(info.foreign_keys[0].foreign_table, parent);
+        assert!(
+            info.indexes
+                .iter()
+                .any(|i| i.name == format!("{child}_name_idx")),
+            "{:?}",
+            info.indexes
+        );
+        let probe = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(probe.len(), 1, "connection usable after table_info");
+
+        let _ = conn
+            .execute(&cx, &format!("DROP TABLE `{child}`"), &[])
+            .await;
+        let _ = conn
+            .execute(&cx, &format!("DROP TABLE `{parent}`"), &[])
+            .await;
+    });
+}
+
+/// A text-protocol row whose first value is the empty string starts with the
+/// byte `0x00`. Until 2026-09 the result-set reader took that for an OK packet,
+/// dropped the rows, and left the terminator in the stream, so the next
+/// statement failed with "Protocol error: Invalid column count".
+#[test]
+fn mysql_row_with_empty_first_value_does_not_desync_the_connection() {
+    let Some(cfg) = mysql_test_config() else {
+        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
+        return;
+    };
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create asupersync runtime");
+    let cx = Cx::for_testing();
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedMySqlConnection::connect(&cx, cfg).await);
+        let rows = unwrap_outcome(
+            conn.query(
+                &cx,
+                "SELECT '' AS blank, 42 AS answer UNION ALL SELECT 'x', 43",
+                &[],
+            )
+            .await,
+        );
+        assert_eq!(rows.len(), 2, "both rows survive: {rows:?}");
+        assert_eq!(rows[0].get_named::<String>("blank").unwrap(), "");
+        assert_eq!(rows[0].get_named::<i64>("answer").unwrap(), 42);
+        assert_eq!(rows[1].get_named::<String>("blank").unwrap(), "x");
+        let probe = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(probe.len(), 1, "connection usable afterwards");
+    });
+}

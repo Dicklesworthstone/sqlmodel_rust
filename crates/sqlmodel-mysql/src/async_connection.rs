@@ -33,7 +33,7 @@ use crate::config::MySqlConfig;
 use crate::connection::{ConnectionState, ServerCapabilities};
 use crate::protocol::{
     Command, ErrPacket, MAX_PACKET_SIZE, PacketHeader, PacketReader, PacketType, PacketWriter,
-    capabilities, charset, prepared,
+    RowPacket, capabilities, charset, parse_result_terminator, prepared,
 };
 use crate::types::{
     ColumnDef, FieldType, decode_binary_value_with_len, decode_text_value, interpolate_params,
@@ -1354,24 +1354,15 @@ impl MySqlAsyncConnection {
                 break;
             }
 
-            #[allow(clippy::cast_possible_truncation)] // MySQL packets are max 16MB
-            match PacketType::from_first_byte(payload[0], payload.len() as u32) {
-                PacketType::Eof | PacketType::Ok => {
-                    let mut reader = PacketReader::new(&payload);
-                    if payload[0] == 0x00 {
-                        if let Some(ok) = reader.parse_ok_packet() {
-                            self.status_flags = ok.status_flags;
-                            self.warnings = ok.warnings;
-                        }
-                    } else if payload[0] == 0xFE
-                        && let Some(eof) = reader.parse_eof_packet()
-                    {
-                        self.status_flags = eof.status_flags;
-                        self.warnings = eof.warnings;
+            match RowPacket::classify(&payload) {
+                RowPacket::Terminator => {
+                    if let Some((status_flags, warnings)) = parse_result_terminator(&payload) {
+                        self.status_flags = status_flags;
+                        self.warnings = warnings;
                     }
                     break;
                 }
-                PacketType::Error => {
+                RowPacket::Error => {
                     let mut reader = PacketReader::new(&payload);
                     let Some(err) = reader.parse_err_packet() else {
                         return Outcome::Err(protocol_error("Invalid error packet"));
@@ -1379,7 +1370,7 @@ impl MySqlAsyncConnection {
                     self.state = ConnectionState::Ready;
                     return Outcome::Err(query_error(&err));
                 }
-                _ => {
+                RowPacket::Row => {
                     let row = self.parse_text_row(&payload, &columns);
                     rows.push(row);
                 }
@@ -1790,24 +1781,15 @@ impl MySqlAsyncConnection {
                 break;
             }
 
-            #[allow(clippy::cast_possible_truncation)] // MySQL packets are max 16MB
-            match PacketType::from_first_byte(payload[0], payload.len() as u32) {
-                PacketType::Eof | PacketType::Ok => {
-                    let mut reader = PacketReader::new(&payload);
-                    if payload[0] == 0x00 {
-                        if let Some(ok) = reader.parse_ok_packet() {
-                            self.status_flags = ok.status_flags;
-                            self.warnings = ok.warnings;
-                        }
-                    } else if payload[0] == 0xFE
-                        && let Some(eof) = reader.parse_eof_packet()
-                    {
-                        self.status_flags = eof.status_flags;
-                        self.warnings = eof.warnings;
+            match RowPacket::classify(&payload) {
+                RowPacket::Terminator => {
+                    if let Some((status_flags, warnings)) = parse_result_terminator(&payload) {
+                        self.status_flags = status_flags;
+                        self.warnings = warnings;
                     }
                     break;
                 }
-                PacketType::Error => {
+                RowPacket::Error => {
                     let mut reader = PacketReader::new(&payload);
                     let Some(err) = reader.parse_err_packet() else {
                         return Outcome::Err(protocol_error("Invalid error packet"));
@@ -1815,7 +1797,7 @@ impl MySqlAsyncConnection {
                     self.state = ConnectionState::Ready;
                     return Outcome::Err(query_error(&err));
                 }
-                _ => {
+                RowPacket::Row => {
                     let row = self.parse_binary_row(&payload, cols);
                     rows.push(row);
                 }

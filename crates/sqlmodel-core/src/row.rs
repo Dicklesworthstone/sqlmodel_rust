@@ -43,8 +43,27 @@ impl ColumnInfo {
     }
 
     /// Get the index of a column by name.
+    ///
+    /// An exact match wins. Failing that, a name that matches exactly one
+    /// column ignoring ASCII case is accepted: unquoted SQL identifiers are
+    /// case-insensitive, and servers report them in their own case (PostgreSQL
+    /// folds to lower case, MySQL returns `information_schema` columns in
+    /// upper case), so `get_named("constraint_name")` should find
+    /// `CONSTRAINT_NAME`.
     pub fn index_of(&self, name: &str) -> Option<usize> {
-        self.name_to_index.get(name).copied()
+        if let Some(index) = self.name_to_index.get(name) {
+            return Some(*index);
+        }
+        let mut found = None;
+        for (index, candidate) in self.names.iter().enumerate() {
+            if candidate.eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return None; // ambiguous: two columns differ only by case
+                }
+                found = Some(index);
+            }
+        }
+        found
     }
 
     /// Get the name of a column by index.
@@ -641,6 +660,35 @@ mod tests {
         // Typed name access
         assert_eq!(row.get_named::<i32>("id").unwrap(), 42);
         assert_eq!(row.get_named::<String>("name").unwrap(), "Bob");
+    }
+
+    /// Servers report unquoted identifiers in their own case (MySQL returns
+    /// `information_schema` columns upper-cased); a lookup that misses exactly
+    /// falls back to an unambiguous case-insensitive match.
+    #[test]
+    fn named_lookup_falls_back_to_case_insensitive_match() {
+        let row = Row::new(
+            vec!["CONSTRAINT_NAME".to_string(), "Column_name".to_string()],
+            vec![
+                Value::Text("fk_a".to_string()),
+                Value::Text("a".to_string()),
+            ],
+        );
+        assert_eq!(row.get_named::<String>("constraint_name").unwrap(), "fk_a");
+        assert_eq!(row.get_named::<String>("COLUMN_NAME").unwrap(), "a");
+        assert_eq!(row.get_named::<String>("Column_name").unwrap(), "a");
+
+        // Two columns that differ only by case stay exact-match only.
+        let row = Row::new(
+            vec!["id".to_string(), "ID".to_string()],
+            vec![Value::Int(1), Value::Int(2)],
+        );
+        assert_eq!(row.get_named::<i32>("id").unwrap(), 1);
+        assert_eq!(row.get_named::<i32>("ID").unwrap(), 2);
+        assert!(
+            row.get_named::<i32>("Id").is_err(),
+            "ambiguous lookups fail"
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@ use crate::auth;
 use crate::config::MySqlConfig;
 use crate::protocol::{
     Command, ErrPacket, MAX_PACKET_SIZE, PacketHeader, PacketReader, PacketType, PacketWriter,
-    capabilities, charset,
+    RowPacket, capabilities, charset, parse_result_terminator,
 };
 use crate::types::{ColumnDef, FieldType, decode_text_value, interpolate_params};
 
@@ -679,24 +679,15 @@ impl MySqlConnection {
                 break;
             }
 
-            match PacketType::from_first_byte(payload[0], payload.len() as u32) {
-                PacketType::Eof | PacketType::Ok => {
-                    // End of result set
-                    let mut reader = PacketReader::new(&payload);
-                    if payload[0] == 0x00 {
-                        if let Some(ok) = reader.parse_ok_packet() {
-                            self.status_flags = ok.status_flags;
-                            self.warnings = ok.warnings;
-                        }
-                    } else if payload[0] == 0xFE
-                        && let Some(eof) = reader.parse_eof_packet()
-                    {
-                        self.status_flags = eof.status_flags;
-                        self.warnings = eof.warnings;
+            match RowPacket::classify(&payload) {
+                RowPacket::Terminator => {
+                    if let Some((status_flags, warnings)) = parse_result_terminator(&payload) {
+                        self.status_flags = status_flags;
+                        self.warnings = warnings;
                     }
                     break;
                 }
-                PacketType::Error => {
+                RowPacket::Error => {
                     let mut reader = PacketReader::new(&payload);
                     let err = reader
                         .parse_err_packet()
@@ -704,8 +695,7 @@ impl MySqlConnection {
                     self.state = ConnectionState::Ready;
                     return Err(query_error(&err));
                 }
-                _ => {
-                    // Data row
+                RowPacket::Row => {
                     let row = self.parse_text_row(&payload, &columns);
                     rows.push(row);
                 }
@@ -765,23 +755,15 @@ impl MySqlConnection {
                 break;
             }
 
-            match PacketType::from_first_byte(payload[0], payload.len() as u32) {
-                PacketType::Eof | PacketType::Ok => {
-                    let mut reader = PacketReader::new(&payload);
-                    if payload[0] == 0x00 {
-                        if let Some(ok) = reader.parse_ok_packet() {
-                            self.status_flags = ok.status_flags;
-                            self.warnings = ok.warnings;
-                        }
-                    } else if payload[0] == 0xFE
-                        && let Some(eof) = reader.parse_eof_packet()
-                    {
-                        self.status_flags = eof.status_flags;
-                        self.warnings = eof.warnings;
+            match RowPacket::classify(&payload) {
+                RowPacket::Terminator => {
+                    if let Some((status_flags, warnings)) = parse_result_terminator(&payload) {
+                        self.status_flags = status_flags;
+                        self.warnings = warnings;
                     }
                     break;
                 }
-                PacketType::Error => {
+                RowPacket::Error => {
                     let mut reader = PacketReader::new(&payload);
                     let err = reader
                         .parse_err_packet()
@@ -789,7 +771,7 @@ impl MySqlConnection {
                     self.state = ConnectionState::Ready;
                     return Err(query_error(&err));
                 }
-                _ => {
+                RowPacket::Row => {
                     let row = self.parse_text_row(&payload, &columns);
                     rows.push(row);
                 }

@@ -35,13 +35,13 @@ use sqlmodel_core::{FieldInfo, Model};
 /// }
 ///
 /// // Extract the expected schema
-/// let schema = Hero::table_schema();
+/// let schema = Hero::table_schema(Dialect::Sqlite);
 /// assert_eq!(schema.name, "heroes");
 /// ```
 pub trait ModelSchema: Model {
-    /// Get the expected table schema for this model.
-    fn table_schema() -> TableInfo {
-        table_schema_from_model::<Self>()
+    /// Get the expected table schema for this model, typed for `dialect`.
+    fn table_schema(dialect: Dialect) -> TableInfo {
+        table_schema_from_model::<Self>(dialect)
     }
 }
 
@@ -53,8 +53,8 @@ impl<M: Model> ModelSchema for M {}
 // ============================================================================
 
 /// Extract a TableInfo from a Model type.
-pub fn table_schema_from_model<M: Model>() -> TableInfo {
-    table_schema_from_fields(M::TABLE_NAME, M::fields(), M::PRIMARY_KEY)
+pub fn table_schema_from_model<M: Model>(dialect: Dialect) -> TableInfo {
+    table_schema_from_fields(dialect, M::TABLE_NAME, M::fields(), M::PRIMARY_KEY)
 }
 
 /// Convert field metadata to a TableInfo.
@@ -62,7 +62,12 @@ pub fn table_schema_from_model<M: Model>() -> TableInfo {
 /// This is the core conversion function that transforms the compile-time
 /// FieldInfo array into a runtime TableInfo structure compatible with
 /// database introspection.
+/// Column types follow the dialect exactly as `SchemaBuilder` renders them
+/// (`FieldInfo::effective_sql_type_for`), so the schema this produces is what
+/// the generated DDL creates: for example a keyed `String` is `VARCHAR(255)`
+/// on MySQL, where a `TEXT` column cannot carry a key.
 pub fn table_schema_from_fields(
+    dialect: Dialect,
     table_name: &str,
     fields: &[FieldInfo],
     primary_key_cols: &[&str],
@@ -74,7 +79,7 @@ pub fn table_schema_from_fields(
 
     for field in fields {
         // Convert FieldInfo to ColumnInfo
-        let sql_type = field.effective_sql_type();
+        let sql_type = field.effective_sql_type_for(dialect);
         columns.push(ColumnInfo {
             name: field.column_name.to_string(),
             sql_type: sql_type.clone(),
@@ -155,7 +160,7 @@ fn parse_fk_reference(reference: &str) -> Option<(String, String)> {
 /// ```
 pub fn expected_schema<M: Model>(dialect: Dialect) -> DatabaseSchema {
     let mut schema = DatabaseSchema::new(dialect);
-    let table_info = table_schema_from_model::<M>();
+    let table_info = table_schema_from_model::<M>(dialect);
     schema.tables.insert(table_info.name.clone(), table_info);
     schema
 }
@@ -164,13 +169,13 @@ pub fn expected_schema<M: Model>(dialect: Dialect) -> DatabaseSchema {
 ///
 /// This allows building a complete expected schema from multiple models.
 pub trait ModelTuple {
-    /// Get all table schemas from this tuple of models.
-    fn all_table_schemas() -> Vec<TableInfo>;
+    /// Get all table schemas from this tuple of models, typed for `dialect`.
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo>;
 
     /// Build a complete database schema from all models in this tuple.
     fn database_schema(dialect: Dialect) -> DatabaseSchema {
         let mut schema = DatabaseSchema::new(dialect);
-        for table in Self::all_table_schemas() {
+        for table in Self::all_table_schemas(dialect) {
             schema.tables.insert(table.name.clone(), table);
         }
         schema
@@ -179,67 +184,67 @@ pub trait ModelTuple {
 
 // Implement for single model
 impl<A: Model> ModelTuple for (A,) {
-    fn all_table_schemas() -> Vec<TableInfo> {
-        vec![table_schema_from_model::<A>()]
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
+        vec![table_schema_from_model::<A>(dialect)]
     }
 }
 
 // Implement for 2-tuple
 impl<A: Model, B: Model> ModelTuple for (A, B) {
-    fn all_table_schemas() -> Vec<TableInfo> {
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
         vec![
-            table_schema_from_model::<A>(),
-            table_schema_from_model::<B>(),
+            table_schema_from_model::<A>(dialect),
+            table_schema_from_model::<B>(dialect),
         ]
     }
 }
 
 // Implement for 3-tuple
 impl<A: Model, B: Model, C: Model> ModelTuple for (A, B, C) {
-    fn all_table_schemas() -> Vec<TableInfo> {
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
         vec![
-            table_schema_from_model::<A>(),
-            table_schema_from_model::<B>(),
-            table_schema_from_model::<C>(),
+            table_schema_from_model::<A>(dialect),
+            table_schema_from_model::<B>(dialect),
+            table_schema_from_model::<C>(dialect),
         ]
     }
 }
 
 // Implement for 4-tuple
 impl<A: Model, B: Model, C: Model, D: Model> ModelTuple for (A, B, C, D) {
-    fn all_table_schemas() -> Vec<TableInfo> {
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
         vec![
-            table_schema_from_model::<A>(),
-            table_schema_from_model::<B>(),
-            table_schema_from_model::<C>(),
-            table_schema_from_model::<D>(),
+            table_schema_from_model::<A>(dialect),
+            table_schema_from_model::<B>(dialect),
+            table_schema_from_model::<C>(dialect),
+            table_schema_from_model::<D>(dialect),
         ]
     }
 }
 
 // Implement for 5-tuple
 impl<A: Model, B: Model, C: Model, D: Model, E: Model> ModelTuple for (A, B, C, D, E) {
-    fn all_table_schemas() -> Vec<TableInfo> {
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
         vec![
-            table_schema_from_model::<A>(),
-            table_schema_from_model::<B>(),
-            table_schema_from_model::<C>(),
-            table_schema_from_model::<D>(),
-            table_schema_from_model::<E>(),
+            table_schema_from_model::<A>(dialect),
+            table_schema_from_model::<B>(dialect),
+            table_schema_from_model::<C>(dialect),
+            table_schema_from_model::<D>(dialect),
+            table_schema_from_model::<E>(dialect),
         ]
     }
 }
 
 // Implement for 6-tuple
 impl<A: Model, B: Model, C: Model, D: Model, E: Model, F: Model> ModelTuple for (A, B, C, D, E, F) {
-    fn all_table_schemas() -> Vec<TableInfo> {
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
         vec![
-            table_schema_from_model::<A>(),
-            table_schema_from_model::<B>(),
-            table_schema_from_model::<C>(),
-            table_schema_from_model::<D>(),
-            table_schema_from_model::<E>(),
-            table_schema_from_model::<F>(),
+            table_schema_from_model::<A>(dialect),
+            table_schema_from_model::<B>(dialect),
+            table_schema_from_model::<C>(dialect),
+            table_schema_from_model::<D>(dialect),
+            table_schema_from_model::<E>(dialect),
+            table_schema_from_model::<F>(dialect),
         ]
     }
 }
@@ -248,15 +253,15 @@ impl<A: Model, B: Model, C: Model, D: Model, E: Model, F: Model> ModelTuple for 
 impl<A: Model, B: Model, C: Model, D: Model, E: Model, F: Model, G: Model> ModelTuple
     for (A, B, C, D, E, F, G)
 {
-    fn all_table_schemas() -> Vec<TableInfo> {
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
         vec![
-            table_schema_from_model::<A>(),
-            table_schema_from_model::<B>(),
-            table_schema_from_model::<C>(),
-            table_schema_from_model::<D>(),
-            table_schema_from_model::<E>(),
-            table_schema_from_model::<F>(),
-            table_schema_from_model::<G>(),
+            table_schema_from_model::<A>(dialect),
+            table_schema_from_model::<B>(dialect),
+            table_schema_from_model::<C>(dialect),
+            table_schema_from_model::<D>(dialect),
+            table_schema_from_model::<E>(dialect),
+            table_schema_from_model::<F>(dialect),
+            table_schema_from_model::<G>(dialect),
         ]
     }
 }
@@ -265,16 +270,16 @@ impl<A: Model, B: Model, C: Model, D: Model, E: Model, F: Model, G: Model> Model
 impl<A: Model, B: Model, C: Model, D: Model, E: Model, F: Model, G: Model, H: Model> ModelTuple
     for (A, B, C, D, E, F, G, H)
 {
-    fn all_table_schemas() -> Vec<TableInfo> {
+    fn all_table_schemas(dialect: Dialect) -> Vec<TableInfo> {
         vec![
-            table_schema_from_model::<A>(),
-            table_schema_from_model::<B>(),
-            table_schema_from_model::<C>(),
-            table_schema_from_model::<D>(),
-            table_schema_from_model::<E>(),
-            table_schema_from_model::<F>(),
-            table_schema_from_model::<G>(),
-            table_schema_from_model::<H>(),
+            table_schema_from_model::<A>(dialect),
+            table_schema_from_model::<B>(dialect),
+            table_schema_from_model::<C>(dialect),
+            table_schema_from_model::<D>(dialect),
+            table_schema_from_model::<E>(dialect),
+            table_schema_from_model::<F>(dialect),
+            table_schema_from_model::<G>(dialect),
+            table_schema_from_model::<H>(dialect),
         ]
     }
 }
@@ -387,13 +392,13 @@ mod tests {
 
     #[test]
     fn test_model_schema_table_name() {
-        let schema = TestHero::table_schema();
+        let schema = TestHero::table_schema(Dialect::Sqlite);
         assert_eq!(schema.name, "heroes");
     }
 
     #[test]
     fn test_model_schema_columns() {
-        let schema = TestHero::table_schema();
+        let schema = TestHero::table_schema(Dialect::Sqlite);
         assert_eq!(schema.columns.len(), 4);
 
         let id_col = schema.column("id").unwrap();
@@ -408,13 +413,13 @@ mod tests {
 
     #[test]
     fn test_model_schema_primary_key() {
-        let schema = TestHero::table_schema();
+        let schema = TestHero::table_schema(Dialect::Sqlite);
         assert_eq!(schema.primary_key, vec!["id"]);
     }
 
     #[test]
     fn test_model_schema_foreign_keys() {
-        let schema = TestHero::table_schema();
+        let schema = TestHero::table_schema(Dialect::Sqlite);
         assert_eq!(schema.foreign_keys.len(), 1);
 
         let fk = &schema.foreign_keys[0];
@@ -426,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_model_schema_unique_constraints() {
-        let schema = TestHero::table_schema();
+        let schema = TestHero::table_schema(Dialect::Sqlite);
         assert_eq!(schema.unique_constraints.len(), 1);
 
         let uk = &schema.unique_constraints[0];
@@ -435,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_model_schema_indexes() {
-        let schema = TestHero::table_schema();
+        let schema = TestHero::table_schema(Dialect::Sqlite);
         assert_eq!(schema.indexes.len(), 1);
 
         let idx = &schema.indexes[0];

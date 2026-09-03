@@ -533,6 +533,35 @@ pub fn schema_diff(current: &DatabaseSchema, expected: &DatabaseSchema) -> Schem
     schema_diff_with_policy(current, expected, DestructivePolicy::Warn)
 }
 
+/// Order tables so that every table comes after the tables its foreign keys
+/// reference (within the given set); ties and tables outside any dependency
+/// chain are ordered by name, so the result is deterministic. A reference
+/// cycle cannot be satisfied; the tables involved keep name order.
+fn order_tables_by_foreign_keys(mut tables: Vec<&TableInfo>) -> Vec<&TableInfo> {
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut ordered: Vec<&TableInfo> = Vec::with_capacity(tables.len());
+    let mut placed: HashSet<&str> = HashSet::new();
+    while ordered.len() < tables.len() {
+        let next = tables.iter().find(|t| {
+            !placed.contains(t.name.as_str())
+                && t.foreign_keys.iter().all(|fk| {
+                    fk.foreign_table == t.name
+                        || placed.contains(fk.foreign_table.as_str())
+                        || !tables.iter().any(|o| o.name == fk.foreign_table)
+                })
+        });
+        // No table is free of unplaced references: a cycle. Take the first
+        // remaining table by name rather than looping forever.
+        let next = next
+            .or_else(|| tables.iter().find(|t| !placed.contains(t.name.as_str())))
+            .copied();
+        let Some(table) = next else { break };
+        placed.insert(table.name.as_str());
+        ordered.push(table);
+    }
+    ordered
+}
+
 /// Compare two schemas and generate operations to transform current to expected.
 pub fn schema_diff_with_policy(
     current: &DatabaseSchema,
@@ -569,28 +598,41 @@ impl SchemaDiffer {
             });
         }
 
-        // Find new tables (in expected but not current)
-        for (name, table) in &expected.tables {
-            if renamed_to.contains(name.as_str()) {
-                continue;
-            }
-            if !current.tables.contains_key(name) {
-                diff.add_op(SchemaOperation::CreateTable(table.clone()));
-            }
+        // Find new tables (in expected but not current), created in
+        // foreign-key dependency order: a table must exist before another
+        // table references it (MySQL refuses otherwise; PostgreSQL too unless
+        // the hash order happened to be right).
+        let new_tables: Vec<&TableInfo> = expected
+            .tables
+            .iter()
+            .filter(|(name, _)| {
+                !renamed_to.contains(name.as_str()) && !current.tables.contains_key(*name)
+            })
+            .map(|(_, table)| table)
+            .collect();
+        for table in order_tables_by_foreign_keys(new_tables) {
+            diff.add_op(SchemaOperation::CreateTable(table.clone()));
         }
 
-        // Find dropped tables (in current but not expected)
-        for name in current.tables.keys() {
-            if renamed_from.contains(name.as_str()) {
-                continue;
-            }
-            if !expected.tables.contains_key(name) {
-                diff.add_destructive_op(
-                    SchemaOperation::DropTable(name.clone()),
-                    WarningSeverity::DataLoss,
-                    format!("Dropping table '{}' will delete all data", name),
-                );
-            }
+        // Find dropped tables (in current but not expected), dropped in the
+        // reverse order: dependents before the tables they reference.
+        let dropped_tables: Vec<&TableInfo> = current
+            .tables
+            .iter()
+            .filter(|(name, _)| {
+                !renamed_from.contains(name.as_str()) && !expected.tables.contains_key(*name)
+            })
+            .map(|(_, table)| table)
+            .collect();
+        for table in order_tables_by_foreign_keys(dropped_tables)
+            .into_iter()
+            .rev()
+        {
+            diff.add_destructive_op(
+                SchemaOperation::DropTable(table.name.clone()),
+                WarningSeverity::DataLoss,
+                format!("Dropping table '{}' will delete all data", table.name),
+            );
         }
 
         // Compare existing tables
@@ -746,7 +788,14 @@ fn diff_table(current: &TableInfo, expected: &TableInfo, dialect: Dialect, diff:
     diff_unique_constraints(current, &expected.unique_constraints, diff);
 
     // Diff indexes
-    diff_indexes(table, &current.indexes, &expected.indexes, diff);
+    diff_indexes(
+        table,
+        &current.indexes,
+        &expected.indexes,
+        &current.foreign_keys,
+        dialect,
+        diff,
+    );
 }
 
 /// Compare columns between tables.
@@ -1031,9 +1080,30 @@ fn diff_unique_constraints(
 }
 
 /// Compare indexes.
-fn diff_indexes(table: &str, current: &[IndexInfo], expected: &[IndexInfo], diff: &mut SchemaDiff) {
+///
+/// `foreign_keys` are the current table's keys: MySQL creates an index for
+/// every foreign key that has none, named after the column. It is not part of
+/// the declared schema and cannot be dropped while the key exists, so it is
+/// never reported as a difference there.
+fn diff_indexes(
+    table: &str,
+    current: &[IndexInfo],
+    expected: &[IndexInfo],
+    foreign_keys: &[ForeignKeyInfo],
+    dialect: Dialect,
+    diff: &mut SchemaDiff,
+) {
+    let implicit_fk_index = |index: &IndexInfo| {
+        dialect == Dialect::Mysql
+            && !index.unique
+            && index.columns.len() == 1
+            && foreign_keys.iter().any(|fk| fk.column == index.columns[0])
+    };
     // Skip primary key indexes as they're handled separately
-    let current_filtered: Vec<_> = current.iter().filter(|i| !i.primary).collect();
+    let current_filtered: Vec<_> = current
+        .iter()
+        .filter(|i| !i.primary && !implicit_fk_index(i))
+        .collect();
     let expected_filtered: Vec<_> = expected.iter().filter(|i| !i.primary).collect();
 
     // Build maps by name
@@ -1297,11 +1367,18 @@ fn normalize_type(sql_type: &str, dialect: Dialect) -> String {
             "SMALLSERIAL" => "SMALLINT".to_string(),
             _ => upper,
         },
-        Dialect::Mysql => match upper.as_str() {
-            "INTEGER" => "INT".to_string(),
-            "BOOL" | "BOOLEAN" => "TINYINT".to_string(),
-            _ => upper,
-        },
+        Dialect::Mysql => {
+            // Integer display widths (`TINYINT(1)`, `INT(11)`) are presentation
+            // hints MySQL 8 still reports for `BOOLEAN` and legacy DDL; they
+            // never change the type, so they must not read as a difference.
+            let base = upper.split('(').next().unwrap_or("").trim().to_string();
+            match base.as_str() {
+                "INTEGER" | "INT" => "INT".to_string(),
+                "BOOL" | "BOOLEAN" | "TINYINT" => "TINYINT".to_string(),
+                "SMALLINT" | "MEDIUMINT" | "BIGINT" => base,
+                _ => upper,
+            }
+        }
     }
 }
 
@@ -1338,6 +1415,133 @@ mod tests {
             indexes: Vec::new(),
             comment: None,
         }
+    }
+
+    /// MySQL reports `BOOLEAN` back as `tinyint(1)` and keeps display widths
+    /// on integers; none of that is a type change.
+    #[test]
+    fn mysql_type_normalization_ignores_display_widths() {
+        for (reported, declared) in [
+            ("tinyint(1)", "BOOLEAN"),
+            ("tinyint(1)", "BOOL"),
+            ("int(11)", "INTEGER"),
+            ("int", "INT"),
+            ("bigint(20)", "BIGINT"),
+            ("smallint(6)", "SMALLINT"),
+        ] {
+            assert_eq!(
+                normalize_type(reported, Dialect::Mysql),
+                normalize_type(declared, Dialect::Mysql),
+                "{reported} vs {declared}"
+            );
+        }
+        // Parameters that matter are kept.
+        assert_eq!(
+            normalize_type("varchar(255)", Dialect::Mysql),
+            "VARCHAR(255)"
+        );
+        assert_eq!(
+            normalize_type("decimal(10,2)", Dialect::Mysql),
+            "DECIMAL(10,2)"
+        );
+        assert_ne!(
+            normalize_type("varchar(255)", Dialect::Mysql),
+            normalize_type("varchar(64)", Dialect::Mysql)
+        );
+    }
+
+    /// The index MySQL creates for a foreign key is not a difference; on other
+    /// dialects an undeclared index still is.
+    #[test]
+    fn mysql_implicit_foreign_key_index_is_not_a_difference() {
+        let fk_index = IndexInfo {
+            name: "team_id".to_string(),
+            columns: vec!["team_id".to_string()],
+            unique: false,
+            index_type: None,
+            primary: false,
+        };
+        let fk = ForeignKeyInfo {
+            name: Some("players_ibfk_1".to_string()),
+            column: "team_id".to_string(),
+            foreign_table: "teams".to_string(),
+            foreign_column: "id".to_string(),
+            on_delete: None,
+            on_update: None,
+        };
+        let mut current = make_table("players", vec![make_column("team_id", "BIGINT", false)]);
+        current.foreign_keys = vec![fk.clone()];
+        current.indexes = vec![fk_index];
+        let mut expected = make_table("players", vec![make_column("team_id", "BIGINT", false)]);
+        expected.foreign_keys = vec![fk];
+
+        for (dialect, expect_drop) in [(Dialect::Mysql, false), (Dialect::Postgres, true)] {
+            let mut cur = DatabaseSchema::new(dialect);
+            cur.tables.insert("players".into(), current.clone());
+            let mut exp = DatabaseSchema::new(dialect);
+            exp.tables.insert("players".into(), expected.clone());
+            let diff = schema_diff(&cur, &exp);
+            let drops = diff
+                .operations
+                .iter()
+                .filter(|op| matches!(op, SchemaOperation::DropIndex { .. }))
+                .count();
+            assert_eq!(
+                drops,
+                usize::from(expect_drop),
+                "{dialect:?}: {:?}",
+                diff.operations
+            );
+        }
+    }
+
+    /// Found by the e2e schema fixpoint scenario on MySQL: tables were created
+    /// in hash-map order, so a referencing table could come before the table
+    /// it references.
+    #[test]
+    fn new_tables_are_created_in_foreign_key_order_and_dropped_in_reverse() {
+        let fk = |table: &str| ForeignKeyInfo {
+            name: None,
+            column: format!("{table}_id"),
+            foreign_table: table.to_string(),
+            foreign_column: "id".to_string(),
+            on_delete: None,
+            on_update: None,
+        };
+        let mut teams = make_table("teams", vec![make_column("id", "INTEGER", false)]);
+        teams.primary_key = vec!["id".into()];
+        let mut players = make_table("players", vec![make_column("id", "INTEGER", false)]);
+        players.foreign_keys = vec![fk("teams")];
+        let mut awards = make_table("awards", vec![make_column("id", "INTEGER", false)]);
+        awards.foreign_keys = vec![fk("players")];
+        // "awards" < "players" < "teams" alphabetically, the opposite of the
+        // dependency order, so name order alone would be wrong.
+        let mut expected = DatabaseSchema::new(Dialect::Mysql);
+        for t in [&awards, &players, &teams] {
+            expected.tables.insert(t.name.clone(), t.clone());
+        }
+
+        let diff = schema_diff(&DatabaseSchema::new(Dialect::Mysql), &expected);
+        let created: Vec<&str> = diff
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                SchemaOperation::CreateTable(t) => Some(t.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created, ["teams", "players", "awards"]);
+
+        let diff = schema_diff(&expected, &DatabaseSchema::new(Dialect::Mysql));
+        let dropped: Vec<&str> = diff
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                SchemaOperation::DropTable(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dropped, ["awards", "players", "teams"]);
     }
 
     #[test]

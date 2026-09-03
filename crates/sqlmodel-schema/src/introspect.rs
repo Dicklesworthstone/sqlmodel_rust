@@ -612,7 +612,7 @@ impl Introspector {
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        let columns: Vec<ColumnInfo> = rows
+        let mut columns: Vec<ColumnInfo> = rows
             .iter()
             .filter_map(|row| {
                 let name = row.get_named::<String>("column_name").ok()?;
@@ -639,12 +639,46 @@ impl Introspector {
                     parsed_type,
                     nullable: nullable_str == "YES",
                     default,
-                    primary_key: false, // Determined via separate index query
+                    primary_key: false, // filled in below
                     auto_increment,
                     comment: comment.filter(|s| !s.is_empty()),
                 })
             })
             .collect();
+
+        // Primary-key membership. `TableInfo::primary_key` is derived from this
+        // flag; until 2026-09 nothing set it on PostgreSQL, so every table
+        // introspected as keyless and `schema_diff` kept re-adding the key.
+        let pk_sql = "SELECT kcu.column_name
+                      FROM information_schema.table_constraints tc
+                      JOIN information_schema.key_column_usage kcu
+                        ON kcu.constraint_name = tc.constraint_name
+                       AND kcu.constraint_schema = tc.constraint_schema
+                       AND kcu.table_name = tc.table_name
+                      WHERE tc.constraint_type = 'PRIMARY KEY'
+                        AND tc.table_name = $1
+                        AND tc.table_schema = current_schema()
+                      ORDER BY kcu.ordinal_position";
+        let pk_rows = match conn
+            .query(
+                cx,
+                pk_sql,
+                &[sqlmodel_core::Value::Text(table_name.to_string())],
+            )
+            .await
+        {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        for row in &pk_rows {
+            if let Ok(pk_column) = row.get_named::<String>("column_name")
+                && let Some(column) = columns.iter_mut().find(|c| c.name == pk_column)
+            {
+                column.primary_key = true;
+            }
+        }
 
         Outcome::Ok(columns)
     }
@@ -1059,13 +1093,16 @@ impl Introspector {
         conn: &C,
         table_name: &str,
     ) -> Outcome<Vec<ForeignKeyInfo>, Error> {
+        // MySQL reports `information_schema` columns in upper case
+        // (`CONSTRAINT_NAME`); the aliases pin the names the parser reads.
+        // Without them every foreign key was silently dropped (2026-09).
         let sql = "SELECT
-                       kcu.constraint_name,
-                       kcu.column_name,
-                       kcu.referenced_table_name,
-                       kcu.referenced_column_name,
-                       rc.delete_rule,
-                       rc.update_rule
+                       kcu.constraint_name AS constraint_name,
+                       kcu.column_name AS column_name,
+                       kcu.referenced_table_name AS referenced_table_name,
+                       kcu.referenced_column_name AS referenced_column_name,
+                       rc.delete_rule AS delete_rule,
+                       rc.update_rule AS update_rule
                    FROM information_schema.key_column_usage AS kcu
                    JOIN information_schema.referential_constraints AS rc
                        ON rc.constraint_name = kcu.constraint_name

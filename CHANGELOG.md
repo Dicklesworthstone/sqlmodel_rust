@@ -188,6 +188,45 @@ facade tests, and the driver integration suites run against live Docker database
 - **FrankenSQLite lost every column name for `SELECT * FROM "order"`.** The driver names star
   projections from `PRAGMA table_info(<table>)`, emitted unquoted; a reserved-word table name made
   the pragma a syntax error and the row came back nameless. The table is now always quoted.
+- **PostgreSQL introspection never reported a primary key.** `Introspector::table_info` derives
+  the primary key from the columns' `primary_key` flag, and the PostgreSQL column query left that
+  flag `false` with a comment promising a separate index query that did not exist, so every
+  PostgreSQL table introspected as keyless and `schema_diff` always wanted to add the primary key
+  again. Primary-key columns are now read from `information_schema.table_constraints`. Found by
+  the new e2e schema fixpoint scenario (introspect, diff, generate, apply, introspect, diff empty).
+- **`schema_diff` created tables in hash-map order.** A generated migration could create a table
+  before the table its foreign key references; MySQL rejects that outright ("Failed to open the
+  referenced table") and PostgreSQL only worked when the hashing happened to cooperate. New tables
+  are now created in foreign-key dependency order (ties by name, so output is deterministic) and
+  dropped in the reverse order. Found by the e2e schema fixpoint scenario on MySQL.
+- **The expected schema built from models was dialect-blind.** `table_schema_from_model`,
+  `table_schema_from_fields`, `ModelSchema::table_schema`, and `ModelTuple::all_table_schemas`
+  mapped field types without the dialect, so a generated migration declared a keyed `String` as
+  `TEXT` on MySQL ("BLOB/TEXT column used in key specification without a key length") while
+  `SchemaBuilder` had already learned to say `VARCHAR(255)`. They now take the dialect and use the
+  same `FieldInfo::effective_sql_type_for` rule, so the schema the differ expects is the schema
+  the generated DDL creates. Found by the e2e schema fixpoint scenario on MySQL.
+- **`schema_diff` reported two false differences on MySQL.** `BOOLEAN` comes back from the server
+  as `tinyint(1)` and integers keep their display widths, which the normalizer treated as type
+  changes; and the index MySQL creates for every foreign key was reported as an index to drop,
+  which MySQL would have refused. Display widths are ignored and implicit foreign-key indexes are
+  not differences. Found by the e2e schema fixpoint scenario.
+- **MySQL introspection never reported a foreign key.** The foreign-key query read
+  `information_schema` columns by their lower-case names, but MySQL returns them upper-cased
+  (`CONSTRAINT_NAME`), so every row was dropped and `schema_diff` kept wanting to add the keys.
+  The query now aliases each column. Found by the e2e schema fixpoint scenario on MySQL, together
+  with a new MySQL integration test that introspects a table with a foreign key and an index.
+- **MySQL: a row whose first value is an empty string desynchronized the connection.** In the
+  text protocol such a row starts with the byte `0x00`, which both result-set readers took for an
+  OK packet: they stopped reading, dropped that row and every row after it, and left the real
+  terminator in the stream, so the next statement failed with "Protocol error: Invalid column
+  count". Binary-protocol rows always start with `0x00` and were affected the same way. Inside a
+  result set only `0xFE` (EOF, or OK when `CLIENT_DEPRECATE_EOF` is negotiated) ends the rows and
+  `0xFF` is an error; everything else is a row. Found by the e2e schema fixpoint scenario: the
+  introspector reads `TABLE_COMMENT`, which is the empty string for a table without a comment.
+- **`Row::get_named` now matches column names case-insensitively** when no exact match exists and
+  the match is unambiguous, since unquoted SQL identifiers are case-insensitive and servers report
+  them in their own case (PostgreSQL lower, MySQL `information_schema` upper).
 - **`Session::merge` onto an expired object was lost.** Every tracked object is expired after
   `commit`; merging a detached copy onto one replaced its values but never marked it dirty, so the
   following flush issued no `UPDATE` and the change silently vanished. The merged object is now

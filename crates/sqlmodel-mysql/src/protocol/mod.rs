@@ -222,6 +222,10 @@ pub enum PacketType {
 
 impl PacketType {
     /// Detect packet type from the first byte of payload.
+    ///
+    /// This is the classification for the *first* packet of a response. Inside
+    /// a result set's row phase use [`RowPacket::classify`]: there a leading
+    /// `0x00` is a row, not an OK packet.
     pub fn from_first_byte(byte: u8, payload_len: u32) -> Self {
         match byte {
             0x00 => PacketType::Ok,
@@ -231,6 +235,62 @@ impl PacketType {
             0xFB => PacketType::LocalInfile,
             _ => PacketType::Data,
         }
+    }
+}
+
+/// What a packet is once a result set's column definitions have been read.
+///
+/// A text-protocol row whose first value is the empty string starts with
+/// `0x00` (a zero-length length-encoded string), and every binary-protocol row
+/// starts with `0x00`; neither is an OK packet. Reading them as one dropped the
+/// rows and left the real terminator in the stream, so the next statement
+/// failed with "Invalid column count" (found 2026-09 through the introspector,
+/// whose `TABLE_COMMENT` is the empty string for a table without a comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPacket {
+    /// A data row, text or binary.
+    Row,
+    /// `0xFE` with a payload shorter than 16 MiB: the EOF packet (fewer than
+    /// 9 bytes) or, with `CLIENT_DEPRECATE_EOF`, the OK packet that ends the
+    /// rows. A row can only start with `0xFE` when its first value is at least
+    /// 16 MiB long, which cannot fit in one packet.
+    Terminator,
+    /// `0xFF`: the server aborted the result set.
+    Error,
+}
+
+impl RowPacket {
+    /// Classify a packet read in a result set's row phase.
+    #[must_use]
+    pub fn classify(payload: &[u8]) -> Self {
+        match payload.first() {
+            Some(0xFF) => RowPacket::Error,
+            Some(0xFE) if payload.len() < 0xFF_FFFF => RowPacket::Terminator,
+            _ => RowPacket::Row,
+        }
+    }
+}
+
+/// Parse the packet that ends a result set's rows and return its
+/// `(status_flags, warnings)`: an EOF packet when shorter than 9 bytes,
+/// otherwise an OK packet carrying the `0xFE` header.
+#[must_use]
+pub fn parse_result_terminator(payload: &[u8]) -> Option<(u16, u16)> {
+    if payload.len() < 9 {
+        let mut reader = PacketReader::new(payload);
+        reader
+            .parse_eof_packet()
+            .map(|eof| (eof.status_flags, eof.warnings))
+    } else {
+        // OK layout after the 0xFE header: affected rows, last insert id,
+        // status, warnings. Parsed here rather than through `parse_ok_packet`,
+        // whose optional-marker skip would swallow a zero affected-rows byte.
+        let mut reader = PacketReader::new(payload.get(1..)?);
+        let _affected_rows = reader.read_lenenc_int()?;
+        let _last_insert_id = reader.read_lenenc_int()?;
+        let status_flags = reader.read_u16_le()?;
+        let warnings = reader.read_u16_le()?;
+        Some((status_flags, warnings))
     }
 }
 
@@ -308,6 +368,34 @@ mod tests {
         };
         let bytes = header.to_bytes();
         assert_eq!(bytes, [0xFF, 0xFF, 0xFF, 255]);
+    }
+
+    #[test]
+    fn row_phase_never_takes_a_leading_zero_for_an_ok_packet() {
+        // Text row whose first value is the empty string, then "x".
+        assert_eq!(RowPacket::classify(&[0x00, 0x01, b'x']), RowPacket::Row);
+        // Binary rows always start with 0x00.
+        assert_eq!(RowPacket::classify(&[0x00, 0x00, 0x2A]), RowPacket::Row);
+        // Ordinary text row: first byte is the first value's length.
+        assert_eq!(RowPacket::classify(&[0x2C, b'a']), RowPacket::Row);
+        // EOF and the DEPRECATE_EOF OK terminator, short and long.
+        assert_eq!(
+            RowPacket::classify(&[0xFE, 0x00, 0x00, 0x02, 0x00]),
+            RowPacket::Terminator
+        );
+        assert_eq!(RowPacket::classify(&[0xFE; 32]), RowPacket::Terminator);
+        assert_eq!(RowPacket::classify(&[0xFF, 0x28, 0x04]), RowPacket::Error);
+        assert_eq!(RowPacket::classify(&[]), RowPacket::Row);
+
+        // Terminator parsing: EOF layout (warnings, status), then OK layout.
+        assert_eq!(
+            parse_result_terminator(&[0xFE, 0x03, 0x00, 0x22, 0x00]),
+            Some((0x0022, 3))
+        );
+        assert_eq!(
+            parse_result_terminator(&[0xFE, 0x00, 0x00, 0x22, 0x00, 0x03, 0x00, 0x00, 0x00]),
+            Some((0x0022, 3))
+        );
     }
 
     #[test]
