@@ -2,6 +2,14 @@
 //!
 //! Caches compiled SQL strings keyed by a hash so repeated queries
 //! avoid redundant string building.
+//!
+//! This is a cache of SQL *text* for callers that build the same query
+//! repeatedly; it is not connected to any driver and is not a server-side
+//! prepared-statement cache. Server-side reuse lives in the drivers: the
+//! MySQL driver prepares each distinct parameterized statement once per
+//! connection, the PostgreSQL driver parses every query as the unnamed
+//! statement (named statements only through `Connection::prepare`), and
+//! the SQLite drivers keep none (see the README's "Prepared statements" row).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
