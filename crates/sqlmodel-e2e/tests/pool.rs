@@ -339,6 +339,203 @@ where
     assert_eq!(stats.total_connections, 0, "{name}: everything retired");
 }
 
+/// A server session id as reported by `SELECT pg_backend_pid()` /
+/// `SELECT CONNECTION_ID()` (MySQL reports the latter as an unsigned value).
+async fn session_id<C: Connection>(cx: &Cx, conn: &C, sql: &str, label: &str) -> i64 {
+    let rows = expect_outcome(conn.query(cx, sql, &[]).await, label);
+    let value = rows[0]
+        .get(0)
+        .unwrap_or_else(|| panic!("{label}: no session id"));
+    match value {
+        Value::Text(s) | Value::Decimal(s) => s.parse().unwrap_or_else(|_| panic!("{label}: {s}")),
+        other => other
+            .as_i64()
+            .unwrap_or_else(|| panic!("{label}: not an integer: {other:?}")),
+    }
+}
+
+/// Server-side proof for the network drivers, observed through backend ids:
+/// lifetime retirement opens a different server session; an idle connection
+/// killed on the server is replaced transparently when checkout validation
+/// is on; without it the dead lease fails its first statement and must be
+/// detached rather than returned (the rule the pool documents).
+fn exercise_server_sessions<C, F, Fut>(
+    rt: &Runtime,
+    cx: &Cx,
+    name: &str,
+    factory: &F,
+    session_sql: &str,
+    kill_sql: impl Fn(i64) -> String,
+) where
+    C: Connection + 'static,
+    F: Fn() -> Fut + Sync,
+    Fut: Future<Output = Outcome<C, Error>> + Send,
+{
+    rt.block_on(async {
+        let control = expect_outcome(factory().await, &format!("{name}: control connection"));
+
+        // 1. Retirement is a new server session, not the same one again.
+        let short: Pool<C> = Pool::new(
+            PoolConfig::new(1)
+                .min_connections(0)
+                .acquire_timeout(ACQUIRE_TIMEOUT_MS)
+                .max_lifetime(1),
+        );
+        let first = {
+            let lease = expect_outcome(
+                short.acquire(cx, factory).await,
+                &format!("{name}: acquire (session 1)"),
+            );
+            session_id(cx, &*lease, session_sql, &format!("{name}: session 1")).await
+        };
+        std::thread::sleep(Duration::from_millis(5));
+        let second = {
+            let lease = expect_outcome(
+                short.acquire(cx, factory).await,
+                &format!("{name}: acquire (session 2)"),
+            );
+            session_id(cx, &*lease, session_sql, &format!("{name}: session 2")).await
+        };
+        eprintln!("{name}: lifetime retirement moved session {first} -> {second}");
+        assert_ne!(
+            first, second,
+            "{name}: retirement must open a new server session"
+        );
+        expect_outcome(
+            short.close_and_drain(cx).await,
+            &format!("{name}: close retirement pool"),
+        );
+
+        // 2. With checkout validation, a killed idle connection is replaced
+        //    transparently: the next acquire succeeds on a new session.
+        let pool: Pool<C> = Pool::new(
+            PoolConfig::new(1)
+                .min_connections(0)
+                .acquire_timeout(2_000)
+                .test_on_checkout(true),
+        );
+        let doomed = {
+            let lease = expect_outcome(
+                pool.acquire(cx, factory).await,
+                &format!("{name}: acquire (doomed)"),
+            );
+            session_id(cx, &*lease, session_sql, &format!("{name}: doomed session")).await
+        };
+        expect_outcome(
+            control.query(cx, &kill_sql(doomed), &[]).await,
+            &format!("{name}: kill session {doomed}"),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let closed_before = pool.stats().connections_closed;
+        let lease = expect_outcome(
+            pool.acquire(cx, factory).await,
+            &format!("{name}: acquire after the server killed the idle connection"),
+        );
+        let replacement = session_id(
+            cx,
+            &*lease,
+            session_sql,
+            &format!("{name}: replacement session"),
+        )
+        .await;
+        eprintln!(
+            "{name}: killed session {doomed}; checkout validation replaced it with {replacement}"
+        );
+        assert_ne!(replacement, doomed, "{name}: a new server session");
+        expect_outcome(
+            lease.query(cx, "SELECT 1", &[]).await,
+            &format!("{name}: query on the replacement"),
+        );
+        drop(lease);
+        let stats = pool.stats();
+        eprintln!("{name}: after replacement {stats:?}");
+        assert_eq!(
+            stats.connections_closed,
+            closed_before + 1,
+            "{name}: the dead connection was closed"
+        );
+        assert_eq!(
+            stats.connections_created, 2,
+            "{name}: exactly one reconnect"
+        );
+        assert!(stats.total_connections <= 1, "{name}: never more than max");
+        expect_outcome(
+            pool.close_and_drain(cx).await,
+            &format!("{name}: close validation pool"),
+        );
+
+        // 3. Without checkout validation the dead connection is handed out
+        //    again and its first statement fails; detaching it (instead of
+        //    dropping it back) makes the next acquire open a fresh session.
+        let pool: Pool<C> = Pool::new(
+            PoolConfig::new(1)
+                .min_connections(0)
+                .acquire_timeout(2_000)
+                .test_on_checkout(false),
+        );
+        let doomed = {
+            let lease = expect_outcome(
+                pool.acquire(cx, factory).await,
+                &format!("{name}: acquire (doomed, no validation)"),
+            );
+            session_id(
+                cx,
+                &*lease,
+                session_sql,
+                &format!("{name}: doomed session 2"),
+            )
+            .await
+        };
+        expect_outcome(
+            control.query(cx, &kill_sql(doomed), &[]).await,
+            &format!("{name}: kill session {doomed} (no validation)"),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let lease = expect_outcome(
+            pool.acquire(cx, factory).await,
+            &format!("{name}: acquire the dead connection (no validation)"),
+        );
+        assert_eq!(
+            pool.stats().connections_created,
+            1,
+            "{name}: without validation the pool cannot know the connection is dead"
+        );
+        let error = match lease.query(cx, "SELECT 1", &[]).await {
+            Outcome::Err(e) => e,
+            other => panic!("{name}: a dead lease must fail its first statement, got {other:?}"),
+        };
+        eprintln!("{name}: dead lease failed with: {error}");
+        assert!(
+            matches!(error, Error::Connection(_)),
+            "{name}: the driver's connection error, not a pool error: {error}"
+        );
+        drop(lease.detach());
+        let stats = pool.stats();
+        assert_eq!(
+            stats.total_connections, 0,
+            "{name}: detached connection left the pool"
+        );
+        assert_eq!(stats.active_connections, 0, "{name}");
+        let lease = expect_outcome(
+            pool.acquire(cx, factory).await,
+            &format!("{name}: acquire after detaching the dead lease"),
+        );
+        let fresh = session_id(cx, &*lease, session_sql, &format!("{name}: fresh session")).await;
+        assert_ne!(fresh, doomed, "{name}: a new server session after detach");
+        expect_outcome(
+            lease.query(cx, "SELECT 1", &[]).await,
+            &format!("{name}: query on the fresh session"),
+        );
+        drop(lease);
+        assert_eq!(pool.stats().connections_created, 2, "{name}");
+        expect_outcome(
+            pool.close_and_drain(cx).await,
+            &format!("{name}: close no-validation pool"),
+        );
+        drop(control);
+    });
+}
+
 #[test]
 fn pool_holds_real_connections_on_every_multi_connection_driver() {
     let cx = Cx::for_testing();
@@ -389,6 +586,14 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_server_sessions(
+                    &rt,
+                    &cx,
+                    name,
+                    &factory,
+                    "SELECT pg_backend_pid()",
+                    |id| format!("SELECT pg_terminate_backend({id})"),
+                );
             }
             DriverUnderTest::MySql(cfg) | DriverUnderTest::MariaDb(cfg) => {
                 let cfg = cfg.clone();
@@ -400,6 +605,14 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_server_sessions(
+                    &rt,
+                    &cx,
+                    name,
+                    &factory,
+                    "SELECT CONNECTION_ID()",
+                    |id| format!("KILL CONNECTION {id}"),
+                );
             }
         }
         ran.push(name);

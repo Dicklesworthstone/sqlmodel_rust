@@ -1369,6 +1369,7 @@ mod tests {
     use super::*;
     use asupersync::{Budget, Time};
     use sqlmodel_core::connection::{IsolationLevel, PreparedStatement, TransactionOps};
+    use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind};
     use sqlmodel_core::{Row, Value};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize};

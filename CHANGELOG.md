@@ -347,6 +347,16 @@ facade tests, and the driver integration suites run against live Docker database
   snapshot for SQLite's table recreation (the bug-37 shape). The e2e `schema_fixpoint` scenario
   now moves a populated table's key from `id` to a composite key and back, and gives a keyless,
   populated log table a key and takes it away again, on every driver.
+- **The pool failed an `acquire` instead of replacing a dead idle connection.** With
+  `test_on_checkout` a connection that failed its ping was closed and the acquire returned a
+  `Disconnected` error, leaving the caller to retry; it now moves on to the next idle connection
+  or opens a new one. Proven on PostgreSQL and MySQL by killing the idle session on the server
+  (`pg_terminate_backend` / `KILL CONNECTION`): the next acquire hands out a new server session
+  and `connections_closed` grows by one. The never-implemented `test_on_return` option is gone
+  (a return is a synchronous `Drop`); the documented rule is to `detach` a lease whose statement
+  failed with a connection error, which the same scenario asserts. The crate-level example showed
+  a `Pool::new(config, factory)` / `acquire(&cx)` API that does not exist; it now shows the real
+  one. Lifetime retirement is also proven to open a different server session.
 - **MySQL unsigned integers above the signed range came back negative.** Both decoders cast an
   unsigned column into the same-width signed `Value` (`TINYINT UNSIGNED` 200 read as -56,
   `BIGINT UNSIGNED` 18446744073709551615 read as -1), and the binary decoder ignored the unsigned
