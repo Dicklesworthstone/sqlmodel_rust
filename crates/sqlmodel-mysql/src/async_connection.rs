@@ -8,7 +8,7 @@
 // The Error type is intentionally large to carry full context
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{self, Read as StdRead, Write as StdWrite};
 use std::net::TcpStream as StdTcpStream;
@@ -66,6 +66,12 @@ pub struct MySqlAsyncConnection {
     sequence_id: u8,
     /// Prepared statement metadata (keyed by statement ID)
     prepared_stmts: HashMap<u32, PreparedStmtMeta>,
+    /// Statements prepared on behalf of parameterized `query`/`execute`
+    /// calls, keyed by SQL text, so a repeated statement is prepared once.
+    statement_cache: HashMap<String, PreparedStatement>,
+    /// Least recently used first; bounded by [`STATEMENT_CACHE_CAPACITY`],
+    /// evicted statements are closed on the server.
+    statement_order: VecDeque<String>,
     /// Optional console for rich output
     #[cfg(feature = "console")]
     console: Option<Arc<SqlModelConsole>>,
@@ -75,6 +81,11 @@ pub struct MySqlAsyncConnection {
 ///
 /// Stores the MySQL-specific information needed to execute
 /// and decode results from a prepared statement.
+/// Prepared statements kept per connection for parameterized `query` /
+/// `execute` calls; the least recently used is closed when a new one is
+/// needed beyond this.
+pub const STATEMENT_CACHE_CAPACITY: usize = 64;
+
 #[derive(Debug, Clone)]
 struct PreparedStmtMeta {
     /// Server-assigned statement ID (stored for potential future use in close/reset)
@@ -344,6 +355,8 @@ impl MySqlAsyncConnection {
             config,
             sequence_id: 0,
             prepared_stmts: HashMap::new(),
+            statement_cache: HashMap::new(),
+            statement_order: VecDeque::new(),
             #[cfg(feature = "console")]
             console: None,
         };
@@ -1231,7 +1244,79 @@ impl MySqlAsyncConnection {
     }
 
     /// Execute a text protocol query asynchronously.
+    /// Run a statement and return its rows.
+    ///
+    /// With parameters and `?` placeholders the statement goes through the
+    /// binary protocol (`COM_STMT_PREPARE` / `COM_STMT_EXECUTE`; prepared
+    /// statements are cached per connection, at most
+    /// [`STATEMENT_CACHE_CAPACITY`] of them, the least recently used closed on
+    /// eviction), so values are bound as typed parameters instead of rendered
+    /// as literals and re-parsed by the server. Statements without parameters
+    /// or with `$n` placeholders, and the few statement kinds MySQL refuses to
+    /// prepare (`ER_UNSUPPORTED_PS`), use the text protocol with the values
+    /// interpolated.
     pub async fn query_async(
+        &mut self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> Outcome<Vec<Row>, Error> {
+        if params.is_empty() || !sql.contains('?') {
+            return self.query_text_async(cx, sql, params).await;
+        }
+        let stmt = match self.cached_prepare_async(cx, sql).await {
+            Outcome::Ok(Some(stmt)) => stmt,
+            Outcome::Ok(None) => return self.query_text_async(cx, sql, params).await,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        self.query_prepared_async(cx, &stmt, params).await
+    }
+
+    /// Prepare `sql` once per connection. `Ok(None)` means the server refuses
+    /// to prepare this statement kind, and the caller should fall back to the
+    /// text protocol.
+    async fn cached_prepare_async(
+        &mut self,
+        cx: &Cx,
+        sql: &str,
+    ) -> Outcome<Option<PreparedStatement>, Error> {
+        if let Some(stmt) = self.statement_cache.get(sql).cloned() {
+            if let Some(pos) = self.statement_order.iter().position(|s| s == sql) {
+                self.statement_order.remove(pos);
+            }
+            self.statement_order.push_back(sql.to_string());
+            return Outcome::Ok(Some(stmt));
+        }
+        let stmt = match self.prepare_async(cx, sql).await {
+            Outcome::Ok(stmt) => stmt,
+            Outcome::Err(Error::Query(q))
+                if q.message
+                    .contains("not supported in the prepared statement protocol") =>
+            {
+                return Outcome::Ok(None);
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        while self.statement_cache.len() >= STATEMENT_CACHE_CAPACITY {
+            let Some(oldest) = self.statement_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.statement_cache.remove(&oldest) {
+                self.close_prepared_async(&evicted).await;
+            }
+        }
+        self.statement_cache.insert(sql.to_string(), stmt.clone());
+        self.statement_order.push_back(sql.to_string());
+        Outcome::Ok(Some(stmt))
+    }
+
+    /// The text protocol: `COM_QUERY` with the parameters interpolated as
+    /// literals.
+    async fn query_text_async(
         &mut self,
         _cx: &Cx,
         sql: &str,
@@ -1635,14 +1720,8 @@ impl MySqlAsyncConnection {
         self.state = ConnectionState::InQuery;
         self.sequence_id = 0;
 
-        // Build and send COM_STMT_EXECUTE
-        let param_types: Vec<FieldType> = meta.params.iter().map(|c| c.column_type).collect();
-        let packet = prepared::build_stmt_execute_packet(
-            stmt_id,
-            params,
-            Some(&param_types),
-            self.sequence_id,
-        );
+        // Build and send COM_STMT_EXECUTE (parameter types follow the values).
+        let packet = prepared::build_stmt_execute_packet(stmt_id, params, self.sequence_id);
         if let Outcome::Err(e) = self.write_packet_raw_async(&packet).await {
             return Outcome::Err(e);
         }

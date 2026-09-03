@@ -123,6 +123,17 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   connection, and the detach rule are checked through backend ids (see Fixed below). A lease
   holder that panics is proven to return its connection during unwinding: the pool keeps
   serving with consistent counters and still drains (documented on the crate).
+- **MySQL parameterized statements use the binary protocol.** `Connection::query` / `execute` /
+  `insert` with parameters and `?` placeholders now go through `COM_STMT_PREPARE` /
+  `COM_STMT_EXECUTE`, binding values as typed parameters instead of rendering them as literals
+  for the text protocol (the literal renderer was the source of bugs 24 and 25). Prepared
+  statements are cached per connection, keyed by SQL text, at most 64 (`STATEMENT_CACHE_CAPACITY`)
+  with the least recently used closed on eviction. Parameterless statements, `$n` placeholders,
+  and the statement kinds MySQL refuses to prepare (`ER_UNSUPPORTED_PS`) keep the text protocol.
+  An integration test reads the server's `Com_stmt_prepare` / `Com_stmt_execute` /
+  `Com_stmt_close` counters: one prepare per distinct statement, one execute per call, closes on
+  eviction. The whole e2e crate (types, attributes, operations, session, migrations, pool) runs
+  MySQL on this path.
 - **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
   script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
   PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and
@@ -371,6 +382,11 @@ facade tests, and the driver integration suites run against live Docker database
   against PostgreSQL took 93 s and failed). The wait is now an asupersync `Notify` raced against
   a timer slice, so waiters yield. A pool unit test contends four tasks on a pool of one under a
   current-thread runtime; the e2e fan-out is the live proof.
+- **MySQL `COM_STMT_EXECUTE` declared the wrong parameter types.** The execute packet copied the
+  placeholder types from the prepare response (MySQL reports `VAR_STRING` for every `?`) while
+  encoding each value in its own binary form, so any integer, float, boolean, or temporal
+  parameter was rejected with "Malformed communication packet". The packet now declares the type
+  of each value as encoded. Surfaced the moment the ORM started using the prepared path.
 - **MySQL unsigned integers above the signed range came back negative.** Both decoders cast an
   unsigned column into the same-width signed `Value` (`TINYINT UNSIGNED` 200 read as -56,
   `BIGINT UNSIGNED` 18446744073709551615 read as -1), and the binary decoder ignored the unsigned

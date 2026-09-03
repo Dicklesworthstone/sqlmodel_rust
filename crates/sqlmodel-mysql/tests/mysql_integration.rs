@@ -747,3 +747,95 @@ fn mysql_prepared_statements_decode_rows_nulls_and_types_without_desync() {
             .await;
     });
 }
+
+/// Parameterized `query`/`execute` calls go through `COM_STMT_PREPARE` /
+/// `COM_STMT_EXECUTE` with a per-connection cache: the server's own counters
+/// show one prepare per distinct statement, one execute per call, and a
+/// close for every statement evicted from the bounded cache.
+#[test]
+fn mysql_parameterized_queries_are_prepared_once_and_executed_per_call() {
+    let Some(cfg) = mysql_test_config() else {
+        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
+        return;
+    };
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create asupersync runtime");
+    let cx = Cx::for_testing();
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedMySqlConnection::connect(&cx, cfg).await);
+        let counter = |name: &'static str| {
+            let conn = &conn;
+            let cx = &cx;
+            async move {
+                let rows = unwrap_outcome(
+                    conn.query(cx, &format!("SHOW SESSION STATUS LIKE '{name}'"), &[])
+                        .await,
+                );
+                rows[0]
+                    .get_named::<String>("Value")
+                    .expect("Value column")
+                    .parse::<u64>()
+                    .expect("status counter")
+            }
+        };
+        let prepares = counter("Com_stmt_prepare").await;
+        let executes = counter("Com_stmt_execute").await;
+        let closes = counter("Com_stmt_close").await;
+
+        for i in 0..5 {
+            let rows = unwrap_outcome(conn.query(&cx, "SELECT ? + 1", &[Value::BigInt(i)]).await);
+            assert_eq!(rows[0].get_as::<i64>(0).unwrap(), i + 1);
+        }
+        let rows = unwrap_outcome(conn.query(&cx, "SELECT ? * 2", &[Value::Int(21)]).await);
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 42);
+        assert_eq!(
+            counter("Com_stmt_prepare").await - prepares,
+            2,
+            "one prepare per distinct statement"
+        );
+        assert_eq!(
+            counter("Com_stmt_execute").await - executes,
+            6,
+            "one execute per call"
+        );
+
+        // `$n` placeholders (and parameterless statements) stay on the text
+        // protocol, where the driver interpolates the values.
+        let rows = unwrap_outcome(conn.query(&cx, "SELECT $1 + 1", &[Value::BigInt(1)]).await);
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 2);
+        assert_eq!(counter("Com_stmt_prepare").await - prepares, 2);
+
+        // Typed values arrive as their own types, not as rendered literals.
+        let rows = unwrap_outcome(
+            conn.query(
+                &cx,
+                "SELECT ?, ?, ?, ?",
+                &[
+                    Value::Bool(true),
+                    Value::Double(2.5),
+                    Value::Text("it's".into()),
+                    Value::Null,
+                ],
+            )
+            .await,
+        );
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 1);
+        assert!((rows[0].get_as::<f64>(1).unwrap() - 2.5).abs() < f64::EPSILON);
+        assert_eq!(rows[0].get_as::<String>(2).unwrap(), "it's");
+        assert!(rows[0].get(3).unwrap().is_null());
+
+        // The cache is bounded: more distinct statements than the capacity
+        // close the least recently used ones on the server.
+        for i in 0..(sqlmodel_mysql::STATEMENT_CACHE_CAPACITY + 8) {
+            unwrap_outcome(
+                conn.query(&cx, &format!("SELECT ? + {i}"), &[Value::BigInt(1)])
+                    .await,
+            );
+        }
+        let evicted = counter("Com_stmt_close").await - closes;
+        assert!(evicted >= 8, "evicted statements are closed, got {evicted}");
+    });
+}

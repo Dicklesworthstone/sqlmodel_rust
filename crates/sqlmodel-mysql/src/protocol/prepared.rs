@@ -128,12 +128,14 @@ pub fn build_stmt_prepare_packet(sql: &str, sequence_id: u8) -> Vec<u8> {
 /// - NULL bitmap (if num_params > 0)
 /// - New params bound flag (1 byte)
 /// - Parameter types and values (if new_params_bound = 1)
-pub fn build_stmt_execute_packet(
-    statement_id: u32,
-    params: &[Value],
-    param_types: Option<&[FieldType]>,
-    sequence_id: u8,
-) -> Vec<u8> {
+///
+/// The type sent for each parameter describes how *this packet* encodes the
+/// value (`value_to_field_type`), never the placeholder type the server
+/// reported at prepare time: MySQL reports `VAR_STRING` for every `?`, and a
+/// packet that declared that while writing an integer's raw bytes was
+/// rejected as a malformed packet (found by the e2e crate the moment the ORM
+/// used this path).
+pub fn build_stmt_execute_packet(statement_id: u32, params: &[Value], sequence_id: u8) -> Vec<u8> {
     let mut writer = PacketWriter::with_capacity(64 + params.len() * 16);
 
     // Command
@@ -163,18 +165,10 @@ pub fn build_stmt_execute_packet(
         // New params bound flag: 1 = we're sending types
         writer.write_u8(1);
 
-        // Parameter types (2 bytes each: type + flags)
-        for (i, param) in params.iter().enumerate() {
-            let field_type = if let Some(types) = param_types {
-                if i < types.len() {
-                    types[i]
-                } else {
-                    value_to_field_type(param)
-                }
-            } else {
-                value_to_field_type(param)
-            };
-
+        // Parameter types (2 bytes each: type + flags), one per value as it is
+        // encoded below.
+        for param in params {
+            let field_type = value_to_field_type(param);
             // Type byte
             writer.write_u8(field_type as u8);
             // Flags byte (0x00 for signed, 0x80 for unsigned)
@@ -587,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_build_stmt_execute_no_params() {
-        let packet = build_stmt_execute_packet(1, &[], None, 0);
+        let packet = build_stmt_execute_packet(1, &[], 0);
 
         // Check command
         assert_eq!(packet[4], Command::StmtExecute as u8);
@@ -607,7 +601,7 @@ mod tests {
     #[test]
     fn test_build_stmt_execute_with_params() {
         let params = vec![Value::Int(42), Value::Text("hello".to_string())];
-        let packet = build_stmt_execute_packet(1, &params, None, 0);
+        let packet = build_stmt_execute_packet(1, &params, 0);
 
         // Check command
         assert_eq!(packet[4], Command::StmtExecute as u8);
@@ -639,7 +633,7 @@ mod tests {
     #[test]
     fn test_build_stmt_execute_with_null() {
         let params = vec![Value::Null, Value::Int(42)];
-        let packet = build_stmt_execute_packet(1, &params, None, 0);
+        let packet = build_stmt_execute_packet(1, &params, 0);
 
         // NULL bitmap should have bit 0 set
         assert_eq!(packet[14], 0x01);
