@@ -145,6 +145,8 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
     // Generate from_row implementation
     let from_row_body = generate_from_row(model);
+    // Generate hydrate_relationship implementation (eager loading)
+    let hydrate_body = generate_hydrate_relationship(model);
 
     // Generate primary_key_value implementation
     let pk_value_body = generate_primary_key_value(model);
@@ -190,6 +192,14 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 
             fn from_row(row: &sqlmodel_core::Row) -> sqlmodel_core::Result<Self> {
                 #from_row_body
+            }
+
+            fn hydrate_relationship(
+                &mut self,
+                relationship: &str,
+                rows: &[sqlmodel_core::Row],
+            ) -> sqlmodel_core::Result<()> {
+                #hydrate_body
             }
 
             fn primary_key_value(&self) -> Vec<sqlmodel_core::Value> {
@@ -984,29 +994,117 @@ fn generate_debug_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     }
 }
 
-/// Generate the RELATIONSHIPS constant from relationship fields.
-fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
-    fn relationship_inner_model_ty(ty: &syn::Type) -> Option<syn::Type> {
-        let syn::Type::Path(tp) = ty else {
-            return None;
-        };
+/// Split a relationship field type into its container (`Related`,
+/// `RelatedMany`, or `Lazy`) and the related model type.
+fn relationship_container(ty: &syn::Type) -> Option<(String, syn::Type)> {
+    let syn::Type::Path(tp) = ty else {
+        return None;
+    };
 
-        let last = tp.path.segments.last()?;
-        let ident = last.ident.to_string();
-        if ident != "Related" && ident != "RelatedMany" && ident != "Lazy" {
-            return None;
-        }
-
-        let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
-            return None;
-        };
-
-        args.args.iter().find_map(|arg| match arg {
-            syn::GenericArgument::Type(t) => Some(t.clone()),
-            _ => None,
-        })
+    let last = tp.path.segments.last()?;
+    let ident = last.ident.to_string();
+    if ident != "Related" && ident != "RelatedMany" && ident != "Lazy" {
+        return None;
     }
 
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+
+    let inner = args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    })?;
+    Some((ident, inner))
+}
+
+/// Generate `Model::hydrate_relationship`: assign each relationship field from
+/// the prefixed rows an eager-loading JOIN produced. Without this the eager
+/// query fetched the related columns and threw them away.
+fn generate_hydrate_relationship(model: &ModelDef) -> proc_macro2::TokenStream {
+    let relationship_fields = model.relationship_fields();
+    if relationship_fields.is_empty() {
+        return quote::quote! {
+            let _ = rows;
+            Err(sqlmodel_core::Error::Custom(format!(
+                "model `{}` has no relationship `{relationship}`",
+                <Self as sqlmodel_core::Model>::TABLE_NAME
+            )))
+        };
+    }
+
+    let mut arms = Vec::new();
+    for field in relationship_fields {
+        let Some(rel) = field.relationship.as_ref() else {
+            continue;
+        };
+        let Some((container, related_ty)) = relationship_container(&field.ty) else {
+            continue;
+        };
+        let field_name = &field.name;
+        let field_ty = &field.ty;
+        let name_str = field_name.to_string();
+        let body = if container == "RelatedMany" {
+            let fresh = if let Some(ref lt) = rel.link_table {
+                let table = &lt.table;
+                let local_col = &lt.local_column;
+                let remote_col = &lt.remote_column;
+                quote::quote! {
+                    <#field_ty>::with_link_table(
+                        sqlmodel_core::LinkTableInfo::new(#table, #local_col, #remote_col)
+                    )
+                }
+            } else {
+                let fk = rel.foreign_key.clone().unwrap_or_default();
+                quote::quote! { <#field_ty>::new(#fk) }
+            };
+            quote::quote! {
+                let mut objects = Vec::with_capacity(rows.len());
+                for row in rows {
+                    objects.push(<#related_ty as sqlmodel_core::Model>::from_row(row)?);
+                }
+                let mut loaded = #fresh;
+                if let Some(pk) = self.primary_key_value().into_iter().next() {
+                    loaded.set_parent_pk(pk);
+                }
+                let _ = loaded.set_loaded(objects);
+                self.#field_name = loaded;
+            }
+        } else {
+            quote::quote! {
+                let object = match rows.first() {
+                    Some(row) => Some(<#related_ty as sqlmodel_core::Model>::from_row(row)?),
+                    None => None,
+                };
+                let loaded = match self.#field_name.fk().cloned() {
+                    Some(fk) => <#field_ty>::from_fk(fk),
+                    None => <#field_ty>::empty(),
+                };
+                let _ = loaded.set_loaded(object);
+                self.#field_name = loaded;
+            }
+        };
+        arms.push(quote::quote! {
+            #name_str => {
+                #body
+                Ok(())
+            }
+        });
+    }
+
+    quote::quote! {
+        match relationship {
+            #(#arms)*
+            other => Err(sqlmodel_core::Error::Custom(format!(
+                "model `{}` has no relationship `{other}`",
+                <Self as sqlmodel_core::Model>::TABLE_NAME
+            ))),
+        }
+    }
+}
+
+/// Generate the RELATIONSHIPS constant from relationship fields.
+fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
     let relationship_fields = model.relationship_fields();
 
     if relationship_fields.is_empty() {
@@ -1025,9 +1123,8 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
             continue;
         };
         let field_name = &field.name;
-        let related_table = &rel.model;
 
-        let Some(related_ty) = relationship_inner_model_ty(&field.ty) else {
+        let Some((_, related_ty)) = relationship_container(&field.ty) else {
             relationship_ts.push(quote::quote! {
                 ::core::compile_error!(
                     "sqlmodel: relationship field type must be Related<T>, RelatedMany<T>, or Lazy<T>"
@@ -1148,9 +1245,12 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
         };
 
         relationship_ts.push(quote::quote! {
+            // The related *table* comes from the related model's own metadata;
+            // `model = "..."` names the type. Emitting that name here made every
+            // eager JOIN target a table called `Team`.
             sqlmodel_core::RelationshipInfo::new(
                 stringify!(#field_name),
-                #related_table,
+                <#related_ty as sqlmodel_core::Model>::TABLE_NAME,
                 #kind_ts
             )
             .related_fields(<#related_ty as sqlmodel_core::Model>::fields)

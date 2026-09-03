@@ -200,6 +200,29 @@ pub trait Model: Sized + Send + Sync {
         None
     }
 
+    /// Hydrate one relationship field from the rows an eager-loading JOIN
+    /// produced for this instance.
+    ///
+    /// `relationship` is the field name (`RELATIONSHIPS[i].name`). `rows` are
+    /// the related table's columns for every joined row that belonged to this
+    /// instance, already stripped of their `table__` prefix and with the
+    /// no-match rows of a LEFT JOIN removed. A to-one field (`Related<T>`,
+    /// `Lazy<T>`) becomes loaded with the first row, or loaded-as-`None` when
+    /// there is none; a `RelatedMany<T>` field becomes loaded with all of them.
+    ///
+    /// The derive macro implements this for every relationship field. The
+    /// default is an error rather than a silent no-op, so a hand-written model
+    /// that declares `RELATIONSHIPS` but not this method cannot return
+    /// unloaded fields from an eager query as if they had been loaded.
+    #[allow(clippy::result_large_err)]
+    fn hydrate_relationship(&mut self, relationship: &str, rows: &[Row]) -> Result<()> {
+        let _ = rows;
+        Err(crate::Error::Custom(format!(
+            "model `{}` has no eager hydration for relationship `{relationship}`",
+            Self::TABLE_NAME
+        )))
+    }
+
     /// Get the value of the primary key field(s).
     fn primary_key_value(&self) -> Vec<Value>;
 
@@ -443,6 +466,19 @@ mod tests {
     #[test]
     fn test_default_relationships_is_empty() {
         assert!(TestModel::RELATIONSHIPS.is_empty());
+    }
+
+    #[test]
+    fn default_hydrate_relationship_refuses_rather_than_pretending() {
+        let mut model = TestModel;
+        let err = model
+            .hydrate_relationship("team", &[])
+            .expect_err("a model without generated hydration must not report success");
+        assert!(
+            err.to_string()
+                .contains("no eager hydration for relationship `team`"),
+            "{err}"
+        );
     }
 
     // Test default ModelEvents implementation
