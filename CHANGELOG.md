@@ -120,7 +120,9 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   max connections. While max leases are held, PostgreSQL's `pg_stat_activity` (the pool's
   sessions carry an `application_name`) and MySQL's `information_schema.processlist` report
   exactly max sessions for the pool. Lifetime retirement, a server-side kill of an idle
-  connection, and the detach rule are checked through backend ids (see Fixed below).
+  connection, and the detach rule are checked through backend ids (see Fixed below). A lease
+  holder that panics is proven to return its connection during unwinding: the pool keeps
+  serving with consistent counters and still drains (documented on the crate).
 - **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
   script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
   PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and

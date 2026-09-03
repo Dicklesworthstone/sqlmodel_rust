@@ -681,6 +681,136 @@ fn exercise_server_sessions<C, F, Fut>(
     });
 }
 
+/// A lease holder that panics returns its connection during unwinding: the
+/// pool keeps serving with consistent accounting and still drains.
+fn exercise_panicking_holder<C, F, Fut>(rt: &Runtime, cx: &Cx, name: &str, factory: &F)
+where
+    C: Connection + 'static,
+    F: Fn() -> Fut + Sync,
+    Fut: Future<Output = Outcome<C, Error>> + Send,
+{
+    let pool: Arc<Pool<C>> = Arc::new(Pool::new(
+        PoolConfig::new(MAX)
+            .min_connections(0)
+            .acquire_timeout(2_000),
+    ));
+    let joined = std::thread::scope(|scope| {
+        let pool = Arc::clone(&pool);
+        scope
+            .spawn(move || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("asupersync runtime");
+                let cx = Cx::for_testing();
+                rt.block_on(async {
+                    let lease = expect_outcome(
+                        pool.acquire(&cx, factory).await,
+                        "panicking holder: acquire",
+                    );
+                    expect_outcome(
+                        lease.query(&cx, "SELECT 1", &[]).await,
+                        "panicking holder: query",
+                    );
+                    assert_eq!(pool.stats().active_connections, 1);
+                    panic!("lease holder panics on purpose (expected in this test)");
+                });
+            })
+            .join()
+    });
+    assert!(
+        joined.is_err(),
+        "{name}: the holder thread must have panicked"
+    );
+    let stats = pool.stats();
+    eprintln!("{name}: after a panicking holder {stats:?}");
+    assert_eq!(
+        stats.active_connections, 0,
+        "{name}: the lease was returned during unwinding"
+    );
+    assert_eq!(stats.total_connections, 1, "{name}: still pooled");
+    assert!(stats.total_connections <= MAX, "{name}");
+    rt.block_on(async {
+        let lease = expect_outcome(
+            pool.acquire(cx, factory).await,
+            &format!("{name}: acquire after the panic"),
+        );
+        let rows = expect_outcome(
+            lease.query(cx, "SELECT 1", &[]).await,
+            &format!("{name}: query after the panic"),
+        );
+        assert_eq!(rows.len(), 1, "{name}");
+        drop(lease);
+        assert_eq!(
+            pool.stats().connections_created,
+            1,
+            "{name}: the returned connection was reused, not replaced"
+        );
+        expect_outcome(
+            pool.close_and_drain(cx).await,
+            &format!("{name}: close_and_drain after the panic"),
+        );
+    });
+    assert_eq!(pool.stats().total_connections, 0, "{name}: drained");
+}
+
+/// A cancelled `close_and_drain` reports `Cancelled` but leaves the pool
+/// closed: acquires are refused, the active lease still returns, and a
+/// later drain completes.
+fn exercise_cancelled_drain<C, F, Fut>(rt: &Runtime, cx: &Cx, name: &str, factory: &F)
+where
+    C: Connection + 'static,
+    F: Fn() -> Fut + Sync,
+    Fut: Future<Output = Outcome<C, Error>> + Send,
+{
+    let pool: Pool<C> = Pool::new(
+        PoolConfig::new(MAX)
+            .min_connections(0)
+            .acquire_timeout(ACQUIRE_TIMEOUT_MS),
+    );
+    rt.block_on(async {
+        let lease = expect_outcome(
+            pool.acquire(cx, factory).await,
+            &format!("{name}: acquire before the cancelled drain"),
+        );
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        match pool.close_and_drain(&cancelled).await {
+            Outcome::Cancelled(reason) => {
+                eprintln!("{name}: drain cancelled as requested: {reason:?}");
+            }
+            Outcome::Ok(()) => {
+                panic!("{name}: a cancelled drain with an active lease must not report Ok")
+            }
+            Outcome::Err(e) => panic!("{name}: cancelled drain failed: {e}"),
+            Outcome::Panicked(p) => panic!("{name}: cancelled drain panicked: {p:?}"),
+        }
+        assert!(pool.is_closed(), "{name}: the pool stays closed");
+        match pool.acquire(cx, factory).await {
+            Outcome::Err(e) => assert_eq!(
+                pool_error_kind(&e),
+                Some(PoolErrorKind::Closed),
+                "{name}: acquire after a cancelled drain must report Closed, got {e}"
+            ),
+            Outcome::Ok(_) => panic!("{name}: acquire after a cancelled drain succeeded"),
+            Outcome::Cancelled(r) => panic!("{name}: acquire cancelled: {r:?}"),
+            Outcome::Panicked(p) => panic!("{name}: acquire panicked: {p:?}"),
+        }
+        expect_outcome(
+            lease.query(cx, "SELECT 1", &[]).await,
+            &format!("{name}: the active lease still works while the pool drains"),
+        );
+        drop(lease);
+        expect_outcome(
+            pool.close_and_drain(cx).await,
+            &format!("{name}: drain after the cancelled one"),
+        );
+    });
+    let stats = pool.stats();
+    eprintln!("{name}: after the cancelled drain {stats:?}");
+    assert_eq!(stats.total_connections, 0, "{name}: drained");
+    assert_eq!(stats.active_connections, 0, "{name}");
+}
+
 #[test]
 fn pool_holds_real_connections_on_every_multi_connection_driver() {
     let cx = Cx::for_testing();
@@ -706,6 +836,8 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_panicking_holder(&rt, &cx, name, &factory);
+                exercise_cancelled_drain(&rt, &cx, name, &factory);
                 exercise_fan_out(&rt, &cx, name, factory.clone(), None);
             }
             DriverUnderTest::Franken(path) => {
@@ -721,6 +853,8 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_panicking_holder(&rt, &cx, name, &factory);
+                exercise_cancelled_drain(&rt, &cx, name, &factory);
                 exercise_fan_out(&rt, &cx, name, factory.clone(), None);
             }
             DriverUnderTest::Postgres(cfg) => {
@@ -734,6 +868,8 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_panicking_holder(&rt, &cx, name, &factory);
+                exercise_cancelled_drain(&rt, &cx, name, &factory);
                 exercise_server_sessions(
                     &rt,
                     &cx,
@@ -783,6 +919,8 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_panicking_holder(&rt, &cx, name, &factory);
+                exercise_cancelled_drain(&rt, &cx, name, &factory);
                 exercise_server_sessions(
                     &rt,
                     &cx,
