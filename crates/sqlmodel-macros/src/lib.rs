@@ -1150,16 +1150,21 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
         };
 
         // Build optional method calls
-        let local_key_call = if let Some(ref fk) = rel.foreign_key {
-            quote::quote! { .local_key(#fk) }
-        } else {
-            quote::quote! {}
+        // Which side the `foreign_key` column lives on: this model for to-one
+        // relationships (`local_key`), the related model for one-to-many
+        // (`remote_key`, which cascades and eager JOINs read). Emitting it as
+        // `local_key` for every kind made a one-to-many JOIN look for the
+        // child's column on the parent table.
+        let fk_is_remote = matches!(rel.kind, RelationshipKindAttr::OneToMany);
+        let local_key_call = match &rel.foreign_key {
+            Some(fk) if !fk_is_remote => quote::quote! { .local_key(#fk) },
+            _ => quote::quote! {},
         };
 
-        let remote_key_call = if let Some(ref rk) = rel.remote_key {
-            quote::quote! { .remote_key(#rk) }
-        } else {
-            quote::quote! {}
+        let remote_key_call = match (&rel.remote_key, &rel.foreign_key) {
+            (Some(rk), _) => quote::quote! { .remote_key(#rk) },
+            (None, Some(fk)) if fk_is_remote => quote::quote! { .remote_key(#fk) },
+            _ => quote::quote! {},
         };
 
         let back_populates_call = if let Some(ref bp) = rel.back_populates {

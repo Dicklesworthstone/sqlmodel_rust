@@ -573,17 +573,16 @@ impl<M: Model> Select<M> {
                 }
             };
             let key = format!("{:?}", model.primary_key_value());
-            let slot = match index.get(&key) {
-                Some(slot) => *slot,
-                None => {
-                    pending.push(Pending {
-                        model,
-                        related: vec![Vec::new(); join_info.len()],
-                        seen: vec![HashSet::new(); join_info.len()],
-                    });
-                    index.insert(key, pending.len() - 1);
-                    pending.len() - 1
-                }
+            let slot = if let Some(slot) = index.get(&key) {
+                *slot
+            } else {
+                pending.push(Pending {
+                    model,
+                    related: vec![Vec::new(); join_info.len()],
+                    seen: vec![HashSet::new(); join_info.len()],
+                });
+                index.insert(key, pending.len() - 1);
+                pending.len() - 1
             };
 
             for (i, info) in join_info.iter().enumerate() {
@@ -673,7 +672,16 @@ impl<M: Model> Select<M> {
                 &self.aliased_projection,
             ));
         } else if self.columns.is_empty() {
-            sql.push('*');
+            if joins.is_empty() {
+                sql.push('*');
+            } else {
+                // With a JOIN, `*` also returns the joined table's columns, and
+                // a same-named column (`id`, `name`) from the joined table wins
+                // the by-name lookup: the model was silently mapped from the
+                // wrong table. Project this model's own columns instead.
+                sql.push_str(&dialect.quote_table(M::TABLE_NAME));
+                sql.push_str(".*");
+            }
         } else {
             sql.push_str(&self.columns.join(", "));
         }
@@ -1590,9 +1598,11 @@ mod tests {
 
         let (sql, params) = query.build();
 
+        // With a JOIN the model's own columns are projected (`"heroes".*`), so a
+        // same-named column on the joined table cannot shadow them.
         assert_eq!(
             sql,
-            "SELECT * FROM \"heroes\" INNER JOIN \"teams\" ON \"teams\".\"active\" = $1 WHERE \"age\" > $2 GROUP BY team_id HAVING \"count\" > $3"
+            "SELECT \"heroes\".* FROM \"heroes\" INNER JOIN \"teams\" ON \"teams\".\"active\" = $1 WHERE \"age\" > $2 GROUP BY team_id HAVING \"count\" > $3"
         );
         assert_eq!(
             params,

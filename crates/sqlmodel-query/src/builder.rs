@@ -170,7 +170,7 @@ fn extract_pk_values_from_rows(
     for row in rows {
         if row.len() < pk_col_count {
             return Err(sqlmodel_core::Error::Custom(format!(
-                "joined-table inheritance PK lookup returned {} columns; expected at least {}",
+                "primary-key lookup returned {} columns; expected at least {}",
                 row.len(),
                 pk_col_count
             )));
@@ -179,7 +179,7 @@ fn extract_pk_values_from_rows(
         for i in 0..pk_col_count {
             let Some(v) = row.get(i) else {
                 return Err(sqlmodel_core::Error::Custom(format!(
-                    "joined-table inheritance PK lookup missing column index {i}"
+                    "primary-key lookup missing column index {i}"
                 )));
             };
             vals.push(v.clone());
@@ -234,6 +234,58 @@ fn split_explicit_joined_sets<M: Model>(
     }
 
     Ok((parent_sets, child_sets))
+}
+
+/// The WHERE fragment (without the keyword) an UPDATE or DELETE uses: the
+/// explicit filter with any single-table-inheritance discriminator folded in,
+/// or, for a model instance, its primary key (plus the discriminator). Shared
+/// by the statement builders and the MySQL RETURNING fallback, which must read
+/// the affected rows with exactly the predicate the statement used.
+fn dml_where_fragment<M: Model>(
+    dialect: Dialect,
+    where_clause: Option<&Where>,
+    model: Option<&M>,
+    param_offset: usize,
+) -> (String, Vec<Value>) {
+    let sti = crate::select::sti_discriminator_filter::<M>();
+    let where_clause = match (where_clause, &sti) {
+        (Some(w), Some(d)) => Some(w.clone().and(d.clone())),
+        (Some(w), None) => Some(w.clone()),
+        (None, Some(d)) if model.is_none() => Some(Where::new(d.clone())),
+        _ => None,
+    };
+    if let Some(where_clause) = where_clause {
+        return where_clause.build_with_dialect(dialect, param_offset);
+    }
+    let Some(model) = model else {
+        return (String::new(), Vec::new());
+    };
+    let mut params = Vec::new();
+    let mut conditions = Vec::new();
+    for (i, (col, value)) in M::PRIMARY_KEY
+        .iter()
+        .zip(model.primary_key_value())
+        .enumerate()
+    {
+        conditions.push(format!(
+            "{} = {}",
+            dialect.quote_identifier(col),
+            dialect.placeholder(param_offset + i + 1)
+        ));
+        params.push(value);
+    }
+    if conditions.is_empty() {
+        return (String::new(), params);
+    }
+    let mut sql = conditions.join(" AND ");
+    if let Some(d) = sti {
+        let (d_sql, d_params) =
+            Where::new(d).build_with_dialect(dialect, param_offset + params.len());
+        sql.push_str(" AND ");
+        sql.push_str(&d_sql);
+        params.extend(d_params);
+    }
+    (sql, params)
 }
 
 fn build_pk_in_where(
@@ -1002,6 +1054,11 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
     }
 
     /// Execute the INSERT and return the inserted ID.
+    ///
+    /// With a conflict clause the insert may be skipped (`DO NOTHING`) or turn
+    /// into an update; the result is then the key of the row that was inserted
+    /// or updated where the database reports one (PostgreSQL), else the model's
+    /// own key, else 0. SQLite and MySQL report their last-insert-id as usual.
     pub async fn execute<C: Connection>(
         self,
         cx: &Cx,
@@ -1310,6 +1367,28 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
         if matches!(dialect, Dialect::Postgres) && !wants_returning && M::PRIMARY_KEY.len() == 1 {
             sql.push_str(" RETURNING ");
             sql.push_str(&dialect.quote_identifier(M::PRIMARY_KEY[0]));
+            if self.on_conflict.is_some() {
+                // A conflict clause may skip the insert (DO NOTHING), and then
+                // nothing is returned; that is not an error. Report the key of
+                // the inserted or updated row, else the model's own key, else 0.
+                return match conn.query(cx, &sql, &params).await {
+                    Outcome::Ok(rows) => Outcome::Ok(
+                        rows.first()
+                            .and_then(|row| row.get(0))
+                            .and_then(Value::as_i64)
+                            .or_else(|| {
+                                self.model
+                                    .primary_key_value()
+                                    .first()
+                                    .and_then(Value::as_i64)
+                            })
+                            .unwrap_or(0),
+                    ),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                };
+            }
         }
         conn.insert(cx, &sql, &params).await
     }
@@ -2290,8 +2369,12 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
         // Single-table inheritance child models always carry their implicit
         // discriminator predicate so an UPDATE can never touch sibling kinds;
         // without a filter a model instance is matched by its primary key.
-        let (where_sql, where_params) =
-            dml_where_fragment::<M>(dialect, self.where_clause.as_ref(), self.model, params.len());
+        let (where_sql, where_params) = dml_where_fragment::<M>(
+            dialect,
+            self.where_clause.as_ref(),
+            self.model,
+            params.len(),
+        );
         if !where_sql.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_sql);
@@ -2848,6 +2931,113 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
             }
+        } else if conn.dialect() == Dialect::Mysql {
+            // MySQL has no RETURNING: snapshot the matching keys, update, and
+            // re-read those rows, all inside one transaction.
+            let dialect = Dialect::Mysql;
+            self.returning = false;
+            let (sql, params) = self.build_with_dialect(dialect);
+            if sql.is_empty() {
+                return Outcome::Ok(Vec::new());
+            }
+            let pk_cols = M::PRIMARY_KEY;
+            if pk_cols.is_empty() {
+                return Outcome::Err(sqlmodel_core::Error::Custom(
+                    "RETURNING on MySQL re-reads the updated rows by primary key; this model has \
+                     none"
+                        .to_string(),
+                ));
+            }
+            let table = dialect.quote_table(M::TABLE_NAME);
+            let (where_sql, where_params) =
+                dml_where_fragment::<M>(dialect, self.where_clause.as_ref(), self.model, 0);
+            let mut pk_select = format!(
+                "SELECT {} FROM {table}",
+                pk_cols
+                    .iter()
+                    .map(|c| dialect.quote_identifier(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !where_sql.is_empty() {
+                pk_select.push_str(" WHERE ");
+                pk_select.push_str(&where_sql);
+            }
+            let tx = match conn.begin(cx).await {
+                Outcome::Ok(t) => t,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let pk_values = match tx.query(cx, &pk_select, &where_params).await {
+                Outcome::Ok(rows) => match extract_pk_values_from_rows(rows, pk_cols.len()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                },
+                Outcome::Err(e) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Panicked(p);
+                }
+            };
+            match tx.execute(cx, &sql, &params).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+            let rows = if pk_values.is_empty() {
+                Vec::new()
+            } else {
+                let (in_sql, in_params) = build_pk_in_where(dialect, pk_cols, &pk_values, 0);
+                match tx
+                    .query(
+                        cx,
+                        &format!("SELECT * FROM {table} WHERE {in_sql}"),
+                        &in_params,
+                    )
+                    .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            };
+            match tx.commit(cx).await {
+                Outcome::Ok(()) => Outcome::Ok(rows),
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            }
         } else {
             let (sql, params) = self.build_with_dialect(conn.dialect());
             if sql.is_empty() {
@@ -3244,7 +3434,63 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
                 Outcome::Panicked(p) => Outcome::Panicked(p),
             };
         }
-        let (sql, params) = self.build_with_dialect(conn.dialect());
+        let dialect = conn.dialect();
+        if dialect == Dialect::Mysql {
+            // MySQL has no RETURNING: read the matching rows, then delete them,
+            // inside one transaction.
+            self.returning = false;
+            let (sql, params) = self.build_with_dialect(dialect);
+            let (where_sql, where_params) =
+                dml_where_fragment::<M>(dialect, self.where_clause.as_ref(), self.model, 0);
+            let mut select = format!("SELECT * FROM {}", dialect.quote_table(M::TABLE_NAME));
+            if !where_sql.is_empty() {
+                select.push_str(" WHERE ");
+                select.push_str(&where_sql);
+            }
+            let tx = match conn.begin(cx).await {
+                Outcome::Ok(t) => t,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let rows = match tx.query(cx, &select, &where_params).await {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(e) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Panicked(p);
+                }
+            };
+            match tx.execute(cx, &sql, &params).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+            return match tx.commit(cx).await {
+                Outcome::Ok(()) => Outcome::Ok(rows),
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            };
+        }
+        let (sql, params) = self.build_with_dialect(dialect);
         conn.query(cx, &sql, &params).await
     }
 }

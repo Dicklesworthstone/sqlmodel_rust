@@ -1539,13 +1539,15 @@ fn extract_select_star_projection(sql: &str) -> Option<(String, Vec<String>)> {
     if table.is_empty() {
         return None;
     }
-    // Anything that widens the row shape disqualifies the schema lookup.
+    // Anything that widens the row shape disqualifies the schema lookup for a
+    // bare `*`. A qualified `"t".*` is exactly t's columns whatever is joined,
+    // which is what `select!(Model)` emits as soon as a JOIN is added.
     let tail_upper = after_from.to_uppercase();
-    if tail_upper.contains(" JOIN ")
+    let widened = tail_upper.contains(" JOIN ")
         || tail_upper[table.len().min(tail_upper.len())..]
             .trim_start()
-            .starts_with(',')
-    {
+            .starts_with(',');
+    if widened && star_qualifier.is_none() {
         return None;
     }
     if let Some(qualifier) = star_qualifier
@@ -2260,6 +2262,12 @@ mod tests {
             ("SELECT \"t\".* FROM \"t\"", Some("t")),
             ("SELECT id, name FROM t", None),
             ("SELECT * FROM a JOIN b ON a.id = b.a_id", None),
+            // A qualified star is that table's columns whatever is joined
+            // (what `select!(Model).join(..)` emits).
+            (
+                "SELECT \"a\".* FROM \"a\" INNER JOIN \"b\" ON \"a\".\"b_id\" = \"b\".\"id\"",
+                Some("a"),
+            ),
             ("SELECT * FROM a, b", None),
             ("SELECT count(*) FROM t", None),
             ("SELECT u.* FROM t", None),

@@ -564,7 +564,7 @@ Expr::case()
 
 | Capability | Status | Notes |
 |------------|--------|-------|
-| Query execution | ✅ Complete | Full SELECT/INSERT/UPDATE/DELETE with eager loading |
+| Query execution | ✅ Complete | SELECT/INSERT/UPDATE/DELETE, upserts (`on_conflict_*`), bulk inserts (`insert_many!`), RETURNING (re-read by key on MySQL, which has none), the `Join` builder, typed subqueries (`Expr::in_query`, `into_exists`), and one-level eager loading (`all_eager`), each executed on every driver by the e2e `operations` scenario |
 | Connection pooling | ✅ Complete | Generic pool with timeouts, health checks, metrics |
 | Transactions | ✅ Complete | BEGIN/COMMIT/ROLLBACK with savepoint support |
 | SQLite driver | ✅ Complete | Full Connection trait with transactions |
