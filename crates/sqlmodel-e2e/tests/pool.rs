@@ -561,6 +561,7 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_fan_out(&rt, &cx, name, factory.clone(), None);
             }
             DriverUnderTest::Franken(path) => {
                 let p = path.to_string_lossy().into_owned();
@@ -575,6 +576,7 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                 };
                 rt.block_on(exercise(&cx, name, &factory));
                 exercise_contention(&rt, &cx, name, &factory);
+                exercise_fan_out(&rt, &cx, name, factory.clone(), None);
             }
             DriverUnderTest::Postgres(cfg) => {
                 let cfg = cfg.clone();
@@ -594,6 +596,35 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                     "SELECT pg_backend_pid()",
                     |id| format!("SELECT pg_terminate_backend({id})"),
                 );
+                // The pool's sessions carry an application_name so
+                // pg_stat_activity can count exactly them.
+                let tag = format!("sqlmodel-e2e-pool-{}", std::process::id());
+                let tagged_cfg = cfg.clone().application_name(tag.clone());
+                let cx3 = cx.clone();
+                let tagged = move || {
+                    let cfg = tagged_cfg.clone();
+                    let cx = cx3.clone();
+                    async move { SharedPgConnection::connect(&cx, cfg).await }
+                };
+                let control = rt.block_on(async {
+                    expect_outcome(
+                        SharedPgConnection::connect(&cx, cfg.clone()).await,
+                        &format!("{name}: control connection for counting"),
+                    )
+                });
+                exercise_fan_out(
+                    &rt,
+                    &cx,
+                    name,
+                    tagged,
+                    Some(ServerCount {
+                        control,
+                        sql: "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1"
+                            .into(),
+                        params: vec![Value::Text(tag)],
+                        extra: 0,
+                    }),
+                );
             }
             DriverUnderTest::MySql(cfg) | DriverUnderTest::MariaDb(cfg) => {
                 let cfg = cfg.clone();
@@ -612,6 +643,29 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
                     &factory,
                     "SELECT CONNECTION_ID()",
                     |id| format!("KILL CONNECTION {id}"),
+                );
+                // MySQL sessions are counted by user and database; the control
+                // connection is one of them.
+                let control = rt.block_on(async {
+                    expect_outcome(
+                        SharedMySqlConnection::connect(&cx, cfg.clone()).await,
+                        &format!("{name}: control connection for counting"),
+                    )
+                });
+                let database = cfg.database.clone().unwrap_or_default();
+                exercise_fan_out(
+                    &rt,
+                    &cx,
+                    name,
+                    factory.clone(),
+                    Some(ServerCount {
+                        control,
+                        sql: "SELECT count(*) FROM information_schema.processlist \
+                              WHERE user = ? AND db = ?"
+                            .into(),
+                        params: vec![Value::Text(cfg.user.clone()), Value::Text(database)],
+                        extra: 1,
+                    }),
                 );
             }
         }
