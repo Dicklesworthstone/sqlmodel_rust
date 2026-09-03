@@ -262,6 +262,14 @@ impl Row {
 }
 
 /// Trait for converting from a `Value` to a typed value.
+///
+/// The derive's `from_row` reads every column through this trait, so a
+/// field type without an implementation fails at compile time; the
+/// diagnostic below names the feature that provides the external types.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be read from a database row: it has no `FromValue` implementation",
+    note = "chrono, uuid, and rust_decimal fields need the matching `sqlmodel` feature: `chrono`, `uuid`, or `decimal`"
+)]
 pub trait FromValue: Sized {
     /// Convert from a Value, returning an error if the conversion fails.
     #[allow(clippy::result_large_err)]

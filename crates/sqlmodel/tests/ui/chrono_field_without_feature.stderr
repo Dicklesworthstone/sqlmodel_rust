@@ -1,0 +1,56 @@
+error[E0277]: the trait bound `Value: From<NaiveDateTime>` is not satisfied
+ --> tests/ui/chrono_field_without_feature.rs:2:10
+  |
+2 | #[derive(sqlmodel::Model)]
+  |          ^^^^^^^^^^^^^^^ the trait `From<NaiveDateTime>` is not implemented for `Value`
+  |
+  = help: `Value` implements trait `From<T>`:
+            From<&Hybrid<T>>
+            From<&[u8]>
+            From<&str>
+            From<Hybrid<T>>
+            From<Option<T>>
+            From<String>
+            From<Vec<String>>
+            From<Vec<bool>>
+            From<Vec<f64>>
+            From<Vec<i32>>
+            From<Vec<i64>>
+            From<Vec<u8>>
+            From<[u8; 16]>
+            From<bool>
+            From<f32>
+            From<f64>
+            From<i16>
+            From<i32>
+            From<i64>
+            From<i8>
+            From<serde_json::value::Value>
+            From<u16>
+            From<u32>
+            From<u8>
+  = note: this error originates in the derive macro `sqlmodel::Model` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `NaiveDateTime` cannot be read from a database row: it has no `FromValue` implementation
+ --> tests/ui/chrono_field_without_feature.rs:2:10
+  |
+2 | #[derive(sqlmodel::Model)]
+  |          ^^^^^^^^^^^^^^^ the trait `FromValue` is not implemented for `NaiveDateTime`
+  |
+  = note: chrono, uuid, and rust_decimal fields need the matching `sqlmodel` feature: `chrono`, `uuid`, or `decimal`
+  = help: the following other types implement trait `FromValue`:
+            Option<T>
+            String
+            Value
+            Vec<u8>
+            [u8; 16]
+            bool
+            f32
+            f64
+          and $N others
+note: required by a bound in `Row::get_named`
+ --> $WORKSPACE/crates/sqlmodel-core/src/row.rs
+  |
+  |     pub fn get_named<T: FromValue>(&self, name: &str) -> Result<T> {
+  |                         ^^^^^^^^^ required by this bound in `Row::get_named`
+  = note: this error originates in the derive macro `sqlmodel::Model` (in Nightly builds, run with -Z macro-backtrace for more info)

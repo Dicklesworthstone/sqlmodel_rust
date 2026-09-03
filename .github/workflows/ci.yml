@@ -89,6 +89,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose
 
+      # The default-features run above covers the compile-fail half of the
+      # facade's `tests/ui` (external-type fields without their feature); this
+      # runs the half that must compile with the features on.
+      - name: Run UI pass cases with the external-type features on
+        run: cargo test -p sqlmodel --features chrono,uuid,decimal --test ui
+
       - name: Run doc tests (README doctests need the nightly-try feature)
         run: cargo test --workspace --doc --features sqlmodel/nightly-try
 

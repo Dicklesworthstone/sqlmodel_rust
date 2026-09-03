@@ -43,3 +43,11 @@ sqlmodel-sqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
+# `tests/ui`: a model with a chrono/uuid/rust_decimal field must fail to
+# compile without the matching feature, with a diagnostic naming it. The
+# external crates are dev-dependencies so the UI cases can name the types
+# whether or not the feature is on.
+trybuild = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rust_decimal = { workspace = true }

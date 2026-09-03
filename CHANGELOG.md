@@ -142,6 +142,23 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   cache. The README's new "Prepared statements" row and the `sqlmodel_query::cache` docs say the
   same; that module caches SQL text and is not connected to any driver. A PostgreSQL
   named-statement cache is tracked as bd-vsyd.
+- **Compile-time diagnostics that name the feature.** A model with a `chrono`, `uuid`, or
+  `rust_decimal` field built without the matching `sqlmodel` feature now fails with
+  "`chrono::NaiveDateTime` cannot be read from a database row" plus a note naming the feature to
+  enable (`#[diagnostic::on_unimplemented]` on `FromValue`), instead of a bare unsatisfied trait
+  bound. `crates/sqlmodel/tests/ui` pins the diagnostics with trybuild snapshots (feature-off
+  cases under the default features, pass cases with the three features on).
+- **C SQLite versus FrankenSQLite differential oracle.** The e2e `sqlite_differential` test runs
+  one ORM script (DDL, single and bulk inserts, constraint failures, upserts, every builder read
+  shape, joins, subqueries, EXISTS, aggregates and scalar functions, `typeof()` storage classes,
+  UPDATE/DELETE with RETURNING, transactions, introspection, `sqlite_master`) on both drivers in
+  lockstep and compares every observation after normalizing integer widths; error kinds are
+  compared, not messages. Unlisted divergences fail the test, and so does a listed divergence that
+  stopped diverging. The list holds five entries, all FrankenSQLite-side and cross-checked against
+  the `sqlite3` CLI: its `last_insert_rowid()` drifts after a failed INSERT and after
+  `INSERT ... RETURNING` (a successful `insert!` still reports the right id on both), and it
+  stores `CREATE TABLE IF NOT EXISTS` verbatim in `sqlite_master` where C SQLite normalizes it.
+  The report prints the C SQLite and fsqlite versions.
 - **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
   script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
   PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and
