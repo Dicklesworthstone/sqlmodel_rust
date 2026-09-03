@@ -101,7 +101,6 @@ impl Default for PoolConfig {
             acquire_timeout_ms: 30_000, // 30 seconds
             max_lifetime_ms: 1_800_000, // 30 minutes
             test_on_checkout: true,
-            test_on_return: false,
         }
     }
 }
@@ -144,17 +143,12 @@ impl PoolConfig {
         self
     }
 
-    /// Enable/disable test on checkout.
+    /// Enable/disable the ping before a connection is handed out (see the
+    /// crate-level "Health-check rule"). There is no test on return: a return
+    /// is a synchronous `Drop`; detach a lease you know to be dead instead.
     #[must_use]
     pub fn test_on_checkout(mut self, enabled: bool) -> Self {
         self.test_on_checkout = enabled;
-        self
-    }
-
-    /// Enable/disable test on return.
-    #[must_use]
-    pub fn test_on_return(mut self, enabled: bool) -> Self {
-        self.test_on_return = enabled;
         self
     }
 }
@@ -665,7 +659,10 @@ impl<C: Connection> Pool<C> {
     /// - The pool is closed
     /// - The acquire timeout is exceeded
     /// - Cancellation is requested via the `Cx` context
-    /// - Connection validation fails (if `test_on_checkout` is enabled)
+    ///
+    /// An idle connection that fails its checkout ping (`test_on_checkout`)
+    /// is closed and the acquire moves on to the next idle connection or a
+    /// new one; it is not an error.
     pub async fn acquire<F, Fut>(&self, cx: &Cx, factory: F) -> Outcome<PooledConnection<C>, Error>
     where
         F: Fn() -> Fut,
@@ -787,8 +784,21 @@ impl<C: Connection> Pool<C> {
                     }));
                 }
                 AcquireAction::ValidateExisting(meta) => {
-                    // Validate and wrap the connection (lock is released)
-                    return self.validate_and_wrap(cx, meta, test_on_checkout).await;
+                    // Validate and wrap the connection (lock is released). A
+                    // dead idle connection has been closed by now; go round
+                    // again for the next idle one or a fresh connection.
+                    match self.validate_and_wrap(cx, meta, test_on_checkout).await {
+                        Outcome::Ok(Some(pooled)) => return Outcome::Ok(pooled),
+                        Outcome::Ok(None) => {
+                            tracing::warn!(
+                                "pooled connection failed its checkout ping; closed and replaced"
+                            );
+                            continue;
+                        }
+                        Outcome::Err(e) => return Outcome::Err(e),
+                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => return Outcome::Panicked(p),
+                    }
                 }
                 AcquireAction::CreateNew => {
                     // Create new connection outside of lock
@@ -1660,7 +1670,6 @@ mod tests {
         assert_eq!(config.acquire_timeout_ms, 30_000);
         assert_eq!(config.max_lifetime_ms, 1_800_000);
         assert!(config.test_on_checkout);
-        assert!(!config.test_on_return);
     }
 
     #[test]
@@ -1670,8 +1679,7 @@ mod tests {
             .idle_timeout(60_000)
             .acquire_timeout(5_000)
             .max_lifetime(300_000)
-            .test_on_checkout(false)
-            .test_on_return(true);
+            .test_on_checkout(false);
 
         assert_eq!(config.min_connections, 5);
         assert_eq!(config.max_connections, 20);
@@ -1679,7 +1687,6 @@ mod tests {
         assert_eq!(config.acquire_timeout_ms, 5_000);
         assert_eq!(config.max_lifetime_ms, 300_000);
         assert!(!config.test_on_checkout);
-        assert!(config.test_on_return);
     }
 
     #[test]
