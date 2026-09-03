@@ -222,7 +222,9 @@ where
             "{name}: the expired connection must be replaced, not reused"
         );
         assert!(stats.connections_closed >= 1, "{name}: expired one closed");
-        assert_eq!(stats.total_connections, 1, "{name}: never more than max");
+        // With a 1 ms lifetime the replacement may itself age out during its
+        // query and be retired on return; either way the pool never exceeds max.
+        assert!(stats.total_connections <= 1, "{name}: never more than max");
         expect_outcome(
             short.close_and_drain(cx).await,
             &format!("{name}: close lifetime pool"),

@@ -426,10 +426,7 @@ impl MigrationRunner {
         }
 
         // Query applied migrations
-        let sql = format!(
-            "SELECT id, applied_at, checksum FROM {}",
-            self.table_name
-        );
+        let sql = format!("SELECT id, applied_at, checksum FROM {}", self.table_name);
         let rows = match conn.query(cx, &sql, &[]).await {
             Outcome::Ok(rows) => rows,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -487,7 +484,12 @@ impl MigrationRunner {
 
         // Refuse to run anything while an applied migration no longer matches
         // what was applied: the history is no longer trustworthy.
-        if let Some((id, MigrationStatus::Drifted { recorded, current, .. })) = status
+        if let Some((
+            id,
+            MigrationStatus::Drifted {
+                recorded, current, ..
+            },
+        )) = status
             .iter()
             .find(|(_, s)| matches!(s, MigrationStatus::Drifted { .. }))
         {
@@ -837,11 +839,30 @@ mod tests {
 
     #[test]
     fn checksum_is_stable_and_tracks_the_up_sql_only() {
-        let a = Migration::new("0001", "create", "CREATE TABLE t (id INTEGER)", "DROP TABLE t");
-        let same = Migration::new("0001", "other description", "CREATE TABLE t (id INTEGER)", "");
-        let edited = Migration::new("0001", "create", "CREATE TABLE t (id BIGINT)", "DROP TABLE t");
+        let a = Migration::new(
+            "0001",
+            "create",
+            "CREATE TABLE t (id INTEGER)",
+            "DROP TABLE t",
+        );
+        let same = Migration::new(
+            "0001",
+            "other description",
+            "CREATE TABLE t (id INTEGER)",
+            "",
+        );
+        let edited = Migration::new(
+            "0001",
+            "create",
+            "CREATE TABLE t (id BIGINT)",
+            "DROP TABLE t",
+        );
         assert_eq!(a.checksum().len(), 16);
-        assert_eq!(a.checksum(), same.checksum(), "id/description/down do not count");
+        assert_eq!(
+            a.checksum(),
+            same.checksum(),
+            "id/description/down do not count"
+        );
         assert_ne!(a.checksum(), edited.checksum(), "the up SQL does");
         assert_eq!(a.checksum(), a.checksum(), "deterministic");
     }
