@@ -8,7 +8,8 @@ use crate::expr::{Dialect, Expr};
 use crate::join::Join;
 use crate::subquery::SelectQuery;
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Model, RelationshipKind, Value};
+use sqlmodel_core::{Connection, Model, RelationshipKind, Row, Value};
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 type ParentFieldsFn = fn() -> &'static [sqlmodel_core::FieldInfo];
@@ -94,12 +95,16 @@ fn render_aliased_projection(dialect: Dialect, pairs: &[(&'static str, &'static 
 /// Used internally to track which relationships are being eagerly loaded
 /// and how to hydrate them from the query results.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for full hydration (future implementation)
+#[allow(dead_code)] // `kind` and `nested` are diagnostics; nested paths are not joined yet.
 struct EagerJoinInfo {
     /// Name of the relationship field.
     relationship_name: &'static str,
     /// Table name of the related model.
     related_table: &'static str,
+    /// Primary-key columns of the related model, used to drop the no-match
+    /// rows of a LEFT JOIN and to deduplicate a to-one row repeated by
+    /// another include's fan-out.
+    related_pk: Vec<&'static str>,
     /// Kind of relationship.
     kind: RelationshipKind,
     /// Nested relationships to load.
@@ -390,6 +395,11 @@ impl<M: Model> Select<M> {
                     join_info.push(EagerJoinInfo {
                         relationship_name: include.relationship,
                         related_table: rel.related_table,
+                        related_pk: (rel.related_fields_fn)()
+                            .iter()
+                            .filter(|f| f.primary_key)
+                            .map(|f| f.column_name)
+                            .collect(),
                         kind: rel.kind,
                         nested: include.nested.clone(),
                     });
@@ -522,68 +532,105 @@ impl<M: Model> Select<M> {
         );
         tracing::trace!(sql = %sql, "Eager SQL");
 
-        let rows = conn.query(cx, &sql, &params).await;
+        let rows = match conn.query(cx, &sql, &params).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        tracing::debug!(row_count = rows.len(), "Processing eager query results");
 
-        rows.and_then(|rows| {
-            tracing::debug!(row_count = rows.len(), "Processing eager query results");
+        // A JOIN repeats the parent row once per related row (and a second
+        // to-many include multiplies them). Group the related rows under one
+        // parent per primary key, in first-seen order, then hand each group to
+        // the model so it can load its relationship fields.
+        struct Pending<M> {
+            model: M,
+            related: Vec<Vec<Row>>,
+            seen: Vec<HashSet<String>>,
+        }
+        let mut pending: Vec<Pending<M>> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
 
-            // Use a map to deduplicate by primary key (JOINs can duplicate parent rows)
-            let mut seen_pks = std::collections::HashSet::new();
-            let mut models = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let parent_row = row.subset_by_prefix(M::TABLE_NAME);
+            // A row without the parent prefix can only come from a hand-built
+            // query; parse it as-is so such callers keep working.
+            let parsed = if parent_row.is_empty() {
+                tracing::warn!(
+                    table = M::TABLE_NAME,
+                    "Row has no columns with parent table prefix"
+                );
+                M::from_row(row)
+            } else {
+                M::from_row(&parent_row)
+            };
+            let model = match parsed {
+                Ok(model) => model,
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to parse model from eager row");
+                    return Outcome::Err(e);
+                }
+            };
+            let key = format!("{:?}", model.primary_key_value());
+            let slot = match index.get(&key) {
+                Some(slot) => *slot,
+                None => {
+                    pending.push(Pending {
+                        model,
+                        related: vec![Vec::new(); join_info.len()],
+                        seen: vec![HashSet::new(); join_info.len()],
+                    });
+                    index.insert(key, pending.len() - 1);
+                    pending.len() - 1
+                }
+            };
 
-            for row in &rows {
-                // Extract parent columns using table prefix
-                let parent_row = row.subset_by_prefix(M::TABLE_NAME);
-
-                // Skip if we can't parse (shouldn't happen with well-formed query)
-                if parent_row.is_empty() {
-                    tracing::warn!(
-                        table = M::TABLE_NAME,
-                        "Row has no columns with parent table prefix"
-                    );
-                    // Fall back to trying the row as-is (backwards compatibility)
-                    match M::from_row(row) {
-                        Ok(model) => {
-                            models.push(model);
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "Failed to parse model from row");
-                            return Outcome::Err(e);
-                        }
-                    }
+            for (i, info) in join_info.iter().enumerate() {
+                if !row.has_prefix(info.related_table) || row.prefix_is_all_null(info.related_table)
+                {
                     continue;
                 }
-
-                // Parse the parent model from extracted columns
-                match M::from_row(&parent_row) {
-                    Ok(model) => {
-                        // Deduplicate by primary key
-                        let pk = model.primary_key_value();
-                        let pk_hash = {
-                            use std::hash::{Hash, Hasher};
-                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            // Hash the debug representation as a simple PK identifier
-                            format!("{:?}", pk).hash(&mut hasher);
-                            hasher.finish()
-                        };
-
-                        if seen_pks.insert(pk_hash) {
-                            models.push(model);
-                        }
+                let related = row.subset_by_prefix(info.related_table);
+                let related_key = if info.related_pk.is_empty() {
+                    format!("{:?}", related.values().collect::<Vec<_>>())
+                } else {
+                    let pk: Vec<Option<&Value>> = info
+                        .related_pk
+                        .iter()
+                        .map(|c| related.get_by_name(c))
+                        .collect();
+                    if pk.iter().all(|v| v.is_none_or(Value::is_null)) {
+                        // LEFT JOIN with no match for this include.
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "Failed to parse model from prefixed row");
-                        return Outcome::Err(e);
-                    }
+                    format!("{pk:?}")
+                };
+                let group = &mut pending[slot];
+                if group.seen[i].insert(related_key) {
+                    group.related[i].push(related);
                 }
             }
+        }
 
-            tracing::debug!(
-                unique_models = models.len(),
-                "Eager loading complete (deduplicated)"
-            );
-            Outcome::Ok(models)
-        })
+        let mut models = Vec::with_capacity(pending.len());
+        for group in pending {
+            let mut model = group.model;
+            for (i, info) in join_info.iter().enumerate() {
+                if let Err(e) =
+                    model.hydrate_relationship(info.relationship_name, &group.related[i])
+                {
+                    return Outcome::Err(e);
+                }
+            }
+            models.push(model);
+        }
+
+        tracing::debug!(
+            unique_models = models.len(),
+            "Eager loading complete (deduplicated and hydrated)"
+        );
+        Outcome::Ok(models)
     }
 
     /// Build the SQL query and parameters.
@@ -800,8 +847,10 @@ impl<M: Model> Select<M> {
         crate::Join::lateral(join_type, sql, alias, on, params)
     }
 
-    /// Build an optimized EXISTS subquery (SELECT 1 instead of SELECT *).
-    fn into_query(self) -> SelectQuery {
+    /// Convert this SELECT into a dialect-independent subquery for embedding
+    /// in another statement (`Expr::in_query`, `Expr::exists_query`, lateral
+    /// joins). The subquery is rendered when the enclosing statement is.
+    pub fn into_query(self) -> SelectQuery {
         let Select {
             columns,
             // Polymorphic projections are not meaningful inside a subquery.
@@ -2105,6 +2154,39 @@ mod tests {
         let (sql, _, _) = query.build_eager_with_dialect(Dialect::default());
 
         assert!(sql.starts_with("SELECT DISTINCT"));
+    }
+
+    #[test]
+    fn in_query_embeds_a_typed_subquery_with_renumbered_params() {
+        let red_teams = Select::<EagerTeam>::new()
+            .columns(&["id"])
+            .filter(Expr::col("name").eq("red"))
+            .into_query();
+        let (sql, params) = Select::<EagerHero>::new()
+            .filter(Expr::col("name").ne("ghost"))
+            .filter(Expr::col("team_id").in_query(red_teams))
+            .build_with_dialect(Dialect::Postgres);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"heroes\" WHERE \"name\" <> $1 AND \"team_id\" IN \
+             (SELECT id FROM \"teams\" WHERE \"name\" = $2)"
+        );
+        assert_eq!(params, vec![Value::from("ghost"), Value::from("red")]);
+
+        let (mysql, _) = Select::<EagerHero>::new()
+            .filter(
+                Expr::col("team_id").not_in_query(
+                    Select::<EagerTeam>::new()
+                        .columns(&["id"])
+                        .filter(Expr::col("name").eq("red"))
+                        .into_query(),
+                ),
+            )
+            .build_with_dialect(Dialect::Mysql);
+        assert_eq!(
+            mysql,
+            "SELECT * FROM `heroes` WHERE `team_id` NOT IN (SELECT id FROM `teams` WHERE `name` = ?)"
+        );
     }
 
     // ==================== EXISTS Tests ====================

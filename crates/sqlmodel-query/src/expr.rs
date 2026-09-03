@@ -111,6 +111,17 @@ pub enum Expr {
         negated: bool,
     },
 
+    /// `expr IN (SELECT ...)` / `expr NOT IN (SELECT ...)` built from a query
+    /// builder, rendered for the dialect of the enclosing statement.
+    InQuery {
+        /// The tested expression (usually a column)
+        expr: Box<Expr>,
+        /// The subquery builder
+        subquery: Box<SelectQuery>,
+        /// Whether this is NOT IN
+        negated: bool,
+    },
+
     /// Raw SQL fragment (escape hatch)
     Raw(String),
 
@@ -1439,6 +1450,27 @@ impl Expr {
         }
     }
 
+    /// `self IN (SELECT ...)` from a query builder (`Select::into_query`).
+    ///
+    /// The subquery's parameters are carried along and renumbered for the
+    /// enclosing statement.
+    pub fn in_query(self, subquery: SelectQuery) -> Self {
+        Expr::InQuery {
+            expr: Box::new(self),
+            subquery: Box::new(subquery),
+            negated: false,
+        }
+    }
+
+    /// `self NOT IN (SELECT ...)` from a query builder.
+    pub fn not_in_query(self, subquery: SelectQuery) -> Self {
+        Expr::InQuery {
+            expr: Box::new(self),
+            subquery: Box::new(subquery),
+            negated: true,
+        }
+    }
+
     // ==================== JSON Functions ====================
 
     /// Extract a JSON value by key (returns JSON).
@@ -1786,11 +1818,17 @@ impl Expr {
                 negated,
             } => {
                 let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                let not_str = if *negated { "NOT " } else { "" };
+                // `x IN (SELECT ...)`: a lone subquery is the IN list itself.
+                // Wrapping it again (`IN ((SELECT ...))`) turns it into a
+                // scalar subquery, which fails as soon as it yields two rows.
+                if let [Expr::Subquery(sql)] = values.as_slice() {
+                    return format!("{expr_sql} {not_str}IN ({sql})");
+                }
                 let value_sqls: Vec<_> = values
                     .iter()
                     .map(|v| v.build_with_dialect(dialect, params, offset))
                     .collect();
-                let not_str = if *negated { "NOT " } else { "" };
                 format!("{expr_sql} {not_str}IN ({})", value_sqls.join(", "))
             }
 
@@ -1893,6 +1931,24 @@ impl Expr {
 
                 let not_str = if *negated { "NOT " } else { "" };
                 format!("{not_str}EXISTS ({adjusted_subquery})")
+            }
+
+            Expr::InQuery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let expr_sql = expr.build_with_dialect(dialect, params, offset);
+                let (subquery_sql, subquery_params) = subquery.build_with_dialect(dialect);
+                let start_idx = offset + params.len();
+                let adjusted_subquery = if subquery_params.is_empty() {
+                    subquery_sql
+                } else {
+                    adjust_placeholder_indices(&subquery_sql, start_idx, dialect)
+                };
+                params.extend(subquery_params.iter().cloned());
+                let not_str = if *negated { "NOT " } else { "" };
+                format!("{expr_sql} {not_str}IN ({adjusted_subquery})")
             }
 
             Expr::Raw(sql) => sql.clone(),
@@ -3058,6 +3114,29 @@ mod tests {
     // ==================== Subquery Tests ====================
 
     #[test]
+    fn in_list_with_a_lone_subquery_is_the_in_list_itself() {
+        // `IN ((SELECT ...))` is a scalar subquery on PostgreSQL and fails as
+        // soon as it yields two rows; the lone subquery must be the list.
+        let mut params = Vec::new();
+        let sql = Expr::col("team_id")
+            .in_list(vec![Expr::subquery(
+                "SELECT id FROM teams WHERE name = 'red'",
+            )])
+            .build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(
+            sql,
+            "\"team_id\" IN (SELECT id FROM teams WHERE name = 'red')"
+        );
+        assert!(params.is_empty());
+
+        // Two entries stay a value list, subquery or not.
+        let sql = Expr::col("team_id")
+            .not_in_list(vec![Expr::subquery("SELECT 1"), Expr::subquery("SELECT 2")])
+            .build_with_dialect(Dialect::Postgres, &mut params, 0);
+        assert_eq!(sql, "\"team_id\" NOT IN ((SELECT 1), (SELECT 2))");
+    }
+
+    #[test]
     fn test_subquery() {
         let expr = Expr::col("dept_id").in_list(vec![Expr::subquery(
             "SELECT id FROM departments WHERE active = true",
@@ -3066,7 +3145,7 @@ mod tests {
         let sql = expr.build(&mut params, 0);
         assert_eq!(
             sql,
-            "\"dept_id\" IN ((SELECT id FROM departments WHERE active = true))"
+            "\"dept_id\" IN (SELECT id FROM departments WHERE active = true)"
         );
     }
 
