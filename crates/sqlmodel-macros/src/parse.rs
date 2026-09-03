@@ -175,7 +175,10 @@ pub struct FieldDef {
 /// Parsed relationship attribute from `#[sqlmodel(relationship(...))]`.
 #[derive(Debug, Clone)]
 pub struct RelationshipAttr {
-    /// Related model's table name (e.g., "teams" or the model name).
+    /// The `model = "..."` text as written. Accepted for readability only: the
+    /// related table and fields come from the field's own type
+    /// (`Lazy<Team>` → `Team::TABLE_NAME`), so this can never disagree with it.
+    #[allow(dead_code)]
     pub model: String,
     /// Local FK column (for ManyToOne/OneToOne).
     pub foreign_key: Option<String>,
