@@ -115,6 +115,12 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   `InsertBuilder`, `InsertManyBuilder`, `UpdateBuilder`, `DeleteBuilder`, `OnConflict`,
   `SelectQuery`, and the `insert_many!` macro; bulk inserts and eager loading previously needed
   a direct `sqlmodel-query` dependency.
+- **Pool proof on the server side.** The e2e pool scenario now runs 4 x max acquirers as tasks
+  under one asupersync runtime (no OS threads): every task is served, no timeout, never more than
+  max connections. While max leases are held, PostgreSQL's `pg_stat_activity` (the pool's
+  sessions carry an `application_name`) and MySQL's `information_schema.processlist` report
+  exactly max sessions for the pool. Lifetime retirement, a server-side kill of an idle
+  connection, and the detach rule are checked through backend ids (see Fixed below).
 - **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
   script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
   PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and
@@ -357,6 +363,12 @@ facade tests, and the driver integration suites run against live Docker database
   failed with a connection error, which the same scenario asserts. The crate-level example showed
   a `Pool::new(config, factory)` / `acquire(&cx)` API that does not exist; it now shows the real
   one. Lifetime retirement is also proven to open a different server session.
+- **A full pool deadlocked a single-threaded runtime.** A task waiting for a lease blocked the
+  runtime thread in a `std::sync::Condvar::wait_timeout`, so the tasks holding the leases could
+  never run to return them; every waiter timed out (4 x max tasks on a current-thread runtime
+  against PostgreSQL took 93 s and failed). The wait is now an asupersync `Notify` raced against
+  a timer slice, so waiters yield. A pool unit test contends four tasks on a pool of one under a
+  current-thread runtime; the e2e fan-out is the live proof.
 - **MySQL unsigned integers above the signed range came back negative.** Both decoders cast an
   unsigned column into the same-width signed `Value` (`TINYINT UNSIGNED` 200 read as -56,
   `BIGINT UNSIGNED` 18446744073709551615 read as -1), and the binary decoder ignored the unsigned

@@ -339,19 +339,164 @@ where
     assert_eq!(stats.total_connections, 0, "{name}: everything retired");
 }
 
-/// A server session id as reported by `SELECT pg_backend_pid()` /
-/// `SELECT CONNECTION_ID()` (MySQL reports the latter as an unsigned value).
-async fn session_id<C: Connection>(cx: &Cx, conn: &C, sql: &str, label: &str) -> i64 {
-    let rows = expect_outcome(conn.query(cx, sql, &[]).await, label);
+/// The single integer a scalar query returns (MySQL reports unsigned and
+/// COUNT values as text/decimal on the text protocol).
+async fn scalar_i64<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    sql: &str,
+    params: &[Value],
+    label: &str,
+) -> i64 {
+    let rows = expect_outcome(conn.query(cx, sql, params).await, label);
     let value = rows[0]
         .get(0)
-        .unwrap_or_else(|| panic!("{label}: no session id"));
+        .unwrap_or_else(|| panic!("{label}: no value"));
     match value {
         Value::Text(s) | Value::Decimal(s) => s.parse().unwrap_or_else(|_| panic!("{label}: {s}")),
         other => other
             .as_i64()
             .unwrap_or_else(|| panic!("{label}: not an integer: {other:?}")),
     }
+}
+
+/// A server session id as reported by `SELECT pg_backend_pid()` /
+/// `SELECT CONNECTION_ID()`.
+async fn session_id<C: Connection>(cx: &Cx, conn: &C, sql: &str, label: &str) -> i64 {
+    scalar_i64(cx, conn, sql, &[], label).await
+}
+
+/// How a control connection counts this pool's sessions on the server.
+struct ServerCount<C> {
+    control: C,
+    sql: String,
+    params: Vec<Value>,
+    /// Sessions the count includes besides the pool's (the control
+    /// connection itself when it cannot be told apart).
+    extra: usize,
+}
+
+/// 4 x MAX acquirers as tasks under one asupersync runtime (the pool's
+/// intended use), every one served without a timeout and without a
+/// connection beyond MAX; while MAX leases are held the server itself
+/// reports exactly MAX sessions for the pool.
+fn exercise_fan_out<C, F, Fut>(
+    rt: &Runtime,
+    cx: &Cx,
+    name: &str,
+    factory: F,
+    server_count: Option<ServerCount<C>>,
+) where
+    C: Connection + 'static,
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Outcome<C, Error>> + Send + 'static,
+{
+    let pool: Arc<Pool<C>> = Arc::new(Pool::new(
+        PoolConfig::new(MAX)
+            .min_connections(0)
+            .acquire_timeout(10_000),
+    ));
+
+    // Server-side count while every lease is out.
+    rt.block_on(async {
+        let mut leases = Vec::new();
+        for i in 0..MAX {
+            leases.push(expect_outcome(
+                pool.acquire(cx, &factory).await,
+                &format!("{name}: fan-out fill {i}"),
+            ));
+        }
+        if let Some(count) = &server_count {
+            let seen = scalar_i64(
+                cx,
+                &count.control,
+                &count.sql,
+                &count.params,
+                &format!("{name}: server-side session count"),
+            )
+            .await;
+            eprintln!(
+                "{name}: server reports {seen} sessions with {MAX} leases held (+{} control)",
+                count.extra
+            );
+            assert_eq!(
+                seen,
+                i64::try_from(MAX + count.extra).expect("small"),
+                "{name}: the server must see exactly max connections for the pool"
+            );
+        } else {
+            eprintln!(
+                "{name}: no server sessions to count; the pool's own stats are the only observable"
+            );
+        }
+        drop(leases);
+    });
+
+    // 4 x MAX tasks, each acquiring, holding the lease across two statements,
+    // releasing. Structured under one runtime: no OS threads involved.
+    let handle = rt.handle();
+    let tasks: Vec<_> = (0..4 * MAX)
+        .map(|i| {
+            let pool = Arc::clone(&pool);
+            let factory = factory.clone();
+            handle.spawn(async move {
+                let cx = Cx::for_testing();
+                let lease = match pool.acquire(&cx, &factory).await {
+                    Outcome::Ok(lease) => lease,
+                    Outcome::Err(e) => return Err(format!("task {i}: acquire: {e}")),
+                    Outcome::Cancelled(r) => {
+                        return Err(format!("task {i}: acquire cancelled: {r:?}"));
+                    }
+                    Outcome::Panicked(p) => {
+                        return Err(format!("task {i}: acquire panicked: {p:?}"));
+                    }
+                };
+                for sql in ["SELECT 1", "SELECT 2"] {
+                    match lease.query(&cx, sql, &[]).await {
+                        Outcome::Ok(rows) if rows.len() == 1 => {}
+                        other => return Err(format!("task {i}: {sql}: {other:?}")),
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+    let results = rt.block_on(async {
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await);
+        }
+        results
+    });
+    // (`Result::err` would resolve to the prelude's `sqlmodel::Result` alias.)
+    let failures: Vec<String> = results.into_iter().filter_map(|r| r.err()).collect();
+    assert!(
+        failures.is_empty(),
+        "{name}: fan-out failures: {failures:#?}"
+    );
+    let stats = pool.stats();
+    eprintln!("{name}: fan-out {stats:?}");
+    assert_eq!(
+        stats.acquires,
+        (5 * MAX) as u64,
+        "{name}: every acquire counted"
+    );
+    assert_eq!(stats.timeouts, 0, "{name}: no task timed out");
+    assert!(
+        stats.connections_created <= MAX as u64,
+        "{name}: fan-out created {} connections",
+        stats.connections_created
+    );
+    assert_eq!(stats.active_connections, 0, "{name}: every lease returned");
+    rt.block_on(async {
+        expect_outcome(
+            pool.close_and_drain(cx).await,
+            &format!("{name}: close fan-out pool"),
+        );
+        if let Some(count) = server_count {
+            drop(count.control);
+        }
+    });
 }
 
 /// Server-side proof for the network drivers, observed through backend ids:
@@ -550,7 +695,7 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
             DriverUnderTest::CSqliteMemory => unreachable!("filtered out"),
             DriverUnderTest::CSqliteFile(path) => {
                 let p = path.to_string_lossy().into_owned();
-                let factory = || {
+                let factory = move || {
                     let p = p.clone();
                     async move {
                         match SqliteConnection::open_file(p) {
@@ -565,7 +710,7 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
             }
             DriverUnderTest::Franken(path) => {
                 let p = path.to_string_lossy().into_owned();
-                let factory = || {
+                let factory = move || {
                     let p = p.clone();
                     async move {
                         match FrankenConnection::open_file(p) {
@@ -580,9 +725,10 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
             }
             DriverUnderTest::Postgres(cfg) => {
                 let cfg = cfg.clone();
+                let factory_cfg = cfg.clone();
                 let cx2 = cx.clone();
-                let factory = || {
-                    let cfg = cfg.clone();
+                let factory = move || {
+                    let cfg = factory_cfg.clone();
                     let cx = cx2.clone();
                     async move { SharedPgConnection::connect(&cx, cfg).await }
                 };
@@ -628,9 +774,10 @@ fn pool_holds_real_connections_on_every_multi_connection_driver() {
             }
             DriverUnderTest::MySql(cfg) | DriverUnderTest::MariaDb(cfg) => {
                 let cfg = cfg.clone();
+                let factory_cfg = cfg.clone();
                 let cx2 = cx.clone();
-                let factory = || {
-                    let cfg = cfg.clone();
+                let factory = move || {
+                    let cfg = factory_cfg.clone();
                     let cx = cx2.clone();
                     async move { SharedMySqlConnection::connect(&cx, cfg).await }
                 };

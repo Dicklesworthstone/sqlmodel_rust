@@ -62,14 +62,14 @@ pub use sharding::{ModuloShardChooser, QueryHints, ShardChooser, ShardedPool, Sh
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use asupersync::{
     Budget, CancelReason, Cx, Outcome,
     combinator::{Either, Select},
     runtime::RuntimeBuilder,
-    sync::OnceCell,
+    sync::{Notify, OnceCell},
 };
 use sqlmodel_core::error::{PoolError, PoolErrorKind};
 use sqlmodel_core::{Connection, Error};
@@ -256,7 +256,11 @@ struct PoolShared<C: Connection> {
     /// Protected pool state
     inner: Mutex<PoolInner<C>>,
     /// Notifies waiters when connections become available
-    conn_available: Condvar,
+    /// Woken on every return and on close. Async on purpose: a waiter must
+    /// not block the runtime thread, or the tasks that would release a
+    /// lease never run (a `Condvar` here deadlocked single-threaded runtimes
+    /// until every waiter timed out; found by the e2e fan-out on PostgreSQL).
+    conn_available: Notify,
     /// One-shot latch initialized when the irreversible pool drain completes.
     active_drained: OnceCell<()>,
     /// Stable first teardown failure, retained so every current or later
@@ -273,7 +277,7 @@ impl<C: Connection> PoolShared<C> {
     fn new(config: PoolConfig) -> Self {
         Self {
             inner: Mutex::new(PoolInner::new(config)),
-            conn_available: Condvar::new(),
+            conn_available: Notify::new(),
             active_drained: OnceCell::new(),
             retirement_failure: Mutex::new(None),
             connections_created: AtomicU64::new(0),
@@ -900,21 +904,17 @@ impl<C: Connection> Pool<C> {
                         }));
                     }
 
-                    // Wait with timeout (use shorter interval for cancellation checks)
+                    // Wait for a return notification or a short slice of the
+                    // deadline (the slice keeps cancellation checks frequent),
+                    // yielding to the runtime instead of blocking its thread.
+                    // A release between the bookkeeping above and this await is
+                    // not lost: `Notify` stores a `notify_one` permit.
                     let wait_time = remaining.min(Duration::from_millis(100));
                     {
-                        let inner = match self.shared.lock_or_error("acquire_wait") {
-                            Ok(guard) => guard,
-                            Err(e) => return Outcome::Err(e),
-                        };
-                        // wait_timeout can also return a poisoned error, handle it
-                        let _ = self
-                            .shared
-                            .conn_available
-                            .wait_timeout(inner, wait_time)
-                            .map_err(|_| {
-                                tracing::error!("Pool mutex poisoned during wait_timeout");
-                            });
+                        let mut notified = std::pin::pin!(self.shared.conn_available.notified());
+                        let mut slice =
+                            std::pin::pin!(asupersync::time::sleep(cx.now(), wait_time));
+                        let _ = Select::new(notified.as_mut(), slice.as_mut()).await;
                     }
 
                     // Decrement waiter count after waking
@@ -1035,7 +1035,7 @@ impl<C: Connection> Pool<C> {
         };
 
         // Wake all waiters so they see the pool is closed
-        self.shared.conn_available.notify_all();
+        self.shared.conn_available.notify_waiters();
         retired
     }
 
@@ -2422,6 +2422,58 @@ mod tests {
         assert_eq!(stats.total_connections, 1);
         drop(acquired);
         assert_eq!(pool.stats().idle_connections, 1);
+    }
+
+    #[test]
+    fn waiters_yield_instead_of_blocking_a_single_threaded_runtime() {
+        // Four tasks contend on a pool of one under one current-thread
+        // runtime: a waiter must yield so the holder can run and return its
+        // lease. With the old blocking `Condvar` wait the holder never ran
+        // and every waiter timed out (found by the e2e fan-out on PostgreSQL).
+        let pool: Arc<Pool<MockConnection>> = Arc::new(Pool::new(
+            PoolConfig::new(1)
+                .min_connections(0)
+                .acquire_timeout(2_000)
+                .test_on_checkout(false),
+        ));
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+        let tasks: Vec<_> = (0..4)
+            .map(|i| {
+                let pool = Arc::clone(&pool);
+                handle.spawn(async move {
+                    let cx = Cx::for_testing();
+                    match pool
+                        .acquire(&cx, || async { Outcome::Ok(MockConnection::new(1)) })
+                        .await
+                    {
+                        Outcome::Ok(lease) => {
+                            // Hold the lease across a yield so the others queue.
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+                            drop(lease);
+                            Ok(i)
+                        }
+                        Outcome::Err(e) => Err(e.to_string()),
+                        Outcome::Cancelled(_) | Outcome::Panicked(_) => Err("cancelled".into()),
+                    }
+                })
+            })
+            .collect();
+        let results = runtime.block_on(async {
+            let mut results = Vec::new();
+            for task in tasks {
+                results.push(task.await);
+            }
+            results
+        });
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        let stats = pool.stats();
+        assert_eq!(stats.timeouts, 0, "{stats:?}");
+        assert_eq!(stats.connections_created, 1, "{stats:?}");
+        assert_eq!(stats.acquires, 4, "{stats:?}");
+        assert_eq!(stats.active_connections, 0, "{stats:?}");
     }
 
     #[test]
