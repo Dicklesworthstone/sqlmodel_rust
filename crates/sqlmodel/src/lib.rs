@@ -128,11 +128,15 @@ pub use sqlmodel_core::{
     Row,
     SqlEnum,
     SqlModelDump,
+    // Partial updates (sqlmodel_update family)
+    SqlModelUpdate,
     SqlModelValidate,
     SqlType,
     TaskId,
     TrackedModel,
     TypeInfo,
+    UpdateInput,
+    UpdateOptions,
     ValidateInput,
     ValidateOptions,
     ValidateResult,
@@ -694,6 +698,8 @@ pub mod prelude {
         Session,
         SessionConfig,
         SqlModelDump,
+        // Partial updates (sqlmodel_update family)
+        SqlModelUpdate,
         SqlModelValidate,
         TaskId,
         TrackedModel,
@@ -702,6 +708,8 @@ pub mod prelude {
         // Transaction handles (`tx.execute(..)`, `tx.commit(..)`)
         TransactionOps,
         TransactionOptions,
+        UpdateInput,
+        UpdateOptions,
         ValidateInput,
         ValidateOptions,
         ValidateResult,
