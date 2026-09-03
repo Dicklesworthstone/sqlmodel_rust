@@ -22,6 +22,11 @@
 //! dropped, it is handed out again and fails its next statement. The e2e pool
 //! scenario asserts both behaviours against PostgreSQL and MySQL.
 //!
+//! A lease holder that panics returns its connection during unwinding (the
+//! lease's `Drop` runs); the pool's accounting stays consistent, it keeps
+//! serving, and `close_and_drain` still completes. Only a panic *inside* the
+//! pool's own lock poisons it, and every lock site recovers from that.
+//!
 //! # Features
 //!
 //! - Generic over any `Connection` type
@@ -1225,8 +1230,9 @@ enum FactoryPublish<C: Connection> {
 
 /// A connection borrowed from the pool.
 ///
-/// When dropped, the connection is automatically returned to the pool.
-/// The connection can be used via `Deref` and `DerefMut`.
+/// When dropped, the connection is automatically returned to the pool, also
+/// while a panic unwinds the holder. The connection can be used via `Deref`
+/// and `DerefMut`.
 pub struct PooledConnection<C: Connection> {
     /// The connection metadata (Some while held, None after return)
     meta: Option<ConnectionMeta<C>>,
