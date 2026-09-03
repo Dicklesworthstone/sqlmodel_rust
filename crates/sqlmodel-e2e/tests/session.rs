@@ -691,6 +691,147 @@ fn session_unit_of_work_and_relationships_work_on_every_available_driver() {
     let ran = run_owned_on_every_driver(&cx, &IdentityAndLoads);
     assert!(ran.contains(&"frankensqlite"), "{ran:?}");
     assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
+
+    let ran = run_owned_on_every_driver(&cx, &StatementReuse);
+    assert!(ran.contains(&"frankensqlite"), "{ran:?}");
+    assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
+}
+
+/// A server-side statement counter, where the server keeps one.
+#[derive(Clone, Copy)]
+enum StatementCounter {
+    Prepares,
+    Executes,
+}
+
+/// Read the counter from the same connection the session uses (both are
+/// per-session values). `None` where the server has no such counter.
+async fn statement_counter<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    dialect: Dialect,
+    which: StatementCounter,
+    label: &str,
+) -> Option<i64> {
+    match (dialect, which) {
+        (Dialect::Mysql, StatementCounter::Prepares) => {
+            let rows = expect_outcome(
+                conn.query(cx, "SHOW SESSION STATUS LIKE 'Com_stmt_prepare'", &[])
+                    .await,
+                label,
+            );
+            Some(rows[0].get_named::<String>("Value").unwrap().parse().unwrap())
+        }
+        (Dialect::Mysql, StatementCounter::Executes) => {
+            let rows = expect_outcome(
+                conn.query(cx, "SHOW SESSION STATUS LIKE 'Com_stmt_execute'", &[])
+                    .await,
+                label,
+            );
+            Some(rows[0].get_named::<String>("Value").unwrap().parse().unwrap())
+        }
+        (Dialect::Postgres, StatementCounter::Prepares) => {
+            let rows = expect_outcome(
+                conn.query(cx, "SELECT count(*) FROM pg_prepared_statements", &[])
+                    .await,
+                label,
+            );
+            Some(rows[0].get_as::<i64>(0).unwrap())
+        }
+        (Dialect::Postgres | Dialect::Sqlite, _) => None,
+    }
+}
+
+/// What server-side statement reuse a `Session` actually gets, read from the
+/// server: MySQL prepares each distinct statement once (the driver's
+/// per-connection cache) and executes it per call; PostgreSQL parses every
+/// query as the unnamed statement, so `pg_prepared_statements` stays empty;
+/// the SQLite drivers keep no statement cache. The README says exactly this.
+struct StatementReuse;
+
+impl OwnedScenario for StatementReuse {
+    async fn run<C: Connection + 'static>(&self, cx: &Cx, conn: C, driver: &DriverUnderTest) {
+        let d = driver.name();
+        let dialect = driver.dialect();
+        fresh_tables(cx, &conn, driver).await;
+        // Seed outside the session so the gets below hit the database.
+        for i in 1..=20 {
+            expect_outcome(
+                insert!(&Author::new(i, &format!("author{i}"), None))
+                    .execute(cx, &conn)
+                    .await,
+                &format!("{d}: seed {i}"),
+            );
+        }
+        let mut s = Session::new(conn);
+        let prepares_before = statement_counter(
+            cx,
+            s.connection(),
+            dialect,
+            StatementCounter::Prepares,
+            &format!("{d}: prepares before"),
+        )
+        .await;
+        let executes_before = statement_counter(
+            cx,
+            s.connection(),
+            dialect,
+            StatementCounter::Executes,
+            &format!("{d}: executes before"),
+        )
+        .await;
+        for i in 1..=20i64 {
+            let author: Option<Author> =
+                expect_outcome(s.get(cx, i).await, &format!("{d}: get {i}"));
+            assert_eq!(
+                author.map(|a| a.name),
+                Some(format!("author{i}")),
+                "{d}: get {i}"
+            );
+        }
+        let prepares_after = statement_counter(
+            cx,
+            s.connection(),
+            dialect,
+            StatementCounter::Prepares,
+            &format!("{d}: prepares after"),
+        )
+        .await;
+        let executes_after = statement_counter(
+            cx,
+            s.connection(),
+            dialect,
+            StatementCounter::Executes,
+            &format!("{d}: executes after"),
+        )
+        .await;
+        match dialect {
+            Dialect::Mysql => {
+                assert_eq!(
+                    prepares_after.unwrap() - prepares_before.unwrap(),
+                    1,
+                    "{d}: the session's SELECT by key is prepared once"
+                );
+                assert_eq!(
+                    executes_after.unwrap() - executes_before.unwrap(),
+                    20,
+                    "{d}: and executed per get"
+                );
+                eprintln!("{d}: 20 gets = 1 COM_STMT_PREPARE + 20 COM_STMT_EXECUTE (driver cache)");
+            }
+            Dialect::Postgres => {
+                assert_eq!(
+                    (prepares_before, prepares_after),
+                    (Some(0), Some(0)),
+                    "{d}: the driver uses the unnamed statement; nothing is cached on the server"
+                );
+                eprintln!("{d}: 20 gets left pg_prepared_statements empty (unnamed statements)");
+            }
+            Dialect::Sqlite => {
+                eprintln!("{d}: no statement cache in the driver; every query is prepared afresh");
+            }
+        }
+    }
 }
 
 /// Drop and recreate the four tables the session scenarios share.
