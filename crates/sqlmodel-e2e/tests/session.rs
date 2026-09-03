@@ -824,7 +824,10 @@ impl OwnedScenario for BatchOps {
         five.sqlmodel_update(
             HashMap::from([
                 ("name".to_string(), serde_json::json!("Only")),
-                ("email".to_string(), serde_json::json!("ignored@example.com")),
+                (
+                    "email".to_string(),
+                    serde_json::json!("ignored@example.com"),
+                ),
             ]),
             UpdateOptions::default().update_fields(["name"]),
         )
@@ -845,7 +848,11 @@ impl OwnedScenario for BatchOps {
         ] {
             expect_outcome(
                 s.connection()
-                    .execute(cx, &format!("DROP TABLE {}", dialect.quote_identifier(t)), &[])
+                    .execute(
+                        cx,
+                        &format!("DROP TABLE {}", dialect.quote_identifier(t)),
+                        &[],
+                    )
                     .await,
                 &format!("{d}: drop {t}"),
             );
