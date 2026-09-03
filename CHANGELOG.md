@@ -317,6 +317,23 @@ Second round, same day, on the tree that adds the type matrix, Session, Pool, an
   (memory, file), FrankenSQLite, PostgreSQL 16, and MySQL 8.4; driver integration suites 7/7 each.
   GitHub Actions runs still had not started when checked.
 
+Third round, same day, on the tree that quotes table names, adds the expression and Session
+relationship scenarios, the pool contention slice, and migration checksums. RCH's remote admission
+was paused for most of it, so these gates ran locally through the shim's escape hatch:
+
+- `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps` clean.
+- `cargo test --workspace --no-fail-fast`: 51 suites, 2008 passed, 0 failed after the one pool
+  assertion that assumed a 1 ms-lifetime replacement survives its own query was relaxed, 188 ignored
+  (pre-existing). `cargo test -p sqlmodel --doc --features nightly-try`: 3 passed (the compiled
+  README blocks), 8 ignored; the other crates' doctests had passed in the same run before it was
+  stopped.
+- `cargo audit --deny warnings` clean; `cargo deny check advisories bans licenses sources` all ok.
+- Live databases (run 16): all seven `sqlmodel-e2e` scenarios (smoke with the reserved-word table,
+  expressions, types, migrations with checksum drift, session unit-of-work plus relationships, pool
+  with OS-thread waiters, concurrent writers) pass on C SQLite (memory, file), FrankenSQLite,
+  PostgreSQL 16, and MySQL 8.4.
+
 ## [0.4.1] -- 2026-08-25
 
 Small release. The workspace version was bumped to 0.4.1 by
