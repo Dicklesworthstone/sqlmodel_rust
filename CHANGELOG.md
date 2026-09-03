@@ -95,6 +95,12 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   multi-statement migration, which is exactly what `Migration::from_operations` produces, could not
   run on PostgreSQL at all (the extended protocol rejects several statements in one execute), and
   nothing was ever transactional.
+- **Migration runners exclude each other.** `MigrationRunner::migrate` and `rollback` hold a
+  server-side lock keyed by the tracking table for the whole call (`pg_advisory_lock` on
+  PostgreSQL, `GET_LOCK` with a two-minute wait on MySQL), so two services starting at once do not
+  race: the second waits and then finds nothing pending. SQLite has no server to hold a lock; a
+  second runner there fails on the file lock or the tracking key instead of waiting and can be run
+  again, which the e2e race test asserts. Either way no migration is applied twice.
 - **Migration checksums.** `MigrationRunner` records a fingerprint of each applied migration's
   `up` SQL (`Migration::checksum`, 64-bit FNV-1a) in a new `checksum` column of the tracking table
   and compares it on every run: an applied migration whose SQL was edited afterwards is reported as
@@ -215,6 +221,12 @@ facade tests, and the driver integration suites run against live Docker database
   `SELECT __sqlmodel_error__('... requires table_info')`, which fails the moment it is run. The
   inverse now carries the table as it is after the forward operation and the rollback rebuilds the
   table. Found by the e2e schema fixpoint scenario rolling back a nullability change on SQLite.
+- **FrankenSQLite kept a stale snapshot after a failed `COMMIT`.** When a commit failed on a
+  snapshot conflict the driver returned the error but neither rolled back nor cleared its
+  in-transaction flag, so the connection kept reading the old snapshot: a retry did not see what
+  the other writer had committed and re-created tables that already existed. A failed commit now
+  rolls back and returns the connection to autocommit on a fresh snapshot. Found by the e2e
+  migration-runner race on FrankenSQLite; unit test with two connections.
 - **`schema_diff` reported two false differences on MySQL.** `BOOLEAN` comes back from the server
   as `tinyint(1)` and integers keep their display widths, which the normalizer treated as type
   changes; and the index MySQL creates for every foreign key was reported as an index to drop,

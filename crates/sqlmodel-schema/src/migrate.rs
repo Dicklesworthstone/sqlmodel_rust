@@ -9,7 +9,9 @@
 use crate::ddl::DdlGenerator;
 use crate::diff::SchemaOperation;
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Error, TransactionOps, Value};
+use sqlmodel_core::{
+    Connection, Error, TransactionMode, TransactionOps, TransactionOptions, Value,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -637,12 +639,13 @@ impl MigrationRunner {
         direction: ScriptDirection,
         record_sql: &str,
         record_params: &[Value],
-    ) -> Outcome<(), Error> {
+    ) -> Outcome<bool, Error> {
         let id = migration.id.as_str();
         let script = match direction {
             ScriptDirection::Up => migration.up.as_str(),
             ScriptDirection::Down => migration.down.as_str(),
         };
+        let direction_kind = direction;
         let direction = direction.name();
         let statements = split_statements(script);
         // A script that manages its own transaction (SQLite table recreation
@@ -652,12 +655,52 @@ impl MigrationRunner {
         // tracking row is then written after the script, outside it.
         let owns_transaction = statements.iter().any(|s| statement_controls_transaction(s));
         if conn.dialect().supports_transactional_ddl() && !owns_transaction {
-            let tx = match conn.begin(cx).await {
+            // On SQLite take the write lock at BEGIN (IMMEDIATE) so two
+            // runners serialize here instead of conflicting at COMMIT.
+            let options = if conn.dialect() == sqlmodel_core::Dialect::Sqlite {
+                TransactionOptions::default().with_mode(TransactionMode::Immediate)
+            } else {
+                TransactionOptions::default()
+            };
+            let tx = match conn.begin_with_options(cx, options).await {
                 Outcome::Ok(tx) => tx,
                 Outcome::Err(e) => return Outcome::Err(e),
                 Outcome::Cancelled(r) => return Outcome::Cancelled(r),
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             };
+            // Re-check under the lock: another runner may have applied (or
+            // rolled back) this migration between our status read and BEGIN.
+            let check_sql = format!(
+                "SELECT 1 FROM {} WHERE id = {}",
+                self.table_name,
+                conn.dialect().placeholder(1)
+            );
+            let recorded = match tx
+                .query(cx, &check_sql, &[Value::Text(id.to_string())])
+                .await
+            {
+                Outcome::Ok(rows) => !rows.is_empty(),
+                Outcome::Err(e) => {
+                    let _ = tx.rollback(cx).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    let _ = tx.rollback(cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    let _ = tx.rollback(cx).await;
+                    return Outcome::Panicked(p);
+                }
+            };
+            let already_done = match direction_kind {
+                ScriptDirection::Up => recorded,
+                ScriptDirection::Down => !recorded,
+            };
+            if already_done {
+                let _ = tx.rollback(cx).await;
+                return Outcome::Ok(false);
+            }
             for (index, statement) in statements.iter().enumerate() {
                 match tx.execute(cx, statement, &[]).await {
                     Outcome::Ok(_) => {}
@@ -690,7 +733,7 @@ impl MigrationRunner {
                     return Outcome::Panicked(p);
                 }
             }
-            return tx.commit(cx).await;
+            return tx.commit(cx).await.map(|()| true);
         }
 
         // No transactional DDL (MySQL): statements before a failure stay
@@ -707,10 +750,94 @@ impl MigrationRunner {
         }
         conn.execute(cx, record_sql, record_params)
             .await
-            .map(|_| ())
+            .map(|_| true)
+    }
+
+    /// Key for the server-side lock that serializes runners on one database:
+    /// a hash of the tracking table name, so runners sharing a history table
+    /// exclude each other and unrelated ones do not.
+    fn lock_key(&self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.table_name.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Take the migration lock: `pg_advisory_lock` on PostgreSQL and
+    /// `GET_LOCK` on MySQL, both session-level and held until
+    /// [`Self::release_lock`]. SQLite has no server to hold a lock; there the
+    /// database file lock and the tracking table's primary key keep a second
+    /// runner from applying a migration twice, but it fails instead of
+    /// waiting (see [`Self::migrate`]).
+    async fn acquire_lock<C: Connection>(&self, cx: &Cx, conn: &C) -> Outcome<(), Error> {
+        match conn.dialect() {
+            sqlmodel_core::Dialect::Postgres => {
+                #[allow(clippy::cast_possible_wrap)] // any bigint is a valid key
+                let key = self.lock_key() as i64;
+                conn.execute(cx, "SELECT pg_advisory_lock($1)", &[Value::BigInt(key)])
+                    .await
+                    .map(|_| ())
+            }
+            sqlmodel_core::Dialect::Mysql => {
+                let name = format!("sqlmodel_migrate_{:016x}", self.lock_key());
+                let rows = match conn
+                    .query(cx, "SELECT GET_LOCK(?, 120)", &[Value::Text(name.clone())])
+                    .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let granted = rows
+                    .first()
+                    .and_then(|r| r.get_as::<i64>(0).ok())
+                    .unwrap_or(0);
+                if granted == 1 {
+                    Outcome::Ok(())
+                } else {
+                    Outcome::Err(Error::Custom(format!(
+                        "could not acquire migration lock `{name}` within 120s; \
+                         another runner is still migrating this database"
+                    )))
+                }
+            }
+            sqlmodel_core::Dialect::Sqlite => Outcome::Ok(()),
+        }
+    }
+
+    /// Release the lock taken by [`Self::acquire_lock`]. Best effort: a
+    /// session-level lock also goes away with the connection.
+    async fn release_lock<C: Connection>(&self, cx: &Cx, conn: &C) {
+        match conn.dialect() {
+            sqlmodel_core::Dialect::Postgres => {
+                #[allow(clippy::cast_possible_wrap)]
+                let key = self.lock_key() as i64;
+                let _ = conn
+                    .execute(cx, "SELECT pg_advisory_unlock($1)", &[Value::BigInt(key)])
+                    .await;
+            }
+            sqlmodel_core::Dialect::Mysql => {
+                let name = format!("sqlmodel_migrate_{:016x}", self.lock_key());
+                let _ = conn
+                    .query(cx, "SELECT RELEASE_LOCK(?)", &[Value::Text(name)])
+                    .await;
+            }
+            sqlmodel_core::Dialect::Sqlite => {}
+        }
     }
 
     /// Apply all pending migrations, in order, and return the ids applied.
+    ///
+    /// Only one runner at a time migrates a given database: on PostgreSQL and
+    /// MySQL the call holds a server-side lock keyed by the tracking table
+    /// (`pg_advisory_lock` / `GET_LOCK`, waiting up to two minutes on MySQL),
+    /// so a second runner waits and then finds nothing pending. SQLite has no
+    /// server to hold such a lock; a second runner there fails on the database
+    /// file lock or the tracking table's primary key instead of waiting, and
+    /// can simply be run again. Either way no migration is applied twice.
     ///
     /// Each migration's statements are split on top-level semicolons (see
     /// [`split_statements`]) and run one at a time: the PostgreSQL extended
@@ -731,6 +858,23 @@ impl MigrationRunner {
     /// Refuses to run while any applied migration is
     /// [`MigrationStatus::Drifted`].
     pub async fn migrate<C: Connection>(&self, cx: &Cx, conn: &C) -> Outcome<Vec<String>, Error> {
+        match self.acquire_lock(cx, conn).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+        let result = self.migrate_locked(cx, conn).await;
+        self.release_lock(cx, conn).await;
+        result
+    }
+
+    /// [`Self::migrate`] with the lock already held.
+    async fn migrate_locked<C: Connection>(
+        &self,
+        cx: &Cx,
+        conn: &C,
+    ) -> Outcome<Vec<String>, Error> {
         let status = match self.status(cx, conn).await {
             Outcome::Ok(s) => s,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -797,21 +941,39 @@ impl MigrationRunner {
                     )
                     .await
                 {
-                    Outcome::Ok(()) => {}
+                    Outcome::Ok(true) => applied.push(id),
+                    // Another runner got there first; nothing to do.
+                    Outcome::Ok(false) => {}
                     Outcome::Err(e) => return Outcome::Err(e),
                     Outcome::Cancelled(r) => return Outcome::Cancelled(r),
                     Outcome::Panicked(p) => return Outcome::Panicked(p),
                 }
-
-                applied.push(id);
             }
         }
 
         Outcome::Ok(applied)
     }
 
-    /// Rollback the last applied migration.
+    /// Roll back the last applied migration and return its id, or `None` when
+    /// nothing is applied. Holds the same lock as [`Self::migrate`].
     pub async fn rollback<C: Connection>(
+        &self,
+        cx: &Cx,
+        conn: &C,
+    ) -> Outcome<Option<String>, Error> {
+        match self.acquire_lock(cx, conn).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+        let result = self.rollback_locked(cx, conn).await;
+        self.release_lock(cx, conn).await;
+        result
+    }
+
+    /// [`Self::rollback`] with the lock already held.
+    async fn rollback_locked<C: Connection>(
         &self,
         cx: &Cx,
         conn: &C,
@@ -867,7 +1029,9 @@ impl MigrationRunner {
             )
             .await
         {
-            Outcome::Ok(()) => {}
+            Outcome::Ok(true) => {}
+            // Another runner rolled it back first.
+            Outcome::Ok(false) => return Outcome::Ok(None),
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),

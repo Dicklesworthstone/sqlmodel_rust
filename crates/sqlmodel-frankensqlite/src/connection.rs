@@ -625,10 +625,21 @@ impl FrankenConnection {
             }));
         }
 
-        inner
+        let committed = inner
             .conn
             .execute_sync("COMMIT")
-            .map_err(|e| franken_to_query_error(&e, "COMMIT"))?;
+            .map_err(|e| franken_to_query_error(&e, "COMMIT"));
+        if let Err(e) = committed {
+            // A failed COMMIT (snapshot conflict, busy) leaves the transaction
+            // open on its old snapshot. Until 2026-09 the driver kept its
+            // `in_transaction` flag too, so the connection went on reading
+            // stale data and a retry re-created tables that already existed
+            // (found by the e2e migration-runner race). Roll back so the
+            // connection is back in autocommit with a fresh snapshot.
+            let _ = inner.conn.execute_sync("ROLLBACK");
+            inner.in_transaction = false;
+            return Err(e);
+        }
 
         inner.in_transaction = false;
         Ok(())
@@ -2499,6 +2510,77 @@ mod tests {
         assert_eq!(rows_a[0].get(0), Some(&Value::Text("from a".into())));
         assert_eq!(rows_b[0].get(0), Some(&Value::Text("from b".into())));
 
+        drop(a);
+        drop(b);
+        remove_db_family(&path);
+    }
+
+    /// After a COMMIT that fails on a snapshot conflict the connection must be
+    /// back in autocommit on a fresh snapshot: it sees what the other
+    /// connection committed and can begin again. Found by the e2e
+    /// migration-runner race (2026-09): the loser kept reading its old
+    /// snapshot and re-created tables that already existed.
+    #[test]
+    fn failed_commit_returns_the_connection_to_a_fresh_snapshot() {
+        use sqlmodel_core::Cx;
+        let path = concurrent_test_db("failed_commit");
+        let a = FrankenConnection::open_file(&path).unwrap();
+        a.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        a.execute_raw("INSERT INTO t VALUES (1, 0)").unwrap();
+        let b = FrankenConnection::open_file(&path).unwrap();
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let tx_a = Connection::begin_with_options(&a, &cx, TransactionOptions::concurrent())
+                .await
+                .into_result()
+                .unwrap();
+            let tx_b = Connection::begin_with_options(&b, &cx, TransactionOptions::concurrent())
+                .await
+                .into_result()
+                .unwrap();
+            TransactionOps::execute(&tx_a, &cx, "UPDATE t SET val = 10 WHERE id = 1", &[])
+                .await
+                .into_result()
+                .unwrap();
+            TransactionOps::execute(&tx_a, &cx, "CREATE TABLE winner (id INTEGER)", &[])
+                .await
+                .into_result()
+                .unwrap();
+            let stmt_b =
+                TransactionOps::execute(&tx_b, &cx, "UPDATE t SET val = 20 WHERE id = 1", &[])
+                    .await;
+            tx_a.commit(&cx).await.into_result().expect("a commits");
+            let failed = match stmt_b {
+                Outcome::Err(e) => {
+                    let _ = tx_b.rollback(&cx).await;
+                    e
+                }
+                Outcome::Ok(_) => match tx_b.commit(&cx).await {
+                    Outcome::Err(e) => e,
+                    other => panic!("b must lose the conflict, got {other:?}"),
+                },
+                other => panic!("unexpected: {other:?}"),
+            };
+            assert!(failed.is_retryable(), "{failed}");
+        });
+        // b is in autocommit again and sees a's commit ...
+        let rows = b.query_sync("SELECT val FROM t WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows[0].get(0), Some(&Value::BigInt(10)), "b sees a's value");
+        let rows = b
+            .query_sync("SELECT name FROM sqlite_master WHERE name = 'winner'", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "b sees the table a created");
+        // ... and can run a new transaction.
+        b.begin_sync(IsolationLevel::ReadCommitted).unwrap();
+        b.execute_sync("UPDATE t SET val = 30 WHERE id = 1", &[])
+            .unwrap();
+        b.commit_sync().unwrap();
+        let rows = a.query_sync("SELECT val FROM t WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows[0].get(0), Some(&Value::BigInt(30)));
         drop(a);
         drop(b);
         remove_db_family(&path);

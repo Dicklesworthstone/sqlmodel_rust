@@ -72,6 +72,25 @@ struct PlayerV3 {
     nickname: Option<String>,
 }
 
+/// And one more: a nullable `captain_id` referencing teams. Adding a foreign
+/// key is a table recreation on SQLite too (with rows and a NULL column).
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table = "e2e_fix_players")]
+struct PlayerV4 {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    #[sqlmodel(foreign_key = "e2e_fix_teams.id")]
+    team_id: i64,
+    #[sqlmodel(index = "e2e_fix_players_name_idx", nullable)]
+    name: Option<String>,
+    score: i32,
+    active: bool,
+    #[sqlmodel(nullable)]
+    nickname: Option<String>,
+    #[sqlmodel(foreign_key = "e2e_fix_teams.id", nullable)]
+    captain_id: Option<i64>,
+}
+
 async fn count<C: Connection>(cx: &Cx, conn: &C, table: &str, label: &str) -> i64 {
     let rows = expect_outcome(
         conn.query(cx, &format!("SELECT COUNT(*) FROM {table}"), &[])
@@ -210,8 +229,8 @@ impl Scenario for Fixpoint {
         let mut relax = Migration::from_operations(&diff.operations, &*ddl, "name nullable");
         relax.id = "0003_name_nullable".into();
         eprintln!("{d}: relax migration up:\n{}", relax.up);
-        let runner =
-            MigrationRunner::new(vec![initial.clone(), evolve.clone(), relax]).table_name(tracking);
+        let runner = MigrationRunner::new(vec![initial.clone(), evolve.clone(), relax.clone()])
+            .table_name(tracking);
         let applied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: relax"));
         assert_eq!(applied, vec!["0003_name_nullable"], "{d}");
         let current = introspect_ours(cx, conn, dialect, &ours, &format!("{d}: relaxed")).await;
@@ -265,6 +284,94 @@ impl Scenario for Fixpoint {
             )
             .await,
             &format!("{d}: remove null-name row"),
+        );
+
+        // 4b. A new nullable column with a foreign key: ADD COLUMN plus ADD
+        // FOREIGN KEY, the latter a table recreation on SQLite. Rows survive,
+        // the key is enforced, and rolling it back reaches the fixpoint again.
+        let expected = <(Team, PlayerV4) as ModelTuple>::database_schema(dialect);
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.iter().any(|op| matches!(
+                op,
+                sqlmodel_schema::diff::SchemaOperation::AddForeignKey { .. }
+            )),
+            "{d}: expected an AddForeignKey, got {:?}",
+            diff.operations
+        );
+        let mut captain = Migration::from_operations(&diff.operations, &*ddl, "captain fk");
+        captain.id = "0004_captain".into();
+        eprintln!("{d}: captain migration up:\n{}", captain.up);
+        let runner = MigrationRunner::new(vec![
+            initial.clone(),
+            evolve.clone(),
+            relax.clone(),
+            captain,
+        ])
+        .table_name(tracking);
+        let applied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: captain"));
+        assert_eq!(applied, vec!["0004_captain"], "{d}");
+        let current = introspect_ours(cx, conn, dialect, &ours, &format!("{d}: captained")).await;
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after adding the foreign key; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &players_q, "players after fk recreate").await,
+            2,
+            "{d}"
+        );
+        expect_outcome(
+            conn.execute(
+                cx,
+                &format!(
+                    "UPDATE {players_q} SET {} = 2 WHERE {} = 1",
+                    q("captain_id"),
+                    q("id")
+                ),
+                &[],
+            )
+            .await,
+            &format!("{d}: valid captain"),
+        );
+        if dialect == Dialect::Sqlite {
+            expect_outcome(
+                conn.execute(cx, "PRAGMA foreign_keys = ON", &[]).await,
+                &format!("{d}: enable foreign keys"),
+            );
+        }
+        assert!(
+            matches!(
+                conn.execute(
+                    cx,
+                    &format!(
+                        "UPDATE {players_q} SET {} = 99 WHERE {} = 1",
+                        q("captain_id"),
+                        q("id")
+                    ),
+                    &[],
+                )
+                .await,
+                Outcome::Err(_)
+            ),
+            "{d}: the new foreign key must be enforced"
+        );
+        let rolled = expect_outcome(runner.rollback(cx, conn).await, &format!("{d}: rollback 4"));
+        assert_eq!(rolled.as_deref(), Some("0004_captain"), "{d}");
+        let expected = <(Team, PlayerV3) as ModelTuple>::database_schema(dialect);
+        let current = introspect_ours(cx, conn, dialect, &ours, &format!("{d}: uncaptained")).await;
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after rolling back the foreign key; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &players_q, "players after fk rollback").await,
+            2,
+            "{d}"
         );
 
         // 5. Rolling back twice restores the earlier fixpoints, rows intact.
