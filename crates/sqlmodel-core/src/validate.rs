@@ -1345,10 +1345,17 @@ pub trait SqlModelUpdate: Model + serde::Serialize + DeserializeOwned {
             err
         })?;
 
-        // Filter out null values (None fields)
+        // Keep the model's columns whose value is set (non-null). Anything
+        // else the model serializes (relationship fields such as
+        // `RelatedMany`/`Lazy`, computed values) is not a column and must not
+        // reach the update, which rejects unknown keys.
+        let columns: std::collections::HashSet<&str> =
+            Self::fields().iter().map(|f| f.name).collect();
         let update_map: HashMap<String, serde_json::Value> =
             if let serde_json::Value::Object(map) = source_json {
-                map.into_iter().filter(|(_, v)| !v.is_null()).collect()
+                map.into_iter()
+                    .filter(|(k, v)| !v.is_null() && columns.contains(k.as_str()))
+                    .collect()
             } else {
                 let mut err = ValidationError::new();
                 err.add(
@@ -1862,6 +1869,84 @@ mod tests {
     // ========================================================================
 
     use crate::{FieldInfo, Row, SqlType};
+
+    /// A model that serializes more than its columns (a relationship-like
+    /// field), as every model with `RelatedMany`/`Lazy` fields does.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct PatchableWithRelation {
+        id: i64,
+        name: String,
+        email: Option<String>,
+        tags: Vec<String>,
+    }
+
+    impl Model for PatchableWithRelation {
+        const TABLE_NAME: &'static str = "patchable";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt).primary_key(true),
+                FieldInfo::new("name", "name", SqlType::Text),
+                FieldInfo::new("email", "email", SqlType::Text).nullable(true),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", Value::BigInt(self.id)),
+                ("name", Value::Text(self.name.clone())),
+                ("email", self.email.clone().map_or(Value::Null, Value::Text)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> crate::Result<Self> {
+            Ok(Self {
+                id: row.get_named("id")?,
+                name: row.get_named("name")?,
+                email: row.get_named("email")?,
+                tags: Vec::new(),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![Value::BigInt(self.id)]
+        }
+
+        fn is_new(&self) -> bool {
+            false
+        }
+    }
+
+    /// `sqlmodel_update_from` must take only the columns from the patch:
+    /// relationship-like fields are not columns and used to make it fail with
+    /// "Unknown field" (found 2026-09 by the e2e Session scenario).
+    #[test]
+    fn update_from_patch_ignores_non_column_fields_and_none() {
+        let mut current = PatchableWithRelation {
+            id: 5,
+            name: "before".into(),
+            email: Some("keep@example.com".into()),
+            tags: vec!["a".into()],
+        };
+        let patch = PatchableWithRelation {
+            id: 5,
+            name: "after".into(),
+            email: None,
+            tags: vec!["ignored".into()],
+        };
+        current
+            .sqlmodel_update_from(&patch, UpdateOptions::default())
+            .expect("patch applies");
+        assert_eq!(current.name, "after");
+        assert_eq!(current.email.as_deref(), Some("keep@example.com"));
+        assert_eq!(
+            current.tags,
+            vec!["a".to_string()],
+            "not a column: untouched"
+        );
+    }
 
     /// Test model with aliases for validation and serialization tests.
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

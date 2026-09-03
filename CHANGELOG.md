@@ -254,6 +254,20 @@ facade tests, and the driver integration suites run against live Docker database
 - **`Row::get_named` now matches column names case-insensitively** when no exact match exists and
   the match is unambiguous, since unquoted SQL identifiers are case-insensitive and servers report
   them in their own case (PostgreSQL lower, MySQL `information_schema` upper).
+- **`sqlmodel_update_from` failed for any model with relationship fields.** It serialized the
+  whole patch model and then rejected `books` (or any `RelatedMany`/`Lazy` field) as an unknown
+  field, so a model with relationships could never be patched from another instance. Only the
+  model's columns are taken from the patch now.
+- **`Session::mark_dirty` ignored expired objects.** Every object is expired after `commit`, so
+  modifying an object obtained before the commit and calling `mark_dirty` was a silent no-op and
+  the change never reached the database. An expired object is now persistent and dirty again,
+  as with `merge`.
+- **`Session::rollback` kept rolled-back inserts as persistent.** An object INSERTed by a flush
+  inside a transaction that was then rolled back stayed `Persistent` in the identity map although
+  its row was gone, so `add`ing it again was a silent no-op and the next commit wrote nothing.
+  Rollback now drops objects that were inserted in the rolled-back transaction (they are transient
+  again) and expires the remaining persistent ones, so stale in-memory state is reloaded. Found by
+  the e2e `add_all` scenario.
 - **`Session::flush` set every column on every UPDATE.** A dirty object was written back with
   all of its non-key columns, which resent unchanged values on every save and turned two sessions
   editing different columns of the same row into a lost update. The UPDATE now names only the

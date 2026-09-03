@@ -502,6 +502,9 @@ pub struct Session<C: Connection> {
     pending_delete: Vec<ObjectKey>,
     /// Objects that are dirty (need UPDATE).
     pending_dirty: Vec<ObjectKey>,
+    /// Objects whose INSERT ran inside the current transaction. A rollback
+    /// makes them transient again (their rows are gone); a commit forgets them.
+    inserted_in_transaction: std::collections::HashSet<ObjectKey>,
     /// Configuration.
     config: SessionConfig,
     /// N+1 query detection tracker (optional).
@@ -525,6 +528,7 @@ impl<C: Connection> Session<C> {
             pending_new: Vec::new(),
             pending_delete: Vec::new(),
             pending_dirty: Vec::new(),
+            inserted_in_transaction: std::collections::HashSet::new(),
             config,
             n1_tracker: None,
             event_callbacks: SessionEventCallbacks::default(),
@@ -712,10 +716,19 @@ impl<C: Connection> Session<C> {
         let key = ObjectKey::from_model(obj);
 
         if let Some(tracked) = self.identity_map.get_mut(&key) {
-            // Only mark persistent objects as dirty
-            if tracked.state != ObjectState::Persistent {
+            // Persistent objects, and expired ones (every object is expired
+            // after `commit`, and after `rollback`): the caller supplies the
+            // full current state, so the object is persistent again and
+            // dirty. Ignoring expired objects silently dropped every change
+            // made after a commit (found 2026-09 by the e2e Session scenario).
+            if !matches!(
+                tracked.state,
+                ObjectState::Persistent | ObjectState::Expired
+            ) {
                 return;
             }
+            tracked.state = ObjectState::Persistent;
+            tracked.expired_attributes = None;
 
             // Update the stored object and values
             tracked.object = Box::new(obj.clone());
@@ -1931,6 +1944,7 @@ impl<C: Connection> Session<C> {
                 match self.connection.execute(cx, &sql, &tracked.values).await {
                     Outcome::Ok(_) => {
                         tracked.state = ObjectState::Persistent;
+                        self.inserted_in_transaction.insert(*key);
                         // Set original_state for future dirty checking (serialize current values)
                         tracked.original_state =
                             Some(serde_json::to_vec(&tracked.values).unwrap_or_default());
@@ -2097,6 +2111,9 @@ impl<C: Connection> Session<C> {
             }
         }
 
+        // Committed: the inserts are durable, nothing to undo any more.
+        self.inserted_in_transaction.clear();
+
         // Expire objects if configured
         if self.config.expire_on_commit {
             for tracked in self.identity_map.values_mut() {
@@ -2211,6 +2228,7 @@ impl<C: Connection> Session<C> {
             self.in_transaction = false;
         }
         self.identity_map.clear();
+        self.inserted_in_transaction.clear();
         self.pending_new.clear();
         self.pending_delete.clear();
         self.pending_dirty.clear();
@@ -2233,17 +2251,25 @@ impl<C: Connection> Session<C> {
         self.pending_delete.clear();
         self.pending_dirty.clear();
 
-        // Revert objects to original state or remove new ones
+        // Objects inserted inside the rolled-back transaction have no row any
+        // more: they become transient again (dropped from the map), so adding
+        // them again inserts again. Until 2026-09 they stayed `Persistent`
+        // and a later `add` was a silent no-op. Every other persistent object
+        // is expired, because its in-memory state may reflect rolled-back
+        // changes; the next `get` reloads it.
+        let inserted = std::mem::take(&mut self.inserted_in_transaction);
         let mut to_remove = Vec::new();
         for (key, tracked) in &mut self.identity_map {
-            match tracked.state {
-                ObjectState::New => {
-                    to_remove.push(*key);
-                }
-                ObjectState::Deleted => {
-                    tracked.state = ObjectState::Persistent;
-                }
-                _ => {}
+            if tracked.state == ObjectState::New || inserted.contains(key) {
+                to_remove.push(*key);
+                continue;
+            }
+            if matches!(
+                tracked.state,
+                ObjectState::Persistent | ObjectState::Deleted
+            ) {
+                tracked.state = ObjectState::Expired;
+                tracked.expired_attributes = None;
             }
         }
 
@@ -5288,6 +5314,109 @@ mod tests {
         assert_eq!(
             updates[0].1,
             vec![Value::Text("blue".into()), Value::BigInt(7)]
+        );
+    }
+
+    /// An object inserted inside a transaction that is rolled back has no row
+    /// any more; adding it again must insert again. Until 2026-09 it stayed
+    /// persistent in the identity map and the second `add` was a no-op.
+    #[test]
+    fn rollback_forgets_objects_inserted_in_the_rolled_back_transaction() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // A committed object that must merely be expired by a later rollback.
+            let old = Team {
+                id: Some(1),
+                name: "old".to_string(),
+            };
+            session.add(&old);
+            unwrap_outcome(session.commit(&cx).await);
+            session.expire_all();
+
+            let fresh = Team {
+                id: Some(2),
+                name: "fresh".to_string(),
+            };
+            session.add(&fresh);
+            unwrap_outcome(session.flush(&cx).await);
+            assert_eq!(session.object_state(&fresh), Some(ObjectState::Persistent));
+            unwrap_outcome(session.rollback(&cx).await);
+            assert_eq!(
+                session.object_state(&fresh),
+                None,
+                "a rolled-back insert is transient again"
+            );
+            assert_eq!(
+                session.object_state(&old),
+                Some(ObjectState::Expired),
+                "other persistent objects are expired by the rollback"
+            );
+
+            session.add(&fresh);
+            unwrap_outcome(session.flush(&cx).await);
+        });
+
+        let guard = state.lock().unwrap();
+        let inserts = guard
+            .executed
+            .iter()
+            .filter(|(sql, _)| sql.starts_with("INSERT") && sql.contains("teams"))
+            .count();
+        assert_eq!(
+            inserts, 3,
+            "old + fresh + fresh again: {:?}",
+            guard.executed
+        );
+    }
+
+    /// `mark_dirty` on an object expired by `commit` must still produce the
+    /// UPDATE; it used to return silently for anything not `Persistent`.
+    #[test]
+    fn mark_dirty_after_commit_updates_the_expired_object() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            let team = Team {
+                id: Some(3),
+                name: "before".to_string(),
+            };
+            session.add(&team);
+            unwrap_outcome(session.commit(&cx).await);
+            assert_eq!(session.object_state(&team), Some(ObjectState::Expired));
+
+            let mut renamed = team.clone();
+            renamed.name = "after".to_string();
+            session.mark_dirty(&renamed);
+            assert!(session.is_modified(&renamed));
+            unwrap_outcome(session.flush(&cx).await);
+        });
+
+        let guard = state.lock().unwrap();
+        let updates: Vec<&(String, Vec<Value>)> = guard
+            .executed
+            .iter()
+            .filter(|(sql, _)| sql.starts_with("UPDATE"))
+            .collect();
+        assert_eq!(updates.len(), 1, "executed: {:?}", guard.executed);
+        assert!(
+            updates[0].1.contains(&Value::Text("after".into())),
+            "{:?}",
+            updates[0]
         );
     }
 
