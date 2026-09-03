@@ -254,6 +254,12 @@ facade tests, and the driver integration suites run against live Docker database
 - **`Row::get_named` now matches column names case-insensitively** when no exact match exists and
   the match is unambiguous, since unquoted SQL identifiers are case-insensitive and servers report
   them in their own case (PostgreSQL lower, MySQL `information_schema` upper).
+- **MySQL unsigned integers above the signed range came back negative.** Both decoders cast an
+  unsigned column into the same-width signed `Value` (`TINYINT UNSIGNED` 200 read as -56,
+  `BIGINT UNSIGNED` 18446744073709551615 read as -1), and the binary decoder ignored the unsigned
+  flag entirely. Unsigned values are now widened to the next signed variant, and an unsigned
+  64-bit value above `i64::MAX` is carried exactly as `Value::Decimal`. Found by the new
+  binary-protocol integration test against MySQL 8.4.
 - **The N+1 query detector never saw a query.** `Session::enable_n1_detection` installed a tracker,
   but no loader ever called `record_lazy_load`, so `n1_stats()` stayed at zero however many
   per-parent loads a loop issued. `load_lazy` now records one load per call under the child's

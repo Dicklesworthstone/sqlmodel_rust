@@ -401,6 +401,14 @@ impl FromValue for u32 {
 
 impl FromValue for u64 {
     fn from_value(value: &Value) -> Result<Self> {
+        // Drivers carry an unsigned 64-bit value above `i64::MAX` as its
+        // exact digits (MySQL `BIGINT UNSIGNED`), since `Value` has no
+        // unsigned variant.
+        if let Value::Decimal(digits) | Value::Text(digits) = value
+            && let Ok(v) = digits.parse::<u64>()
+        {
+            return Ok(v);
+        }
         let v = value.as_i64().ok_or_else(|| {
             Error::Type(TypeError {
                 expected: "u64",
@@ -665,6 +673,19 @@ mod tests {
     /// Servers report unquoted identifiers in their own case (MySQL returns
     /// `information_schema` columns upper-cased); a lookup that misses exactly
     /// falls back to an unambiguous case-insensitive match.
+    /// A `u64` above `i64::MAX` arrives as exact digits (MySQL `BIGINT
+    /// UNSIGNED`) and must convert; negatives and non-digits must not.
+    #[test]
+    fn u64_reads_exact_digits_above_the_signed_range() {
+        assert_eq!(
+            u64::from_value(&Value::Decimal("18446744073709551615".into())).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(u64::from_value(&Value::BigInt(42)).unwrap(), 42);
+        assert!(u64::from_value(&Value::BigInt(-1)).is_err());
+        assert!(u64::from_value(&Value::Text("not a number".into())).is_err());
+    }
+
     #[test]
     fn named_lookup_falls_back_to_case_insensitive_match() {
         let row = Row::new(

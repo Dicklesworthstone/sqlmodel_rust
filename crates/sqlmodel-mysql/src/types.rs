@@ -340,6 +340,14 @@ fn text_or_bytes(data: &[u8], charset: u16) -> Value {
 /// This function parses the string based on the column type; `charset` is the
 /// column's character set number and decides text versus bytes for string and
 /// blob wire types.
+/// An unsigned 64-bit column value as a `Value`: `BigInt` while it fits,
+/// otherwise the exact digits as `Decimal` (there is no unsigned variant, and
+/// wrapping it into a negative number, as both decoders did until 2026-09,
+/// silently corrupted every value above `i64::MAX`).
+fn unsigned_bigint(v: u64) -> Value {
+    i64::try_from(v).map_or_else(|_| Value::Decimal(v.to_string()), Value::BigInt)
+}
+
 pub fn decode_text_value(
     field_type: FieldType,
     data: &[u8],
@@ -352,9 +360,10 @@ pub fn decode_text_value(
         // TINYINT (8-bit)
         FieldType::Tiny => {
             if is_unsigned {
+                // Widened: 200 in a TINYINT UNSIGNED is not -56.
                 text.parse::<u8>().map_or_else(
                     |_| Value::Text(text.into_owned()),
-                    |v| Value::TinyInt(v as i8),
+                    |v| Value::SmallInt(i16::from(v)),
                 )
             } else {
                 text.parse::<i8>()
@@ -366,7 +375,7 @@ pub fn decode_text_value(
             if is_unsigned {
                 text.parse::<u16>().map_or_else(
                     |_| Value::Text(text.into_owned()),
-                    |v| Value::SmallInt(v as i16),
+                    |v| Value::Int(i32::from(v)),
                 )
             } else {
                 text.parse::<i16>()
@@ -376,8 +385,10 @@ pub fn decode_text_value(
         // INT/MEDIUMINT (32-bit)
         FieldType::Long | FieldType::Int24 => {
             if is_unsigned {
-                text.parse::<u32>()
-                    .map_or_else(|_| Value::Text(text.into_owned()), |v| Value::Int(v as i32))
+                text.parse::<u32>().map_or_else(
+                    |_| Value::Text(text.into_owned()),
+                    |v| Value::BigInt(i64::from(v)),
+                )
             } else {
                 text.parse::<i32>()
                     .map_or_else(|_| Value::Text(text.into_owned()), Value::Int)
@@ -386,10 +397,8 @@ pub fn decode_text_value(
         // BIGINT (64-bit)
         FieldType::LongLong => {
             if is_unsigned {
-                text.parse::<u64>().map_or_else(
-                    |_| Value::Text(text.into_owned()),
-                    |v| Value::BigInt(v as i64),
-                )
+                text.parse::<u64>()
+                    .map_or_else(|_| Value::Text(text.into_owned()), unsigned_bigint)
             } else {
                 text.parse::<i64>()
                     .map_or_else(|_| Value::Text(text.into_owned()), Value::BigInt)
@@ -1058,16 +1067,23 @@ pub fn encode_binary_value(value: &Value, field_type: FieldType) -> Vec<u8> {
 pub fn decode_binary_value_with_len(
     data: &[u8],
     field_type: FieldType,
-    _is_unsigned: bool,
+    is_unsigned: bool,
     charset: u16,
 ) -> (Value, usize) {
     match field_type {
-        // Fixed-size integer types
+        // Fixed-size integer types. Unsigned columns are widened into the next
+        // signed variant; until 2026-09 the flag was ignored and every value
+        // above the signed range came back negative.
         FieldType::Tiny => {
             if data.is_empty() {
                 return (Value::Null, 0);
             }
-            (Value::TinyInt(data[0] as i8), 1)
+            let value = if is_unsigned {
+                Value::SmallInt(i16::from(data[0]))
+            } else {
+                Value::TinyInt(data[0] as i8)
+            };
+            (value, 1)
         }
 
         FieldType::Short | FieldType::Year => {
@@ -1075,7 +1091,12 @@ pub fn decode_binary_value_with_len(
                 return (Value::Null, 0);
             }
             let val = u16::from_le_bytes([data[0], data[1]]);
-            (Value::SmallInt(val as i16), 2)
+            let value = if is_unsigned {
+                Value::Int(i32::from(val))
+            } else {
+                Value::SmallInt(val as i16)
+            };
+            (value, 2)
         }
 
         FieldType::Long | FieldType::Int24 => {
@@ -1083,7 +1104,12 @@ pub fn decode_binary_value_with_len(
                 return (Value::Null, 0);
             }
             let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            (Value::Int(val as i32), 4)
+            let value = if is_unsigned {
+                Value::BigInt(i64::from(val))
+            } else {
+                Value::Int(val as i32)
+            };
+            (value, 4)
         }
 
         FieldType::LongLong => {
@@ -1093,7 +1119,12 @@ pub fn decode_binary_value_with_len(
             let val = u64::from_le_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
             ]);
-            (Value::BigInt(val as i64), 8)
+            let value = if is_unsigned {
+                unsigned_bigint(val)
+            } else {
+                Value::BigInt(val as i64)
+            };
+            (value, 8)
         }
 
         FieldType::Float => {
@@ -1476,6 +1507,65 @@ mod tests {
 
     /// `utf8mb4_0900_ai_ci`, the MySQL 8 default collation.
     const UTF8MB4: u16 = 255;
+
+    /// Unsigned columns above the signed range must not come back negative,
+    /// in either protocol (found 2026-09 by the binary-protocol integration
+    /// test: `BIGINT UNSIGNED` max read as -1).
+    #[test]
+    fn unsigned_integers_are_widened_not_wrapped() {
+        // Text protocol.
+        assert_eq!(
+            decode_text_value(FieldType::Tiny, b"200", true, UTF8MB4),
+            Value::SmallInt(200)
+        );
+        assert_eq!(
+            decode_text_value(FieldType::Short, b"65535", true, UTF8MB4),
+            Value::Int(65535)
+        );
+        assert_eq!(
+            decode_text_value(FieldType::Long, b"4294967295", true, UTF8MB4),
+            Value::BigInt(4_294_967_295)
+        );
+        assert_eq!(
+            decode_text_value(FieldType::LongLong, b"42", true, UTF8MB4),
+            Value::BigInt(42)
+        );
+        assert_eq!(
+            decode_text_value(FieldType::LongLong, b"18446744073709551615", true, UTF8MB4),
+            Value::Decimal("18446744073709551615".to_string())
+        );
+        // Signed columns are unchanged.
+        assert_eq!(
+            decode_text_value(FieldType::Tiny, b"-56", false, UTF8MB4),
+            Value::TinyInt(-56)
+        );
+
+        // Binary protocol.
+        assert_eq!(
+            decode_binary_value_with_len(&[200], FieldType::Tiny, true, UTF8MB4),
+            (Value::SmallInt(200), 1)
+        );
+        assert_eq!(
+            decode_binary_value_with_len(&[200], FieldType::Tiny, false, UTF8MB4),
+            (Value::TinyInt(-56), 1)
+        );
+        assert_eq!(
+            decode_binary_value_with_len(&[0xFF, 0xFF], FieldType::Short, true, UTF8MB4),
+            (Value::Int(65535), 2)
+        );
+        assert_eq!(
+            decode_binary_value_with_len(&[0xFF; 4], FieldType::Long, true, UTF8MB4),
+            (Value::BigInt(4_294_967_295), 4)
+        );
+        assert_eq!(
+            decode_binary_value_with_len(&[0xFF; 8], FieldType::LongLong, true, UTF8MB4),
+            (Value::Decimal("18446744073709551615".to_string()), 8)
+        );
+        assert_eq!(
+            decode_binary_value_with_len(&[0xFF; 8], FieldType::LongLong, false, UTF8MB4),
+            (Value::BigInt(-1), 8)
+        );
+    }
 
     #[test]
     fn temporal_values_render_as_iso_literals_in_text_protocol() {

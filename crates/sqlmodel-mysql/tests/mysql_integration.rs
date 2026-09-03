@@ -570,3 +570,180 @@ fn mysql_row_with_empty_first_value_does_not_desync_the_connection() {
         assert_eq!(probe.len(), 1, "connection usable afterwards");
     });
 }
+
+/// The binary protocol (COM_STMT_PREPARE / EXECUTE) has never returned a row
+/// from a live server in any test: the ORM interpolates parameters into the
+/// text protocol. Every binary row starts with 0x00 (the byte bug 34 mistook
+/// for an OK packet), NULLs live in a bitmap offset by two bits, and each
+/// type has its own wire encoding. This drives all of that against MySQL 8.4.
+#[test]
+fn mysql_prepared_statements_decode_rows_nulls_and_types_without_desync() {
+    let Some(cfg) = mysql_test_config() else {
+        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
+        return;
+    };
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create asupersync runtime");
+    let cx = Cx::for_testing();
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedMySqlConnection::connect(&cx, cfg).await);
+        let table = test_table_name("sqlmodel_binary");
+        let _ = conn
+            .execute(&cx, &format!("DROP TABLE IF EXISTS `{table}`"), &[])
+            .await;
+        unwrap_outcome(
+            conn.execute(
+                &cx,
+                &format!(
+                    "CREATE TABLE `{table}` (\
+                     id INT NOT NULL PRIMARY KEY, e VARCHAR(8) NULL, t TINYINT NULL, \
+                     s SMALLINT NULL, m MEDIUMINT NULL, i INT NULL, b BIGINT NULL, \
+                     u BIGINT UNSIGNED NULL, d DECIMAL(10,2) NULL, dt DATETIME(6) NULL, \
+                     bl BLOB NULL, txt TEXT NULL)"
+                ),
+                &[],
+            )
+            .await,
+        );
+        // Row 1: empty first value and NULLs in the middle and at the end.
+        // Row 2: every column set. Row 3: everything NULL.
+        unwrap_outcome(
+            conn.execute(
+                &cx,
+                &format!(
+                    "INSERT INTO `{table}` VALUES \
+                     (1, '', NULL, 7, NULL, 70000, NULL, 18446744073709551615, NULL, NULL, X'00FF', NULL), \
+                     (2, 'two', -2, -300, -40000, -500000, -6000000000, 42, 12.34, '2026-09-02 12:34:56.123456', X'', 'text'), \
+                     (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+                ),
+                &[],
+            )
+            .await,
+        );
+
+        let stmt = unwrap_outcome(
+            conn.prepare(
+                &cx,
+                &format!(
+                    "SELECT e, t, s, m, i, b, u, d, dt, bl, txt FROM `{table}` WHERE id >= ? ORDER BY id"
+                ),
+            )
+            .await,
+        );
+        let rows = unwrap_outcome(
+            conn.query_prepared(&cx, &stmt, &[Value::BigInt(1)]).await,
+        );
+        assert_eq!(rows.len(), 3, "{rows:?}");
+
+        let r1 = &rows[0];
+        assert_eq!(r1.get_named::<String>("e").unwrap(), "", "empty first value");
+        assert!(r1.get_by_name("t").unwrap().is_null(), "t NULL: {r1:?}");
+        assert_eq!(r1.get_named::<i64>("s").unwrap(), 7);
+        assert!(r1.get_by_name("m").unwrap().is_null(), "m NULL");
+        assert_eq!(r1.get_named::<i64>("i").unwrap(), 70_000);
+        assert!(r1.get_by_name("b").unwrap().is_null(), "b NULL");
+        assert_eq!(
+            r1.get_named::<u64>("u").unwrap(),
+            u64::MAX,
+            "unsigned bigint max: {:?}",
+            r1.get_by_name("u")
+        );
+        assert!(r1.get_by_name("d").unwrap().is_null(), "d NULL");
+        assert!(r1.get_by_name("dt").unwrap().is_null(), "dt NULL");
+        assert_eq!(r1.get_named::<Vec<u8>>("bl").unwrap(), vec![0x00, 0xFF]);
+        assert!(r1.get_by_name("txt").unwrap().is_null(), "txt NULL");
+
+        let r2 = &rows[1];
+        assert_eq!(r2.get_named::<String>("e").unwrap(), "two");
+        assert_eq!(r2.get_named::<i64>("t").unwrap(), -2);
+        assert_eq!(r2.get_named::<i64>("s").unwrap(), -300);
+        assert_eq!(r2.get_named::<i64>("m").unwrap(), -40_000);
+        assert_eq!(r2.get_named::<i64>("i").unwrap(), -500_000);
+        assert_eq!(r2.get_named::<i64>("b").unwrap(), -6_000_000_000);
+        assert_eq!(r2.get_named::<i64>("u").unwrap(), 42);
+        let d = r2.get_by_name("d").unwrap().clone();
+        assert!(
+            matches!(&d, Value::Decimal(s) | Value::Text(s) if s.trim_end_matches('0').trim_end_matches('.') == "12.34"),
+            "decimal decoded as {d:?}"
+        );
+        let dt = r2.get_by_name("dt").unwrap().clone();
+        assert!(
+            !dt.is_null(),
+            "datetime decoded as {dt:?}"
+        );
+        assert_eq!(r2.get_named::<Vec<u8>>("bl").unwrap(), Vec::<u8>::new());
+        assert_eq!(r2.get_named::<String>("txt").unwrap(), "text");
+
+        let r3 = &rows[2];
+        for col in ["e", "t", "s", "m", "i", "b", "u", "d", "dt", "bl", "txt"] {
+            assert!(r3.get_by_name(col).unwrap().is_null(), "row 3 {col} must be NULL: {r3:?}");
+        }
+
+        // The connection is still in sync after a binary result set.
+        let probe = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(probe.len(), 1);
+
+        // Zero rows, then in sync again.
+        let none = unwrap_outcome(
+            conn.query_prepared(&cx, &stmt, &[Value::BigInt(100)]).await,
+        );
+        assert!(none.is_empty(), "{none:?}");
+        let probe = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(probe.len(), 1);
+
+        // A large result set (many packets) whose rows all begin with 0x00.
+        let many = unwrap_outcome(
+            conn.prepare(
+                &cx,
+                "WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?) \
+                 SELECT n, '' AS blank, NULL AS nothing FROM seq",
+            )
+            .await,
+        );
+        let rows = unwrap_outcome(
+            conn.query_prepared(&cx, &many, &[Value::BigInt(1000)]).await,
+        );
+        assert_eq!(rows.len(), 1000, "1000 rows expected");
+        assert_eq!(rows[999].get_named::<i64>("n").unwrap(), 1000);
+        assert_eq!(rows[0].get_named::<String>("blank").unwrap(), "");
+        assert!(rows[0].get_by_name("nothing").unwrap().is_null());
+        let probe = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(probe.len(), 1, "connection usable after 1000 binary rows");
+
+        // execute_prepared with a NULL parameter, read back through the same path.
+        let ins = unwrap_outcome(
+            conn.prepare(
+                &cx,
+                &format!("INSERT INTO `{table}` (id, e, i, txt) VALUES (?, ?, ?, ?)"),
+            )
+            .await,
+        );
+        let affected = unwrap_outcome(
+            conn.execute_prepared(
+                &cx,
+                &ins,
+                &[
+                    Value::BigInt(4),
+                    Value::Text("four".into()),
+                    Value::Null,
+                    Value::Text("t4".into()),
+                ],
+            )
+            .await,
+        );
+        assert_eq!(affected, 1);
+        let rows = unwrap_outcome(
+            conn.query_prepared(&cx, &stmt, &[Value::BigInt(4)]).await,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("e").unwrap(), "four");
+        assert!(rows[0].get_by_name("i").unwrap().is_null(), "NULL parameter stored as NULL");
+
+        let _ = conn
+            .execute(&cx, &format!("DROP TABLE `{table}`"), &[])
+            .await;
+    });
+}
