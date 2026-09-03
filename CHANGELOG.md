@@ -340,6 +340,13 @@ facade tests, and the driver integration suites run against live Docker database
   `information_schema.columns.is_identity`, and a single-column `INTEGER PRIMARY KEY` (SQLite's
   auto-assigning rowid alias) is reported as `auto_increment`, so an auto-increment model reads back
   the same on every engine (asserted by the e2e `attributes` scenario).
+- **A migration that dropped a primary key could not be rolled back.** `DropPrimaryKey::inverse`
+  was `None`, so `Migration::from_operations` for a key change (`id` to `(id, team_id)`) wrote an
+  empty `down` script and the runner reported the rollback as unrunnable. The inverse is now an
+  `AddPrimaryKey` of the columns recorded in the pre-forward snapshot, carrying the post-forward
+  snapshot for SQLite's table recreation (the bug-37 shape). The e2e `schema_fixpoint` scenario
+  now moves a populated table's key from `id` to a composite key and back, and gives a keyless,
+  populated log table a key and takes it away again, on every driver.
 - **MySQL unsigned integers above the signed range came back negative.** Both decoders cast an
   unsigned column into the same-width signed `Value` (`TINYINT UNSIGNED` 200 read as -56,
   `BIGINT UNSIGNED` 18446744073709551615 read as -1), and the binary decoder ignored the unsigned

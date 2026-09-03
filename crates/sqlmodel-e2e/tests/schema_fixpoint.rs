@@ -91,6 +91,57 @@ struct PlayerV4 {
     captain_id: Option<i64>,
 }
 
+/// The key moves from `id` to (`id`, `team_id`): a DropPrimaryKey followed by
+/// an AddPrimaryKey, each a table recreation on SQLite and an `ALTER TABLE`
+/// elsewhere. Rows must survive and the change must roll back.
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table = "e2e_fix_players")]
+struct PlayerV5 {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    #[sqlmodel(primary_key, foreign_key = "e2e_fix_teams.id")]
+    team_id: i64,
+    #[sqlmodel(index = "e2e_fix_players_name_idx", nullable)]
+    name: Option<String>,
+    score: i32,
+    active: bool,
+    #[sqlmodel(nullable)]
+    nickname: Option<String>,
+    #[sqlmodel(foreign_key = "e2e_fix_teams.id", nullable)]
+    captain_id: Option<i64>,
+}
+
+/// A log table created without any primary key (an append-only log) ...
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table = "e2e_fix_log")]
+struct LogV1 {
+    at: i64,
+    message: String,
+}
+
+/// ... which gains one once it holds rows.
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table = "e2e_fix_log")]
+struct LogV2 {
+    #[sqlmodel(primary_key)]
+    at: i64,
+    message: String,
+}
+
+/// The primary-key operations of a diff, in order, for readable assertions.
+fn key_ops(diff: &sqlmodel_schema::diff::SchemaDiff) -> Vec<&'static str> {
+    use sqlmodel_schema::diff::SchemaOperation;
+    diff.operations
+        .iter()
+        .map(|op| match op {
+            SchemaOperation::DropPrimaryKey { .. } => "drop-pk",
+            SchemaOperation::AddPrimaryKey { .. } => "add-pk",
+            SchemaOperation::CreateTable { .. } => "create-table",
+            _ => "other",
+        })
+        .collect()
+}
+
 async fn count<C: Connection>(cx: &Cx, conn: &C, table: &str, label: &str) -> i64 {
     let rows = expect_outcome(
         conn.query(cx, &format!("SELECT COUNT(*) FROM {table}"), &[])
@@ -137,6 +188,7 @@ impl Scenario for Fixpoint {
         let tracking = "e2e_fix_history";
         let ours = [<Team as Model>::TABLE_NAME, <Player as Model>::TABLE_NAME];
         for t in [
+            <LogV1 as Model>::TABLE_NAME,
             <Player as Model>::TABLE_NAME,
             <Team as Model>::TABLE_NAME,
             tracking,
@@ -306,7 +358,7 @@ impl Scenario for Fixpoint {
             initial.clone(),
             evolve.clone(),
             relax.clone(),
-            captain,
+            captain.clone(),
         ])
         .table_name(tracking);
         let applied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: captain"));
@@ -358,6 +410,241 @@ impl Scenario for Fixpoint {
             ),
             "{d}: the new foreign key must be enforced"
         );
+
+        // 4c. The key moves from `id` to (`id`, `team_id`): DropPrimaryKey then
+        // AddPrimaryKey on a populated table (two recreations on SQLite, two
+        // ALTER TABLEs elsewhere). Rows survive.
+        let current =
+            introspect_ours(cx, conn, dialect, &ours, &format!("{d}: before key change")).await;
+        let expected = <(Team, PlayerV5) as ModelTuple>::database_schema(dialect);
+        let diff = schema_diff(&current, &expected);
+        assert_eq!(
+            key_ops(&diff),
+            ["drop-pk", "add-pk"],
+            "{d}: {:?}",
+            diff.operations
+        );
+        let mut composite = Migration::from_operations(&diff.operations, &*ddl, "composite key");
+        composite.id = "0005_composite_key".into();
+        eprintln!(
+            "{d}: composite key migration up:\n{}\ndown:\n{}",
+            composite.up, composite.down
+        );
+        let runner = MigrationRunner::new(vec![
+            initial.clone(),
+            evolve.clone(),
+            relax.clone(),
+            captain.clone(),
+            composite.clone(),
+        ])
+        .table_name(tracking);
+        let applied = expect_outcome(
+            runner.migrate(cx, conn).await,
+            &format!("{d}: composite key"),
+        );
+        assert_eq!(applied, vec!["0005_composite_key"], "{d}");
+        let current =
+            introspect_ours(cx, conn, dialect, &ours, &format!("{d}: composite key")).await;
+        assert_eq!(
+            current.tables[<Player as Model>::TABLE_NAME].primary_key,
+            vec!["id".to_string(), "team_id".to_string()],
+            "{d}: composite key introspected"
+        );
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after the key change; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &players_q, "players after key change").await,
+            2,
+            "{d}"
+        );
+
+        // 4d. A keyless log table gets rows, then a primary key.
+        let ours_with_log = [
+            <Team as Model>::TABLE_NAME,
+            <Player as Model>::TABLE_NAME,
+            <LogV1 as Model>::TABLE_NAME,
+        ];
+        let log_q = q(<LogV1 as Model>::TABLE_NAME);
+        let expected = <(Team, PlayerV5, LogV1) as ModelTuple>::database_schema(dialect);
+        let diff = schema_diff(&current, &expected);
+        assert_eq!(
+            key_ops(&diff),
+            ["create-table"],
+            "{d}: {:?}",
+            diff.operations
+        );
+        let mut log = Migration::from_operations(&diff.operations, &*ddl, "keyless log");
+        log.id = "0006_log".into();
+        let runner = MigrationRunner::new(vec![
+            initial.clone(),
+            evolve.clone(),
+            relax.clone(),
+            captain.clone(),
+            composite.clone(),
+            log.clone(),
+        ])
+        .table_name(tracking);
+        let applied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: log"));
+        assert_eq!(applied, vec!["0006_log"], "{d}");
+        expect_outcome(
+            conn.execute(
+                cx,
+                &format!(
+                    "INSERT INTO {log_q} ({}, {}) VALUES (1, 'boot'), (2, 'ready')",
+                    q("at"),
+                    q("message")
+                ),
+                &[],
+            )
+            .await,
+            &format!("{d}: seed log"),
+        );
+        let current = introspect_ours(
+            cx,
+            conn,
+            dialect,
+            &ours_with_log,
+            &format!("{d}: keyless log"),
+        )
+        .await;
+        assert!(
+            current.tables[<LogV1 as Model>::TABLE_NAME]
+                .primary_key
+                .is_empty(),
+            "{d}: log created without a key"
+        );
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint with the keyless log; leftover operations: {:#?}",
+            diff.operations
+        );
+        let expected = <(Team, PlayerV5, LogV2) as ModelTuple>::database_schema(dialect);
+        let diff = schema_diff(&current, &expected);
+        assert_eq!(key_ops(&diff), ["add-pk"], "{d}: {:?}", diff.operations);
+        let mut log_key = Migration::from_operations(&diff.operations, &*ddl, "log key");
+        log_key.id = "0007_log_key".into();
+        eprintln!(
+            "{d}: log key migration up:\n{}\ndown:\n{}",
+            log_key.up, log_key.down
+        );
+        let runner = MigrationRunner::new(vec![
+            initial.clone(),
+            evolve.clone(),
+            relax.clone(),
+            captain.clone(),
+            composite.clone(),
+            log.clone(),
+            log_key.clone(),
+        ])
+        .table_name(tracking);
+        let applied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: log key"));
+        assert_eq!(applied, vec!["0007_log_key"], "{d}");
+        let current = introspect_ours(
+            cx,
+            conn,
+            dialect,
+            &ours_with_log,
+            &format!("{d}: keyed log"),
+        )
+        .await;
+        assert_eq!(
+            current.tables[<LogV1 as Model>::TABLE_NAME].primary_key,
+            vec!["at".to_string()],
+            "{d}: log key introspected"
+        );
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint with the keyed log; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(count(cx, conn, &log_q, "log after key").await, 2, "{d}");
+        let duplicate = format!(
+            "INSERT INTO {log_q} ({}, {}) VALUES (1, 'again')",
+            q("at"),
+            q("message")
+        );
+        assert!(
+            matches!(conn.execute(cx, &duplicate, &[]).await, Outcome::Err(_)),
+            "{d}: the new key must be enforced"
+        );
+
+        // 4e. Rolling the key changes back restores each fixpoint, rows intact,
+        // and really removes the key (the duplicate is accepted again).
+        let rolled = expect_outcome(runner.rollback(cx, conn).await, &format!("{d}: rollback 7"));
+        assert_eq!(rolled.as_deref(), Some("0007_log_key"), "{d}");
+        let expected = <(Team, PlayerV5, LogV1) as ModelTuple>::database_schema(dialect);
+        let current = introspect_ours(
+            cx,
+            conn,
+            dialect,
+            &ours_with_log,
+            &format!("{d}: unkeyed log"),
+        )
+        .await;
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after dropping the log key; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &log_q, "log after key rollback").await,
+            2,
+            "{d}"
+        );
+        expect_outcome(
+            conn.execute(cx, &duplicate, &[]).await,
+            &format!("{d}: duplicate accepted once the key is gone"),
+        );
+        assert_eq!(
+            count(cx, conn, &log_q, "log with duplicate").await,
+            3,
+            "{d}"
+        );
+
+        let rolled = expect_outcome(runner.rollback(cx, conn).await, &format!("{d}: rollback 6"));
+        assert_eq!(rolled.as_deref(), Some("0006_log"), "{d}");
+        let expected = <(Team, PlayerV5) as ModelTuple>::database_schema(dialect);
+        let current =
+            introspect_ours(cx, conn, dialect, &ours_with_log, &format!("{d}: no log")).await;
+        assert!(
+            !current.tables.contains_key(<LogV1 as Model>::TABLE_NAME),
+            "{d}: the log table is gone"
+        );
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after dropping the log; leftover operations: {:#?}",
+            diff.operations
+        );
+
+        let rolled = expect_outcome(runner.rollback(cx, conn).await, &format!("{d}: rollback 5"));
+        assert_eq!(rolled.as_deref(), Some("0005_composite_key"), "{d}");
+        let expected = <(Team, PlayerV4) as ModelTuple>::database_schema(dialect);
+        let current = introspect_ours(cx, conn, dialect, &ours, &format!("{d}: single key")).await;
+        assert_eq!(
+            current.tables[<Player as Model>::TABLE_NAME].primary_key,
+            vec!["id".to_string()],
+            "{d}: the original key is back"
+        );
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after restoring the key; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &players_q, "players after key rollback").await,
+            2,
+            "{d}"
+        );
+
         let rolled = expect_outcome(runner.rollback(cx, conn).await, &format!("{d}: rollback 4"));
         assert_eq!(rolled.as_deref(), Some("0004_captain"), "{d}");
         let expected = <(Team, PlayerV3) as ModelTuple>::database_schema(dialect);

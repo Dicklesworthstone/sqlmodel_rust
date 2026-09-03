@@ -245,7 +245,18 @@ impl SchemaOperation {
                 table: table.clone(),
                 table_info: self.table_info_after(),
             }),
-            SchemaOperation::DropPrimaryKey { .. } => None,
+            // The dropped key's columns are in the pre-forward snapshot, so the
+            // rollback can put it back (a recreation on SQLite, which needs the
+            // post-forward snapshot). Until 2026-09 this was `None`: a migration
+            // that changed a primary key could never be rolled back.
+            SchemaOperation::DropPrimaryKey { table, table_info } => table_info
+                .as_ref()
+                .filter(|before| !before.primary_key.is_empty())
+                .map(|before| SchemaOperation::AddPrimaryKey {
+                    table: table.clone(),
+                    columns: before.primary_key.clone(),
+                    table_info: self.table_info_after(),
+                }),
             SchemaOperation::AddForeignKey { table, fk, .. } => {
                 Some(SchemaOperation::DropForeignKey {
                     table: table.clone(),
@@ -1993,6 +2004,43 @@ mod tests {
             op.unwrap().is_some(),
             "Expected table_info on AddPrimaryKey op"
         );
+    }
+
+    #[test]
+    fn drop_primary_key_inverts_to_the_previous_key_with_the_post_drop_snapshot() {
+        let mut heroes = make_table(
+            "heroes",
+            vec![
+                make_column("id", "INTEGER", false),
+                make_column("team_id", "INTEGER", false),
+            ],
+        );
+        heroes.primary_key = vec!["id".to_string()];
+        heroes.columns[0].primary_key = true;
+        let drop = SchemaOperation::DropPrimaryKey {
+            table: "heroes".to_string(),
+            table_info: Some(heroes),
+        };
+        let Some(SchemaOperation::AddPrimaryKey {
+            table,
+            columns,
+            table_info,
+        }) = drop.inverse()
+        else {
+            panic!("dropping a primary key must be reversible");
+        };
+        assert_eq!(table, "heroes");
+        assert_eq!(columns, vec!["id".to_string()]);
+        let after = table_info.expect("post-forward snapshot for the SQLite recreation");
+        assert!(after.primary_key.is_empty(), "snapshot reflects the drop");
+        assert!(after.columns.iter().all(|c| !c.primary_key));
+
+        // Without a snapshot there is nothing to restore.
+        let blind = SchemaOperation::DropPrimaryKey {
+            table: "heroes".to_string(),
+            table_info: None,
+        };
+        assert!(blind.inverse().is_none());
     }
 
     #[test]
