@@ -687,6 +687,10 @@ fn session_unit_of_work_and_relationships_work_on_every_available_driver() {
     let ran = run_owned_on_every_driver(&cx, &BatchOps);
     assert!(ran.contains(&"frankensqlite"), "{ran:?}");
     assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
+
+    let ran = run_owned_on_every_driver(&cx, &IdentityAndLoads);
+    assert!(ran.contains(&"frankensqlite"), "{ran:?}");
+    assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
 }
 
 /// Drop and recreate the four tables the session scenarios share.
@@ -724,6 +728,183 @@ async fn fresh_tables<C: Connection>(cx: &Cx, conn: &C, driver: &DriverUnderTest
             conn.execute(cx, &stmt, &[]).await,
             &format!("{d}: ddl `{stmt}`"),
         );
+    }
+}
+
+/// What the identity map guarantees on a real database (counted through the
+/// capturing connection), and the N+1 detector on real loads: a per-parent
+/// loop crosses the threshold, one batch load does not.
+struct IdentityAndLoads;
+
+impl OwnedScenario for IdentityAndLoads {
+    async fn run<C: Connection + 'static>(&self, cx: &Cx, conn: C, driver: &DriverUnderTest) {
+        let d = driver.name();
+        let dialect = driver.dialect();
+        let authors = dialect.quote_identifier(<Author as Model>::TABLE_NAME);
+        fresh_tables(cx, &conn, driver).await;
+        let mut s = Session::new(CapturingConnection::new(conn));
+        let selects = |s: &Session<CapturingConnection<C>>| {
+            s.connection()
+                .statements()
+                .iter()
+                .filter(|(sql, _)| sql.starts_with("SELECT"))
+                .count()
+        };
+
+        for i in 1..=5 {
+            s.add(&Author::new(i, &format!("author{i}"), None));
+            for j in 1..=2 {
+                s.add(&book(
+                    i * 10 + j,
+                    i,
+                    &format!("book{i}-{j}"),
+                    &format!("isbn-{i}-{j}"),
+                ));
+            }
+        }
+        expect_outcome(s.commit(cx).await, &format!("{d}: seed"));
+
+        // 1. A second get for a tracked object issues no SELECT.
+        s.connection().clear();
+        let first: Author = expect_outcome(s.get(cx, 1i64).await, &format!("{d}: get 1"))
+            .unwrap_or_else(|| panic!("{d}: author 1 missing"));
+        assert_eq!(selects(&s), 1, "{d}: the first get queries");
+        let again: Author = expect_outcome(s.get(cx, 1i64).await, &format!("{d}: get 1 again"))
+            .unwrap_or_else(|| panic!("{d}: author 1 missing"));
+        assert_eq!(
+            selects(&s),
+            1,
+            "{d}: the second get is served by the identity map"
+        );
+        assert_eq!(first.name, again.name, "{d}");
+
+        // 2. A change made behind the session's back is invisible until expire.
+        expect_outcome(
+            s.connection()
+                .execute(
+                    cx,
+                    &format!(
+                        "UPDATE {authors} SET {} = 'renamed' WHERE {} = 1",
+                        dialect.quote_identifier("name"),
+                        dialect.quote_identifier("id")
+                    ),
+                    &[],
+                )
+                .await,
+            &format!("{d}: rename behind the session"),
+        );
+        let stale: Author = expect_outcome(s.get(cx, 1i64).await, &format!("{d}: get stale"))
+            .unwrap_or_else(|| panic!("{d}: author 1 missing"));
+        assert_eq!(
+            stale.name, "author1",
+            "{d}: identity map still serves the old state"
+        );
+        s.expire(&stale, None);
+        assert!(s.is_expired(&stale), "{d}");
+        let before = selects(&s);
+        let fresh: Author = expect_outcome(s.get(cx, 1i64).await, &format!("{d}: get fresh"))
+            .unwrap_or_else(|| panic!("{d}: author 1 missing"));
+        assert_eq!(selects(&s), before + 1, "{d}: expire forces one reload");
+        assert_eq!(fresh.name, "renamed", "{d}: reloaded state");
+
+        // 3. refresh reloads immediately.
+        expect_outcome(
+            s.connection()
+                .execute(
+                    cx,
+                    &format!(
+                        "UPDATE {authors} SET {} = 'refreshed' WHERE {} = 1",
+                        dialect.quote_identifier("name"),
+                        dialect.quote_identifier("id")
+                    ),
+                    &[],
+                )
+                .await,
+            &format!("{d}: rename again"),
+        );
+        let refreshed: Author =
+            expect_outcome(s.refresh(cx, &fresh).await, &format!("{d}: refresh"))
+                .unwrap_or_else(|| panic!("{d}: author 1 missing on refresh"));
+        assert_eq!(refreshed.name, "refreshed", "{d}");
+
+        // 4. N+1 detection: five per-parent loads of the same relationship
+        // cross a threshold of 3; one batch load for the same parents does not.
+        s.enable_n1_detection(3);
+        s.reset_n1_tracking();
+        let mut parents: Vec<Author> = (1..=5)
+            .map(|i| Author::new(i, &format!("author{i}"), None))
+            .collect();
+        s.connection().clear();
+        for parent in &mut parents {
+            let loaded = expect_outcome(
+                s.load_one_to_many(
+                    cx,
+                    std::slice::from_mut(parent),
+                    |a| &mut a.books,
+                    |a| Value::from(a.id),
+                )
+                .await,
+                &format!("{d}: per-parent load"),
+            );
+            assert_eq!(loaded, 2, "{d}: two books per author");
+        }
+        assert_eq!(selects(&s), 5, "{d}: one SELECT per parent");
+        let stats = s.n1_stats().expect("detection enabled");
+        assert_eq!(stats.total_loads, 5, "{d}: {stats:?}");
+        assert_eq!(
+            stats.potential_n1, 1,
+            "{d}: the loop is reported once: {stats:?}"
+        );
+
+        s.reset_n1_tracking();
+        s.connection().clear();
+        let mut parents: Vec<Author> = (1..=5)
+            .map(|i| Author::new(i, &format!("author{i}"), None))
+            .collect();
+        let loaded = expect_outcome(
+            s.load_one_to_many(cx, &mut parents, |a| &mut a.books, |a| Value::from(a.id))
+                .await,
+            &format!("{d}: batch load"),
+        );
+        assert_eq!(loaded, 10, "{d}");
+        assert_eq!(selects(&s), 1, "{d}: one SELECT for the batch");
+        let stats = s.n1_stats().expect("detection enabled");
+        assert_eq!(stats.total_loads, 1, "{d}: {stats:?}");
+        assert_eq!(
+            stats.potential_n1, 0,
+            "{d}: a batch load is not an N+1: {stats:?}"
+        );
+
+        // 5. Lazy many-to-one, per book, is the other N+1 shape.
+        s.reset_n1_tracking();
+        let library: Vec<Book> = (1..=5).map(|i| book(i * 10 + 1, i, "", "")).collect();
+        for volume in &library {
+            expect_outcome(
+                s.load_lazy(&volume.author, cx).await,
+                &format!("{d}: lazy author"),
+            );
+        }
+        let stats = s.n1_stats().expect("detection enabled");
+        assert_eq!(stats.total_loads, 5, "{d}: {stats:?}");
+        assert_eq!(stats.potential_n1, 1, "{d}: {stats:?}");
+
+        for t in [
+            <AuthorTag as Model>::TABLE_NAME,
+            <Book as Model>::TABLE_NAME,
+            <Tag as Model>::TABLE_NAME,
+            <Author as Model>::TABLE_NAME,
+        ] {
+            expect_outcome(
+                s.connection()
+                    .execute(
+                        cx,
+                        &format!("DROP TABLE {}", dialect.quote_identifier(t)),
+                        &[],
+                    )
+                    .await,
+                &format!("{d}: drop {t}"),
+            );
+        }
     }
 }
 

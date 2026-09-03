@@ -254,6 +254,12 @@ facade tests, and the driver integration suites run against live Docker database
 - **`Row::get_named` now matches column names case-insensitively** when no exact match exists and
   the match is unambiguous, since unquoted SQL identifiers are case-insensitive and servers report
   them in their own case (PostgreSQL lower, MySQL `information_schema` upper).
+- **The N+1 query detector never saw a query.** `Session::enable_n1_detection` installed a tracker,
+  but no loader ever called `record_lazy_load`, so `n1_stats()` stayed at zero however many
+  per-parent loads a loop issued. `load_lazy` now records one load per call under the child's
+  table and the batch loaders (`load_many`, `load_one_to_many`, `load_many_to_many`) record one
+  load per call, so a per-parent loop crosses the threshold and a batch does not. Proven on every
+  driver by the e2e Session scenario.
 - **`sqlmodel_update_from` failed for any model with relationship fields.** It serialized the
   whole patch model and then rejected `books` (or any `RelatedMany`/`Lazy` field) as an unknown
   field, so a model with relationships could never be patched from another instance. Only the

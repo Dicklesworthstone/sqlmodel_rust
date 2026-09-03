@@ -489,6 +489,18 @@ struct CascadeChildDeleteKey {
 ///
 /// It tracks objects loaded from or added to the database and coordinates
 /// flushing changes back to the database.
+///
+/// # Identity map semantics
+///
+/// The session hands out *clones*: `get` returns an owned copy of the tracked
+/// object, never a shared pointer, so two `get`s are equal but not identical.
+/// What the identity map guarantees is about queries, not pointers: a second
+/// `get` for a tracked, non-expired object issues no SELECT; `expire`,
+/// `expire_all` (which `commit` applies when `expire_on_commit` is set) and
+/// `rollback` make the next `get` reload; `refresh` reloads immediately.
+/// Rows fetched with the query builders (`select!` on the connection) never
+/// consult or update the identity map; only `get`, `merge`, `add` and the
+/// relationship loaders do.
 pub struct Session<C: Connection> {
     /// The database connection.
     connection: C,
@@ -2314,6 +2326,10 @@ impl<C: Connection> Session<C> {
             already_loaded = lazy.is_loaded(),
             "Loading lazy relationship"
         );
+        // One load per call: a loop of these over a result set is the N+1
+        // shape the detector exists for. Keyed by the child table because a
+        // `Lazy<T>` does not know its parent.
+        self.record_lazy_load(T::TABLE_NAME, "lazy");
 
         // If already loaded, return success
         if lazy.is_loaded() {
@@ -2380,6 +2396,8 @@ impl<C: Connection> Session<C> {
         T: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
         F: Fn(&P) -> &Lazy<T>,
     {
+        // A batch load is one load however many objects it covers.
+        self.record_lazy_load(P::TABLE_NAME, T::TABLE_NAME);
         // Collect all FK values that need loading
         let mut fk_values: Vec<Value> = Vec::new();
         let mut fk_indices: Vec<usize> = Vec::new();
@@ -2565,6 +2583,8 @@ impl<C: Connection> Session<C> {
         FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
         FP: Fn(&P) -> Vec<Value>,
     {
+        // A batch load is one load however many parents it covers.
+        self.record_lazy_load(P::TABLE_NAME, Child::TABLE_NAME);
         // Collect all parent PK tuples.
         let mut pk_tuples: Vec<Vec<Value>> = Vec::with_capacity(objects.len());
         let mut pk_by_index: Vec<(usize, Vec<Value>)> = Vec::new();
@@ -2791,6 +2811,9 @@ impl<C: Connection> Session<C> {
         FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
         FP: Fn(&P) -> Value,
     {
+        // A batch load is one load however many parents it covers; calling
+        // this once per parent is the N+1 shape the detector reports.
+        self.record_lazy_load(P::TABLE_NAME, Child::TABLE_NAME);
         // Collect parent PKs for objects that still need loading.
         let mut pks: Vec<Value> = Vec::new();
         let mut pk_by_index: Vec<(usize, Value)> = Vec::new();
