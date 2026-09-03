@@ -68,13 +68,14 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use asupersync::{
     Budget, CancelReason, Cx, Outcome,
     combinator::{Either, Select},
     runtime::RuntimeBuilder,
     sync::{Notify, OnceCell},
+    time::TimerDriverHandle,
 };
 use sqlmodel_core::error::{PoolError, PoolErrorKind};
 use sqlmodel_core::{Connection, Error};
@@ -180,36 +181,44 @@ pub struct PoolStats {
 }
 
 /// Metadata about a pooled connection.
-#[derive(Debug)]
+///
+/// Timestamps use asupersync's `Time` read through a [`TimerDriverHandle`]
+/// instead of `std::time::Instant`, so every pool timing decision (idle
+/// timeout, max lifetime, acquire deadline) observes the same clock as the
+/// runtime: the wall clock in production and a [`asupersync::time::VirtualClock`]
+/// under the lab runtime used by deterministic tests.
 struct ConnectionMeta<C> {
     /// The actual connection
     conn: C,
     /// When this connection was created
-    created_at: Instant,
+    created_at: asupersync::time::Time,
     /// When this connection was last used
-    last_used: Instant,
+    last_used: asupersync::time::Time,
+    /// Clock shared with the owning pool
+    clock: TimerDriverHandle,
 }
 
 impl<C> ConnectionMeta<C> {
-    fn new(conn: C) -> Self {
-        let now = Instant::now();
+    fn new(conn: C, clock: TimerDriverHandle) -> Self {
+        let now = clock.now();
         Self {
             conn,
             created_at: now,
             last_used: now,
+            clock,
         }
     }
 
     fn touch(&mut self) {
-        self.last_used = Instant::now();
+        self.last_used = self.clock.now();
     }
 
     fn age(&self) -> Duration {
-        self.created_at.elapsed()
+        Duration::from_nanos(self.clock.now().duration_since(self.created_at))
     }
 
     fn idle_time(&self) -> Duration {
-        self.last_used.elapsed()
+        Duration::from_nanos(self.clock.now().duration_since(self.last_used))
     }
 }
 
@@ -276,10 +285,14 @@ struct PoolShared<C: Connection> {
     connections_closed: AtomicU64,
     acquires: AtomicU64,
     timeouts: AtomicU64,
+    /// Clock every pool timestamp and deadline is read from. Production pools
+    /// share asupersync's wall-clock timer driver; tests install a virtual
+    /// clock so timing behavior is deterministic.
+    clock: TimerDriverHandle,
 }
 
 impl<C: Connection> PoolShared<C> {
-    fn new(config: PoolConfig) -> Self {
+    fn new(config: PoolConfig, clock: TimerDriverHandle) -> Self {
         Self {
             inner: Mutex::new(PoolInner::new(config)),
             conn_available: Notify::new(),
@@ -289,6 +302,7 @@ impl<C: Connection> PoolShared<C> {
             connections_closed: AtomicU64::new(0),
             acquires: AtomicU64::new(0),
             timeouts: AtomicU64::new(0),
+            clock,
         }
     }
 
@@ -615,10 +629,25 @@ pub struct Pool<C: Connection> {
 
 impl<C: Connection> Pool<C> {
     /// Create a new connection pool with the given configuration.
+    ///
+    /// Timestamps and deadlines are read from asupersync's wall-clock timer
+    /// driver. Use [`Pool::with_timer_driver`] to supply a different clock
+    /// (for example a virtual clock under the lab runtime in tests).
     #[must_use]
     pub fn new(config: PoolConfig) -> Self {
+        Self::with_timer_driver(config, TimerDriverHandle::with_wall_clock())
+    }
+
+    /// Create a new connection pool whose clock is the given timer driver.
+    ///
+    /// Every pool timestamp (connection age, idle time) and every deadline
+    /// (acquire timeout) reads `clock.now()`, so sharing this handle with the
+    /// runtime's timer driver keeps the pool consistent with `cx.now()` —
+    /// including a lab runtime's virtual clock.
+    #[must_use]
+    pub fn with_timer_driver(config: PoolConfig, clock: TimerDriverHandle) -> Self {
         Self {
-            shared: Arc::new(PoolShared::new(config)),
+            shared: Arc::new(PoolShared::new(config, clock)),
         }
     }
 
@@ -677,7 +706,8 @@ impl<C: Connection> Pool<C> {
         F: Fn() -> Fut,
         Fut: Future<Output = Outcome<C, Error>>,
     {
-        let deadline = Instant::now() + Duration::from_millis(self.config().acquire_timeout_ms);
+        let clock = self.shared.clock.clone();
+        let deadline = clock.now() + Duration::from_millis(self.config().acquire_timeout_ms);
         let test_on_checkout = self.config().test_on_checkout;
         let max_lifetime = Duration::from_millis(self.config().max_lifetime_ms);
         let idle_timeout = Duration::from_millis(self.config().idle_timeout_ms);
@@ -689,7 +719,7 @@ impl<C: Connection> Pool<C> {
             }
 
             // Check timeout
-            if Instant::now() >= deadline {
+            if clock.now() >= deadline {
                 self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
                 return Outcome::Err(Error::Pool(PoolError {
                     kind: PoolErrorKind::Timeout,
@@ -821,7 +851,7 @@ impl<C: Connection> Pool<C> {
                                 Ok(inner) if inner.closed => {
                                     let retirement = ActiveConnectionGuard::new(
                                         Arc::clone(&self.shared),
-                                        ConnectionMeta::new(conn),
+                                        ConnectionMeta::new(conn, Arc::clone(&clock)),
                                     );
                                     slot_guard.disarm();
                                     FactoryPublish::Retire {
@@ -841,7 +871,7 @@ impl<C: Connection> Pool<C> {
                                     // rejects the connection, or follows it and
                                     // waits for this active checkout.
                                     self.shared.acquires.fetch_add(1, Ordering::Relaxed);
-                                    let meta = ConnectionMeta::new(conn);
+                                    let meta = ConnectionMeta::new(conn, Arc::clone(&clock));
                                     slot_guard.disarm();
                                     FactoryPublish::Published(PooledConnection::new(
                                         meta,
@@ -851,7 +881,7 @@ impl<C: Connection> Pool<C> {
                                 Err(error) => {
                                     let retirement = ActiveConnectionGuard::new(
                                         Arc::clone(&self.shared),
-                                        ConnectionMeta::new(conn),
+                                        ConnectionMeta::new(conn, Arc::clone(&clock)),
                                     );
                                     slot_guard.disarm();
                                     FactoryPublish::Retire {
@@ -896,7 +926,8 @@ impl<C: Connection> Pool<C> {
                 }
                 AcquireAction::Wait => {
                     // Wait for a connection to become available
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining =
+                        Duration::from_nanos(deadline.as_nanos().saturating_sub(clock.now().as_nanos()));
                     if remaining.is_zero() {
                         if let Ok(mut inner) = self.shared.lock_or_error("acquire_timeout") {
                             inner.waiter_count -= 1;
@@ -1373,6 +1404,7 @@ impl<C: Connection + std::fmt::Debug> std::fmt::Debug for PooledConnection<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::time::VirtualClock;
     use asupersync::{Budget, Time};
     use sqlmodel_core::connection::{IsolationLevel, PreparedStatement, TransactionOps};
     use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind};
@@ -1380,6 +1412,29 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::task::{Context, Poll, Wake, Waker};
+
+    /// A fresh wall-clock timer driver for tests that do not care about
+    /// controlling time (all wall-clock handles read the same OS clock).
+    fn test_clock() -> TimerDriverHandle {
+        TimerDriverHandle::with_wall_clock()
+    }
+
+    /// A virtual clock and the driver handle reading it. Advancing the clock
+    /// moves every `clock.now()` / `meta.age()` / pool deadline at once.
+    fn virtual_clock() -> (Arc<VirtualClock>, TimerDriverHandle) {
+        let clock = Arc::new(VirtualClock::new());
+        let driver = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        (clock, driver)
+    }
+
+    /// Backdates a connection's creation instant, as if it had been sitting
+    /// in the pool for `ago` before the current virtual or wall instant.
+    fn backdate<C>(meta: &mut ConnectionMeta<C>, ago: Duration) {
+        meta.created_at = meta
+            .clock
+            .now()
+            .saturating_sub_nanos(u64::try_from(ago.as_nanos()).expect("duration fits u64 nanos"));
+    }
 
     /// A mock connection for testing pool behavior.
     #[derive(Debug)]
@@ -1729,41 +1784,42 @@ mod tests {
 
     #[test]
     fn test_connection_meta_timing() {
-        use std::thread;
-
         // Create a dummy type for testing
         struct DummyConn;
 
-        let meta = ConnectionMeta::new(DummyConn);
+        let (clock, driver) = virtual_clock();
+        let meta = ConnectionMeta::new(DummyConn, driver);
         let initial_age = meta.age();
+        assert_eq!(initial_age, Duration::ZERO);
 
-        // Small sleep to ensure time passes
-        thread::sleep(Duration::from_millis(10));
+        // Advance virtual time instead of sleeping
+        clock.advance(10_000_000); // 10ms
 
-        // Age should have increased
-        assert!(meta.age() > initial_age);
-        assert!(meta.idle_time() > Duration::ZERO);
+        // Age should reflect the advanced virtual time exactly
+        assert!(meta.age() >= Duration::from_millis(10));
+        assert!(meta.idle_time() >= Duration::from_millis(10));
     }
 
     #[test]
     fn test_connection_meta_touch() {
-        use std::thread;
-
         struct DummyConn;
 
-        let mut meta = ConnectionMeta::new(DummyConn);
+        let (clock, driver) = virtual_clock();
+        let mut meta = ConnectionMeta::new(DummyConn, driver);
 
-        // Small sleep to build up some idle time
-        thread::sleep(Duration::from_millis(10));
+        // Build up some idle time on the virtual clock
+        clock.advance(10_000_000); // 10ms
         let idle_before_touch = meta.idle_time();
-        assert!(idle_before_touch > Duration::ZERO);
+        assert!(idle_before_touch >= Duration::from_millis(10));
 
-        // Touch should reset idle time
+        // Touch should reset idle time to exactly zero on the same clock
         meta.touch();
         let idle_after_touch = meta.idle_time();
-
-        // After touch, idle time should be very small (less than before)
+        assert_eq!(idle_after_touch, Duration::ZERO);
         assert!(idle_after_touch < idle_before_touch);
+
+        // Age is measured from creation and survives the touch
+        assert!(meta.age() >= Duration::from_millis(10));
     }
 
     #[test]
@@ -1835,9 +1891,7 @@ mod tests {
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(
-                MockConnection::with_failing_pool_close(1),
-            ));
+            inner.idle.push_back(ConnectionMeta::new(MockConnection::with_failing_pool_close(1), test_clock()));
         }
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -1878,7 +1932,7 @@ mod tests {
             inner.active_count = 1;
         }
         let pooled = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::with_failing_pool_close(1)),
+            ConnectionMeta::new(MockConnection::with_failing_pool_close(1), test_clock()),
             Arc::downgrade(&pool.shared),
         );
         let first_cx = Cx::for_testing();
@@ -1930,7 +1984,7 @@ mod tests {
             ConnectionMeta::new(MockConnection::with_pool_close_counter(
                 1,
                 Arc::clone(&pool_close_calls),
-            )),
+            ), test_clock()),
             Arc::downgrade(&pool.shared),
         );
         let cx = Cx::for_testing();
@@ -1962,11 +2016,11 @@ mod tests {
             inner.active_count = 2;
         }
         let first = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::new(1)),
+            ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
         );
         let second = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::new(2)),
+            ConnectionMeta::new(MockConnection::new(2), test_clock()),
             Arc::downgrade(&pool.shared),
         );
         let first_cx = Cx::for_testing();
@@ -2016,7 +2070,7 @@ mod tests {
             inner.active_count = 1;
         }
         let pooled = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::new(1)),
+            ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
         );
         let cx = Cx::for_testing();
@@ -2066,7 +2120,7 @@ mod tests {
             inner.active_count = 1;
         }
         let pooled = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::new(1)),
+            ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
         );
         let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(Time::ZERO));
@@ -2109,20 +2163,16 @@ mod tests {
         let pool_close_calls = Arc::new(AtomicUsize::new(0));
         let pool: Pool<MockConnection> =
             Pool::new(PoolConfig::new(3).max_lifetime(1).test_on_checkout(false));
-        let mut first_expired = ConnectionMeta::new(MockConnection::with_pending_pool_close(
-            1,
-            Arc::clone(&pool_close_calls),
-        ));
-        first_expired.created_at = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("one second must fit before the current instant");
-        let mut second_expired = ConnectionMeta::new(MockConnection::with_pool_close_counter(
-            2,
-            Arc::clone(&pool_close_calls),
-        ));
-        second_expired.created_at = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("one second must fit before the current instant");
+        let mut first_expired = ConnectionMeta::new(
+            MockConnection::with_pending_pool_close(1, Arc::clone(&pool_close_calls)),
+            pool.shared.clock.clone(),
+        );
+        backdate(&mut first_expired, Duration::from_secs(1));
+        let mut second_expired = ConnectionMeta::new(
+            MockConnection::with_pool_close_counter(2, Arc::clone(&pool_close_calls)),
+            pool.shared.clock.clone(),
+        );
+        backdate(&mut second_expired, Duration::from_secs(1));
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 2;
@@ -2160,9 +2210,7 @@ mod tests {
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(
-                MockConnection::with_pending_pool_close(1, Arc::clone(&pool_close_calls)),
-            ));
+            inner.idle.push_back(ConnectionMeta::new(MockConnection::with_pending_pool_close(1, Arc::clone(&pool_close_calls)), test_clock()));
         }
         let first_cx = Cx::for_testing();
         let second_cx = Cx::for_testing();
@@ -2209,7 +2257,7 @@ mod tests {
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(failed));
+            inner.idle.push_back(ConnectionMeta::new(failed, test_clock()));
         }
         let cx = Cx::for_testing();
         let mut acquire =
@@ -2279,7 +2327,7 @@ mod tests {
             inner.active_count = 1;
         }
         let pooled = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::new(1)),
+            ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
         );
         let waiting_pool = Arc::clone(&pool);
@@ -2348,7 +2396,7 @@ mod tests {
                     Arc::clone(&pool_close_calls),
                     Arc::downgrade(&pool.shared),
                     Arc::clone(&pool_lock_was_free),
-                )));
+                ), test_clock()));
         }
 
         pool.close();
@@ -2363,13 +2411,11 @@ mod tests {
         let pool_close_calls = Arc::new(AtomicUsize::new(0));
         let pool: Pool<MockConnection> =
             Pool::new(PoolConfig::new(2).max_lifetime(1).test_on_checkout(false));
-        let mut expired = ConnectionMeta::new(MockConnection::with_pool_close_counter(
-            1,
-            Arc::clone(&pool_close_calls),
-        ));
-        expired.created_at = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("one second must fit before the current instant");
+        let mut expired = ConnectionMeta::new(
+            MockConnection::with_pool_close_counter(1, Arc::clone(&pool_close_calls)),
+            pool.shared.clock.clone(),
+        );
+        backdate(&mut expired, Duration::from_secs(1));
         {
             let mut inner = pool
                 .shared
@@ -2404,7 +2450,7 @@ mod tests {
                 .lock()
                 .expect("pool mutex should not be poisoned");
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(failed));
+            inner.idle.push_back(ConnectionMeta::new(failed, test_clock()));
         }
 
         let runtime = RuntimeBuilder::current_thread()
@@ -2511,10 +2557,10 @@ mod tests {
         inner.waiter_count = 2;
         inner
             .idle
-            .push_back(ConnectionMeta::new(MockConnection::new(1)));
+            .push_back(ConnectionMeta::new(MockConnection::new(1), test_clock()));
         inner
             .idle
-            .push_back(ConnectionMeta::new(MockConnection::new(2)));
+            .push_back(ConnectionMeta::new(MockConnection::new(2), test_clock()));
 
         let stats = inner.stats();
         assert_eq!(stats.total_connections, 5);
@@ -2536,7 +2582,7 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // Should have some small positive age
@@ -2557,7 +2603,7 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(42));
+        let meta = ConnectionMeta::new(MockConnection::new(42), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // Verify counts before detach
@@ -2588,7 +2634,7 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // While held, active=1, idle=0
@@ -2615,7 +2661,7 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // Close the pool while connection is out
@@ -2644,7 +2690,7 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(99));
+        let meta = ConnectionMeta::new(MockConnection::new(99), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // Deref should give access to the connection's id
@@ -2662,7 +2708,7 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let mut pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // DerefMut should allow mutation
@@ -2681,7 +2727,7 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         let debug_str = format!("{:?}", pooled);
@@ -2724,7 +2770,7 @@ mod tests {
         let wait: AcquireAction<MockConnection> = AcquireAction::Wait;
         assert!(matches!(wait, AcquireAction::Wait));
 
-        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let validate: AcquireAction<MockConnection> = AcquireAction::ValidateExisting(meta);
         assert!(matches!(validate, AcquireAction::ValidateExisting(_)));
     }
@@ -2761,13 +2807,13 @@ mod tests {
             inner.total_count = 3;
             inner
                 .idle
-                .push_back(ConnectionMeta::new(MockConnection::new(1)));
+                .push_back(ConnectionMeta::new(MockConnection::new(1), test_clock()));
             inner
                 .idle
-                .push_back(ConnectionMeta::new(MockConnection::new(2)));
+                .push_back(ConnectionMeta::new(MockConnection::new(2), test_clock()));
             inner
                 .idle
-                .push_back(ConnectionMeta::new(MockConnection::new(3)));
+                .push_back(ConnectionMeta::new(MockConnection::new(3), test_clock()));
         }
 
         assert_eq!(pool.idle_count(), 3);
@@ -2809,7 +2855,7 @@ mod tests {
             inner.active_count = 1;
             inner
                 .idle
-                .push_back(ConnectionMeta::new(MockConnection::new(1)));
+                .push_back(ConnectionMeta::new(MockConnection::new(1), test_clock()));
         }
 
         // Spawn a thread that will panic while holding the lock
@@ -2976,7 +3022,7 @@ mod tests {
             inner.active_count = 1;
         }
         let pooled = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::new(1)),
+            ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
         );
 
@@ -3029,7 +3075,7 @@ mod tests {
         }
 
         // Create a pooled connection
-        let meta = ConnectionMeta::new(MockConnection::new(1));
+        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // Poison the mutex by panicking in another thread
@@ -3071,7 +3117,7 @@ mod tests {
         }
 
         // Create a pooled connection
-        let meta = ConnectionMeta::new(MockConnection::new(42));
+        let meta = ConnectionMeta::new(MockConnection::new(42), test_clock());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
         // Poison the mutex
@@ -3148,10 +3194,10 @@ mod tests {
             inner.total_count = 2;
             inner
                 .idle
-                .push_back(ConnectionMeta::new(MockConnection::new(1)));
+                .push_back(ConnectionMeta::new(MockConnection::new(1), test_clock()));
             inner
                 .idle
-                .push_back(ConnectionMeta::new(MockConnection::new(2)));
+                .push_back(ConnectionMeta::new(MockConnection::new(2), test_clock()));
         }
 
         // Poison the mutex
