@@ -570,7 +570,7 @@ Expr::case()
 | SQLite driver | ✅ Complete | Full Connection trait with transactions |
 | MySQL driver | ✅ Complete | Wire protocol + SharedMySqlConnection |
 | PostgreSQL driver | ✅ Complete | Wire protocol + SharedPgConnection with SCRAM auth |
-| Runtime migrations | ✅ Complete | Schema diffing, migration runner, version tracking with checksum drift detection |
+| Runtime migrations | ✅ Complete | Schema diffing, migration runner (one transaction per migration on PostgreSQL and SQLite), version tracking with checksum drift detection |
 | Lazy loading | ✅ Explicit | `Lazy<T>` + `Session::load_lazy/load_many` (batch-friendly; no implicit N+1) |
 
 ### Known Limitations

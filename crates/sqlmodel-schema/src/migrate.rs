@@ -9,7 +9,7 @@
 use crate::ddl::DdlGenerator;
 use crate::diff::SchemaOperation;
 use asupersync::{Cx, Outcome};
-use sqlmodel_core::{Connection, Error, Value};
+use sqlmodel_core::{Connection, Error, TransactionOps, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -155,6 +155,145 @@ impl Migration {
 /// Check if a year is a leap year.
 fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Split a migration script into its statements on top-level semicolons.
+///
+/// Single- and double-quoted strings, backtick identifiers, `--` line
+/// comments, `/* */` block comments, and PostgreSQL dollar quoting (`$$`,
+/// `$tag$`) are respected, so a semicolon inside any of them does not split.
+/// Statements that contain nothing but whitespace or comments are dropped
+/// (MySQL rejects an empty query).
+#[must_use]
+pub fn split_statements(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut has_content = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                current.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let start = i;
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            current.extend(&chars[start..i]);
+            continue;
+        }
+        if c == '\'' || c == '"' || c == '`' {
+            has_content = true;
+            current.push(c);
+            i += 1;
+            while i < chars.len() {
+                current.push(chars[i]);
+                if chars[i] == c {
+                    if chars.get(i + 1) == Some(&c) {
+                        current.push(c);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '$' {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let is_tag =
+                chars.get(j) == Some(&'$') && (j == i + 1 || !chars[i + 1].is_ascii_digit());
+            if is_tag {
+                has_content = true;
+                let tag: Vec<char> = chars[i..=j].to_vec();
+                current.extend(&tag);
+                i = j + 1;
+                while i < chars.len() {
+                    if chars[i] == '$' && chars[i..].starts_with(&tag) {
+                        current.extend(&tag);
+                        i += tag.len();
+                        break;
+                    }
+                    current.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        if c == ';' {
+            if has_content {
+                statements.push(current.trim().to_string());
+            }
+            current.clear();
+            has_content = false;
+            i += 1;
+            continue;
+        }
+        if !c.is_whitespace() {
+            has_content = true;
+        }
+        current.push(c);
+        i += 1;
+    }
+    if has_content {
+        statements.push(current.trim().to_string());
+    }
+    statements
+}
+
+/// Which script of a migration to run.
+#[derive(Debug, Clone, Copy)]
+enum ScriptDirection {
+    Up,
+    Down,
+}
+
+impl ScriptDirection {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// The error for a statement that failed inside a migration: names the
+/// migration, the direction, and the statement, and keeps the driver error
+/// as the source.
+fn migration_error(
+    id: &str,
+    direction: &str,
+    index: usize,
+    statement: &str,
+    source: Error,
+) -> Error {
+    let preview: String = statement.chars().take(80).collect();
+    let ellipsis = if statement.chars().count() > 80 {
+        "…"
+    } else {
+        ""
+    };
+    Error::Schema(sqlmodel_core::error::SchemaError {
+        kind: sqlmodel_core::error::SchemaErrorKind::Migration,
+        message: format!(
+            "migration `{id}` {direction} failed at statement {} (`{preview}{ellipsis}`): {source}",
+            index + 1
+        ),
+        source: Some(Box::new(source)),
+    })
 }
 
 // ============================================================================
@@ -473,7 +612,104 @@ impl MigrationRunner {
         Outcome::Ok(status)
     }
 
-    /// Apply all pending migrations.
+    /// Run one migration script (its statements one at a time) and then the
+    /// tracking-table statement, in one transaction where the dialect has
+    /// transactional DDL.
+    async fn run_script<C: Connection>(
+        &self,
+        cx: &Cx,
+        conn: &C,
+        migration: &Migration,
+        direction: ScriptDirection,
+        record_sql: &str,
+        record_params: &[Value],
+    ) -> Outcome<(), Error> {
+        let id = migration.id.as_str();
+        let script = match direction {
+            ScriptDirection::Up => migration.up.as_str(),
+            ScriptDirection::Down => migration.down.as_str(),
+        };
+        let direction = direction.name();
+        let statements = split_statements(script);
+        if conn.dialect().supports_transactional_ddl() {
+            let tx = match conn.begin(cx).await {
+                Outcome::Ok(tx) => tx,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            for (index, statement) in statements.iter().enumerate() {
+                match tx.execute(cx, statement, &[]).await {
+                    Outcome::Ok(_) => {}
+                    Outcome::Err(e) => {
+                        let _ = tx.rollback(cx).await;
+                        return Outcome::Err(migration_error(id, direction, index, statement, e));
+                    }
+                    Outcome::Cancelled(r) => {
+                        let _ = tx.rollback(cx).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        let _ = tx.rollback(cx).await;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            }
+            match tx.execute(cx, record_sql, record_params).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    let _ = tx.rollback(cx).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    let _ = tx.rollback(cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    let _ = tx.rollback(cx).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+            return tx.commit(cx).await;
+        }
+
+        // No transactional DDL (MySQL): statements before a failure stay
+        // applied and no tracking row is written; see `migrate`.
+        for (index, statement) in statements.iter().enumerate() {
+            match conn.execute(cx, statement, &[]).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    return Outcome::Err(migration_error(id, direction, index, statement, e));
+                }
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+        conn.execute(cx, record_sql, record_params)
+            .await
+            .map(|_| ())
+    }
+
+    /// Apply all pending migrations, in order, and return the ids applied.
+    ///
+    /// Each migration's statements are split on top-level semicolons (see
+    /// [`split_statements`]) and run one at a time: the PostgreSQL extended
+    /// protocol and MySQL's text protocol do not accept several statements in
+    /// one `execute`, so a multi-statement migration such as the output of
+    /// [`Migration::from_operations`] would otherwise never run there.
+    ///
+    /// On dialects with transactional DDL (PostgreSQL, SQLite) a migration and
+    /// its tracking row are applied in one transaction: a failing statement
+    /// rolls the whole migration back and the database is unchanged. On MySQL
+    /// every DDL statement commits implicitly, so a failing statement leaves the
+    /// statements before it applied and writes no tracking row; the error names
+    /// the migration and the statement, and the next `migrate` runs the
+    /// migration again from its first statement. Write MySQL migrations so each
+    /// statement can be repeated (`CREATE TABLE IF NOT EXISTS`, `DROP ... IF
+    /// EXISTS`) or keep one DDL statement per migration.
+    ///
+    /// Refuses to run while any applied migration is
+    /// [`MigrationStatus::Drifted`].
     pub async fn migrate<C: Connection>(&self, cx: &Cx, conn: &C) -> Outcome<Vec<String>, Error> {
         let status = match self.status(cx, conn).await {
             Outcome::Ok(s) => s,
@@ -508,15 +744,7 @@ impl MigrationRunner {
                     continue;
                 };
 
-                // Execute the up migration
-                match conn.execute(cx, &migration.up, &[]).await {
-                    Outcome::Ok(_) => {}
-                    Outcome::Err(e) => return Outcome::Err(e),
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
-                }
-
-                // Record the migration. Placeholders must follow the connection's
+                // The tracking row. Placeholders must follow the connection's
                 // dialect: MySQL rejects `$1`, and SQLite only accepted it by treating
                 // `$1` as a named parameter.
                 let dialect = conn.dialect();
@@ -531,21 +759,25 @@ impl MigrationRunner {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs() as i64);
+                let record_params = [
+                    Value::Text(migration.id.clone()),
+                    Value::Text(migration.description.clone()),
+                    Value::BigInt(now),
+                    Value::Text(migration.checksum()),
+                ];
 
-                match conn
-                    .execute(
+                match self
+                    .run_script(
                         cx,
+                        conn,
+                        migration,
+                        ScriptDirection::Up,
                         &record_sql,
-                        &[
-                            Value::Text(migration.id.clone()),
-                            Value::Text(migration.description.clone()),
-                            Value::BigInt(now),
-                            Value::Text(migration.checksum()),
-                        ],
+                        &record_params,
                     )
                     .await
                 {
-                    Outcome::Ok(_) => {}
+                    Outcome::Ok(()) => {}
                     Outcome::Err(e) => return Outcome::Err(e),
                     Outcome::Cancelled(r) => return Outcome::Cancelled(r),
                     Outcome::Panicked(p) => return Outcome::Panicked(p),
@@ -597,25 +829,25 @@ impl MigrationRunner {
             )));
         };
 
-        // Execute the down migration
-        match conn.execute(cx, &migration.down, &[]).await {
-            Outcome::Ok(_) => {}
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
-
-        // Remove the migration record (dialect-correct placeholder; see `migrate`).
+        // The down script and the removal of the tracking row, with the same
+        // statement splitting and transaction rules as `migrate`.
         let delete_sql = format!(
             "DELETE FROM {} WHERE id = {}",
             self.table_name,
             conn.dialect().placeholder(1)
         );
-        match conn
-            .execute(cx, &delete_sql, &[Value::Text(id.clone())])
+        match self
+            .run_script(
+                cx,
+                conn,
+                migration,
+                ScriptDirection::Down,
+                &delete_sql,
+                &[Value::Text(id.clone())],
+            )
             .await
         {
-            Outcome::Ok(_) => {}
+            Outcome::Ok(()) => {}
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
@@ -835,6 +1067,76 @@ mod tests {
         let filename = writer.filename(&m);
         // Filename should be truncated to reasonable length
         assert!(filename.len() < 100);
+    }
+
+    #[test]
+    fn split_statements_respects_quotes_comments_and_dollar_quoting() {
+        assert_eq!(
+            split_statements("CREATE TABLE a (id INT);\n\nINSERT INTO a VALUES (1);"),
+            vec!["CREATE TABLE a (id INT)", "INSERT INTO a VALUES (1)"]
+        );
+        assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
+        assert_eq!(split_statements("   ;  ; \n"), Vec::<String>::new());
+        assert_eq!(
+            split_statements("INSERT INTO t VALUES ('a;b', \"c;d\", `e;f`); SELECT 'it''s;'"),
+            vec![
+                "INSERT INTO t VALUES ('a;b', \"c;d\", `e;f`)",
+                "SELECT 'it''s;'"
+            ]
+        );
+        // Comments never split and are kept with the statement they precede;
+        // a trailing comment-only fragment is dropped.
+        assert_eq!(
+            split_statements(
+                "SELECT 1; -- trailing; comment\n/* block; comment */ SELECT 2; -- only a comment"
+            ),
+            vec![
+                "SELECT 1",
+                "-- trailing; comment\n/* block; comment */ SELECT 2"
+            ]
+        );
+        assert_eq!(
+            split_statements(
+                "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql; SELECT f()"
+            ),
+            vec![
+                "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql",
+                "SELECT f()"
+            ]
+        );
+        assert_eq!(
+            split_statements("DO $body$ BEGIN PERFORM 1; END $body$; SELECT $1; SELECT 2"),
+            vec![
+                "DO $body$ BEGIN PERFORM 1; END $body$",
+                "SELECT $1",
+                "SELECT 2"
+            ]
+        );
+        // `from_operations` output: statements joined with ";\n\n" plus a trailing ";".
+        let m = Migration::new("1", "d", "A;\n\nB;", "");
+        assert_eq!(split_statements(&m.up), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn migration_error_names_migration_direction_and_statement() {
+        let e = migration_error(
+            "0004_partial",
+            "up",
+            2,
+            "INSERT INTO missing (id) VALUES (1)",
+            Error::Custom("no such table".into()),
+        );
+        let text = e.to_string();
+        assert!(text.contains("0004_partial"), "{text}");
+        assert!(text.contains("up failed at statement 3"), "{text}");
+        assert!(text.contains("no such table"), "{text}");
+        assert!(matches!(
+            e,
+            Error::Schema(sqlmodel_core::error::SchemaError {
+                kind: sqlmodel_core::error::SchemaErrorKind::Migration,
+                ..
+            })
+        ));
     }
 
     #[test]

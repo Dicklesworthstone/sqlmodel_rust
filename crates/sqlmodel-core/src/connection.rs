@@ -304,6 +304,13 @@ impl Dialect {
         matches!(self, Dialect::Postgres)
     }
 
+    /// Whether DDL takes part in transactions: on PostgreSQL and SQLite a
+    /// `CREATE TABLE` inside a transaction is rolled back with it, on MySQL
+    /// every DDL statement commits implicitly.
+    pub const fn supports_transactional_ddl(self) -> bool {
+        matches!(self, Dialect::Postgres | Dialect::Sqlite)
+    }
+
     /// Quote an identifier for this dialect.
     ///
     /// Properly escapes embedded quote characters by doubling them:

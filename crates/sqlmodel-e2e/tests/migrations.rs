@@ -137,31 +137,65 @@ impl Scenario for Migrations {
             "{d}: drift changed nothing"
         );
 
-        // a failing migration is not recorded and earlier ones stay applied
-        let mut broken = vec![Migration::new(
-            "0004_broken",
-            "references a missing table",
+        // Partial failure: two statements succeed, the third fails. The error
+        // names the migration and the statement; no tracking row is written.
+        // With transactional DDL (PostgreSQL, SQLite) the database is
+        // unchanged; on MySQL the DDL has already committed (documented).
+        let half = unique_table("e2e_mig_half");
+        let broken = Migration::new(
+            "0004_partial",
+            "two good statements, then a missing table",
             format!(
-                "INSERT INTO {} (id) VALUES (1)",
-                q(&unique_table("e2e_mig_missing"))
+                "CREATE TABLE IF NOT EXISTS {half_q} (id INTEGER PRIMARY KEY);\n\
+                 INSERT INTO {half_q} (id) VALUES (1);\n\
+                 INSERT INTO {} (id) VALUES (1)",
+                q(&unique_table("e2e_mig_missing")),
+                half_q = q(&half),
             ),
-            "SELECT 1",
-        )];
+            format!("DROP TABLE IF EXISTS {}", q(&half)),
+        );
         let runner_broken = MigrationRunner::new({
             let mut all = runner_migrations(&widgets, &gadgets, &q);
-            all.append(&mut broken);
+            all.push(broken);
             all
         })
         .table_name(&tracking);
-        assert!(
-            matches!(runner_broken.migrate(cx, conn).await, Outcome::Err(_)),
-            "{d}: failing up-migration must surface"
-        );
+        match runner_broken.migrate(cx, conn).await {
+            Outcome::Err(e) => {
+                let text = e.to_string();
+                assert!(
+                    text.contains("0004_partial") && text.contains("statement 3"),
+                    "{d}: error must name the migration and the statement: {text}"
+                );
+            }
+            other => panic!("{d}: failing up-migration must surface, got {other:?}"),
+        }
         assert_eq!(
             recorded_ids(cx, conn, &tracking).await.len(),
             3,
-            "{d}: broken one not recorded"
+            "{d}: partial migration not recorded"
         );
+        let half_exists = matches!(
+            conn.query(cx, &format!("SELECT COUNT(*) FROM {}", q(&half)), &[])
+                .await,
+            Outcome::Ok(_)
+        );
+        if driver.dialect().supports_transactional_ddl() {
+            assert!(
+                !half_exists,
+                "{d}: transactional DDL must roll the whole migration back"
+            );
+        } else {
+            assert!(
+                half_exists,
+                "{d}: MySQL DDL commits implicitly; the documented outcome is a leftover table"
+            );
+            expect_outcome(
+                conn.execute(cx, &format!("DROP TABLE {}", q(&half)), &[])
+                    .await,
+                &format!("{d}: drop leftover"),
+            );
+        }
 
         // cleanup
         for t in [&gadgets, &widgets, &tracking] {
@@ -190,11 +224,17 @@ fn runner_migrations(widgets: &str, gadgets: &str, q: &dyn Fn(&str) -> String) -
             format!("INSERT INTO {} (id, name) VALUES (1, 'gear')", q(widgets)),
             format!("DELETE FROM {} WHERE id = 1", q(widgets)),
         ),
+        // Two statements, the shape `Migration::from_operations` produces: the
+        // runner must split them, since neither PostgreSQL's extended protocol
+        // nor MySQL accepts two statements in one execute.
         Migration::new(
             "0003_gadgets",
-            "create gadgets",
+            "create gadgets and index it",
             format!(
-                "CREATE TABLE {} (id INTEGER PRIMARY KEY, widget_id INTEGER NOT NULL)",
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, widget_id INTEGER NOT NULL);\n\n\
+                 CREATE INDEX {} ON {} (widget_id);",
+                q(gadgets),
+                q(&format!("{gadgets}_widget_idx")),
                 q(gadgets)
             ),
             format!("DROP TABLE {}", q(gadgets)),

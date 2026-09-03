@@ -33,7 +33,9 @@ pub use introspect::{
     CheckConstraintInfo, ColumnInfo, DatabaseSchema, Dialect, ForeignKeyInfo, IndexInfo,
     Introspector, ParsedSqlType, TableInfo, UniqueConstraintInfo,
 };
-pub use migrate::{Migration, MigrationFormat, MigrationRunner, MigrationStatus, MigrationWriter};
+pub use migrate::{
+    Migration, MigrationFormat, MigrationRunner, MigrationStatus, MigrationWriter, split_statements,
+};
 
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection, Model};

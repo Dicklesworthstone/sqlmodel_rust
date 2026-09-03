@@ -81,6 +81,17 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   table, lazy many-to-one, lifecycle events, `merge`, session-side cascades), the pool, and two OS
   threads of concurrent writers with `retry_transaction` (no lost updates; C SQLite asserts the
   `UnsupportedMode` refusal).
+- **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
+  script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
+  PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and
+  SQLite a migration and its tracking row are applied in one transaction, so a failing statement
+  leaves the database unchanged; on MySQL, where DDL commits implicitly, the statements before the
+  failure stay applied and no tracking row is written (documented on `migrate`). A failure is an
+  `Error::Schema` of kind `Migration` naming the migration, the direction, and the statement, with
+  the driver error as its source. `Dialect::supports_transactional_ddl` is new. Until now a
+  multi-statement migration, which is exactly what `Migration::from_operations` produces, could not
+  run on PostgreSQL at all (the extended protocol rejects several statements in one execute), and
+  nothing was ever transactional.
 - **Migration checksums.** `MigrationRunner` records a fingerprint of each applied migration's
   `up` SQL (`Migration::checksum`, 64-bit FNV-1a) in a new `checksum` column of the tracking table
   and compares it on every run: an applied migration whose SQL was edited afterwards is reported as
