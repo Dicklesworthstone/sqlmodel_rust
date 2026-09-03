@@ -470,6 +470,9 @@ struct TrackedObject {
     pk_values: Vec<Value>,
     /// Static relationship metadata for this object's model type.
     relationships: &'static [sqlmodel_core::RelationshipInfo],
+    /// Static column metadata for this object's model type (`skip_insert`,
+    /// `skip_update`).
+    fields: &'static [sqlmodel_core::FieldInfo],
     /// Set of expired attribute names (None = all expired, Some(empty) = none expired).
     /// When Some(non-empty), only those specific attributes need reload.
     expired_attributes: Option<std::collections::HashSet<String>>,
@@ -653,6 +656,7 @@ impl<C: Connection> Session<C> {
             pk_columns,
             pk_values,
             relationships: M::RELATIONSHIPS,
+            fields: M::fields(),
             expired_attributes: None,
         };
 
@@ -837,6 +841,7 @@ impl<C: Connection> Session<C> {
             pk_columns,
             pk_values: obj_pk_values,
             relationships: M::RELATIONSHIPS,
+            fields: M::fields(),
             expired_attributes: None,
         };
 
@@ -989,6 +994,7 @@ impl<C: Connection> Session<C> {
             pk_columns: pk_cols,
             pk_values: obj_pk_values,
             relationships: M::RELATIONSHIPS,
+            fields: M::fields(),
             expired_attributes: None,
         };
 
@@ -1936,15 +1942,28 @@ impl<C: Connection> Session<C> {
                     continue;
                 }
 
-                // Build INSERT statement using stored column names and values
-                let columns = &tracked.column_names;
-                let columns_sql: Vec<String> = columns
+                // Build INSERT statement using stored column names and values,
+                // leaving `skip_insert` columns to the database.
+                let inserted: Vec<(&'static str, Value)> = tracked
+                    .column_names
                     .iter()
-                    .map(|c| dialect.quote_identifier(c))
+                    .zip(tracked.values.iter())
+                    .filter(|(col, _)| {
+                        !tracked
+                            .fields
+                            .iter()
+                            .any(|f| f.column_name == **col && f.skip_insert)
+                    })
+                    .map(|(col, value)| (*col, value.clone()))
                     .collect();
-                let placeholders: Vec<String> = (1..=columns.len())
+                let columns_sql: Vec<String> = inserted
+                    .iter()
+                    .map(|(c, _)| dialect.quote_identifier(c))
+                    .collect();
+                let placeholders: Vec<String> = (1..=inserted.len())
                     .map(|i| dialect.placeholder(i))
                     .collect();
+                let insert_values: Vec<Value> = inserted.into_iter().map(|(_, v)| v).collect();
 
                 let sql = format!(
                     "INSERT INTO {} ({}) VALUES ({})",
@@ -1953,7 +1972,7 @@ impl<C: Connection> Session<C> {
                     placeholders.join(", ")
                 );
 
-                match self.connection.execute(cx, &sql, &tracked.values).await {
+                match self.connection.execute(cx, &sql, &insert_values).await {
                     Outcome::Ok(_) => {
                         tracked.state = ObjectState::Persistent;
                         self.inserted_in_transaction.insert(*key);
@@ -2024,8 +2043,12 @@ impl<C: Connection> Session<C> {
                         .as_ref()
                         .and_then(|before| before.get(i))
                         .is_some_and(|before| *before == tracked.values[i]);
-                    // Skip primary key columns and unchanged columns in SET
-                    if !tracked.pk_columns.contains(col) && !unchanged {
+                    let never_updated = tracked
+                        .fields
+                        .iter()
+                        .any(|f| f.column_name == *col && f.skip_update);
+                    // Skip primary key, unchanged, and `skip_update` columns in SET
+                    if !tracked.pk_columns.contains(col) && !unchanged && !never_updated {
                         set_parts.push(format!(
                             "{} = {}",
                             dialect.quote_identifier(col),
@@ -2483,6 +2506,7 @@ impl<C: Connection> Session<C> {
                         pk_columns: T::PRIMARY_KEY.to_vec(),
                         pk_values: pk_values.clone(),
                         relationships: T::RELATIONSHIPS,
+                        fields: T::fields(),
                         expired_attributes: None,
                     };
                     self.identity_map.insert(key, tracked);
@@ -2902,6 +2926,7 @@ impl<C: Connection> Session<C> {
                             pk_columns: Child::PRIMARY_KEY.to_vec(),
                             pk_values: pk_values.clone(),
                             relationships: Child::RELATIONSHIPS,
+                            fields: Child::fields(),
                             expired_attributes: None,
                         }
                     });
@@ -4645,6 +4670,7 @@ mod tests {
                 pk_columns: vec!["id1", "id2"],
                 pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
                 relationships: TeamComposite::RELATIONSHIPS,
+                fields: TeamComposite::fields(),
                 expired_attributes: None,
             },
         );
@@ -4675,6 +4701,7 @@ mod tests {
                     pk_columns: vec!["id"],
                     pk_values: vec![Value::BigInt(child_id)],
                     relationships: HeroCompositeChild::RELATIONSHIPS,
+                    fields: HeroCompositeChild::fields(),
                     expired_attributes: None,
                 },
             );
@@ -4742,6 +4769,7 @@ mod tests {
                 pk_columns: vec!["id1", "id2"],
                 pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
                 relationships: TeamCompositePassive::RELATIONSHIPS,
+                fields: TeamCompositePassive::fields(),
                 expired_attributes: None,
             },
         );
@@ -4763,6 +4791,7 @@ mod tests {
                 pk_columns: vec!["id"],
                 pk_values: vec![Value::BigInt(10)],
                 relationships: HeroCompositeChild::RELATIONSHIPS,
+                fields: HeroCompositeChild::fields(),
                 expired_attributes: None,
             },
         );
@@ -4921,6 +4950,7 @@ mod tests {
                 pk_columns: vec!["id1", "id2"],
                 pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
                 relationships: MmParentComposite::RELATIONSHIPS,
+                fields: MmParentComposite::fields(),
                 expired_attributes: None,
             },
         );

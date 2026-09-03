@@ -5,8 +5,8 @@
 //! actual database schema obtained via introspection.
 
 use crate::introspect::{
-    ColumnInfo, DatabaseSchema, Dialect, ForeignKeyInfo, IndexInfo, ParsedSqlType, TableInfo,
-    UniqueConstraintInfo,
+    CheckConstraintInfo, ColumnInfo, DatabaseSchema, Dialect, ForeignKeyInfo, IndexInfo,
+    ParsedSqlType, TableInfo, UniqueConstraintInfo,
 };
 use sqlmodel_core::{FieldInfo, Model};
 
@@ -76,6 +76,7 @@ pub fn table_schema_from_fields(
     let mut foreign_keys = Vec::new();
     let mut unique_constraints = Vec::new();
     let mut indexes = Vec::new();
+    let mut check_constraints = Vec::new();
 
     for field in fields {
         // Convert FieldInfo to ColumnInfo
@@ -84,12 +85,21 @@ pub fn table_schema_from_fields(
             name: field.column_name.to_string(),
             sql_type: sql_type.clone(),
             parsed_type: ParsedSqlType::parse(&sql_type),
-            nullable: field.nullable,
+            // A primary-key column is NOT NULL by definition, whatever the Rust
+            // field type says: `id: Option<i64>` is the idiomatic "assigned by
+            // the database" key, not a nullable column.
+            nullable: field.nullable && !field.primary_key,
             default: field.default.map(String::from),
             primary_key: field.primary_key,
             auto_increment: field.auto_increment,
-            comment: None,
+            comment: field.column_comment.map(str::to_string),
         });
+        for constraint in field.column_constraints {
+            check_constraints.push(CheckConstraintInfo {
+                name: None,
+                expression: (*constraint).to_string(),
+            });
+        }
 
         // Extract foreign key if present
         if let Some(fk_ref) = field.foreign_key
@@ -131,7 +141,7 @@ pub fn table_schema_from_fields(
         primary_key: primary_key_cols.iter().map(|s| s.to_string()).collect(),
         foreign_keys,
         unique_constraints,
-        check_constraints: Vec::new(),
+        check_constraints,
         indexes,
         comment: None,
     }

@@ -82,7 +82,14 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   round-trips, `MigrationRunner`, `Session` (unit of work, one-to-many, many-to-many through a link
   table, lazy many-to-one, lifecycle events, `merge`, session-side cascades), the pool, and two OS
   threads of concurrent writers with `retry_transaction` (no lost updates; C SQLite asserts the
-  `UnsupportedMode` refusal).
+  `UnsupportedMode` refusal). The `attributes` scenario is a conformance corpus for every
+  `#[sqlmodel(...)]` field attribute in one model set (`primary_key` + `auto_increment` on an
+  `Option<i64>`, `unique`, `nullable`, `column` renames, `column_comment`, `column_constraints`,
+  `default`, `index`, `sql_type`, `foreign_key` with `on_delete`/`on_update` CASCADE and SET NULL,
+  `skip_insert`, `skip_update`, a composite primary key): it prints the DDL, proves the created
+  schema is a fixpoint of the differ, checks what introspection reports, and exercises the
+  runtime behavior (defaults, UNIQUE and CHECK rejections, generated ids, skipped columns,
+  composite `get_by_pk`, cascades) on every driver. Its first run found bugs 44-49 below.
 - **Transactional, statement-by-statement migrations.** `MigrationRunner` splits each migration
   script on top-level semicolons (`sqlmodel_schema::split_statements`; strings, comments, and
   PostgreSQL dollar quoting respected) and runs the statements one at a time. On PostgreSQL and
@@ -254,6 +261,34 @@ facade tests, and the driver integration suites run against live Docker database
 - **`Row::get_named` now matches column names case-insensitively** when no exact match exists and
   the match is unambiguous, since unquoted SQL identifiers are case-insensitive and servers report
   them in their own case (PostgreSQL lower, MySQL `information_schema` upper).
+- **`#[sqlmodel(skip_insert)]` and `#[sqlmodel(skip_update)]` did nothing.** The derive accepted
+  both attributes and dropped them. They now reach `FieldInfo` (`skip_insert`, `skip_update`) and
+  are honored by `insert!`, bulk inserts, `update!`, and the session's flush: a `skip_insert`
+  column is left to the database (server default, trigger), a `skip_update` column is never
+  written back. Found while building the e2e attribute corpus.
+- **Declared CHECK constraints and column comments never reached the DDL.** `check = "..."` /
+  `sa_column(check = ...)` and `comment = "..."` were carried in `FieldInfo` but `SchemaBuilder`,
+  `CreateTable` and `ALTER TABLE ... ADD COLUMN` ignored them. CHECK constraints are now rendered
+  inline on every dialect; comments inline on MySQL and as `COMMENT ON COLUMN` statements on
+  PostgreSQL (SQLite has no column comments). The expected schema built from models carries both
+  as well.
+- **`#[sqlmodel(index = "...")]` never created the index.** `SchemaBuilder::create_table` emitted
+  the table only, so a declared index existed in the expected schema (and the differ kept asking
+  for it) but never in the database unless the caller repeated it through `create_index` by hand.
+  `create_table` now emits a `CREATE INDEX` per declared field index, using the dialect's form
+  (`IF NOT EXISTS` where supported, none on MySQL).
+- **PostgreSQL schema diff saw `CHARACTER VARYING(40)` and `VARCHAR(40)` as different types.**
+  `information_schema` reports the SQL-standard spellings (`character varying`, `character`,
+  `timestamp without time zone`, ...) while models declare the aliases, so every `VARCHAR`,
+  `CHAR`, `TIMESTAMP`, `TIME`, and `DECIMAL` column produced a spurious `AlterColumnType` on each
+  run. The differ's PostgreSQL type normalization now canonicalizes the base name and keeps the
+  length/precision suffix.
+- **An `Option<i64>` primary key was expected to be nullable.** The expected schema copied the
+  field's nullability onto the primary-key column, so the idiomatic "assigned by the database"
+  key diffed as `AlterColumnNullable` on PostgreSQL and MySQL (where a primary key is NOT NULL)
+  forever. A primary-key column is now NOT NULL in the expected schema, and the SQLite
+  introspector reports it the same way (`PRAGMA table_info` says `notnull = 0` for a rowid alias
+  that can never hold NULL).
 - **MySQL unsigned integers above the signed range came back negative.** Both decoders cast an
   unsigned column into the same-width signed `Value` (`TINYINT UNSIGNED` 200 read as -56,
   `BIGINT UNSIGNED` 18446744073709551615 read as -1), and the binary decoder ignored the unsigned

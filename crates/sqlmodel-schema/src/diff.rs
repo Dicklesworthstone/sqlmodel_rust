@@ -1385,18 +1385,36 @@ fn normalize_type(sql_type: &str, dialect: Dialect) -> String {
                 upper
             }
         }
-        Dialect::Postgres => match upper.as_str() {
-            "INT" | "INT4" => "INTEGER".to_string(),
-            "INT8" => "BIGINT".to_string(),
-            "INT2" => "SMALLINT".to_string(),
-            "FLOAT4" => "REAL".to_string(),
-            "FLOAT8" => "DOUBLE PRECISION".to_string(),
-            "BOOL" => "BOOLEAN".to_string(),
-            "SERIAL" => "INTEGER".to_string(),
-            "BIGSERIAL" => "BIGINT".to_string(),
-            "SMALLSERIAL" => "SMALLINT".to_string(),
-            _ => upper,
-        },
+        Dialect::Postgres => {
+            // `information_schema` reports the SQL-standard spellings
+            // (`character varying(40)`, `timestamp without time zone`) while
+            // models declare the short aliases (`VARCHAR(40)`, `TIMESTAMP`).
+            // Both name the same type, so canonicalize the base name and keep
+            // any `(length)` / `(precision, scale)` suffix as written.
+            let (base, suffix) = upper
+                .split_once('(')
+                .map_or((upper.as_str(), None), |(base, rest)| (base, Some(rest)));
+            let canonical = match base.trim() {
+                "INT" | "INT4" | "SERIAL" => "INTEGER",
+                "INT8" | "BIGSERIAL" => "BIGINT",
+                "INT2" | "SMALLSERIAL" => "SMALLINT",
+                "FLOAT4" => "REAL",
+                "FLOAT8" => "DOUBLE PRECISION",
+                "BOOL" => "BOOLEAN",
+                "CHARACTER VARYING" => "VARCHAR",
+                "CHARACTER" | "BPCHAR" => "CHAR",
+                "DECIMAL" => "NUMERIC",
+                "TIMESTAMP WITHOUT TIME ZONE" => "TIMESTAMP",
+                "TIMESTAMP WITH TIME ZONE" => "TIMESTAMPTZ",
+                "TIME WITHOUT TIME ZONE" => "TIME",
+                "TIME WITH TIME ZONE" => "TIMETZ",
+                other => other,
+            };
+            match suffix {
+                Some(rest) => format!("{canonical}({rest}"),
+                None => canonical.to_string(),
+            }
+        }
         Dialect::Mysql => {
             // Integer display widths (`TINYINT(1)`, `INT(11)`) are presentation
             // hints MySQL 8 still reports for `BOOLEAN` and legacy DDL; they
@@ -2094,6 +2112,32 @@ mod tests {
         assert_eq!(normalize_type("INT4", Dialect::Postgres), "INTEGER");
         assert_eq!(normalize_type("INT8", Dialect::Postgres), "BIGINT");
         assert_eq!(normalize_type("SERIAL", Dialect::Postgres), "INTEGER");
+        // information_schema spellings versus the aliases models declare.
+        assert_eq!(
+            normalize_type("character varying(40)", Dialect::Postgres),
+            "VARCHAR(40)"
+        );
+        assert_eq!(normalize_type("CHARACTER(3)", Dialect::Postgres), "CHAR(3)");
+        assert_eq!(
+            normalize_type("timestamp without time zone", Dialect::Postgres),
+            "TIMESTAMP"
+        );
+        assert_eq!(
+            normalize_type("timestamp with time zone", Dialect::Postgres),
+            "TIMESTAMPTZ"
+        );
+        assert_eq!(
+            normalize_type("FLOAT8", Dialect::Postgres),
+            "DOUBLE PRECISION"
+        );
+        assert_eq!(
+            normalize_type("DECIMAL(10,2)", Dialect::Postgres),
+            "NUMERIC(10,2)"
+        );
+        assert_eq!(
+            normalize_type("VARCHAR(40)", Dialect::Postgres),
+            "VARCHAR(40)"
+        );
     }
 
     #[test]

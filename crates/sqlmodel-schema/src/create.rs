@@ -233,6 +233,34 @@ impl<M: Model> CreateTable<M> {
             def.push_str(default);
         }
 
+        // Declared CHECK constraints (`#[sqlmodel(check = "...")]` /
+        // `sa_column(check = ...)`) were carried in the metadata but never
+        // rendered until 2026-09. Every dialect accepts them inline.
+        for constraint in field.column_constraints {
+            let expression = constraint.trim();
+            let expression = expression
+                .strip_prefix("CHECK")
+                .or_else(|| expression.strip_prefix("check"))
+                .map_or(expression, str::trim);
+            let expression = expression
+                .strip_prefix('(')
+                .and_then(|e| e.strip_suffix(')'))
+                .unwrap_or(expression);
+            def.push_str(" CHECK (");
+            def.push_str(expression);
+            def.push(')');
+        }
+
+        // MySQL takes the column comment inline; PostgreSQL needs a separate
+        // `COMMENT ON COLUMN` (emitted by `SchemaBuilder`); SQLite has none.
+        if self.dialect == Dialect::Mysql
+            && let Some(comment) = field.column_comment
+        {
+            def.push_str(" COMMENT '");
+            def.push_str(&comment.replace('\'', "''"));
+            def.push('\'');
+        }
+
         def
     }
 }
@@ -439,6 +467,96 @@ mod tests {
     fn test_create_table_default_value() {
         let sql = CreateTable::<TestWithDefault>::new().build();
         assert!(sql.contains("\"is_active\" BOOLEAN NOT NULL DEFAULT true"));
+    }
+
+    /// CHECK constraints and column comments declared on a model were carried
+    /// in `FieldInfo` but never rendered until 2026-09.
+    struct TestWithCheckAndComment;
+
+    impl Model for TestWithCheckAndComment {
+        const TABLE_NAME: &'static str = "people";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::Integer).primary_key(true),
+                FieldInfo::new("age", "age", SqlType::Integer)
+                    .column_constraints(&["age >= 0", "CHECK (age <= 150)"])
+                    .column_comment("years, it's an int")
+                    .index("idx_people_age"),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(TestWithCheckAndComment)
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![]
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn check_constraints_and_comments_reach_the_ddl() {
+        let sqlite = CreateTable::<TestWithCheckAndComment>::new()
+            .dialect(Dialect::Sqlite)
+            .build();
+        assert!(
+            sqlite.contains("\"age\" INTEGER NOT NULL CHECK (age >= 0) CHECK (age <= 150)"),
+            "{sqlite}"
+        );
+        assert!(
+            !sqlite.contains("COMMENT"),
+            "SQLite has no column comments: {sqlite}"
+        );
+
+        let mysql = CreateTable::<TestWithCheckAndComment>::new()
+            .dialect(Dialect::Mysql)
+            .build();
+        assert!(
+            mysql.contains("CHECK (age >= 0) CHECK (age <= 150) COMMENT 'years, it''s an int'"),
+            "{mysql}"
+        );
+
+        let statements = SchemaBuilder::new()
+            .dialect(Dialect::Postgres)
+            .create_table::<TestWithCheckAndComment>()
+            .build();
+        assert!(
+            statements[0].contains("CHECK (age >= 0)"),
+            "{}",
+            statements[0]
+        );
+        assert!(!statements[0].contains("COMMENT"), "{}", statements[0]);
+        assert_eq!(
+            statements[1],
+            "COMMENT ON COLUMN \"people\".\"age\" IS 'years, it''s an int'"
+        );
+        // `index = "..."` on a field was silently dropped by `create_table` until
+        // 2026-09; callers had to repeat it through `create_index` by hand.
+        assert_eq!(
+            statements[2],
+            "CREATE INDEX IF NOT EXISTS \"idx_people_age\" ON \"people\" (\"age\")"
+        );
+        assert_eq!(statements.len(), 3);
+
+        let mysql_statements = SchemaBuilder::new()
+            .dialect(Dialect::Mysql)
+            .create_table::<TestWithCheckAndComment>()
+            .build();
+        assert_eq!(
+            mysql_statements[1],
+            "CREATE INDEX `idx_people_age` ON `people` (`age`)"
+        );
     }
 
     // Test model with ON DELETE CASCADE
@@ -1349,6 +1467,28 @@ impl SchemaBuilder {
                 .if_not_exists()
                 .build(),
         );
+        // PostgreSQL column comments are separate statements (MySQL takes
+        // them inline in the column definition; SQLite has none).
+        if self.dialect == Dialect::Postgres {
+            for field in M::fields() {
+                if let Some(comment) = field.column_comment {
+                    self.statements.push(format!(
+                        "COMMENT ON COLUMN {}.{} IS '{}'",
+                        self.dialect.quote_identifier(M::TABLE_NAME),
+                        self.dialect.quote_identifier(field.column_name),
+                        comment.replace('\'', "''")
+                    ));
+                }
+            }
+        }
+        // `#[sqlmodel(index = "name")]` declares a single-column index; it is
+        // part of the model's schema (the differ expects it), so create it here
+        // rather than leaving every caller to repeat `create_index`.
+        for field in M::fields() {
+            if let Some(index_name) = field.index {
+                self = self.create_index(index_name, M::TABLE_NAME, &[field.column_name], false);
+            }
+        }
         self
     }
 
@@ -1405,6 +1545,21 @@ fn alter_table_add_column(dialect: Dialect, table: &str, field: &FieldInfo) -> S
     if let Some(default) = field.default {
         stmt.push_str(" DEFAULT ");
         stmt.push_str(default);
+    }
+
+    for constraint in field.column_constraints {
+        let expression = constraint.trim();
+        let expression = expression
+            .strip_prefix("CHECK")
+            .or_else(|| expression.strip_prefix("check"))
+            .map_or(expression, str::trim);
+        let expression = expression
+            .strip_prefix('(')
+            .and_then(|e| e.strip_suffix(')'))
+            .unwrap_or(expression);
+        stmt.push_str(" CHECK (");
+        stmt.push_str(expression);
+        stmt.push(')');
     }
 
     stmt

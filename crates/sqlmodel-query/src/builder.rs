@@ -573,15 +573,19 @@ fn build_insert_sql_for_table_with_columns(
 ) -> (String, Vec<Value>, Vec<&'static str>) {
     let insert_fields: Vec<_> = row
         .iter()
-        .map(|(name, value)| {
+        .filter_map(|(name, value)| {
             let field = fields.iter().find(|f| f.column_name == *name);
+            // `skip_insert` columns are the database's to fill.
+            if field.is_some_and(|f| f.skip_insert) {
+                return None;
+            }
             if let Some(f) = field
                 && f.auto_increment
                 && matches!(value, Value::Null)
             {
-                return (*name, Value::Default);
+                return Some((*name, Value::Default));
             }
-            (*name, value.clone())
+            Some((*name, value.clone()))
         })
         .collect();
 
@@ -932,17 +936,22 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
         let row = self.model.to_row();
         let fields = M::fields();
 
+        // `skip_insert` columns are left to the database default, exactly as the
+        // multi-row and column-list paths above do.
         let insert_fields: Vec<_> = row
             .iter()
-            .map(|(name, value)| {
+            .filter_map(|(name, value)| {
                 let field = fields.iter().find(|f| f.column_name == *name);
+                if field.is_some_and(|f| f.skip_insert) {
+                    return None;
+                }
                 if let Some(f) = field
                     && f.auto_increment
                     && matches!(value, Value::Null)
                 {
-                    return (*name, Value::Default);
+                    return Some((*name, Value::Default));
                 }
-                (*name, value.clone())
+                Some((*name, value.clone()))
             })
             .collect();
 
@@ -1625,6 +1634,9 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
         let insert_columns: Vec<_> = fields
             .iter()
             .filter_map(|field| {
+                if field.skip_insert {
+                    return None;
+                }
                 if field.auto_increment {
                     return Some(field.column_name);
                 }
@@ -1718,6 +1730,9 @@ impl<'a, M: Model> InsertManyBuilder<'a, M> {
         let insert_columns: Vec<_> = fields
             .iter()
             .filter_map(|field| {
+                if field.skip_insert {
+                    return None;
+                }
                 if field.auto_increment {
                     return Some(field.column_name);
                 }
@@ -2178,11 +2193,19 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
             let row = model.to_row();
 
             // Determine which fields to update
+            let model_fields = M::fields();
             let update_fields: Vec<_> = row
                 .iter()
                 .filter(|(name, _)| {
                     // Skip primary key fields
                     if pk.contains(name) {
+                        return false;
+                    }
+                    // Skip `skip_update` columns (never written back)
+                    if model_fields
+                        .iter()
+                        .any(|f| f.column_name == *name && f.skip_update)
+                    {
                         return false;
                     }
                     // Skip columns that have explicit sets
@@ -3536,6 +3559,87 @@ mod tests {
 
         assert_eq!(sql, "INSERT INTO \"only_ids\" DEFAULT VALUES");
         assert!(params.is_empty());
+    }
+
+    /// A column the database owns (`skip_insert`) or that is written once
+    /// (`skip_update`); the attributes parsed but did nothing until 2026-09.
+    struct TestStamped {
+        id: Option<i64>,
+        name: String,
+        created_at: i64,
+    }
+
+    impl Model for TestStamped {
+        const TABLE_NAME: &'static str = "stamped";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", SqlType::BigInt)
+                    .primary_key(true)
+                    .auto_increment(true)
+                    .nullable(true),
+                FieldInfo::new("name", "name", SqlType::Text),
+                FieldInfo::new("created_at", "created_at", SqlType::BigInt)
+                    .skip_insert(true)
+                    .skip_update(true),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
+                ("name", Value::Text(self.name.clone())),
+                ("created_at", Value::BigInt(self.created_at)),
+            ]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Err(sqlmodel_core::Error::Custom(
+                "from_row not used in tests".to_string(),
+            ))
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![self.id.map_or(Value::Null, Value::BigInt)]
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[test]
+    fn skip_insert_and_skip_update_columns_are_left_out() {
+        let stamped = TestStamped {
+            id: Some(7),
+            name: "x".to_string(),
+            created_at: 123,
+        };
+        let (sql, params) = InsertBuilder::new(&stamped).build_with_dialect(Dialect::Postgres);
+        assert_eq!(
+            sql,
+            "INSERT INTO \"stamped\" (\"id\", \"name\") VALUES ($1, $2)"
+        );
+        assert_eq!(params, vec![Value::BigInt(7), Value::Text("x".into())]);
+
+        let batches = InsertManyBuilder::new(std::slice::from_ref(&stamped))
+            .build_batches_with_dialect(Dialect::Sqlite);
+        assert!(
+            batches[0]
+                .0
+                .starts_with("INSERT INTO \"stamped\" (\"id\", \"name\") VALUES"),
+            "{}",
+            batches[0].0
+        );
+
+        let (sql, params) = UpdateBuilder::new(&stamped).build_with_dialect(Dialect::Postgres);
+        assert_eq!(
+            sql,
+            "UPDATE \"stamped\" SET \"name\" = $1 WHERE \"id\" = $2"
+        );
+        assert_eq!(params, vec![Value::Text("x".into()), Value::BigInt(7)]);
     }
 
     #[test]

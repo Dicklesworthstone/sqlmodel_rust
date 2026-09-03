@@ -557,11 +557,14 @@ impl Introspector {
                 let pk = row.get_named::<i64>("pk").ok().unwrap_or(0);
                 let parsed_type = ParsedSqlType::parse(&sql_type);
 
+                // `PRAGMA table_info` reports `notnull = 0` for a rowid alias
+                // (`INTEGER PRIMARY KEY`) even though it can never hold NULL;
+                // a primary-key column is NOT NULL for schema purposes.
                 Some(ColumnInfo {
                     name,
                     sql_type,
                     parsed_type,
-                    nullable: notnull == 0,
+                    nullable: notnull == 0 && pk == 0,
                     default: dflt_value,
                     primary_key: pk > 0,
                     auto_increment: false, // SQLite doesn't report this via PRAGMA

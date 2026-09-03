@@ -121,6 +121,13 @@ pub struct FieldInfo {
     /// Const fields cannot be modified after initial construction.
     /// This is enforced at validation/session level, not compile-time.
     pub const_field: bool,
+    /// Never written by `insert!`, `InsertMany`, or a session flush INSERT:
+    /// the database supplies the value (a `server_default`, a trigger, a
+    /// generated column). Until 2026-09 the attribute parsed but did nothing.
+    pub skip_insert: bool,
+    /// Never written by `update!` or a session flush UPDATE (an immutable
+    /// `created_at`, a database-maintained column).
+    pub skip_update: bool,
     /// Additional SQL constraints for DDL generation (e.g., CHECK constraints).
     /// Each string is a SQL constraint expression that will be added to the column definition.
     pub column_constraints: &'static [&'static str],
@@ -191,6 +198,8 @@ impl FieldInfo {
             default_json: None,
             has_default: false,
             const_field: false,
+            skip_insert: false,
+            skip_update: false,
             column_constraints: &[],
             column_comment: None,
             column_info: None,
@@ -624,6 +633,18 @@ impl FieldInfo {
     /// ```
     pub const fn column_constraints(mut self, constraints: &'static [&'static str]) -> Self {
         self.column_constraints = constraints;
+        self
+    }
+
+    /// Exclude the column from INSERT statements (the database supplies it).
+    pub const fn skip_insert(mut self, value: bool) -> Self {
+        self.skip_insert = value;
+        self
+    }
+
+    /// Exclude the column from UPDATE statements.
+    pub const fn skip_update(mut self, value: bool) -> Self {
+        self.skip_update = value;
         self
     }
 

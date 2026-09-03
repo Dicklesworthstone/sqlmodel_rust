@@ -439,6 +439,8 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
 
         // Const field
         let const_field = field.const_field;
+        let skip_insert = field.skip_insert;
+        let skip_update = field.skip_update;
 
         // Column constraints: sa_column.check is used if sa_column is present,
         // otherwise field.column_constraints (validation prevents both being set)
@@ -522,6 +524,8 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
                 .schema_extra_opt(#schema_extra_ts)
                 .default_json_opt(#default_json_ts)
                 .const_field(#const_field)
+                .skip_insert(#skip_insert)
+                .skip_update(#skip_update)
                 .column_constraints(#column_constraints_ts)
                 .column_comment_opt(#column_comment_ts)
                 .column_info_opt(#column_info_ts)
