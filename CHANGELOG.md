@@ -384,6 +384,17 @@ was paused for most of it, so these gates ran locally through the shim's escape 
   with OS-thread waiters, concurrent writers) pass on C SQLite (memory, file), FrankenSQLite,
   PostgreSQL 16, and MySQL 8.4.
 
+Fourth round, same day, on the tree with transactional migrations, checksums, and the schema
+fixpoint scenario (still through the local escape hatch):
+
+- `cargo fmt --check` clean on every changed file; `cargo clippy --all-targets -- -D warnings`
+  clean for the changed crates (core, schema, mysql, e2e).
+- Unit and facade tests of every crate: 825 (core, mysql, session, query) + 204 (schema) + 970
+  (sqlite, frankensqlite, postgres, pool, macros, console, facade) passed, 0 failed.
+- Live databases (run 18): all eight `sqlmodel-e2e` scenarios (the seven above plus
+  `schema_fixpoint`) pass on C SQLite (memory, file), FrankenSQLite, PostgreSQL 16, and MySQL 8.4;
+  `sqlmodel-mysql` integration 9/9 including the two new regression tests.
+
 ## [0.4.1] -- 2026-08-25
 
 Small release. The workspace version was bumped to 0.4.1 by
