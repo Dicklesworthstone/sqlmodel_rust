@@ -661,4 +661,194 @@ fn session_unit_of_work_and_relationships_work_on_every_available_driver() {
     let ran = run_owned_on_every_driver(&cx, &Relations);
     assert!(ran.contains(&"frankensqlite"), "{ran:?}");
     assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
+
+    let ran = run_owned_on_every_driver(&cx, &BatchOps);
+    assert!(ran.contains(&"frankensqlite"), "{ran:?}");
+    assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
+}
+
+/// Drop and recreate the four tables the session scenarios share.
+async fn fresh_tables<C: Connection>(cx: &Cx, conn: &C, driver: &DriverUnderTest) {
+    let d = driver.name();
+    let dialect = driver.dialect();
+    let q = |t: &str| dialect.quote_identifier(t);
+    for t in [
+        <AuthorTag as Model>::TABLE_NAME,
+        <Book as Model>::TABLE_NAME,
+        <Tag as Model>::TABLE_NAME,
+        <Author as Model>::TABLE_NAME,
+    ] {
+        expect_outcome(
+            conn.execute(cx, &format!("DROP TABLE IF EXISTS {}", q(t)), &[])
+                .await,
+            &format!("{d}: drop stale {t}"),
+        );
+    }
+    if dialect == Dialect::Sqlite {
+        expect_outcome(
+            conn.execute(cx, "PRAGMA foreign_keys = ON", &[]).await,
+            &format!("{d}: enable foreign keys"),
+        );
+    }
+    for stmt in SchemaBuilder::new()
+        .dialect(dialect)
+        .create_table::<Author>()
+        .create_table::<Tag>()
+        .create_table::<Book>()
+        .create_table::<AuthorTag>()
+        .build()
+    {
+        expect_outcome(
+            conn.execute(cx, &stmt, &[]).await,
+            &format!("{d}: ddl `{stmt}`"),
+        );
+    }
+}
+
+/// The batch-shaped entry points: `add_all` and the `sqlmodel_update` family
+/// (dictionary update, patch-model update that leaves `None` alone, and the
+/// `update_fields` filter), each proven on the database with raw SQL.
+struct BatchOps;
+
+impl OwnedScenario for BatchOps {
+    async fn run<C: Connection + 'static>(&self, cx: &Cx, conn: C, driver: &DriverUnderTest) {
+        use sqlmodel_core::validate::{SqlModelUpdate, UpdateOptions};
+        use std::collections::HashMap;
+
+        let d = driver.name();
+        let dialect = driver.dialect();
+        let authors = dialect.quote_identifier(<Author as Model>::TABLE_NAME);
+        fresh_tables(cx, &conn, driver).await;
+        let mut s = Session::new(conn);
+
+        // add_all: fifty objects, one flush, one commit.
+        let batch: Vec<Author> = (1..=50)
+            .map(|i| Author::new(i, &format!("author{i}"), None))
+            .collect();
+        s.add_all(&batch);
+        assert_eq!(s.pending_new_count(), 50, "{d}");
+        expect_outcome(s.flush(cx).await, &format!("{d}: flush add_all"));
+        expect_outcome(s.commit(cx).await, &format!("{d}: commit add_all"));
+        assert_eq!(
+            count(cx, s.connection(), &authors, "after add_all").await,
+            50,
+            "{d}"
+        );
+        assert_eq!(s.debug_state().tracked, 50, "{d}: all fifty tracked");
+
+        // A duplicate key inside a later batch fails the flush with the
+        // driver's constraint error; after rollback the session is usable.
+        let conn = s.into_connection();
+        let mut s = Session::new(conn);
+        s.add_all(&[Author::new(51, "new", None), Author::new(1, "dup", None)]);
+        match s.flush(cx).await {
+            Outcome::Err(e) => {
+                assert!(matches!(e, Error::Query(_)), "{d}: {e}");
+                eprintln!("{d}: duplicate key in add_all surfaced as: {e}");
+            }
+            other => panic!("{d}: duplicate key must fail the flush, got {other:?}"),
+        }
+        expect_outcome(s.rollback(cx).await, &format!("{d}: rollback dup"));
+        assert_eq!(
+            count(cx, s.connection(), &authors, "after failed batch").await,
+            50,
+            "{d}: nothing from the failed batch persisted"
+        );
+        s.add(&Author::new(51, "new", None));
+        expect_outcome(s.commit(cx).await, &format!("{d}: commit after rollback"));
+        assert_eq!(
+            count(cx, s.connection(), &authors, "after recovery").await,
+            51,
+            "{d}"
+        );
+
+        // sqlmodel_update from a map: both columns change.
+        let mut five: Author = expect_outcome(s.get(cx, 5i64).await, &format!("{d}: get 5"))
+            .unwrap_or_else(|| panic!("{d}: author 5 missing"));
+        five.sqlmodel_update(
+            HashMap::from([
+                ("name".to_string(), serde_json::json!("Renamed")),
+                ("email".to_string(), serde_json::json!("five@example.com")),
+            ]),
+            UpdateOptions::default(),
+        )
+        .expect("update from map");
+        assert_eq!(five.name, "Renamed", "{d}");
+        s.mark_dirty(&five);
+        expect_outcome(s.commit(cx).await, &format!("{d}: commit map update"));
+        let read = |s: &Session<C>| async {
+            let rows = expect_outcome(
+                s.connection()
+                    .query(
+                        cx,
+                        &format!("SELECT name, email FROM {authors} WHERE id = 5"),
+                        &[],
+                    )
+                    .await,
+                &format!("{d}: read 5"),
+            );
+            (
+                rows[0].get_as::<String>(0).unwrap(),
+                rows[0].get_as::<Option<String>>(1).unwrap(),
+            )
+        };
+        assert_eq!(
+            read(&s).await,
+            ("Renamed".to_string(), Some("five@example.com".to_string())),
+            "{d}: map update persisted"
+        );
+
+        // sqlmodel_update_from a patch model: None fields do not overwrite.
+        let mut five: Author = expect_outcome(s.get(cx, 5i64).await, &format!("{d}: get 5 again"))
+            .unwrap_or_else(|| panic!("{d}: author 5 missing"));
+        let patch = Author::new(5, "Patched", None);
+        five.sqlmodel_update_from(&patch, UpdateOptions::default())
+            .expect("update from patch");
+        assert_eq!(five.name, "Patched", "{d}");
+        assert_eq!(
+            five.email.as_deref(),
+            Some("five@example.com"),
+            "{d}: a None in the patch leaves the field alone"
+        );
+        s.mark_dirty(&five);
+        expect_outcome(s.commit(cx).await, &format!("{d}: commit patch update"));
+        assert_eq!(
+            read(&s).await,
+            ("Patched".to_string(), Some("five@example.com".to_string())),
+            "{d}: patch update persisted, email kept"
+        );
+
+        // update_fields restricts which keys of the input apply.
+        let mut five: Author = expect_outcome(s.get(cx, 5i64).await, &format!("{d}: get 5 third"))
+            .unwrap_or_else(|| panic!("{d}: author 5 missing"));
+        five.sqlmodel_update(
+            HashMap::from([
+                ("name".to_string(), serde_json::json!("Only")),
+                ("email".to_string(), serde_json::json!("ignored@example.com")),
+            ]),
+            UpdateOptions::default().update_fields(["name"]),
+        )
+        .expect("filtered update");
+        s.mark_dirty(&five);
+        expect_outcome(s.commit(cx).await, &format!("{d}: commit filtered update"));
+        assert_eq!(
+            read(&s).await,
+            ("Only".to_string(), Some("five@example.com".to_string())),
+            "{d}: update_fields kept email"
+        );
+
+        for t in [
+            <AuthorTag as Model>::TABLE_NAME,
+            <Book as Model>::TABLE_NAME,
+            <Tag as Model>::TABLE_NAME,
+            <Author as Model>::TABLE_NAME,
+        ] {
+            expect_outcome(
+                s.connection()
+                    .execute(cx, &format!("DROP TABLE {}", dialect.quote_identifier(t)), &[])
+                    .await,
+                &format!("{d}: drop {t}"),
+            );
+        }
+    }
 }

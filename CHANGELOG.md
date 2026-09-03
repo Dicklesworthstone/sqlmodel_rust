@@ -97,6 +97,10 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   multi-statement migration, which is exactly what `Migration::from_operations` produces, could not
   run on PostgreSQL at all (the extended protocol rejects several statements in one execute), and
   nothing was ever transactional.
+- `SqlModelUpdate`, `UpdateOptions` and `UpdateInput` (the `sqlmodel_update` family) are exported
+  from `sqlmodel_core`'s root and the facade's prelude; they were only reachable through
+  `sqlmodel_core::validate`. The e2e Session scenario now proves `add_all` and every
+  `sqlmodel_update` form on all five drivers.
 - **Migration runners exclude each other.** `MigrationRunner::migrate` and `rollback` hold a
   server-side lock keyed by the tracking table for the whole call (`pg_advisory_lock` on
   PostgreSQL, `GET_LOCK` with a two-minute wait on MySQL), so two services starting at once do not
