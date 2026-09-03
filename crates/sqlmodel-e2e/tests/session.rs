@@ -127,6 +127,28 @@ struct AuthorTag {
     tag_id: i64,
 }
 
+/// One author's `name` and `email`, read with raw SQL.
+async fn name_and_email<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    authors: &str,
+    id: i64,
+) -> (String, Option<String>) {
+    let rows = expect_outcome(
+        conn.query(
+            cx,
+            &format!("SELECT name, email FROM {authors} WHERE id = {id}"),
+            &[],
+        )
+        .await,
+        "read author",
+    );
+    (
+        rows[0].get_as::<String>(0).unwrap(),
+        rows[0].get_as::<Option<String>>(1).unwrap(),
+    )
+}
+
 async fn count<C: Connection>(cx: &Cx, conn: &C, table: &str, label: &str) -> i64 {
     let rows = expect_outcome(
         conn.query(cx, &format!("SELECT COUNT(*) FROM {table}"), &[])
@@ -776,24 +798,8 @@ impl OwnedScenario for BatchOps {
         assert_eq!(five.name, "Renamed", "{d}");
         s.mark_dirty(&five);
         expect_outcome(s.commit(cx).await, &format!("{d}: commit map update"));
-        let read = |s: &Session<C>| async {
-            let rows = expect_outcome(
-                s.connection()
-                    .query(
-                        cx,
-                        &format!("SELECT name, email FROM {authors} WHERE id = 5"),
-                        &[],
-                    )
-                    .await,
-                &format!("{d}: read 5"),
-            );
-            (
-                rows[0].get_as::<String>(0).unwrap(),
-                rows[0].get_as::<Option<String>>(1).unwrap(),
-            )
-        };
         assert_eq!(
-            read(&s).await,
+            name_and_email(cx, s.connection(), &authors, 5).await,
             ("Renamed".to_string(), Some("five@example.com".to_string())),
             "{d}: map update persisted"
         );
@@ -813,7 +819,7 @@ impl OwnedScenario for BatchOps {
         s.mark_dirty(&five);
         expect_outcome(s.commit(cx).await, &format!("{d}: commit patch update"));
         assert_eq!(
-            read(&s).await,
+            name_and_email(cx, s.connection(), &authors, 5).await,
             ("Patched".to_string(), Some("five@example.com".to_string())),
             "{d}: patch update persisted, email kept"
         );
@@ -835,7 +841,7 @@ impl OwnedScenario for BatchOps {
         s.mark_dirty(&five);
         expect_outcome(s.commit(cx).await, &format!("{d}: commit filtered update"));
         assert_eq!(
-            read(&s).await,
+            name_and_email(cx, s.connection(), &authors, 5).await,
             ("Only".to_string(), Some("five@example.com".to_string())),
             "{d}: update_fields kept email"
         );
