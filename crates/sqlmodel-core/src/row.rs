@@ -71,9 +71,11 @@ impl ColumnInfo {
         self.names.get(index).map(String::as_str)
     }
 
-    /// Check if a column exists.
+    /// Check if a column exists, resolved exactly like [`Self::index_of`]
+    /// (exact name first, then an unambiguous case-insensitive match), so
+    /// `contains` and `get_named` never disagree.
     pub fn contains(&self, name: &str) -> bool {
-        self.name_to_index.contains_key(name)
+        self.index_of(name).is_some()
     }
 
     /// Get all column names.
@@ -698,6 +700,11 @@ mod tests {
         assert_eq!(row.get_named::<String>("constraint_name").unwrap(), "fk_a");
         assert_eq!(row.get_named::<String>("COLUMN_NAME").unwrap(), "a");
         assert_eq!(row.get_named::<String>("Column_name").unwrap(), "a");
+        // `contains_column` resolves the same way, so it never disagrees with
+        // `get_named` (it was exact-match only until 2026-09).
+        assert!(row.contains_column("constraint_name"));
+        assert!(row.contains_column("COLUMN_NAME"));
+        assert!(!row.contains_column("missing"));
 
         // Two columns that differ only by case stay exact-match only.
         let row = Row::new(

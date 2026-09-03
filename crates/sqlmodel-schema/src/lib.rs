@@ -34,7 +34,8 @@ pub use introspect::{
     Introspector, ParsedSqlType, TableInfo, UniqueConstraintInfo,
 };
 pub use migrate::{
-    Migration, MigrationFormat, MigrationRunner, MigrationStatus, MigrationWriter, split_statements,
+    DEFAULT_LOCK_TIMEOUT, Migration, MigrationFormat, MigrationRunner, MigrationStatus,
+    MigrationWriter, split_statements,
 };
 
 use asupersync::{Cx, Outcome};

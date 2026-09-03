@@ -395,6 +395,16 @@ facade tests, and the driver integration suites run against live Docker database
   encoding each value in its own binary form, so any integer, float, boolean, or temporal
   parameter was rejected with "Malformed communication packet". The packet now declares the type
   of each value as encoded. Surfaced the moment the ORM started using the prepared path.
+- **API polish after the live rounds.** `MigrationRunner::lock_timeout(Duration)` (default two
+  minutes, `DEFAULT_LOCK_TIMEOUT`) bounds the wait for another runner's migration lock on both
+  servers: PostgreSQL polls `pg_try_advisory_lock` until the deadline (it used to block in
+  `pg_advisory_lock` without limit), MySQL passes the seconds to `GET_LOCK` (hard-coded 120
+  before). `MigrationStatus::Failed` is gone: no code path ever produced it. `Row::contains` /
+  `contains_column` resolve names exactly like `get_named` (exact, then unambiguous
+  case-insensitive), so they can no longer disagree. The MySQL first-packet classification
+  (`PacketType::from_first_byte`) was re-audited: its five call sites all classify the first
+  response packet (authentication result, `COM_QUERY`, `COM_STMT_EXECUTE`), where `0x00` is an OK
+  packet; every row phase already uses `RowPacket::classify`.
 - **MySQL unsigned integers above the signed range came back negative.** Both decoders cast an
   unsigned column into the same-width signed `Value` (`TINYINT UNSIGNED` 200 read as -56,
   `BIGINT UNSIGNED` 18446744073709551615 read as -1), and the binary decoder ignored the unsigned

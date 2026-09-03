@@ -14,6 +14,7 @@ use sqlmodel_core::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// A database migration.
 #[derive(Debug, Clone)]
@@ -508,8 +509,6 @@ pub enum MigrationStatus {
         recorded: String,
         current: String,
     },
-    /// Migration failed
-    Failed { error: String },
 }
 
 /// Migration runner for executing migrations.
@@ -518,7 +517,12 @@ pub struct MigrationRunner {
     migrations: Vec<Migration>,
     /// Name of the migrations tracking table (validated to be safe)
     table_name: String,
+    /// How long `migrate`/`rollback` wait for the server-side migration lock.
+    lock_timeout: Duration,
 }
+
+/// Default wait for the migration lock held by another runner.
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Validate and sanitize a table name to prevent SQL injection.
 ///
@@ -535,7 +539,19 @@ impl MigrationRunner {
         Self {
             migrations,
             table_name: "_sqlmodel_migrations".to_string(),
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
         }
+    }
+
+    /// How long to wait for the migration lock another runner holds before
+    /// failing (default [`DEFAULT_LOCK_TIMEOUT`], two minutes). On PostgreSQL
+    /// the runner polls `pg_try_advisory_lock` until the deadline; on MySQL
+    /// the wait is `GET_LOCK`'s own timeout. SQLite holds no server lock.
+    /// `Duration::ZERO` fails immediately when the lock is taken.
+    #[must_use]
+    pub fn lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
     }
 
     /// Set a custom migrations tracking table name.
@@ -771,40 +787,66 @@ impl MigrationRunner {
     /// database file lock and the tracking table's primary key keep a second
     /// runner from applying a migration twice, but it fails instead of
     /// waiting (see [`Self::migrate`]).
-    async fn acquire_lock<C: Connection>(&self, cx: &Cx, conn: &C) -> Outcome<(), Error> {
-        match conn.dialect() {
+    /// The statement that tries to take the migration lock on `dialect`, with
+    /// its parameters: `pg_try_advisory_lock(key)` (non-blocking; polled by
+    /// [`Self::acquire_lock`]) or `GET_LOCK(name, seconds)` with the configured
+    /// timeout. `None` on SQLite, which holds no server lock.
+    fn lock_statement(&self, dialect: sqlmodel_core::Dialect) -> Option<(String, Vec<Value>)> {
+        match dialect {
             sqlmodel_core::Dialect::Postgres => {
                 #[allow(clippy::cast_possible_wrap)] // any bigint is a valid key
                 let key = self.lock_key() as i64;
-                conn.execute(cx, "SELECT pg_advisory_lock($1)", &[Value::BigInt(key)])
-                    .await
-                    .map(|_| ())
+                Some((
+                    "SELECT pg_try_advisory_lock($1)".to_string(),
+                    vec![Value::BigInt(key)],
+                ))
             }
             sqlmodel_core::Dialect::Mysql => {
                 let name = format!("sqlmodel_migrate_{:016x}", self.lock_key());
-                let rows = match conn
-                    .query(cx, "SELECT GET_LOCK(?, 120)", &[Value::Text(name.clone())])
-                    .await
-                {
-                    Outcome::Ok(rows) => rows,
-                    Outcome::Err(e) => return Outcome::Err(e),
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
-                };
-                let granted = rows
-                    .first()
-                    .and_then(|r| r.get_as::<i64>(0).ok())
-                    .unwrap_or(0);
-                if granted == 1 {
-                    Outcome::Ok(())
-                } else {
-                    Outcome::Err(Error::Custom(format!(
-                        "could not acquire migration lock `{name}` within 120s; \
-                         another runner is still migrating this database"
-                    )))
-                }
+                let seconds = i64::try_from(self.lock_timeout.as_secs()).unwrap_or(i64::MAX);
+                Some((
+                    "SELECT GET_LOCK(?, ?)".to_string(),
+                    vec![Value::Text(name), Value::BigInt(seconds)],
+                ))
             }
-            sqlmodel_core::Dialect::Sqlite => Outcome::Ok(()),
+            sqlmodel_core::Dialect::Sqlite => None,
+        }
+    }
+
+    async fn acquire_lock<C: Connection>(&self, cx: &Cx, conn: &C) -> Outcome<(), Error> {
+        let dialect = conn.dialect();
+        let Some((sql, params)) = self.lock_statement(dialect) else {
+            return Outcome::Ok(());
+        };
+        let deadline = Instant::now() + self.lock_timeout;
+        loop {
+            let rows = match conn.query(cx, &sql, &params).await {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            // `pg_try_advisory_lock` returns a boolean, `GET_LOCK` 1/0/NULL.
+            let granted = rows
+                .first()
+                .and_then(|r| r.get(0))
+                .is_some_and(|v| matches!(v, Value::Bool(true)) || v.as_i64() == Some(1));
+            if granted {
+                return Outcome::Ok(());
+            }
+            // MySQL already waited inside GET_LOCK; PostgreSQL's try-lock
+            // returns at once, so poll until the deadline.
+            if dialect != sqlmodel_core::Dialect::Postgres || Instant::now() >= deadline {
+                return Outcome::Err(Error::Custom(format!(
+                    "could not acquire the migration lock for `{}` within {:?}; \
+                     another runner is still migrating this database",
+                    self.table_name, self.lock_timeout
+                )));
+            }
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
+            asupersync::time::sleep(cx.now(), Duration::from_millis(100)).await;
         }
     }
 
@@ -833,7 +875,8 @@ impl MigrationRunner {
     ///
     /// Only one runner at a time migrates a given database: on PostgreSQL and
     /// MySQL the call holds a server-side lock keyed by the tracking table
-    /// (`pg_advisory_lock` / `GET_LOCK`, waiting up to two minutes on MySQL),
+    /// (`pg_try_advisory_lock` polled / `GET_LOCK`, waiting up to
+    /// [`Self::lock_timeout`], two minutes by default),
     /// so a second runner waits and then finds nothing pending. SQLite has no
     /// server to hold such a lock; a second runner there fails on the database
     /// file lock or the tracking table's primary key instead of waiting, and
@@ -1379,9 +1422,6 @@ mod tests {
     fn test_migration_status_enum() {
         let pending = MigrationStatus::Pending;
         let applied = MigrationStatus::Applied { at: 1_234_567_890 };
-        let failed = MigrationStatus::Failed {
-            error: "Test error".to_string(),
-        };
 
         assert_eq!(pending, MigrationStatus::Pending);
         assert_ne!(pending, applied);
@@ -1390,10 +1430,41 @@ mod tests {
             applied,
             MigrationStatus::Applied { at } if at == 1_234_567_890
         ));
-        assert!(matches!(
-            failed,
-            MigrationStatus::Failed { ref error } if error == "Test error"
-        ));
+    }
+
+    #[test]
+    fn lock_statement_carries_the_configured_timeout() {
+        let runner = MigrationRunner::new(vec![]);
+        assert_eq!(runner.lock_timeout, DEFAULT_LOCK_TIMEOUT);
+        let (sql, params) = runner
+            .lock_statement(sqlmodel_core::Dialect::Mysql)
+            .expect("mysql locks");
+        assert_eq!(sql, "SELECT GET_LOCK(?, ?)");
+        assert_eq!(params[1], Value::BigInt(120), "default wait is two minutes");
+
+        let quick = MigrationRunner::new(vec![]).lock_timeout(Duration::from_secs(5));
+        let (_, params) = quick
+            .lock_statement(sqlmodel_core::Dialect::Mysql)
+            .expect("mysql locks");
+        assert_eq!(params[1], Value::BigInt(5));
+        let (sql, params) = quick
+            .lock_statement(sqlmodel_core::Dialect::Postgres)
+            .expect("postgres locks");
+        assert_eq!(sql, "SELECT pg_try_advisory_lock($1)");
+        assert!(matches!(params[0], Value::BigInt(_)));
+        assert!(
+            quick
+                .lock_statement(sqlmodel_core::Dialect::Sqlite)
+                .is_none(),
+            "SQLite holds no server lock"
+        );
+
+        // Two runners on the same tracking table contend for the same key;
+        // different tables do not.
+        let same = MigrationRunner::new(vec![]).table_name("_sqlmodel_migrations");
+        assert_eq!(runner.lock_key(), same.lock_key());
+        let other = MigrationRunner::new(vec![]).table_name("other_history");
+        assert_ne!(runner.lock_key(), other.lock_key());
     }
 
     #[test]
