@@ -96,8 +96,8 @@ pub use row::Row;
 pub use tracked::TrackedModel;
 pub use types::{SqlEnum, SqlType, TypeInfo};
 pub use validate::{
-    DumpMode, DumpOptions, DumpResult, ModelDump, ModelValidate, SqlModelDump, SqlModelValidate,
-    ValidateInput, ValidateOptions, ValidateResult, apply_serialization_aliases,
-    apply_validation_aliases,
+    DumpMode, DumpOptions, DumpResult, ModelDump, ModelValidate, SqlModelDump, SqlModelUpdate,
+    SqlModelValidate, UpdateInput, UpdateOptions, ValidateInput, ValidateOptions, ValidateResult,
+    apply_serialization_aliases, apply_validation_aliases,
 };
 pub use value::Value;
