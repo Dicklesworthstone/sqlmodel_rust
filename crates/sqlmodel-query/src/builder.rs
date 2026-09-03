@@ -2242,48 +2242,14 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
         );
 
         // Single-table inheritance child models always carry their implicit
-        // discriminator predicate so an UPDATE can never touch sibling kinds.
-        let sti = crate::select::sti_discriminator_filter::<M>();
-        let where_clause = match (&self.where_clause, &sti) {
-            (Some(w), Some(d)) => Some(w.clone().and(d.clone())),
-            (Some(w), None) => Some(w.clone()),
-            (None, Some(d)) if self.model.is_none() => Some(Where::new(d.clone())),
-            _ => None,
-        };
-
-        // Add WHERE clause
-        if let Some(where_clause) = where_clause {
-            let (where_sql, where_params) = where_clause.build_with_dialect(dialect, params.len());
+        // discriminator predicate so an UPDATE can never touch sibling kinds;
+        // without a filter a model instance is matched by its primary key.
+        let (where_sql, where_params) =
+            dml_where_fragment::<M>(dialect, self.where_clause.as_ref(), self.model, params.len());
+        if !where_sql.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_sql);
             params.extend(where_params);
-        } else if let Some(model) = &self.model {
-            // Default to primary key match
-            let pk_values = model.primary_key_value();
-            let pk_conditions: Vec<_> = pk
-                .iter()
-                .zip(pk_values.iter())
-                .enumerate()
-                .map(|(i, (col, _))| {
-                    format!(
-                        "{} = {}",
-                        dialect.quote_identifier(col),
-                        dialect.placeholder(params.len() + i + 1)
-                    )
-                })
-                .collect();
-
-            if !pk_conditions.is_empty() {
-                sql.push_str(" WHERE ");
-                sql.push_str(&pk_conditions.join(" AND "));
-                params.extend(pk_values);
-                if let Some(d) = sti {
-                    let (d_sql, d_params) = Where::new(d).build_with_dialect(dialect, params.len());
-                    sql.push_str(" AND ");
-                    sql.push_str(&d_sql);
-                    params.extend(d_params);
-                }
-            }
         }
 
         // Add RETURNING clause if requested
