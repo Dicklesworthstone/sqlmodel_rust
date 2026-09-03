@@ -197,6 +197,25 @@ impl OwnedScenario for Attributes {
             "{d}: named index: {:?}",
             players_info.indexes
         );
+        // auto_increment survives introspection on every engine: SQLite's rowid
+        // alias, PostgreSQL's identity column, MySQL's AUTO_INCREMENT extra.
+        let player_id = players_info
+            .columns
+            .iter()
+            .find(|c| c.name == "id")
+            .expect("players.id column");
+        assert!(
+            player_id.auto_increment,
+            "{d}: auto_increment introspected: {player_id:?}"
+        );
+        assert!(
+            !players_info
+                .columns
+                .iter()
+                .any(|c| c.name != "id" && c.auto_increment),
+            "{d}: only the key auto-increments: {:?}",
+            players_info.columns
+        );
         let fk = players_info
             .foreign_keys
             .iter()

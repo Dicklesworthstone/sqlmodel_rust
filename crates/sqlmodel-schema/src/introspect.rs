@@ -547,7 +547,7 @@ impl Introspector {
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        let columns: Vec<ColumnInfo> = rows
+        let mut columns: Vec<ColumnInfo> = rows
             .iter()
             .filter_map(|row| {
                 let name = row.get_named::<String>("name").ok()?;
@@ -572,6 +572,7 @@ impl Introspector {
                 })
             })
             .collect();
+        mark_sqlite_rowid_alias(&mut columns);
 
         Outcome::Ok(columns)
     }
@@ -592,6 +593,7 @@ impl Introspector {
                        c.numeric_scale,
                        c.is_nullable,
                        c.column_default,
+                       c.is_identity,
                        COALESCE(d.description, '') as column_comment
                    FROM information_schema.columns c
                    LEFT JOIN pg_catalog.pg_statio_all_tables st
@@ -634,7 +636,14 @@ impl Introspector {
                 let parsed_type = ParsedSqlType::parse(&sql_type);
 
                 // Check if auto-increment by looking at default (nextval)
-                let auto_increment = default.as_ref().is_some_and(|d| d.starts_with("nextval("));
+                // A serial column defaults to `nextval(...)`; an identity column
+                // (what the schema builder emits) has no default and reports
+                // `is_identity = 'YES'`. Until 2026-09 only the first counted.
+                let identity = row
+                    .get_named::<String>("is_identity")
+                    .is_ok_and(|v| v.eq_ignore_ascii_case("YES"));
+                let auto_increment =
+                    identity || default.as_ref().is_some_and(|d| d.starts_with("nextval("));
 
                 Some(ColumnInfo {
                     name,
@@ -1420,6 +1429,22 @@ fn normalize_check_expression(definition: &str) -> String {
     trimmed.to_string()
 }
 
+/// SQLite auto-assigns a single-column `INTEGER PRIMARY KEY` (the rowid alias)
+/// but `PRAGMA table_info` has no way to say so. Report it as `auto_increment`,
+/// the way the other engines report their identity / AUTO_INCREMENT columns, so
+/// an auto-increment model reads back the same on every engine.
+fn mark_sqlite_rowid_alias(columns: &mut [ColumnInfo]) {
+    let pk_count = columns.iter().filter(|c| c.primary_key).count();
+    if pk_count != 1 {
+        return;
+    }
+    for column in columns.iter_mut() {
+        if column.primary_key && column.sql_type.trim().eq_ignore_ascii_case("INTEGER") {
+            column.auto_increment = true;
+        }
+    }
+}
+
 fn extract_sqlite_check_constraints(create_table_sql: &str) -> Vec<CheckConstraintInfo> {
     let Some(definitions) = sqlite_table_definitions(create_table_sql) else {
         return Vec::new();
@@ -1990,6 +2015,30 @@ mod tests {
             normalize_check_expression("CHECK (kind IN ('A,B', 'C'))"),
             "kind IN ('A,B', 'C')"
         );
+    }
+
+    #[test]
+    fn sqlite_rowid_alias_reports_auto_increment() {
+        let col = |name: &str, ty: &str, pk: bool| ColumnInfo {
+            name: name.into(),
+            sql_type: ty.into(),
+            parsed_type: ParsedSqlType::parse(ty),
+            nullable: !pk,
+            default: None,
+            primary_key: pk,
+            auto_increment: false,
+            comment: None,
+        };
+        let mut single = vec![col("id", "INTEGER", true), col("name", "TEXT", false)];
+        mark_sqlite_rowid_alias(&mut single);
+        assert!(single[0].auto_increment && !single[1].auto_increment);
+        // `BIGINT PRIMARY KEY` is not a rowid alias, and neither is a composite key.
+        let mut bigint = vec![col("id", "BIGINT", true)];
+        mark_sqlite_rowid_alias(&mut bigint);
+        assert!(!bigint[0].auto_increment);
+        let mut composite = vec![col("a", "INTEGER", true), col("b", "INTEGER", true)];
+        mark_sqlite_rowid_alias(&mut composite);
+        assert!(composite.iter().all(|c| !c.auto_increment));
     }
 
     #[test]
