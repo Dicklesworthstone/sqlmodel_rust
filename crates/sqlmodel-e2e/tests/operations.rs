@@ -10,7 +10,7 @@
 
 use asupersync::Cx;
 use sqlmodel::prelude::*;
-use sqlmodel::{DeleteBuilder, Dialect, SchemaBuilder, Select, UpdateBuilder};
+use sqlmodel::{DeleteBuilder, SchemaBuilder, Select, UpdateBuilder};
 use sqlmodel_core::{Lazy, RelatedMany};
 use sqlmodel_e2e::{DriverUnderTest, Scenario, expect_outcome, run_on_every_driver};
 
@@ -66,7 +66,10 @@ fn player(id: i64) -> Player {
 
 async fn team_name<C: Connection>(cx: &Cx, conn: &C, id: i64, label: &str) -> String {
     expect_outcome(
-        select!(Team).filter(Expr::col("id").eq(id)).one(cx, conn).await,
+        select!(Team)
+            .filter(Expr::col("id").eq(id))
+            .one(cx, conn)
+            .await,
         label,
     )
     .name
@@ -144,7 +147,11 @@ impl Scenario for Operations {
                 .await,
             &format!("{d}: upsert do update"),
         );
-        assert_eq!(team_name(cx, conn, 1, "after upsert").await, "crimson", "{d}");
+        assert_eq!(
+            team_name(cx, conn, 1, "after upsert").await,
+            "crimson",
+            "{d}"
+        );
         // Conflict on the primary key, keep the existing row.
         expect_outcome(
             insert!(&team(1, "ignored"))
@@ -153,7 +160,11 @@ impl Scenario for Operations {
                 .await,
             &format!("{d}: upsert do nothing"),
         );
-        assert_eq!(team_name(cx, conn, 1, "after do nothing").await, "crimson", "{d}");
+        assert_eq!(
+            team_name(cx, conn, 1, "after do nothing").await,
+            "crimson",
+            "{d}"
+        );
         // Conflict on a UNIQUE column named as the target: no new row.
         expect_outcome(
             insert!(&team(9, "crimson"))
@@ -182,8 +193,16 @@ impl Scenario for Operations {
                 .await,
             &format!("{d}: bulk upsert"),
         );
-        assert_eq!(team_name(cx, conn, 2, "bulk upsert existing").await, "navy", "{d}");
-        assert_eq!(team_name(cx, conn, 4, "bulk upsert new").await, "gold", "{d}");
+        assert_eq!(
+            team_name(cx, conn, 2, "bulk upsert existing").await,
+            "navy",
+            "{d}"
+        );
+        assert_eq!(
+            team_name(cx, conn, 4, "bulk upsert new").await,
+            "gold",
+            "{d}"
+        );
         expect_outcome(
             insert_many!(&[team(3, "ignored"), team(4, "ignored")])
                 .on_conflict_do_nothing()
@@ -191,7 +210,11 @@ impl Scenario for Operations {
                 .await,
             &format!("{d}: bulk do nothing"),
         );
-        assert_eq!(team_name(cx, conn, 3, "bulk do nothing").await, "green", "{d}");
+        assert_eq!(
+            team_name(cx, conn, 3, "bulk do nothing").await,
+            "green",
+            "{d}"
+        );
 
         // ---- Bulk insert ---------------------------------------------------
         let players: Vec<Player> = (1..=100).map(player).collect();
@@ -200,7 +223,11 @@ impl Scenario for Operations {
             &format!("{d}: bulk insert"),
         );
         assert_eq!(inserted, 100, "{d}: bulk insert affected rows");
-        assert_eq!(count(cx, conn, select!(Player), "count players").await, 100, "{d}");
+        assert_eq!(
+            count(cx, conn, select!(Player), "count players").await,
+            100,
+            "{d}"
+        );
 
         // ---- RETURNING -----------------------------------------------------
         if driver.supports_returning() {
@@ -212,7 +239,11 @@ impl Scenario for Operations {
                 &format!("{d}: insert returning"),
             )
             .unwrap_or_else(|| panic!("{d}: insert RETURNING produced no row"));
-            assert_eq!(row.get_named::<String>("name").unwrap(), "player-101", "{d}");
+            assert_eq!(
+                row.get_named::<String>("name").unwrap(),
+                "player-101",
+                "{d}"
+            );
             assert_eq!(row.get_named::<i64>("score").unwrap(), 101, "{d}");
 
             let rows = expect_outcome(
@@ -236,7 +267,11 @@ impl Scenario for Operations {
                 &format!("{d}: delete returning"),
             );
             assert_eq!(rows.len(), 1, "{d}");
-            assert_eq!(rows[0].get_named::<String>("name").unwrap(), "player-101", "{d}");
+            assert_eq!(
+                rows[0].get_named::<String>("name").unwrap(),
+                "player-101",
+                "{d}"
+            );
         } else {
             // MySQL has no RETURNING; `execute_returning` re-reads the rows by
             // primary key instead (see the CHANGELOG entry that added it).
@@ -248,7 +283,11 @@ impl Scenario for Operations {
                 &format!("{d}: insert returning (re-select fallback)"),
             )
             .unwrap_or_else(|| panic!("{d}: insert RETURNING fallback produced no row"));
-            assert_eq!(row.get_named::<String>("name").unwrap(), "player-101", "{d}");
+            assert_eq!(
+                row.get_named::<String>("name").unwrap(),
+                "player-101",
+                "{d}"
+            );
             let rows = expect_outcome(
                 UpdateBuilder::<Player>::empty()
                     .set("score", 1000)
@@ -269,9 +308,17 @@ impl Scenario for Operations {
                 &format!("{d}: delete returning (re-select fallback)"),
             );
             assert_eq!(rows.len(), 1, "{d}");
-            assert_eq!(rows[0].get_named::<String>("name").unwrap(), "player-101", "{d}");
+            assert_eq!(
+                rows[0].get_named::<String>("name").unwrap(),
+                "player-101",
+                "{d}"
+            );
         }
-        assert_eq!(count(cx, conn, select!(Player), "after returning").await, 100, "{d}");
+        assert_eq!(
+            count(cx, conn, select!(Player), "after returning").await,
+            100,
+            "{d}"
+        );
 
         // ---- Eager loading -------------------------------------------------
         // Many-to-one: players come back with their team loaded; the player
@@ -300,7 +347,10 @@ impl Scenario for Operations {
             );
         }
         let orphan = &players[3];
-        assert!(orphan.team.is_loaded(), "{d}: orphan must be loaded-as-None");
+        assert!(
+            orphan.team.is_loaded(),
+            "{d}: orphan must be loaded-as-None"
+        );
         assert!(orphan.team.get().is_none(), "{d}: orphan has no team");
 
         // One-to-many: one Team per row despite the fan-out, with its players.
@@ -318,7 +368,11 @@ impl Scenario for Operations {
             "{d}: eager result is deduplicated"
         );
         for t in &teams {
-            assert!(t.players.is_loaded(), "{d}: team {} players not loaded", t.id);
+            assert!(
+                t.players.is_loaded(),
+                "{d}: team {} players not loaded",
+                t.id
+            );
             let expected_len = if t.id == 4 { 0 } else { 33 };
             assert_eq!(t.players.len(), expected_len, "{d}: team {} players", t.id);
             assert!(
@@ -366,7 +420,10 @@ impl Scenario for Operations {
         )
         .await;
         assert_eq!(green.len(), 33, "{d}");
-        assert!(green.iter().all(|id| (id - 1) % 3 + 1 == 3), "{d}: {green:?}");
+        assert!(
+            green.iter().all(|id| (id - 1) % 3 + 1 == 3),
+            "{d}: {green:?}"
+        );
         // NOT IN excludes the NULL team_id as SQL requires (NULL NOT IN (...) is NULL).
         let not_green = player_ids(
             cx,
@@ -382,9 +439,9 @@ impl Scenario for Operations {
         let green_raw = player_ids(
             cx,
             conn,
-            select!(Player).filter(Expr::col("team_id").in_list(vec![Expr::subquery(
-                format!("SELECT id FROM {quoted_teams} WHERE name = 'green'"),
-            )])),
+            select!(Player).filter(Expr::col("team_id").in_list(vec![Expr::subquery(format!(
+                "SELECT id FROM {quoted_teams} WHERE name = 'green'"
+            ))])),
             &format!("{d}: IN (string subquery)"),
         )
         .await;
@@ -438,7 +495,11 @@ impl Scenario for Operations {
             &format!("{d}: delete with subquery"),
         );
         assert_eq!(deleted, 33, "{d}: delete affected rows");
-        assert_eq!(count(cx, conn, select!(Player), "after delete").await, 67, "{d}");
+        assert_eq!(
+            count(cx, conn, select!(Player), "after delete").await,
+            67,
+            "{d}"
+        );
 
         // ---- Projections into raw rows -------------------------------------
         let (sql, params) = select!(Player)
@@ -451,7 +512,11 @@ impl Scenario for Operations {
         );
         assert_eq!(rows.len(), 1, "{d}");
         assert_eq!(rows[0].len(), 2, "{d}: projected column count");
-        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "player-1", "{d}");
+        assert_eq!(
+            rows[0].get_named::<String>("name").unwrap(),
+            "player-1",
+            "{d}"
+        );
         assert_eq!(rows[0].get_named::<i64>("score").unwrap(), 1, "{d}");
 
         for table in [PLAYERS, TEAMS] {
@@ -468,11 +533,8 @@ impl Scenario for Operations {
 
 #[test]
 fn every_query_builder_operation_executes_on_every_available_driver() {
-    let runtime = asupersync::RuntimeBuilder::current_thread()
-        .build()
-        .expect("runtime");
-    runtime.block_on(|cx: Cx| async move {
-        let ran = run_on_every_driver(&cx, &Operations);
-        assert!(!ran.is_empty(), "no driver ran the operations corpus");
-    });
+    let cx = Cx::for_testing();
+    let ran = run_on_every_driver(&cx, &Operations);
+    assert!(ran.contains(&"frankensqlite"), "{ran:?}");
+    assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
 }
