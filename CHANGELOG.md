@@ -88,7 +88,10 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   leaves the database unchanged; on MySQL, where DDL commits implicitly, the statements before the
   failure stay applied and no tracking row is written (documented on `migrate`). A failure is an
   `Error::Schema` of kind `Migration` naming the migration, the direction, and the statement, with
-  the driver error as its source. `Dialect::supports_transactional_ddl` is new. Until now a
+  the driver error as its source. `Dialect::supports_transactional_ddl` is new. A script that
+  manages its own transaction (the SQLite table-recreation scripts emit `PRAGMA foreign_keys=OFF;
+  BEGIN; ...; COMMIT; PRAGMA foreign_keys=ON`) runs as written, since nesting it would fail at its
+  `BEGIN` and the pragma has no effect inside a transaction. Until now a
   multi-statement migration, which is exactly what `Migration::from_operations` produces, could not
   run on PostgreSQL at all (the extended protocol rejects several statements in one execute), and
   nothing was ever transactional.
@@ -206,6 +209,12 @@ facade tests, and the driver integration suites run against live Docker database
   `SchemaBuilder` had already learned to say `VARCHAR(255)`. They now take the dialect and use the
   same `FieldInfo::effective_sql_type_for` rule, so the schema the differ expects is the schema
   the generated DDL creates. Found by the e2e schema fixpoint scenario on MySQL.
+- **SQLite rollbacks of recreate-based changes were not runnable.** `SchemaOperation::inverse`
+  dropped the table snapshot, so the SQLite generator rendered the `down` script of an altered
+  column type, nullability or default, or an added primary key, foreign key or unique constraint as
+  `SELECT __sqlmodel_error__('... requires table_info')`, which fails the moment it is run. The
+  inverse now carries the table as it is after the forward operation and the rollback rebuilds the
+  table. Found by the e2e schema fixpoint scenario rolling back a nullability change on SQLite.
 - **`schema_diff` reported two false differences on MySQL.** `BOOLEAN` comes back from the server
   as `tinyint(1)` and integers keep their display widths, which the normalizer treated as type
   changes; and the index MySQL creates for every foreign key was reported as an index to drop,

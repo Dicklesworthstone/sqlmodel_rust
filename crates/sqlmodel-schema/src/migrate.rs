@@ -254,6 +254,20 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     statements
 }
 
+/// Whether a top-level statement starts, commits, or rolls back a
+/// transaction itself (`BEGIN`, `COMMIT`, `END`, `ROLLBACK`). A `BEGIN`
+/// inside a dollar-quoted function body is not a top-level statement and
+/// does not count.
+fn statement_controls_transaction(statement: &str) -> bool {
+    let first = statement
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(first.as_str(), "BEGIN" | "COMMIT" | "END" | "ROLLBACK")
+}
+
 /// Which script of a migration to run.
 #[derive(Debug, Clone, Copy)]
 enum ScriptDirection {
@@ -631,7 +645,13 @@ impl MigrationRunner {
         };
         let direction = direction.name();
         let statements = split_statements(script);
-        if conn.dialect().supports_transactional_ddl() {
+        // A script that manages its own transaction (SQLite table recreation
+        // emits `PRAGMA foreign_keys=OFF; BEGIN; ...; COMMIT; PRAGMA
+        // foreign_keys=ON`) runs as written: nesting it in another transaction
+        // fails at its BEGIN, and the PRAGMA has no effect inside one. Its
+        // tracking row is then written after the script, outside it.
+        let owns_transaction = statements.iter().any(|s| statement_controls_transaction(s));
+        if conn.dialect().supports_transactional_ddl() && !owns_transaction {
             let tx = match conn.begin(cx).await {
                 Outcome::Ok(tx) => tx,
                 Outcome::Err(e) => return Outcome::Err(e),
@@ -1115,6 +1135,28 @@ mod tests {
         // `from_operations` output: statements joined with ";\n\n" plus a trailing ";".
         let m = Migration::new("1", "d", "A;\n\nB;", "");
         assert_eq!(split_statements(&m.up), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn scripts_that_manage_their_own_transaction_are_detected() {
+        for s in [
+            "BEGIN",
+            "begin transaction",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "  Begin;",
+        ] {
+            assert!(statement_controls_transaction(s), "{s}");
+        }
+        for s in [
+            "CREATE TABLE t (id INT)",
+            "PRAGMA foreign_keys=OFF",
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "SELECT 'BEGIN'",
+        ] {
+            assert!(!statement_controls_transaction(s), "{s}");
+        }
     }
 
     #[test]

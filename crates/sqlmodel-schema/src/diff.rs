@@ -141,10 +141,40 @@ impl SchemaOperation {
         )
     }
 
+    /// The table snapshot this operation carries: the table as it is right
+    /// before the operation runs (SQLite recreation needs it).
+    fn table_info_before(&self) -> Option<&TableInfo> {
+        match self {
+            SchemaOperation::DropColumn { table_info, .. }
+            | SchemaOperation::AlterColumnType { table_info, .. }
+            | SchemaOperation::AlterColumnNullable { table_info, .. }
+            | SchemaOperation::AlterColumnDefault { table_info, .. }
+            | SchemaOperation::AddPrimaryKey { table_info, .. }
+            | SchemaOperation::DropPrimaryKey { table_info, .. }
+            | SchemaOperation::AddForeignKey { table_info, .. }
+            | SchemaOperation::DropForeignKey { table_info, .. }
+            | SchemaOperation::AddUnique { table_info, .. }
+            | SchemaOperation::DropUnique { table_info, .. } => table_info.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The table as it is after this operation ran: the snapshot the inverse
+    /// operation needs. Without it a SQLite rollback of any recreate-based
+    /// change rendered as an unrunnable `SELECT __sqlmodel_error__(...)`
+    /// (found by the e2e schema fixpoint scenario, 2026-09).
+    fn table_info_after(&self) -> Option<TableInfo> {
+        let mut after = self.table_info_before()?.clone();
+        sqlite_apply_op_to_table_info(&mut after, self);
+        Some(after)
+    }
+
     /// Get the inverse operation for rollback, if possible.
     ///
     /// Some operations are not reversible (e.g., dropping a table/column) because the
     /// original schema and data cannot be reconstructed from the operation alone.
+    /// Inverses of recreate-based operations carry the table snapshot as it is
+    /// after the forward operation, so SQLite can rebuild the table on rollback.
     pub fn inverse(&self) -> Option<Self> {
         match self {
             SchemaOperation::CreateTable(table) => {
@@ -172,7 +202,7 @@ impl SchemaOperation {
                 column: column.clone(),
                 from_type: to_type.clone(),
                 to_type: from_type.clone(),
-                table_info: None,
+                table_info: self.table_info_after(),
             }),
             SchemaOperation::AlterColumnNullable {
                 table,
@@ -189,7 +219,7 @@ impl SchemaOperation {
                 },
                 from_nullable: *to_nullable,
                 to_nullable: *from_nullable,
-                table_info: None,
+                table_info: self.table_info_after(),
             }),
             SchemaOperation::AlterColumnDefault {
                 table,
@@ -202,7 +232,7 @@ impl SchemaOperation {
                 column: column.clone(),
                 from_default: to_default.clone(),
                 to_default: from_default.clone(),
-                table_info: None,
+                table_info: self.table_info_after(),
             }),
             SchemaOperation::RenameColumn { table, from, to } => {
                 Some(SchemaOperation::RenameColumn {
@@ -213,14 +243,14 @@ impl SchemaOperation {
             }
             SchemaOperation::AddPrimaryKey { table, .. } => Some(SchemaOperation::DropPrimaryKey {
                 table: table.clone(),
-                table_info: None,
+                table_info: self.table_info_after(),
             }),
             SchemaOperation::DropPrimaryKey { .. } => None,
             SchemaOperation::AddForeignKey { table, fk, .. } => {
                 Some(SchemaOperation::DropForeignKey {
                     table: table.clone(),
                     name: fk_effective_name(table, fk),
-                    table_info: None,
+                    table_info: self.table_info_after(),
                 })
             }
             SchemaOperation::DropForeignKey { .. } => None,
@@ -229,7 +259,7 @@ impl SchemaOperation {
             } => Some(SchemaOperation::DropUnique {
                 table: table.clone(),
                 name: unique_effective_name(table, constraint),
-                table_info: None,
+                table_info: self.table_info_after(),
             }),
             SchemaOperation::DropUnique { .. } => None,
             SchemaOperation::CreateIndex { table, index } => Some(SchemaOperation::DropIndex {
@@ -1415,6 +1445,57 @@ mod tests {
             indexes: Vec::new(),
             comment: None,
         }
+    }
+
+    /// The inverse of a recreate-based operation carries the table as it is
+    /// after the forward operation, so SQLite can rebuild it on rollback
+    /// instead of emitting a placeholder error statement.
+    #[test]
+    fn sqlite_rollback_of_a_recreate_operation_is_runnable() {
+        use crate::ddl::{DdlGenerator, SqliteDdlGenerator};
+
+        let before = make_table(
+            "players",
+            vec![
+                make_column("id", "INTEGER", false),
+                make_column("name", "TEXT", false),
+            ],
+        );
+        let mut relaxed = before.columns[1].clone();
+        relaxed.nullable = true;
+        let forward = SchemaOperation::AlterColumnNullable {
+            table: "players".to_string(),
+            column: relaxed,
+            from_nullable: false,
+            to_nullable: true,
+            table_info: Some(before),
+        };
+
+        let inverse = forward.inverse().expect("reversible");
+        match &inverse {
+            SchemaOperation::AlterColumnNullable {
+                from_nullable,
+                to_nullable,
+                table_info: Some(snapshot),
+                ..
+            } => {
+                assert!(*from_nullable && !*to_nullable);
+                let name = snapshot.columns.iter().find(|c| c.name == "name").unwrap();
+                assert!(name.nullable, "snapshot reflects the forward change");
+            }
+            other => panic!("unexpected inverse: {other:?}"),
+        }
+
+        let down = SqliteDdlGenerator.generate_rollback(&[forward]).join(";\n");
+        assert!(
+            !down.contains("__sqlmodel_error__"),
+            "rollback must be runnable SQL:\n{down}"
+        );
+        assert!(
+            down.contains("CREATE TABLE"),
+            "rollback recreates the table:\n{down}"
+        );
+        assert!(down.contains("\"name\" TEXT NOT NULL"), "{down}");
     }
 
     /// MySQL reports `BOOLEAN` back as `tinyint(1)` and keeps display widths

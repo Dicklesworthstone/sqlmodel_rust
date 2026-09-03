@@ -54,6 +54,33 @@ struct PlayerV2 {
     nickname: Option<String>,
 }
 
+/// One release later: `name` becomes nullable. On SQLite that is a table
+/// recreation (copy, drop, rename) which must preserve the rows and the
+/// index; on the others it is an `ALTER COLUMN`.
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table = "e2e_fix_players")]
+struct PlayerV3 {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    #[sqlmodel(foreign_key = "e2e_fix_teams.id")]
+    team_id: i64,
+    #[sqlmodel(index = "e2e_fix_players_name_idx", nullable)]
+    name: Option<String>,
+    score: i32,
+    active: bool,
+    #[sqlmodel(nullable)]
+    nickname: Option<String>,
+}
+
+async fn count<C: Connection>(cx: &Cx, conn: &C, table: &str, label: &str) -> i64 {
+    let rows = expect_outcome(
+        conn.query(cx, &format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await,
+        label,
+    );
+    rows[0].get_as::<i64>(0).expect("count")
+}
+
 /// Introspect only the tables this scenario owns (the network databases are
 /// shared with other tests), as a schema the differ can compare.
 async fn introspect_ours<C: Connection>(
@@ -131,6 +158,19 @@ impl Scenario for Fixpoint {
             diff.warnings
         );
 
+        // Rows that every later step must preserve.
+        let teams_q = q(<Team as Model>::TABLE_NAME);
+        let players_q = q(<Player as Model>::TABLE_NAME);
+        for stmt in [
+            format!("INSERT INTO {teams_q} (id, name) VALUES (1, 'red'), (2, 'blue')"),
+            format!(
+                "INSERT INTO {players_q} (id, team_id, name, score, active) \
+                 VALUES (1, 1, 'ann', 10, TRUE), (2, 2, 'bob', 20, FALSE)"
+            ),
+        ] {
+            expect_outcome(conn.execute(cx, &stmt, &[]).await, &format!("{d}: seed"));
+        }
+
         // 3. Evolve: a new nullable column on players -> exactly one AddColumn.
         let expected = <(Team, PlayerV2) as ModelTuple>::database_schema(dialect);
         let diff = schema_diff(&current, &expected);
@@ -143,7 +183,8 @@ impl Scenario for Fixpoint {
         let mut evolve = Migration::from_operations(&diff.operations, &*ddl, "add nickname");
         evolve.id = "0002_nickname".into();
         eprintln!("{d}: evolve migration up:\n{}", evolve.up);
-        let runner = MigrationRunner::new(vec![initial, evolve]).table_name(tracking);
+        let runner =
+            MigrationRunner::new(vec![initial.clone(), evolve.clone()]).table_name(tracking);
         let applied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: evolve"));
         assert_eq!(applied, vec!["0002_nickname"], "{d}");
         let current = introspect_ours(cx, conn, dialect, &ours, &format!("{d}: evolved")).await;
@@ -154,7 +195,95 @@ impl Scenario for Fixpoint {
             diff.operations
         );
 
-        // 4. Rolling the evolution back restores the previous fixpoint.
+        // 4. Evolve again: `name` becomes nullable. On SQLite this is the
+        // table-recreation path (rename, create, copy, drop, re-index).
+        let expected = <(Team, PlayerV3) as ModelTuple>::database_schema(dialect);
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.iter().any(|op| matches!(
+                op,
+                sqlmodel_schema::diff::SchemaOperation::AlterColumnNullable { .. }
+            )),
+            "{d}: expected an AlterColumnNullable, got {:?}",
+            diff.operations
+        );
+        let mut relax = Migration::from_operations(&diff.operations, &*ddl, "name nullable");
+        relax.id = "0003_name_nullable".into();
+        eprintln!("{d}: relax migration up:\n{}", relax.up);
+        let runner =
+            MigrationRunner::new(vec![initial.clone(), evolve.clone(), relax]).table_name(tracking);
+        let applied = expect_outcome(runner.migrate(cx, conn).await, &format!("{d}: relax"));
+        assert_eq!(applied, vec!["0003_name_nullable"], "{d}");
+        let current = introspect_ours(cx, conn, dialect, &ours, &format!("{d}: relaxed")).await;
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after relaxing; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &players_q, "players after recreate").await,
+            2,
+            "{d}"
+        );
+        let bob = expect_outcome(
+            conn.query(
+                cx,
+                &format!(
+                    "SELECT {} FROM {players_q} WHERE {} = 2",
+                    q("name"),
+                    q("id")
+                ),
+                &[],
+            )
+            .await,
+            &format!("{d}: read bob"),
+        );
+        assert_eq!(
+            bob[0].get_as::<String>(0).unwrap(),
+            "bob",
+            "{d}: data survived"
+        );
+        expect_outcome(
+            conn.execute(
+                cx,
+                &format!(
+                    "INSERT INTO {players_q} (id, team_id, name, score, active) \
+                     VALUES (3, 1, NULL, 0, TRUE)"
+                ),
+                &[],
+            )
+            .await,
+            &format!("{d}: NULL name accepted after relaxing"),
+        );
+        // A NULL name cannot survive the rollback to NOT NULL; remove it first.
+        expect_outcome(
+            conn.execute(
+                cx,
+                &format!("DELETE FROM {players_q} WHERE {} = 3", q("id")),
+                &[],
+            )
+            .await,
+            &format!("{d}: remove null-name row"),
+        );
+
+        // 5. Rolling back twice restores the earlier fixpoints, rows intact.
+        let rolled = expect_outcome(runner.rollback(cx, conn).await, &format!("{d}: rollback 3"));
+        assert_eq!(rolled.as_deref(), Some("0003_name_nullable"), "{d}");
+        let expected = <(Team, PlayerV2) as ModelTuple>::database_schema(dialect);
+        let current = introspect_ours(cx, conn, dialect, &ours, &format!("{d}: unrelaxed")).await;
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "{d}: fixpoint after rolling back the recreate; leftover operations: {:#?}",
+            diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &players_q, "players after rollback").await,
+            2,
+            "{d}"
+        );
+
         let rolled = expect_outcome(runner.rollback(cx, conn).await, &format!("{d}: rollback"));
         assert_eq!(rolled.as_deref(), Some("0002_nickname"), "{d}");
         let expected = <(Team, Player) as ModelTuple>::database_schema(dialect);
@@ -164,6 +293,16 @@ impl Scenario for Fixpoint {
             diff.operations.is_empty(),
             "{d}: fixpoint after rollback; leftover operations: {:#?}",
             diff.operations
+        );
+        assert_eq!(
+            count(cx, conn, &players_q, "players at the end").await,
+            2,
+            "{d}"
+        );
+        assert_eq!(
+            count(cx, conn, &teams_q, "teams at the end").await,
+            2,
+            "{d}"
         );
 
         for t in [
