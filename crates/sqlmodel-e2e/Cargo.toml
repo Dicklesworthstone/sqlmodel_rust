@@ -18,7 +18,7 @@ workspace = true
 # The external value types are what the README's type table promises; the
 # round-trip scenario proves them on every driver.
 sqlmodel = { workspace = true, features = ["chrono", "uuid", "decimal"] }
-sqlmodel-core.workspace = true
+sqlmodel-core = { workspace = true, features = ["test-support"] }
 chrono.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true

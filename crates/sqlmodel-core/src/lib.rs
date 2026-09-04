@@ -43,6 +43,13 @@ pub mod types;
 pub mod validate;
 pub mod value;
 
+/// Cancellation-injection test support.
+///
+/// Only compiled under `#[cfg(any(test, feature = "test-support"))]` so the
+/// published default build carries none of it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 /// Optional `From`/`TryFrom`/`FromValue` impls for chrono, uuid, and rust_decimal
 /// types (features `chrono`, `uuid`, `decimal`).
 #[cfg(any(feature = "chrono", feature = "uuid", feature = "decimal"))]
