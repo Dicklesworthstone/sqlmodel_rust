@@ -1079,74 +1079,123 @@ impl Connection for SqliteConnection {
 impl TransactionOps for SqliteTransaction<'_> {
     fn query(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
-        let result = self.conn.query_sync(sql, params);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        // Every operation, including transaction-scoped ones, returns
+        // Cancelled for an already-cancelled context before touching the
+        // database (mirrors the postgres driver and `Connection` methods).
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.conn
+                .query_sync(sql, params)
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        async move { result }
     }
 
     fn query_one(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
-        let result = self.conn.query_sync(sql, params).map(|mut rows| rows.pop());
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.conn
+                .query_sync(sql, params)
+                .map(|mut rows| rows.pop())
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        async move { result }
     }
 
     fn execute(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<u64, Error>> + Send {
-        let result = self.conn.execute_sync(sql, params);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.conn
+                .execute_sync(sql, params)
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        async move { result }
     }
 
-    fn savepoint(&self, _cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
+    fn savepoint(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
         // Quote identifier to prevent SQL injection
         let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
-        let sql = format!("SAVEPOINT {}", quoted_name);
-        let result = self.conn.execute_raw(&sql);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let sql = format!("SAVEPOINT {quoted_name}");
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.conn
+                .execute_raw(&sql)
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        async move { result }
     }
 
-    fn rollback_to(&self, _cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
+    fn rollback_to(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
         // Quote identifier to prevent SQL injection
         let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
-        let sql = format!("ROLLBACK TO {}", quoted_name);
-        let result = self.conn.execute_raw(&sql);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let sql = format!("ROLLBACK TO {quoted_name}");
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.conn
+                .execute_raw(&sql)
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        async move { result }
     }
 
-    fn release(&self, _cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
+    fn release(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
         // Quote identifier to prevent SQL injection
         let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
-        let sql = format!("RELEASE {}", quoted_name);
-        let result = self.conn.execute_raw(&sql);
-        async move { result.map_or_else(Outcome::Err, Outcome::Ok) }
+        let sql = format!("RELEASE {quoted_name}");
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.conn
+                .execute_raw(&sql)
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        async move { result }
     }
 
-    fn commit(mut self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-        self.committed = true;
-        std::future::ready(
+    fn commit(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        // A cancelled commit leaves the transaction uncommitted, so the drop
+        // path still rolls it back: cancellation can never turn into a
+        // partial commit.
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.committed = true;
             self.conn
                 .commit_sync()
-                .map_or_else(Outcome::Err, Outcome::Ok),
-        )
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        std::future::ready(result)
     }
 
-    fn rollback(mut self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-        self.committed = true; // Prevent double rollback in drop
-        std::future::ready(
+    fn rollback(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        let result = if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            Outcome::Cancelled(reason)
+        } else {
+            self.committed = true; // Prevent double rollback in drop
             self.conn
                 .rollback_sync()
-                .map_or_else(Outcome::Err, Outcome::Ok),
-        )
+                .map_or_else(Outcome::Err, Outcome::Ok)
+        };
+        std::future::ready(result)
     }
 }
 

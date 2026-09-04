@@ -2692,6 +2692,11 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
     #[allow(unused_assignments)]
     fn commit(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         async move {
+            // Pre-flight guard: an already-cancelled context must not commit
+            // (same invariant as the postgres driver's SharedPgTransaction).
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };
@@ -2709,6 +2714,9 @@ impl<'conn> TransactionOps for SharedMySqlTransaction<'conn> {
 
     fn rollback(self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
         async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await else {
                 return Outcome::Err(connection_error("Failed to acquire connection lock"));
             };

@@ -12,12 +12,14 @@
 //! Oracles per cancelled run:
 //! 1. the outcome is `Outcome::Cancelled` (never `Ok`, `Err`, or `Panicked`);
 //! 2. the call log marks checkpoint `k` as `cancelled_before`;
-//! 3. no `tx.commit` runs after the cancellation point (a dropped
-//!    transaction must roll back, never commit);
-//! 4. unless the operation is non-atomic by design (`Oracle::Partial`), the
-//!    database state equals the pre-operation snapshot — for transactional
-//!    operations the automatic rollback restores it, for single-call
-//!    operations cancellation precedes the only mutation.
+//! 3. no `commit` runs after the cancellation point (a dropped transaction
+//!    must roll back, never commit);
+//! 4. unless the operation is non-atomic by design, the database state
+//!    matches the oracle: `Snapshot` (equal to the pre-operation snapshot —
+//!    transactional operations restore it by rollback, single-call
+//!    operations never executed their mutation), `FirstKApplied` (exactly
+//!    the first `k - 1` statements applied), or `AllowedExtra` (one of a
+//!    documented set of partial states).
 //!
 //! Runs on C SQLite in memory (per the bead): every iteration gets a fresh
 //! `Cx` and a fresh database, so cancellation stickiness and leftover state
@@ -28,11 +30,11 @@
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
-use sqlmodel::prelude::*;
 use sqlmodel::Session;
+use sqlmodel::prelude::*;
 use sqlmodel_core::test_support::CancelAt;
 use sqlmodel_core::{
-    LinkTableInfo, RelatedMany, RetryPolicy, TransactionOptions, retry_transaction,
+    Lazy, LinkTableInfo, RelatedMany, RetryPolicy, TransactionOptions, retry_transaction,
 };
 use sqlmodel_e2e::expect_outcome;
 use sqlmodel_schema::{Migration, MigrationRunner, create_all};
@@ -53,13 +55,11 @@ struct Item {
     owner: Option<i64>,
 }
 
-impl Item {
-    fn seed(id: i64, name: &str, owner: Option<i64>) -> Self {
-        Self {
-            id: Some(id),
-            name: name.to_owned(),
-            owner,
-        }
+fn item_of(id: i64, name: &str) -> Item {
+    Item {
+        id: Some(id),
+        name: name.to_owned(),
+        owner: None,
     }
 }
 
@@ -92,6 +92,19 @@ struct Child {
     title: String,
     #[sqlmodel(primary_key, foreign_key = "e2e_cancel_parents.id")]
     parent_id: i64,
+    /// Many-to-one, loaded on demand through `Session::load_lazy` /
+    /// `Session::load_many`.
+    #[sqlmodel(relationship(model = "Parent", foreign_key = "parent_id"))]
+    parent: Lazy<Parent>,
+}
+
+fn child(id: i64, parent_id: i64, title: &str) -> Child {
+    Child {
+        id,
+        title: title.to_owned(),
+        parent_id,
+        parent: Lazy::from_fk(parent_id),
+    }
 }
 
 #[derive(sqlmodel::Model, Debug, Clone, Serialize, Deserialize)]
@@ -102,18 +115,12 @@ struct Tag {
     label: String,
 }
 
+/// Joined-table inheritance fixture for the polymorphic sweeps. The models
+/// use the bare `table` attribute on purpose: with an explicit
+/// `table = "..."` the derive's joined-child inference (parse.rs) does not
+/// fire and the polymorphic select rejects the model pair.
 #[derive(sqlmodel::Model, Debug, Clone, Serialize, Deserialize)]
-#[sqlmodel(table = "e2e_cancel_parent_tags")]
-struct ParentTag {
-    #[sqlmodel(primary_key, foreign_key = "e2e_cancel_parents.id")]
-    parent_id: i64,
-    #[sqlmodel(primary_key, foreign_key = "e2e_cancel_tags.id")]
-    tag_id: i64,
-}
-
-/// Joined-table inheritance fixture for the polymorphic sweeps.
-#[derive(sqlmodel::Model, Debug, Clone, Serialize, Deserialize)]
-#[sqlmodel(table = "e2e_cancel_people", inheritance = "joined")]
+#[sqlmodel(table, inheritance = "joined")]
 struct Person {
     #[sqlmodel(primary_key)]
     id: i64,
@@ -121,7 +128,7 @@ struct Person {
 }
 
 #[derive(sqlmodel::Model, Debug, Clone, Serialize, Deserialize)]
-#[sqlmodel(table = "e2e_cancel_students", inherits = "Person")]
+#[sqlmodel(table, inherits = "Person")]
 struct Student {
     #[sqlmodel(parent)]
     person: Person,
@@ -130,7 +137,10 @@ struct Student {
     grade: String,
 }
 
-const ITEMS_TABLE: &str = "e2e_cancel_items";
+struct Fixture {
+    ddl: Vec<&'static str>,
+    seed: Vec<&'static str>,
+}
 
 fn items_fixture() -> Fixture {
     Fixture {
@@ -164,19 +174,14 @@ fn family_fixture() -> Fixture {
 fn inheritance_fixture() -> Fixture {
     Fixture {
         ddl: vec![
-            "CREATE TABLE e2e_cancel_people (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-            "CREATE TABLE e2e_cancel_students (id INTEGER PRIMARY KEY, grade TEXT NOT NULL)",
+            "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            "CREATE TABLE students (id INTEGER PRIMARY KEY, grade TEXT NOT NULL)",
         ],
         seed: vec![
-            "INSERT INTO e2e_cancel_people (id, name) VALUES (1, 'ada'), (2, 'bob'), (3, 'cyd')",
-            "INSERT INTO e2e_cancel_students (id, grade) VALUES (2, 'A')",
+            "INSERT INTO people (id, name) VALUES (1, 'ada'), (2, 'bob'), (3, 'cyd')",
+            "INSERT INTO students (id, grade) VALUES (2, 'A')",
         ],
     }
-}
-
-struct Fixture {
-    ddl: Vec<&'static str>,
-    seed: Vec<&'static str>,
 }
 
 async fn seeded_db(cx: &Cx, fixture: &Fixture) -> SqliteConnection {
@@ -213,18 +218,19 @@ async fn items_state(cx: &Cx, conn: &SqliteConnection) -> Vec<String> {
         .collect()
 }
 
+async fn snapshot_table(cx: &Cx, conn: &SqliteConnection, sql: &str) -> Vec<String> {
+    expect_outcome(conn.query(cx, sql, &[]).await, "snapshot table")
+        .iter()
+        .map(|r| {
+            (0..r.len())
+                .map(|i| r.get_as::<String>(i).unwrap_or_else(|_| "?".to_owned()))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
 async fn family_state(cx: &Cx, conn: &SqliteConnection) -> Vec<String> {
-    async fn table(cx: &Cx, conn: &SqliteConnection, sql: &str) -> Vec<String> {
-        expect_outcome(conn.query(cx, sql, &[]).await, "snapshot table")
-            .iter()
-            .map(|r| {
-                (0..r.len())
-                    .map(|i| r.get_as::<String>(i).unwrap_or_else(|_| "?".to_owned()))
-                    .collect::<Vec<_>>()
-                    .join("|")
-            })
-            .collect()
-    }
     // get_as::<String> on integers is driver-dependent, so every column is
     // read through a CAST to TEXT here.
     let mut out = Vec::new();
@@ -234,7 +240,7 @@ async fn family_state(cx: &Cx, conn: &SqliteConnection) -> Vec<String> {
         "SELECT CAST(id AS TEXT), label FROM e2e_cancel_tags ORDER BY id",
         "SELECT CAST(parent_id AS TEXT), CAST(tag_id AS TEXT) FROM e2e_cancel_parent_tags ORDER BY parent_id, tag_id",
     ] {
-        out.extend(table(cx, conn, sql).await);
+        out.extend(snapshot_table(cx, conn, sql).await);
     }
     out
 }
@@ -242,18 +248,27 @@ async fn family_state(cx: &Cx, conn: &SqliteConnection) -> Vec<String> {
 async fn inheritance_state(cx: &Cx, conn: &SqliteConnection) -> Vec<String> {
     let mut out = Vec::new();
     for sql in [
-        "SELECT CAST(id AS TEXT), name FROM e2e_cancel_people ORDER BY id",
-        "SELECT CAST(id AS TEXT), grade FROM e2e_cancel_students ORDER BY id",
+        "SELECT CAST(id AS TEXT), name FROM people ORDER BY id",
+        "SELECT CAST(id AS TEXT), grade FROM students ORDER BY id",
     ] {
-        let rows = expect_outcome(conn.query(cx, sql, &[]).await, "snapshot inheritance");
-        out.extend(rows.iter().map(|r| {
-            (0..r.len())
-                .map(|i| r.get_as::<String>(i).unwrap_or_else(|_| "?".to_owned()))
-                .collect::<Vec<_>>()
-                .join("|")
-        }));
+        out.extend(snapshot_table(cx, conn, sql).await);
     }
     out
+}
+
+async fn schema_state(cx: &Cx, conn: &SqliteConnection) -> Vec<String> {
+    let rows = expect_outcome(
+        conn.query(
+            cx,
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+            &[],
+        )
+        .await,
+        "snapshot schema",
+    );
+    rows.iter()
+        .map(|r| r.get_as::<String>(0).expect("table name"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +286,13 @@ enum Oracle {
     /// adds in order.
     FirstKApplied {
         applied_by_op: &'static [&'static str],
+    },
+    /// Non-atomic by design with multiple committed steps: every entry names
+    /// one documented partial state as the set of schema objects that may
+    /// additionally exist relative to the pre-operation snapshot. Any other
+    /// extra set fails the sweep.
+    AllowedExtra {
+        allowed: &'static [&'static [&'static str]],
     },
 }
 
@@ -301,8 +323,7 @@ async fn sweep(
         let cx = Cx::for_testing();
         let conn = seeded_db(&cx, fixture).await;
         let before = state(&cx, &conn).await;
-        let wrapped =
-            CancelAt::new(conn, u64::try_from(k).expect("checkpoint index fits u64"));
+        let wrapped = CancelAt::new(conn, u64::try_from(k).expect("checkpoint index fits u64"));
         let outcome = op(&cx, &wrapped).await;
         let log = wrapped.log();
         match outcome {
@@ -313,9 +334,9 @@ async fn sweep(
             Outcome::Err(e) => panic!(
                 "{name}: checkpoint {k}/{k_max} produced Err({e:?}) instead of Cancelled; log {log:?}"
             ),
-            Outcome::Panicked(p) => panic!(
-                "{name}: checkpoint {k}/{k_max} panicked ({p:?}); log {log:?}"
-            ),
+            Outcome::Panicked(p) => {
+                panic!("{name}: checkpoint {k}/{k_max} panicked ({p:?}); log {log:?}")
+            }
         }
         assert!(
             wrapped.cancellation_injected(),
@@ -326,21 +347,21 @@ async fn sweep(
             "{name}: checkpoint {k} is not marked cancelled-before; log {log:?}"
         );
         assert!(
-            !log
-                .iter()
+            !log.iter()
                 .any(|r| r.call == "tx.commit" && !r.cancelled_before),
             "{name}: a commit ran at or after the cancellation point; log {log:?}"
         );
+        // The run Cx is cancelled by the sweep; state reads need a clean one.
+        let snap_cx = Cx::for_testing();
+        let after = state(&snap_cx, wrapped.inner()).await;
         match oracle {
             Oracle::Snapshot => {
-                let after = state(&cx, wrapped.inner()).await;
                 assert_eq!(
                     after, before,
                     "{name}: partial state after cancellation at checkpoint {k}/{k_max}; log {log:?}"
                 );
             }
             Oracle::FirstKApplied { applied_by_op } => {
-                let after = state(&cx, wrapped.inner()).await;
                 for (i, object) in applied_by_op.iter().enumerate() {
                     let applied = after.iter().any(|line| line.contains(object));
                     let want = i < k - 1;
@@ -350,13 +371,20 @@ async fn sweep(
                     );
                 }
             }
+            Oracle::AllowedExtra { allowed } => {
+                let extras: Vec<&str> = after
+                    .iter()
+                    .filter(|line| !before.contains(*line))
+                    .map(String::as_str)
+                    .collect();
+                assert!(
+                    allowed.iter().any(|state| state == &extras.as_slice()),
+                    "{name}: checkpoint {k}/{k_max} left an undocumented partial state {extras:?}; allowed {allowed:?}; full state {after:?}"
+                );
+            }
         }
     }
     eprintln!("cancel-sweep {name}: k=1..={k_max} all Cancelled, oracle {oracle:?} OK");
-}
-
-fn item_of(id: i64, name: &str) -> Item {
-    Item::seed(id, name, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,32 +399,98 @@ fn cancellation_sweep_builder_and_schema_ops_on_c_sqlite_memory() {
     rt.block_on(async {
         let items = items_fixture();
 
-        sweep("insert! execute", &items, Oracle::Snapshot, items_state, async |cx, conn| { insert!(&item_of(99, "inserted")).execute(cx, conn).await.map(|_| ()) })
+        sweep(
+            "insert! execute",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| {
+                insert!(&item_of(99, "inserted"))
+                    .execute(cx, conn)
+                    .await
+                    .map(|_| ())
+            },
+        )
         .await;
 
-        sweep("select all", &items, Oracle::Snapshot, items_state, async |cx, conn| { select!(Item).all(cx, conn).await.map(|_| ()) })
+        sweep(
+            "select all",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| select!(Item).all(cx, conn).await.map(|_| ()),
+        )
         .await;
 
-        sweep("select first", &items, Oracle::Snapshot, items_state, async |cx, conn| { select!(Item).first(cx, conn).await.map(|_| ()) })
+        sweep(
+            "select first",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| select!(Item).first(cx, conn).await.map(|_| ()),
+        )
         .await;
 
-        sweep("select one_or_none", &items, Oracle::Snapshot, items_state, async |cx, conn| { select!(Item).one_or_none(cx, conn).await.map(|_| ()) })
+        sweep(
+            "select one_or_none",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| {
+                select!(Item)
+                    .filter(Expr::col("id").eq(1))
+                    .one_or_none(cx, conn)
+                    .await
+                    .map(|_| ())
+            },
+        )
         .await;
 
-        sweep("select count", &items, Oracle::Snapshot, items_state, async |cx, conn| { select!(Item).count(cx, conn).await.map(|_| ()) })
+        sweep(
+            "select count",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| select!(Item).count(cx, conn).await.map(|_| ()),
+        )
         .await;
 
-        sweep("select exists", &items, Oracle::Snapshot, items_state, async |cx, conn| { select!(Item).exists(cx, conn).await.map(|_| ()) })
+        sweep(
+            "select exists",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| select!(Item).exists(cx, conn).await.map(|_| ()),
+        )
         .await;
 
-        sweep("update! execute", &items, Oracle::Snapshot, items_state, async |cx, conn| { update!(&item_of(1, "updated")).execute(cx, conn).await.map(|_| ()) })
+        sweep(
+            "update! execute",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| {
+                update!(&item_of(1, "updated"))
+                    .execute(cx, conn)
+                    .await
+                    .map(|_| ())
+            },
+        )
         .await;
 
-        sweep("delete! execute", &items, Oracle::Snapshot, items_state, async |cx, conn| { delete!(Item)
-            .filter(Expr::col("id").eq(1))
-            .execute(cx, conn)
-            .await
-            .map(|_| ()) })
+        sweep(
+            "delete! execute",
+            &items,
+            Oracle::Snapshot,
+            items_state,
+            async |cx, conn| {
+                delete!(Item)
+                    .filter(Expr::col("id").eq(1))
+                    .execute(cx, conn)
+                    .await
+                    .map(|_| ())
+            },
+        )
         .await;
 
         // `create_all` applies each DDL statement in its own implicit
@@ -412,40 +506,28 @@ fn cancellation_sweep_builder_and_schema_ops_on_c_sqlite_memory() {
             ddl: vec![],
             seed: vec![],
         };
+        let schemas: Vec<&str> = create_all_ddl.to_vec();
         let applied: &'static [&'static str] = &["e2e_cancel_a", "e2e_cancel_b", "e2e_cancel_c"];
-        async fn schema_state(cx: &Cx, conn: &SqliteConnection) -> Vec<String> {
-            let rows = expect_outcome(
-                conn.query(
-                    cx,
-                    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
-                    &[],
-                )
-                .await,
-                "snapshot schema",
-            );
-            rows.iter()
-                .map(|r| r.get_as::<String>(0).expect("table name"))
-                .collect()
-        }
-        let schemas: Vec<String> = create_all_ddl.to_vec();
-        let schema_refs: Vec<&str> = schemas.iter().map(String::as_str).collect();
         sweep(
             "create_all",
             &create_fixture,
-            Oracle::FirstKApplied { applied_by_op: applied },
+            Oracle::FirstKApplied {
+                applied_by_op: applied,
+            },
             schema_state,
-            async |cx, conn| { create_all(cx, conn, &schema_refs).await.map(|_| ()) },
+            async |cx, conn| create_all(cx, conn, &schemas).await,
         )
         .await;
 
         // Migration runner: one migration whose up-SQL creates a table. The
-        // runner's tracking table and the migration run through the same
-        // connection; the sweep pins the checkpoint behavior.
+        // runner is non-atomic by design: the tracking table is created in
+        // its own committed step before any migration runs. The documented
+        // partial states after a cancellation are: nothing yet, only the
+        // tracking table, or tracking table plus the fully applied migration.
         let migration_fixture = Fixture {
             ddl: vec![],
             seed: vec![],
         };
-        let runner_tables: &'static [&'static str] = &["_sqlmodel_migrations", "e2e_cancel_migrated"];
         let runner = MigrationRunner::new(vec![Migration {
             id: "001".to_owned(),
             description: "create migrated table".to_owned(),
@@ -455,16 +537,17 @@ fn cancellation_sweep_builder_and_schema_ops_on_c_sqlite_memory() {
         sweep(
             "MigrationRunner::migrate",
             &migration_fixture,
-            Oracle::Snapshot,
+            Oracle::AllowedExtra {
+                allowed: &[
+                    &[],
+                    &["_sqlmodel_migrations"],
+                    &["_sqlmodel_migrations", "e2e_cancel_migrated"],
+                ],
+            },
             schema_state,
-            async |cx, conn| { runner.migrate(cx, conn).await.map(|_| ()) },
+            async |cx, conn| runner.migrate(cx, conn).await.map(|_| ()),
         )
         .await;
-        // The oracle above also pins that a cancelled migrate leaves the
-        // tracking table + migration table untouched as a unit; if the
-        // runner is non-atomic on SQLite the Snapshot assert fails with the
-        // observed diff and this comment plus the oracle must change.
-        let _ = runner_tables;
     });
 }
 
@@ -481,19 +564,24 @@ fn cancellation_sweep_transaction_and_inheritance_ops_on_c_sqlite_memory() {
             &items,
             Oracle::Snapshot,
             items_state,
-            async |cx, conn| { retry_transaction(
-                cx,
-                conn,
-                TransactionOptions::new(),
-                &RetryPolicy::default(),
-                async |cx: &Cx, tx| {
-                    tx.execute(cx, "INSERT INTO e2e_cancel_items (id, name, owner) VALUES (50, 'retried', NULL)", &[])
+            async |cx, conn| {
+                retry_transaction(
+                    cx,
+                    conn,
+                    TransactionOptions::new(),
+                    &RetryPolicy::default(),
+                    async |cx: &Cx, tx| {
+                        tx.execute(
+                            cx,
+                            "INSERT INTO e2e_cancel_items (id, name, owner) VALUES (50, 'retried', NULL)",
+                            &[],
+                        )
                         .await
                         .map(|_| ())
-                },
-            )
-            .await
-            .map(|_| ()) },
+                    },
+                )
+                .await
+            },
         )
         .await;
 
@@ -504,11 +592,13 @@ fn cancellation_sweep_transaction_and_inheritance_ops_on_c_sqlite_memory() {
             &people,
             Oracle::Snapshot,
             inheritance_state,
-            async |cx, conn| { select!(Person)
-                .polymorphic_joined::<Student>()
-                .all(cx, conn)
-                .await
-                .map(|_| ()) },
+            async |cx, conn| {
+                select!(Person)
+                    .polymorphic_joined::<Student>()
+                    .all(cx, conn)
+                    .await
+                    .map(|_| ())
+            },
         )
         .await;
 
@@ -517,7 +607,7 @@ fn cancellation_sweep_transaction_and_inheritance_ops_on_c_sqlite_memory() {
             &people,
             Oracle::Snapshot,
             inheritance_state,
-            async |cx, conn| { select!(Student).all(cx, conn).await.map(|_| ()) },
+            async |cx, conn| select!(Student).all(cx, conn).await.map(|_| ()),
         )
         .await;
 
@@ -528,18 +618,106 @@ fn cancellation_sweep_transaction_and_inheritance_ops_on_c_sqlite_memory() {
             &people,
             Oracle::Snapshot,
             inheritance_state,
-            async |cx, conn| { let enrollment = Student {
-                person: Person {
+            async |cx, conn| {
+                let enrollment = Student {
+                    person: Person {
+                        id: 9,
+                        name: "new student".to_owned(),
+                    },
                     id: 9,
-                    name: "new student".to_owned(),
-                },
-                id: 9,
-                grade: "B".to_owned(),
-            };
-            insert!(&enrollment).execute(cx, conn).await.map(|_| ()) },
+                    grade: "B".to_owned(),
+                };
+                insert!(&enrollment).execute(cx, conn).await.map(|_| ())
+            },
         )
         .await;
     });
+}
+
+/// Session owns its connection, so this variant hands the wrapper to
+/// `Session::new` by value and reaches it again through
+/// `Session::connection` for the call log and snapshots.
+async fn sweep_session<State, Op>(name: &str, fixture: &Fixture, state: State, op: Op)
+where
+    State: AsyncFn(&Cx, &SqliteConnection) -> Vec<String>,
+    Op: AsyncFn(&mut Session<CancelAt<SqliteConnection>>, &Cx) -> Outcome<(), Error>,
+{
+    let cx = Cx::for_testing();
+    let conn = seeded_db(&cx, fixture).await;
+    let mut s = Session::new(CancelAt::new(conn, 0));
+    match op(&mut s, &cx).await {
+        Outcome::Ok(()) => {}
+        other => panic!("{name}: baseline run did not succeed: {other:?}"),
+    }
+    let k_max = usize::try_from(s.connection().calls_made()).expect("call count fits usize");
+    assert!(k_max >= 1, "{name}: operation made no connection calls");
+    eprintln!("cancel-sweep {name}: K_max={k_max}");
+
+    for k in 1..=k_max {
+        let cx = Cx::for_testing();
+        let conn = seeded_db(&cx, fixture).await;
+        let before = state(&cx, &conn).await;
+        let mut s = Session::new(CancelAt::new(
+            conn,
+            u64::try_from(k).expect("checkpoint index fits u64"),
+        ));
+        let outcome = op(&mut s, &cx).await;
+        let log = s.connection().log();
+        match outcome {
+            Outcome::Cancelled(_) => {}
+            Outcome::Ok(()) => panic!(
+                "{name}: cancellation at checkpoint {k}/{k_max} was not observed; log {log:?}"
+            ),
+            Outcome::Err(e) => panic!(
+                "{name}: checkpoint {k}/{k_max} produced Err({e:?}) instead of Cancelled; log {log:?}"
+            ),
+            Outcome::Panicked(p) => {
+                panic!("{name}: checkpoint {k}/{k_max} panicked ({p:?}); log {log:?}")
+            }
+        }
+        assert!(
+            !log.iter()
+                .any(|r| r.call == "tx.commit" && !r.cancelled_before),
+            "{name}: a commit ran at or after the cancellation point; log {log:?}"
+        );
+        // A cancelled op leaves the session's transaction open (the caller
+        // owns the rollback, as in tests/session.rs). Close it with a clean
+        // Cx; the rollback then restores the snapshot.
+        let snap_cx = Cx::for_testing();
+        if s.in_transaction() {
+            match s.rollback(&snap_cx).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(e) => panic!(
+                    "{name}: rollback after cancellation at checkpoint {k}/{k_max} failed: {e:?}; log {log:?}"
+                ),
+                Outcome::Cancelled(_) => panic!(
+                    "{name}: rollback after cancellation at checkpoint {k}/{k_max} was itself cancelled; log {log:?}"
+                ),
+                Outcome::Panicked(p) => panic!(
+                    "{name}: rollback after cancellation at checkpoint {k}/{k_max} panicked ({p:?}); log {log:?}"
+                ),
+            }
+        }
+        let after = state(&snap_cx, s.connection().inner()).await;
+        assert_eq!(
+            after, before,
+            "{name}: partial state after cancellation at checkpoint {k}/{k_max}; log {log:?}"
+        );
+    }
+    eprintln!("cancel-sweep {name}: k=1..={k_max} all Cancelled, oracle Snapshot OK");
+}
+
+fn parent(id: i64, name: &str) -> Parent {
+    Parent {
+        id,
+        name: name.to_owned(),
+        children: RelatedMany::new("parent_id"),
+        tags: RelatedMany::with_link_table(LinkTableInfo::new(
+            "e2e_cancel_parent_tags",
+            "parent_id",
+            "tag_id",
+        )),
+    }
 }
 
 #[test]
@@ -549,115 +727,93 @@ fn cancellation_sweep_session_ops_on_c_sqlite_memory() {
         .expect("asupersync runtime");
     rt.block_on(async {
         let family = family_fixture();
-        let link = LinkTableInfo::new(
-            "e2e_cancel_parent_tags",
-            "parent_id",
-            "tag_id",
-        );
+        let link = LinkTableInfo::new("e2e_cancel_parent_tags", "parent_id", "tag_id");
 
-        fn parent(id: i64, name: &str) -> Parent {
-            Parent {
-                id,
-                name: name.to_owned(),
-                children: RelatedMany::new("parent_id"),
-                tags: RelatedMany::with_link_table(LinkTableInfo::new(
-                    "e2e_cancel_parent_tags",
-                    "parent_id",
-                    "tag_id",
-                )),
-            }
-        }
-
-        async fn session_with<F, Fut>(cx: &Cx, conn: CancelAt<SqliteConnection>, op: F) -> Outcome<(), Error>
-        where
-            F: FnOnce(&mut Session<CancelAt<SqliteConnection>>) -> Fut,
-            Fut: Future<Output = Outcome<(), Error>>,
-        {
-            let mut s = Session::new(conn);
-            op(&mut s).await
-        }
-
-        sweep("session get", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
+        sweep_session("session get", &family, family_state, async |s, cx| {
             s.get::<Parent>(cx, 1).await.map(|_| ())
         })
-        .await })
         .await;
 
-        sweep("session add+flush", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
+        sweep_session("session add+flush", &family, family_state, async |s, cx| {
             s.add(&parent(9, "new parent"));
             s.flush(cx).await
         })
-        .await })
         .await;
 
-        sweep("session commit", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
+        sweep_session("session commit", &family, family_state, async |s, cx| {
             s.add(&parent(9, "committed parent"));
             s.commit(cx).await
         })
-        .await })
         .await;
 
-        sweep("session rollback", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
+        sweep_session("session rollback", &family, family_state, async |s, cx| {
             s.add(&parent(9, "rolled back parent"));
-            s.flush(cx).await?;
+            match s.flush(cx).await {
+                Outcome::Ok(()) => {}
+                other => return other,
+            }
             s.rollback(cx).await
         })
-        .await })
         .await;
 
-        sweep("session refresh", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
+        sweep_session("session refresh", &family, family_state, async |s, cx| {
             let ann = parent(1, "ann");
             s.refresh(cx, &ann).await.map(|_| ())
         })
-        .await })
         .await;
 
-        sweep("session merge", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
+        sweep_session("session merge", &family, family_state, async |s, cx| {
             s.merge(cx, parent(1, "merged ann"), true).await.map(|_| ())
         })
-        .await })
         .await;
 
-        sweep("session load_lazy", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
-            let ann = parent(1, "ann");
-            s.load_lazy(&ann.children, cx).await.map(|_| ())
+        sweep_session("session load_lazy", &family, family_state, async |s, cx| {
+            // The child was seeded with parent_id = 1; `load_lazy` must fetch
+            // exactly that parent row through the wrapper.
+            let kid = child(11, 1, "first");
+            s.load_lazy(&kid.parent, cx).await.map(|_| ())
         })
-        .await })
         .await;
 
-        sweep("session load_many", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
-            let mut parents = vec![parent(1, "ann"), parent(2, "bob")];
-            s.load_many(cx, &parents, |p: &Parent| &p.children).await.map(|_| ())
-        })
-        .await })
-        .await;
-
-        sweep("session load_one_to_many", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
-            let mut parents = vec![parent(1, "ann")];
-            s.load_one_to_many(cx, &mut parents, |p| &mut p.children, |p| Value::from(p.id))
+        sweep_session("session load_many", &family, family_state, async |s, cx| {
+            let kids = vec![child(11, 1, "first"), child(13, 2, "third")];
+            s.load_many(cx, &kids, |c: &Child| &c.parent)
                 .await
+                .map(|_| ())
         })
-        .await })
         .await;
 
-        sweep("session load_many_to_many", &family, Oracle::Snapshot, family_state, async |cx, conn| { session_with(cx, conn, |s| async {
-            let mut parents = vec![parent(1, "ann")];
-            s.load_many_to_many_pk(
-                cx,
-                &mut parents,
-                |p| &mut p.tags,
-                |p| vec![Value::from(p.id)],
-                &link,
-            )
-            .await
-            .map(|_| ())
-        })
-        .await })
+        sweep_session(
+            "session load_one_to_many",
+            &family,
+            family_state,
+            async |s, cx| {
+                let mut parents = vec![parent(1, "ann")];
+                s.load_one_to_many(cx, &mut parents, |p| &mut p.children, |p| Value::from(p.id))
+                    .await
+                    .map(|_| ())
+            },
+        )
         .await;
 
-        // The session connection itself must be reachable for raw snapshots
-        // inside cancelled runs; nothing above relied on it.
-        let _ = ITEMS_TABLE;
+        sweep_session(
+            "session load_many_to_many",
+            &family,
+            family_state,
+            async |s, cx| {
+                let mut parents = vec![parent(1, "ann")];
+                s.load_many_to_many_pk(
+                    cx,
+                    &mut parents,
+                    |p| &mut p.tags,
+                    |p| vec![Value::from(p.id)],
+                    &link,
+                )
+                .await
+                .map(|_| ())
+            },
+        )
+        .await;
     });
 }
 
@@ -675,9 +831,7 @@ fn cancellation_sweep_pool_ops_on_c_sqlite_memory() {
         let cancelled = Cx::for_testing();
         cancelled.cancel_with(asupersync::CancelKind::User, Some("pool acquire sweep"));
         let pool: sqlmodel_pool::Pool<CancelAt<SqliteConnection>> =
-            sqlmodel_pool::Pool::new(
-                sqlmodel_pool::PoolConfig::new(2).test_on_checkout(false),
-            );
+            sqlmodel_pool::Pool::new(sqlmodel_pool::PoolConfig::new(2).test_on_checkout(false));
         match pool
             .acquire(&cancelled, || async {
                 // Never executed for an already-cancelled Cx; the Err keeps
@@ -689,7 +843,9 @@ fn cancellation_sweep_pool_ops_on_c_sqlite_memory() {
             .await
         {
             Outcome::Cancelled(_) => {}
-            other => panic!("cancelled acquire must be Cancelled, got {other:?}"),
+            Outcome::Ok(_) => panic!("cancelled acquire must not hand out a lease"),
+            Outcome::Err(_) => panic!("cancelled acquire must be Cancelled, not Err"),
+            Outcome::Panicked(_) => panic!("cancelled acquire must be Cancelled, not Panicked"),
         }
         assert_eq!(pool.stats().acquires, 0, "no lease was handed out");
         assert_eq!(pool.stats().connections_created, 0, "factory never ran");

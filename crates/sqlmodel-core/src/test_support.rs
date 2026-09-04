@@ -5,7 +5,7 @@
 //! [`Cx::set_cancel_requested`] immediately before it is forwarded, so the
 //! driver's own pre-flight `cancel_requested(cx)` guard is what returns
 //! [`Outcome::Cancelled`] — the sweep exercises the real code path, not a
-//! mock. A run with `cancel_at_call == 0` injects nothing and simply records
+//! mock. A run with `cancel_from_call == 0` injects nothing and simply records
 //! the call sequence, which is how a sweep discovers `K_max` for an operation.
 //!
 //! Transaction calls (commit, rollback, savepoints) are intercepted too:
@@ -51,9 +51,9 @@ impl SweepState {
         self.log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn arm(&self, cx: &Cx, call: &'static str, sql: Option<&str>, cancel_at_call: u64) {
+    fn arm(&self, cx: &Cx, call: &'static str, sql: Option<&str>, cancel_from_call: u64) {
         let ordinal = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let cancel_here = cancel_at_call != 0 && ordinal == cancel_at_call;
+        let cancel_here = cancel_from_call != 0 && ordinal == cancel_from_call;
         if cancel_here {
             cx.set_cancel_requested(true);
             self.injected.store(true, Ordering::SeqCst);
@@ -67,7 +67,7 @@ impl SweepState {
 }
 
 /// A [`Connection`] wrapper that cancels the operation's `Cx` immediately
-/// before its `cancel_at_call`-th delegated call (1-based; `0` never cancels).
+/// before its `cancel_from_call`-th delegated call (1-based; `0` never cancels).
 ///
 /// The wrapper itself always delegates: the injected flag is observed by the
 /// driver's own cancellation guard, so the sweep proves the driver returns
@@ -75,22 +75,22 @@ impl SweepState {
 #[derive(Debug)]
 pub struct CancelAt<C> {
     inner: C,
-    cancel_at_call: u64,
+    cancel_from_call: u64,
     state: Arc<SweepState>,
 }
 
 impl<C> CancelAt<C> {
-    /// Wrap `inner`; the `cancel_at_call`-th delegated call (1-based) observes
+    /// Wrap `inner`; the `cancel_from_call`-th delegated call (1-based) observes
     /// cancellation. `0` runs the operation untouched and only records calls.
-    pub fn new(inner: C, cancel_at_call: u64) -> Self {
+    pub fn new(inner: C, cancel_from_call: u64) -> Self {
         Self {
             inner,
-            cancel_at_call,
+            cancel_from_call,
             state: Arc::new(SweepState::default()),
         }
     }
 
-    /// Number of delegated calls so far (`K_max` after a `cancel_at_call == 0`
+    /// Number of delegated calls so far (`K_max` after a `cancel_from_call == 0`
     /// run).
     pub fn calls_made(&self) -> u64 {
         self.state.calls.load(Ordering::SeqCst)
@@ -114,7 +114,7 @@ impl<C> CancelAt<C> {
     fn tx_wrapper<T>(&self, tx: T) -> CancelAtTx<T> {
         CancelAtTx {
             inner: tx,
-            cancel_at_call: self.cancel_at_call,
+            cancel_from_call: self.cancel_from_call,
             state: Arc::clone(&self.state),
         }
     }
@@ -135,23 +135,26 @@ where
     }
 
     async fn query(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<Vec<Row>, Error> {
-        self.state.arm(cx, "query", Some(sql), self.cancel_at_call);
+        self.state
+            .arm(cx, "query", Some(sql), self.cancel_from_call);
         self.inner.query(cx, sql, params).await
     }
 
     async fn query_one(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<Option<Row>, Error> {
         self.state
-            .arm(cx, "query_one", Some(sql), self.cancel_at_call);
+            .arm(cx, "query_one", Some(sql), self.cancel_from_call);
         self.inner.query_one(cx, sql, params).await
     }
 
     async fn execute(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<u64, Error> {
-        self.state.arm(cx, "execute", Some(sql), self.cancel_at_call);
+        self.state
+            .arm(cx, "execute", Some(sql), self.cancel_from_call);
         self.inner.execute(cx, sql, params).await
     }
 
     async fn insert(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<i64, Error> {
-        self.state.arm(cx, "insert", Some(sql), self.cancel_at_call);
+        self.state
+            .arm(cx, "insert", Some(sql), self.cancel_from_call);
         self.inner.insert(cx, sql, params).await
     }
 
@@ -160,22 +163,23 @@ where
         cx: &Cx,
         statements: &[(String, Vec<Value>)],
     ) -> Outcome<Vec<u64>, Error> {
-        self.state
-            .arm(cx, "batch", statements.first().map(|(sql, _)| sql.as_str()),
-            self.cancel_at_call);
+        self.state.arm(
+            cx,
+            "batch",
+            statements.first().map(|(sql, _)| sql.as_str()),
+            self.cancel_from_call,
+        );
         self.inner.batch(cx, statements).await
     }
 
     async fn begin(&self, cx: &Cx) -> Outcome<Self::Tx<'_>, Error> {
-        self.state.arm(cx, "begin", None, self.cancel_at_call);
-        self.inner
-            .begin(cx)
-            .await
-            .map(|tx| self.tx_wrapper(tx))
+        self.state.arm(cx, "begin", None, self.cancel_from_call);
+        self.inner.begin(cx).await.map(|tx| self.tx_wrapper(tx))
     }
 
     async fn begin_with(&self, cx: &Cx, isolation: IsolationLevel) -> Outcome<Self::Tx<'_>, Error> {
-        self.state.arm(cx, "begin_with", None, self.cancel_at_call);
+        self.state
+            .arm(cx, "begin_with", None, self.cancel_from_call);
         self.inner
             .begin_with(cx, isolation)
             .await
@@ -192,7 +196,7 @@ where
         options: TransactionOptions,
     ) -> Outcome<Self::Tx<'_>, Error> {
         self.state
-            .arm(cx, "begin_with_options", None, self.cancel_at_call);
+            .arm(cx, "begin_with_options", None, self.cancel_from_call);
         self.inner
             .begin_with_options(cx, options)
             .await
@@ -200,7 +204,8 @@ where
     }
 
     async fn prepare(&self, cx: &Cx, sql: &str) -> Outcome<PreparedStatement, Error> {
-        self.state.arm(cx, "prepare", Some(sql), self.cancel_at_call);
+        self.state
+            .arm(cx, "prepare", Some(sql), self.cancel_from_call);
         self.inner.prepare(cx, sql).await
     }
 
@@ -210,8 +215,12 @@ where
         stmt: &PreparedStatement,
         params: &[Value],
     ) -> Outcome<Vec<Row>, Error> {
-        self.state
-            .arm(cx, "query_prepared", Some(stmt.sql()), self.cancel_at_call);
+        self.state.arm(
+            cx,
+            "query_prepared",
+            Some(stmt.sql()),
+            self.cancel_from_call,
+        );
         self.inner.query_prepared(cx, stmt, params).await
     }
 
@@ -221,18 +230,22 @@ where
         stmt: &PreparedStatement,
         params: &[Value],
     ) -> Outcome<u64, Error> {
-        self.state
-            .arm(cx, "execute_prepared", Some(stmt.sql()), self.cancel_at_call);
+        self.state.arm(
+            cx,
+            "execute_prepared",
+            Some(stmt.sql()),
+            self.cancel_from_call,
+        );
         self.inner.execute_prepared(cx, stmt, params).await
     }
 
     async fn ping(&self, cx: &Cx) -> Outcome<(), Error> {
-        self.state.arm(cx, "ping", None, self.cancel_at_call);
+        self.state.arm(cx, "ping", None, self.cancel_from_call);
         self.inner.ping(cx).await
     }
 
     async fn close(self, cx: &Cx) -> Result<(), Error> {
-        self.state.arm(cx, "close", None, self.cancel_at_call);
+        self.state.arm(cx, "close", None, self.cancel_from_call);
         self.inner.close(cx).await
     }
 
@@ -241,7 +254,7 @@ where
         Self: Sized,
     {
         self.state
-            .arm(cx, "close_for_pool", None, self.cancel_at_call);
+            .arm(cx, "close_for_pool", None, self.cancel_from_call);
         self.inner.close_for_pool(cx).await
     }
 }
@@ -254,54 +267,55 @@ where
 #[derive(Debug)]
 pub struct CancelAtTx<T> {
     inner: T,
-    cancel_at_call: u64,
+    cancel_from_call: u64,
     state: Arc<SweepState>,
 }
 
 impl<T: TransactionOps + Sync> TransactionOps for CancelAtTx<T> {
     async fn query(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<Vec<Row>, Error> {
         self.state
-            .arm(cx, "tx.query", Some(sql), self.cancel_at_call);
+            .arm(cx, "tx.query", Some(sql), self.cancel_from_call);
         self.inner.query(cx, sql, params).await
     }
 
     async fn query_one(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<Option<Row>, Error> {
         self.state
-            .arm(cx, "tx.query_one", Some(sql), self.cancel_at_call);
+            .arm(cx, "tx.query_one", Some(sql), self.cancel_from_call);
         self.inner.query_one(cx, sql, params).await
     }
 
     async fn execute(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<u64, Error> {
         self.state
-            .arm(cx, "tx.execute", Some(sql), self.cancel_at_call);
+            .arm(cx, "tx.execute", Some(sql), self.cancel_from_call);
         self.inner.execute(cx, sql, params).await
     }
 
     async fn savepoint(&self, cx: &Cx, name: &str) -> Outcome<(), Error> {
         self.state
-            .arm(cx, "tx.savepoint", Some(name), self.cancel_at_call);
+            .arm(cx, "tx.savepoint", Some(name), self.cancel_from_call);
         self.inner.savepoint(cx, name).await
     }
 
     async fn rollback_to(&self, cx: &Cx, name: &str) -> Outcome<(), Error> {
         self.state
-            .arm(cx, "tx.rollback_to", Some(name), self.cancel_at_call);
+            .arm(cx, "tx.rollback_to", Some(name), self.cancel_from_call);
         self.inner.rollback_to(cx, name).await
     }
 
     async fn release(&self, cx: &Cx, name: &str) -> Outcome<(), Error> {
         self.state
-            .arm(cx, "tx.release", Some(name), self.cancel_at_call);
+            .arm(cx, "tx.release", Some(name), self.cancel_from_call);
         self.inner.release(cx, name).await
     }
 
     async fn commit(self, cx: &Cx) -> Outcome<(), Error> {
-        self.state.arm(cx, "tx.commit", None, self.cancel_at_call);
+        self.state.arm(cx, "tx.commit", None, self.cancel_from_call);
         self.inner.commit(cx).await
     }
 
     async fn rollback(self, cx: &Cx) -> Outcome<(), Error> {
-        self.state.arm(cx, "tx.rollback", None, self.cancel_at_call);
+        self.state
+            .arm(cx, "tx.rollback", None, self.cancel_from_call);
         self.inner.rollback(cx).await
     }
 }

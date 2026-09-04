@@ -2586,10 +2586,8 @@ mod tests {
     #[test]
     fn test_pooled_connection_age_and_idle_time() {
         let (clock, driver) = virtual_clock();
-        let pool: Pool<MockConnection> = Pool::with_timer_driver(
-            PoolConfig::new(5).test_on_checkout(false),
-            driver,
-        );
+        let pool: Pool<MockConnection> =
+            Pool::with_timer_driver(PoolConfig::new(5).test_on_checkout(false), driver);
 
         // Properly initialize pool state as if acquire happened
         {
