@@ -447,6 +447,7 @@ sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite sqlmodel-frankensqlite (drivers
 | `sqlmodel-schema` | DDL generation, schema builder, migration support |
 | `sqlmodel-session` | Unit of work + identity map |
 | `sqlmodel-pool` | Connection pooling with asupersync channels |
+| `sqlmodel-e2e` | All-driver end-to-end scenarios, oracles, and golden SQL (not published) |
 | `sqlmodel-postgres` | PostgreSQL wire protocol implementation |
 | `sqlmodel-mysql` | MySQL wire protocol implementation |
 | `sqlmodel-sqlite` | SQLite driver (C SQLite via bundled `libsqlite3-sys`) |
