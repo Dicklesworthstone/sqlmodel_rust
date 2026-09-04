@@ -76,9 +76,9 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `serde` + `serde_json` | Serialization |
 | `proc-macro2` + `quote` + `syn` | Proc macro code generation (sqlmodel-macros only) |
 | `regex` | Compile-time and runtime validation patterns |
-| `tracing` | Structured logging and diagnostics |
-| `sha1` + `sha2` + `hmac` + `pbkdf2` | Database authentication (PostgreSQL, MySQL) |
 | `rand` | Auth nonce generation |
+| `chrono` + `uuid` + `rust_decimal` | Optional model field types (features `chrono`/`uuid`/`decimal` on sqlmodel-core) |
+| `sha1` + `sha2` + `hmac` + `pbkdf2` | Database authentication (PostgreSQL, MySQL) |
 | `md5` | PostgreSQL MD5 authentication |
 | `rsa` | MySQL RSA authentication (`caching_sha2_password`/`sha256_password`) |
 | `rustls` + `webpki-roots` | Optional TLS for PostgreSQL and MySQL |
@@ -167,6 +167,65 @@ Cross-component integration tests live in `crates/sqlmodel/tests/` (in-memory C 
 
 The all-driver end-to-end crate `crates/sqlmodel-e2e` (publish = false) runs one ORM-level scenario per file (`smoke`, `expressions`, `operations`, `types`, `attributes`, `migrations`, `schema_fixpoint`, `session`, `pool`, `concurrent_writers`; plus `sqlite_differential`, which runs one script on C SQLite and FrankenSQLite in lockstep against a known-divergence list, and `golden_sql`, which compares every builder statement against `crates/sqlmodel-e2e/golden/<dialect>/*.sql` and regenerates only with `SQLMODEL_UPDATE_GOLDEN=1`) on C SQLite (memory and file), FrankenSQLite, and — when the URL variables above are set — PostgreSQL, MySQL, and MariaDB (`SQLMODEL_TEST_MARIADB_URL`). Absent network drivers are reported, never skipped silently. Scenarios that share table names must run sequentially inside one `#[test]`: the network databases are shared, and two test threads racing to drop and recreate the same table fail on PostgreSQL with a catalog conflict. Run it with `cargo test -p sqlmodel-e2e`; against local Docker databases it must run on this machine (see the RCH escape hatch below). Every "first run on a real database" so far has found driver defects that unit tests could not see, so a change to a driver, the query builder, or the schema builder is not done until this crate is green on the affected drivers.
 
+### Deterministic concurrency testing
+
+Timing and cancellation behavior is tested under asupersync's deterministic lab runtime — never with
+`thread::sleep`. The rules: every timing feature gets a virtual-time test; every new async operation
+gets an entry in the cancellation sweep.
+
+- **Virtual time**: build the runtime and the component on the same clock. In `sqlmodel-pool`'s
+  `lab_*` tests the pool shares the lab's timer driver via `Pool::with_timer_driver(config,
+  runtime.state.timer_driver_handle()...)`, tasks are spawned with
+  `runtime.state.create_task(region, Budget::INFINITE, fut)` plus
+  `runtime.scheduler.lock().schedule(task, 0)`, and `run_with_auto_advance()` jumps virtual time to
+  every deadline. Tests assert the exact virtual instant of each effect.
+- **Cancellation sweep** (`crates/sqlmodel-e2e/tests/cancellation_sweep.rs`):
+  `sqlmodel_core::test_support::CancelAt` (feature `test-support`) wraps any `Connection`, flips
+  `cx.set_cancel_requested(true)` immediately before the k-th delegated call, and logs every call
+  (transaction calls too, through `CancelAtTx`). The sweep discovers `K_max` with a record-only
+  run, then re-runs each checkpoint asserting `Outcome::Cancelled`, no commit after cancellation,
+  and snapshot-equal state. Sketch:
+
+  ```rust
+  let probe = CancelAt::new(conn, 0);          // baseline: count checkpoints
+  let k_max = probe.calls_made();
+  for k in 1..=k_max {
+      let wrapped = CancelAt::new(fresh_conn(), k);
+      let outcome = op(&cx, &wrapped).await;   // must be Cancelled
+      // plus: no tx.commit after k, state == snapshot
+  }
+  ```
+
+- **Schedule exploration** (`crates/sqlmodel-pool`'s `dpor_*` tests):
+  `asupersync::lab::explorer::DporExplorer::explore(|runtime| { .. })` sweeps seeds of a concurrent
+  program with the oracles checked per run; violations are collected and asserted afterwards with
+  the offending seeds. `SQLMODEL_DPOR_SEED=<n>` replays one seed; asupersync's canonical
+  forced-schedule artifacts (record → `to_canonical_bytes` → `derive_candidate`) minimize a failing
+  schedule. Note: asupersync 0.4.10 has no complete DPOR enumerator, and `Session` cannot be shared
+  across tasks (`&mut self` everywhere), so identity-map interleavings are unrepresentable — one
+  Session per task over pooled connections is the pattern.
+- **Schema metamorphic oracle** (`crates/sqlmodel-e2e/tests/schema_oracle.rs`): fixpoint
+  (create → introspect → `schema_diff` empty), commutation (apply `diff(A → B)`, land at B's
+  fixpoint), involution (every operation followed by its `inverse()` returns to the prior state),
+  and cross-dialect agreement of the operation sequence; plus 600 seeded generated table
+  definitions on the three SQLite variants in under 60 seconds.
+
+### Running the gates
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo doc --workspace --no-deps
+cargo audit --deny warnings
+cargo deny check bans advisories licenses sources
+```
+
+On this machine the RCH shim may refuse local `cargo build/test/clippy/check/doc` when the remote
+fleet is under pressure; offload explicitly with `rch exec -- cargo <cmd>` (see the RCH section
+below), or use the `RCH_SHIM_LOCAL_IDE=1` escape hatch for a build that genuinely must run locally.
+
 ### Unit Tests
 
 ```bash
@@ -202,12 +261,12 @@ cargo test --workspace --all-features
 | `sqlmodel-query` | Query builder DSL, SELECT/INSERT/UPDATE/DELETE generation, parameterized queries, dialect-specific SQL |
 | `sqlmodel-schema` | CREATE TABLE generation, migration runner, database introspection, foreign key DDL |
 | `sqlmodel-session` | Unit-of-work lifecycle, Session CRUD operations, transaction management, identity map |
-| `sqlmodel-pool` | Connection pooling, lifecycle management, health checks, pool sizing |
+| `sqlmodel-pool` | Connection pooling, lifecycle management, health checks, pool sizing; virtual-time lab tests (`lab_*`) and DPOR schedule exploration (`dpor_*`) |
 | `sqlmodel-sqlite` | SQLite wire protocol, C SQLite FFI, prepared statements, type coercion |
 | `sqlmodel-postgres` | PostgreSQL wire protocol, authentication (MD5, SCRAM-SHA-256), type OIDs, TLS |
 | `sqlmodel-mysql` | MySQL wire protocol, authentication (native, caching_sha2, sha256), RSA auth, TLS |
-| `sqlmodel-frankensqlite` | Pure-Rust SQLite adapter, MVCC concurrency, behavioral differences from C SQLite |
-| `sqlmodel-console` | Rich terminal output formatting, agent vs human detection, SQL syntax highlighting |
+| `sqlmodel-frankensqlite` | Pure-Rust SQLite adapter, MVCC concurrency, behavioral differences from C SQLite, transaction cancellation guards |
+| `sqlmodel-e2e` | All-driver end-to-end scenarios, cancellation sweep, schema metamorphic oracle, golden SQL, driver differential |
 
 ---
 
