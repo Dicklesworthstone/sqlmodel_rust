@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use asupersync::{
-    Budget, CancelReason, Cx, Outcome,
+    Budget, CancelReason, Cx, Outcome, Time,
     combinator::{Either, Select},
     runtime::RuntimeBuilder,
     sync::{Notify, OnceCell},
@@ -191,9 +191,9 @@ struct ConnectionMeta<C> {
     /// The actual connection
     conn: C,
     /// When this connection was created
-    created_at: asupersync::time::Time,
+    created_at: Time,
     /// When this connection was last used
-    last_used: asupersync::time::Time,
+    last_used: Time,
     /// Clock shared with the owning pool
     clock: TimerDriverHandle,
 }
@@ -851,7 +851,7 @@ impl<C: Connection> Pool<C> {
                                 Ok(inner) if inner.closed => {
                                     let retirement = ActiveConnectionGuard::new(
                                         Arc::clone(&self.shared),
-                                        ConnectionMeta::new(conn, Arc::clone(&clock)),
+                                        ConnectionMeta::new(conn, clock.clone()),
                                     );
                                     slot_guard.disarm();
                                     FactoryPublish::Retire {
@@ -871,7 +871,7 @@ impl<C: Connection> Pool<C> {
                                     // rejects the connection, or follows it and
                                     // waits for this active checkout.
                                     self.shared.acquires.fetch_add(1, Ordering::Relaxed);
-                                    let meta = ConnectionMeta::new(conn, Arc::clone(&clock));
+                                    let meta = ConnectionMeta::new(conn, clock.clone());
                                     slot_guard.disarm();
                                     FactoryPublish::Published(PooledConnection::new(
                                         meta,
@@ -881,7 +881,7 @@ impl<C: Connection> Pool<C> {
                                 Err(error) => {
                                     let retirement = ActiveConnectionGuard::new(
                                         Arc::clone(&self.shared),
-                                        ConnectionMeta::new(conn, Arc::clone(&clock)),
+                                        ConnectionMeta::new(conn, clock.clone()),
                                     );
                                     slot_guard.disarm();
                                     FactoryPublish::Retire {
@@ -926,8 +926,9 @@ impl<C: Connection> Pool<C> {
                 }
                 AcquireAction::Wait => {
                     // Wait for a connection to become available
-                    let remaining =
-                        Duration::from_nanos(deadline.as_nanos().saturating_sub(clock.now().as_nanos()));
+                    let remaining = Duration::from_nanos(
+                        deadline.as_nanos().saturating_sub(clock.now().as_nanos()),
+                    );
                     if remaining.is_zero() {
                         if let Ok(mut inner) = self.shared.lock_or_error("acquire_timeout") {
                             inner.waiter_count -= 1;
@@ -1404,7 +1405,9 @@ impl<C: Connection + std::fmt::Debug> std::fmt::Debug for PooledConnection<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::lab::{LabConfig, LabRuntime};
     use asupersync::time::VirtualClock;
+    use asupersync::types::RegionId;
     use asupersync::{Budget, Time};
     use sqlmodel_core::connection::{IsolationLevel, PreparedStatement, TransactionOps};
     use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind};
@@ -1891,7 +1894,10 @@ mod tests {
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(MockConnection::with_failing_pool_close(1), test_clock()));
+            inner.idle.push_back(ConnectionMeta::new(
+                MockConnection::with_failing_pool_close(1),
+                test_clock(),
+            ));
         }
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -1981,10 +1987,10 @@ mod tests {
             inner.active_count = 1;
         }
         let pooled = PooledConnection::new(
-            ConnectionMeta::new(MockConnection::with_pool_close_counter(
-                1,
-                Arc::clone(&pool_close_calls),
-            ), test_clock()),
+            ConnectionMeta::new(
+                MockConnection::with_pool_close_counter(1, Arc::clone(&pool_close_calls)),
+                test_clock(),
+            ),
             Arc::downgrade(&pool.shared),
         );
         let cx = Cx::for_testing();
@@ -2210,7 +2216,10 @@ mod tests {
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(MockConnection::with_pending_pool_close(1, Arc::clone(&pool_close_calls)), test_clock()));
+            inner.idle.push_back(ConnectionMeta::new(
+                MockConnection::with_pending_pool_close(1, Arc::clone(&pool_close_calls)),
+                test_clock(),
+            ));
         }
         let first_cx = Cx::for_testing();
         let second_cx = Cx::for_testing();
@@ -2257,7 +2266,9 @@ mod tests {
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(failed, test_clock()));
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(failed, test_clock()));
         }
         let cx = Cx::for_testing();
         let mut acquire =
@@ -2389,14 +2400,15 @@ mod tests {
                 .lock()
                 .expect("pool mutex should not be poisoned");
             inner.total_count = 1;
-            inner
-                .idle
-                .push_back(ConnectionMeta::new(MockConnection::with_pool_close_probe(
+            inner.idle.push_back(ConnectionMeta::new(
+                MockConnection::with_pool_close_probe(
                     1,
                     Arc::clone(&pool_close_calls),
                     Arc::downgrade(&pool.shared),
                     Arc::clone(&pool_lock_was_free),
-                ), test_clock()));
+                ),
+                test_clock(),
+            ));
         }
 
         pool.close();
@@ -2450,7 +2462,9 @@ mod tests {
                 .lock()
                 .expect("pool mutex should not be poisoned");
             inner.total_count = 1;
-            inner.idle.push_back(ConnectionMeta::new(failed, test_clock()));
+            inner
+                .idle
+                .push_back(ConnectionMeta::new(failed, test_clock()));
         }
 
         let runtime = RuntimeBuilder::current_thread()
@@ -2571,9 +2585,11 @@ mod tests {
 
     #[test]
     fn test_pooled_connection_age_and_idle_time() {
-        use std::thread;
-
-        let pool: Pool<MockConnection> = Pool::new(PoolConfig::new(5));
+        let (clock, driver) = virtual_clock();
+        let pool: Pool<MockConnection> = Pool::with_timer_driver(
+            PoolConfig::new(5).test_on_checkout(false),
+            driver,
+        );
 
         // Properly initialize pool state as if acquire happened
         {
@@ -2582,14 +2598,16 @@ mod tests {
             inner.active_count = 1;
         }
 
-        let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
+        let meta = ConnectionMeta::new(MockConnection::new(1), pool.shared.clock.clone());
         let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
 
-        // Should have some small positive age
-        assert!(pooled.age() >= Duration::ZERO);
+        // Age starts at exactly zero on the virtual clock
+        assert_eq!(pooled.age(), Duration::ZERO);
+        assert_eq!(pooled.idle_time(), Duration::ZERO);
 
-        thread::sleep(Duration::from_millis(5));
-        assert!(pooled.age() > Duration::ZERO);
+        clock.advance(5_000_000); // 5ms
+        assert!(pooled.age() >= Duration::from_millis(5));
+        assert!(pooled.idle_time() >= Duration::from_millis(5));
     }
 
     #[test]
@@ -2777,7 +2795,7 @@ mod tests {
 
     #[test]
     fn test_pool_shared_atomic_counters() {
-        let shared = PoolShared::<MockConnection>::new(PoolConfig::new(5));
+        let shared = PoolShared::<MockConnection>::new(PoolConfig::new(5), test_clock());
 
         // Initial values should be 0
         assert_eq!(shared.connections_created.load(Ordering::Relaxed), 0);
@@ -2945,7 +2963,10 @@ mod tests {
     fn test_lock_or_error_returns_error_when_poisoned() {
         use std::thread;
 
-        let shared = Arc::new(PoolShared::<MockConnection>::new(PoolConfig::new(5)));
+        let shared = Arc::new(PoolShared::<MockConnection>::new(
+            PoolConfig::new(5),
+            test_clock(),
+        ));
 
         // Poison the mutex
         let shared_clone = Arc::clone(&shared);
@@ -2973,7 +2994,10 @@ mod tests {
     fn test_lock_or_recover_succeeds_when_poisoned() {
         use std::thread;
 
-        let shared = Arc::new(PoolShared::<MockConnection>::new(PoolConfig::new(5)));
+        let shared = Arc::new(PoolShared::<MockConnection>::new(
+            PoolConfig::new(5),
+            test_clock(),
+        ));
 
         // Set up some state
         {
@@ -3258,5 +3282,367 @@ mod tests {
         // stats() should recover and show correct waiter count
         let stats = pool.stats();
         assert_eq!(stats.pending_requests, 3);
+    }
+
+    // ------------------------------------------------------------------
+    // Timing under LabRuntime virtual time
+    //
+    // Every timing feature of the pool (idle timeout, max lifetime, acquire
+    // timeout, checkout health, drain) is exercised on a `LabRuntime` whose
+    // virtual clock is shared with the pool via `Pool::with_timer_driver`.
+    // Virtual time is advanced explicitly (or auto-advanced by the lab
+    // scheduler), so each test asserts the exact virtual instant of the
+    // effect with zero wall-clock waiting.
+    // ------------------------------------------------------------------
+
+    /// Creates a lab runtime, a pool sharing the lab's virtual clock, and
+    /// the root region tasks are spawned into.
+    fn lab_pool(config: PoolConfig) -> (LabRuntime, Arc<Pool<MockConnection>>, RegionId) {
+        let mut runtime = LabRuntime::new(LabConfig::new(0x50f1).max_steps(500_000));
+        let driver = runtime
+            .state
+            .timer_driver_handle()
+            .expect("lab runtime installs a virtual-clock timer driver");
+        let pool = Arc::new(Pool::with_timer_driver(config, driver));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        (runtime, pool, region)
+    }
+
+    #[test]
+    fn lab_idle_timeout_retires_exactly_the_expired_idle_connections() {
+        let (mut runtime, pool, region) = lab_pool(
+            PoolConfig::new(3)
+                .idle_timeout(100)
+                .test_on_checkout(false)
+                .acquire_timeout(5_000),
+        );
+        let stats_after = Arc::new(OnceCell::<PoolStats>::new());
+        let stats_recorder = Arc::clone(&stats_after);
+        let acquired_id = Arc::new(OnceCell::<u32>::new());
+        let id_recorder = Arc::clone(&acquired_id);
+
+        let (task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                // Three concurrent leases => three distinct connections.
+                let a = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(1)) })
+                    .await
+                    .expect("acquire a");
+                let b = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await
+                    .expect("acquire b");
+                let c = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(3)) })
+                    .await
+                    .expect("acquire c");
+                drop(c);
+                drop(b);
+                drop(a);
+                // Everything idle at once; 250ms virtual passes the 100ms
+                // idle timeout for all three.
+                asupersync::time::sleep(cx.now(), Duration::from_millis(250)).await;
+                let d = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(4)) })
+                    .await
+                    .expect("acquire d");
+                let _ = id_recorder.set(d.id);
+                let _ = stats_recorder.set(pool.stats());
+            })
+            .expect("spawn lab task");
+        runtime.scheduler.lock().schedule(task, 0);
+
+        // Run until parked, then jump virtual time to each timer deadline.
+        runtime.run_with_auto_advance();
+
+        assert_eq!(acquired_id.get().copied(), Some(4));
+        let stats = stats_after.get().expect("task ran to completion");
+        // Exactly the three idle connections were retired and replaced.
+        assert_eq!(stats.connections_created, 4);
+        assert_eq!(stats.connections_closed, 3);
+        assert_eq!(stats.acquires, 4);
+        assert_eq!(stats.idle_connections, 0);
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.total_connections, 1);
+    }
+
+    #[test]
+    fn lab_max_lifetime_replaces_a_connection_exactly_when_it_passes() {
+        let (mut runtime, pool, region) = lab_pool(
+            PoolConfig::new(2)
+                .max_lifetime(500)
+                .idle_timeout(100_000)
+                .test_on_checkout(false)
+                .acquire_timeout(5_000),
+        );
+        let first_id = Arc::new(OnceCell::<u32>::new());
+        let first_recorder = Arc::clone(&first_id);
+        let second = Arc::new(OnceCell::<(u32, u64, u64)>::new());
+        let second_recorder = Arc::clone(&second);
+
+        let (task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                let a = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(1)) })
+                    .await
+                    .expect("acquire a");
+                drop(a);
+                // At 400ms of age the connection is still inside its 500ms
+                // lifetime: the next checkout must hand back the SAME one.
+                asupersync::time::sleep(cx.now(), Duration::from_millis(400)).await;
+                let b = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await
+                    .expect("acquire b");
+                let _ = first_recorder.set(b.id);
+                drop(b);
+                // 101ms later the lifetime has passed (501ms > 500ms): the
+                // next checkout must retire it and create a fresh one.
+                asupersync::time::sleep(cx.now(), Duration::from_millis(101)).await;
+                let c = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(3)) })
+                    .await
+                    .expect("acquire c");
+                let stats = pool.stats();
+                let _ = second_recorder.set((
+                    c.id,
+                    stats.connections_created,
+                    stats.connections_closed,
+                ));
+            })
+            .expect("spawn lab task");
+        runtime.scheduler.lock().schedule(task, 0);
+
+        runtime.run_with_auto_advance();
+
+        assert_eq!(
+            first_id.get().copied(),
+            Some(1),
+            "not retired before its lifetime passes"
+        );
+        assert_eq!(
+            second.get().copied(),
+            Some((3, 2, 1)),
+            "replaced exactly once the lifetime has passed"
+        );
+    }
+
+    #[test]
+    fn lab_acquire_timeout_fires_at_the_exact_virtual_deadline() {
+        let (mut runtime, pool, region) = lab_pool(
+            PoolConfig::new(1)
+                .acquire_timeout(200)
+                .test_on_checkout(false),
+        );
+        let holder_result = Arc::new(OnceCell::<u64>::new());
+        let holder_recorder = Arc::clone(&holder_result);
+        let waiter_result = Arc::new(OnceCell::<(u64, bool)>::new());
+        let waiter_recorder = Arc::clone(&waiter_result);
+
+        let holder_pool = Arc::clone(&pool);
+        let (holder, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                let lease = holder_pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(1)) })
+                    .await
+                    .expect("holder acquires the only lease");
+                // Hold the lease well past the waiter's deadline.
+                asupersync::time::sleep(cx.now(), Duration::from_millis(10_000)).await;
+                drop(lease);
+                let _ = holder_recorder.set(cx.now().as_millis());
+            })
+            .expect("spawn holder");
+        runtime.scheduler.lock().schedule(holder, 0);
+        let waiter_pool = Arc::clone(&pool);
+        let (waiter, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                let outcome = waiter_pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await;
+                let instant_ms = cx.now().as_millis();
+                let timed_out = matches!(
+                    &outcome,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                );
+                let _ = waiter_recorder.set((instant_ms, timed_out));
+            })
+            .expect("spawn waiter");
+        runtime.scheduler.lock().schedule(waiter, 0);
+
+        runtime.run_with_auto_advance();
+
+        // The waiter failed at exactly T+200ms: woken only by its own
+        // deadline slices, never early.
+        assert_eq!(
+            waiter_result.get().copied(),
+            Some((200, true)),
+            "acquire timeout fires at the exact virtual deadline"
+        );
+        assert_eq!(pool.stats().timeouts, 1);
+        // The holder ran to its own (much later) wake-up and released.
+        assert_eq!(holder_result.get().copied(), Some(10_000));
+    }
+
+    #[test]
+    fn lab_unhealthy_connection_is_replaced_on_the_first_checkout_after_failure() {
+        let (mut runtime, pool, region) = lab_pool(
+            PoolConfig::new(2)
+                .test_on_checkout(true)
+                .idle_timeout(100_000)
+                .acquire_timeout(5_000),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let checkout = Arc::new(OnceCell::<(u32, u64, u64)>::new());
+        let checkout_recorder = Arc::clone(&checkout);
+        let ping_flag = Arc::clone(&flag);
+
+        let (task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                let factory_flag = Arc::clone(&ping_flag);
+                let a = pool
+                        .acquire(&cx, move || {
+                            let flag_for_conn = Arc::clone(&factory_flag);
+                            async move {
+                                Outcome::Ok(MockConnection::with_ping_behavior(1, flag_for_conn))
+                            }
+                        })
+                        .await
+                        .expect("acquire healthy a");
+                drop(a);
+                // From this virtual instant on, the pooled connection pings
+                // unhealthy.
+                ping_flag.store(true, Ordering::Relaxed);
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                let b = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await
+                    .expect("acquire after failure");
+                let stats = pool.stats();
+                let _ = checkout_recorder.set((
+                    b.id,
+                    stats.connections_created,
+                    stats.connections_closed,
+                ));
+            })
+            .expect("spawn lab task");
+        runtime.scheduler.lock().schedule(task, 0);
+
+        runtime.run_with_auto_advance();
+
+        // The dead connection was closed at checkout and a fresh one
+        // created; the acquire itself still succeeded.
+        assert_eq!(
+            checkout.get().copied(),
+            Some((2, 2, 1)),
+            "first checkout after the health flip gets a replacement"
+        );
+    }
+
+    #[test]
+    fn lab_close_and_drain_wakes_waiters_immediately_and_completes_at_last_release() {
+        let (mut runtime, pool, region) = lab_pool(
+            PoolConfig::new(2)
+                .test_on_checkout(false)
+                .acquire_timeout(5_000),
+        );
+        let holder_done = Arc::new(OnceCell::<u64>::new());
+        let holder_recorder = Arc::clone(&holder_done);
+        let drainer_done = Arc::new(OnceCell::<(u64, bool)>::new());
+        let drainer_recorder = Arc::clone(&drainer_done);
+        let waiter_done = Arc::new(OnceCell::<(u64, bool)>::new());
+        let waiter_recorder = Arc::clone(&waiter_done);
+
+        let holder_pool = Arc::clone(&pool);
+        let (holder, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                let lease = holder_pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(1)) })
+                    .await
+                    .expect("holder acquires");
+                asupersync::time::sleep(cx.now(), Duration::from_millis(10_000)).await;
+                drop(lease);
+                let _ = holder_recorder.set(cx.now().as_millis());
+            })
+            .expect("spawn holder");
+        runtime.scheduler.lock().schedule(holder, 0);
+        let drainer_pool = Arc::clone(&pool);
+        let (drainer, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                let outcome = drainer_pool.close_and_drain(&cx).await;
+                let _ = drainer_recorder.set((cx.now().as_millis(), outcome.is_ok()));
+            })
+            .expect("spawn drainer");
+        runtime.scheduler.lock().schedule(drainer, 0);
+        let waiter_pool = Arc::clone(&pool);
+        let (waiter, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a cx");
+                let outcome = waiter_pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await;
+                let instant_ms = cx.now().as_millis();
+                let closed = matches!(
+                    &outcome,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Closed,
+                        ..
+                    }))
+                );
+                let _ = waiter_recorder.set((instant_ms, closed));
+            })
+            .expect("spawn waiter");
+        // The waiter is only scheduled AFTER the close: its first (and only)
+        // acquire attempt must observe the closed pool - no timer, no wake.
+
+        // Deterministic phase 1: holder and drainer run at t=0 until parked.
+        // The holder parks on its sleep; the drainer marks the pool closed
+        // and parks on the drain latch while the holder's lease is active.
+        runtime.run_until_idle();
+        assert!(waiter_done.get().is_none(), "waiter has not run yet");
+        assert!(
+            drainer_done.get().is_none(),
+            "drain waits for the active lease"
+        );
+
+        // Deterministic phase 2: the waiter runs at t=0 against the closed
+        // pool and must fail immediately with `Closed`.
+        runtime.scheduler.lock().schedule(waiter, 0);
+        runtime.run_until_idle();
+
+        assert_eq!(
+            waiter_done.get().copied(),
+            Some((0, true)),
+            "waiter observes Closed immediately at close"
+        );
+
+        // Deterministic phase 3: jump exactly to the holder's wake-up. The
+        // release retires the lease and the drain completes at that instant.
+        runtime.advance_to_next_timer();
+        runtime.run_until_idle();
+
+        assert_eq!(holder_done.get().copied(), Some(10_000));
+        assert_eq!(
+            drainer_done.get().copied(),
+            Some((10_000, true)),
+            "drain completes exactly at the last release"
+        );
     }
 }
