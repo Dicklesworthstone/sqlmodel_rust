@@ -14,5 +14,5 @@
 # Advancing the pin is a deliberate step: bump the date, run the full gate
 # (fmt + clippy -D warnings + test --workspace), and keep the new date only if green.
 [toolchain]
-channel = "nightly-2026-08-25"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
