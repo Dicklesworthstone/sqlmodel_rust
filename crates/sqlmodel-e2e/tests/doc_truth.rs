@@ -38,17 +38,6 @@ fn read(rel: &str) -> String {
         .unwrap_or_else(|error| panic!("cannot read {rel}: {error}"))
 }
 
-/// Lines (1-based) of `content` containing `needle`, formatted for failure
-/// messages.
-fn offending_lines<'a>(content: &'a str, needle: &str) -> Vec<String> {
-    content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains(needle))
-        .map(|(i, line)| format!("line {}: {line}", i + 1))
-        .collect()
-}
-
 fn crate_directories() -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(repo_root().join("crates"))
         .expect("crates/ directory")
@@ -114,7 +103,7 @@ fn agents_key_files_reference_existing_paths() {
         let Some(rest) = line.trim().strip_prefix("| `sqlmodel-") else {
             continue;
         };
-        let Some(crate_end) = rest.find("`") else {
+        let Some(crate_end) = rest.find('`') else {
             continue;
         };
         let crate_name = format!("sqlmodel-{}", &rest[..crate_end]);
@@ -123,7 +112,7 @@ fn agents_key_files_reference_existing_paths() {
             continue;
         };
         let path_part = &after_crate[src_start + 1..];
-        let Some(path_end) = path_part.find("`") else {
+        let Some(path_end) = path_part.find('`') else {
             continue;
         };
         let src_path = &path_part[..path_end];
@@ -156,7 +145,9 @@ fn cited_bead_ids_exist_in_the_tracker() {
                 continue;
             }
             for id in bead_ids_in(line) {
-                let present = tracker.lines().any(|entry| entry.contains(&format!("\"{id}\"")));
+                let present = tracker
+                    .lines()
+                    .any(|entry| entry.contains(&format!("\"{id}\"")));
                 if !present {
                     unknown.push((format!("{document}:{}", index + 1), id));
                 }
@@ -229,8 +220,7 @@ fn readme_versions_match_the_workspace_version() {
         for cited in cited_sqlmodel_versions(line) {
             // `0.4` is compatible with workspace `0.4.2`: a cited version is
             // fine when the workspace version extends it at a dot boundary.
-            let compatible =
-                cited == version || version.starts_with(&format!("{cited}."));
+            let compatible = cited == version || version.starts_with(&format!("{cited}."));
             if !compatible {
                 offenders.push(format!(
                     "line {}: {line} (cited {cited}, workspace {version})",
@@ -261,18 +251,13 @@ fn cited_sqlmodel_versions(line: &str) -> Vec<&str> {
     }
     versions
 }
-    assert!(
-        offenders.is_empty(),
-        "README cites a version that is not the workspace version {version}: {offenders:?}"
-    );
-}
 
 #[test]
 fn feature_parity_is_verified_against_the_newest_release() {
     let changelog = read("CHANGELOG.md");
     let newest_release = changelog
         .lines()
-        .filter_map(|line| {
+        .find_map(|line| {
             let entry = line.trim().strip_prefix("## [")?;
             if entry.starts_with("Unreleased") {
                 return None;
@@ -280,14 +265,13 @@ fn feature_parity_is_verified_against_the_newest_release() {
             // `## [0.4.2] -- 2026-08-31` -> "2026-08-31"
             find_date(entry)
         })
-        .next()
         .expect("CHANGELOG has a dated release entry");
     let parity = read("FEATURE_PARITY.md");
     let verified_line = parity
         .lines()
         .find(|line| line.contains("Last Updated"))
         .expect("FEATURE_PARITY carries a Last Updated line");
-    let verified = find_date(&verified_line)
+    let verified = find_date(verified_line)
         .unwrap_or_else(|| panic!("no YYYY-MM-DD date found in: {verified_line}"));
     assert!(
         newest_release.as_str() <= verified.as_str(),
@@ -301,13 +285,16 @@ fn find_date(line: &str) -> Option<String> {
     let bytes = line.as_bytes();
     for start in 0..bytes.len() {
         if start + 10 <= bytes.len()
-            && bytes[start..start + 10].iter().enumerate().all(|(offset, b)| {
-                if offset == 4 || offset == 7 {
-                    *b == b'-'
-                } else {
-                    b.is_ascii_digit()
-                }
-            })
+            && bytes[start..start + 10]
+                .iter()
+                .enumerate()
+                .all(|(offset, b)| {
+                    if offset == 4 || offset == 7 {
+                        *b == b'-'
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                })
         {
             return Some(line[start..start + 10].to_owned());
         }
