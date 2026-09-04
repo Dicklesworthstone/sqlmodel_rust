@@ -42,6 +42,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check sqlmodel-mysql feature matrix
+        run: |
+          cargo check -p sqlmodel-mysql --no-default-features
+          cargo check -p sqlmodel-mysql --features tls
+          cargo check -p sqlmodel-mysql --features rsa-auth
+          cargo check -p sqlmodel-mysql --all-features
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

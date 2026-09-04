@@ -163,6 +163,10 @@ sqlmodel-postgres = "0.4.2"
 
 # Optional rich console output
 sqlmodel-console = { version = "0.4.2", features = ["rich"] }
+
+# TLS-only MySQL deployments can drop the `rsa` dependency (the no-TLS
+# full-auth path is compiled out; the server must then allow TLS auth):
+# sqlmodel-mysql = { version = "0.4.2", default-features = false, features = ["tls"] }
 ```
 
 All SQLModel crates are released in lockstep at the same version (0.4.2); mix

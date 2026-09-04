@@ -383,7 +383,9 @@ tls = ["dep:rustls", "dep:webpki-roots"]  # TLS for PostgreSQL
 
 # sqlmodel-mysql
 [features]
-tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]  # TLS for MySQL
+default = ["rsa-auth"]
+tls = ["dep:rustls", "dep:webpki-roots"]  # TLS for MySQL (PEM via rustls' pki_types)
+rsa-auth = ["dep:rsa"]  # no-TLS full auth for caching_sha2_password/sha256_password
 
 # sqlmodel-sqlite
 [features]

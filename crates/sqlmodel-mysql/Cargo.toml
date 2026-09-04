@@ -17,12 +17,18 @@ categories = ["database", "database-implementations"]
 workspace = true
 
 [features]
-default = []
+default = ["rsa-auth"]
 console = ["dep:sqlmodel-console"]
 # TLS support via rustls. PEM parsing uses rustls' re-exported `pki_types::pem`
 # (rustls-pki-types), the maintained successor of the unmaintained
 # rustls-pemfile crate (RUSTSEC-2025-0134).
 tls = ["dep:rustls", "dep:webpki-roots"]
+# RSA public-key exchange for the no-TLS full-auth path of
+# `caching_sha2_password` / `sha256_password`. On by default so existing users
+# see no change; TLS-only deployments can drop the `rsa` dependency (and its
+# standing RUSTSEC advisory on the 0.10 release candidate) with
+# `default-features = false, features = ["tls"]`.
+rsa-auth = ["dep:rsa"]
 
 [dependencies]
 sqlmodel-core.workspace = true
@@ -34,8 +40,9 @@ sha2 = "0.11"
 rand = "0.10"
 # rsa 0.10 (currently at rc) is the release line built against digest 0.11 and
 # rand_core 0.10, matching sha1/sha2 0.11 and rand 0.10 above. Move to plain
-# "0.10" once the stable release ships.
-rsa = { version = "0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
+# "0.10" once the stable release ships. Optional: only the `rsa-auth` feature
+# (no-TLS full authentication) needs it.
+rsa = { version = "0.10.0-rc.18", optional = true, default-features = false, features = ["std", "encoding"] }
 
 # Optional console support
 sqlmodel-console = { workspace = true, optional = true }

@@ -26,8 +26,13 @@ use sha2::{Digest, Sha256};
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
 
+// RSA is only needed for the no-TLS full-auth path; the `rsa-auth` feature
+// (on by default) controls it so TLS-only deployments can drop the dependency.
+#[cfg(feature = "rsa-auth")]
 use rsa::RsaPublicKey;
+#[cfg(feature = "rsa-auth")]
 use rsa::pkcs1::DecodeRsaPublicKey;
+#[cfg(feature = "rsa-auth")]
 use rsa::pkcs8::DecodePublicKey;
 
 /// Well-known authentication plugin names.
@@ -195,6 +200,7 @@ pub fn generate_nonce(length: usize) -> Vec<u8> {
 ///
 /// This is used for full authentication for `caching_sha2_password`/`sha256_password`
 /// when the connection is not secured by TLS.
+#[cfg(feature = "rsa-auth")]
 pub fn sha256_password_rsa(
     password: &str,
     seed: &[u8],
@@ -236,6 +242,25 @@ pub fn sha256_password_rsa(
     };
 
     Ok(encrypted)
+}
+
+/// Without the `rsa-auth` feature the no-TLS full-auth path is unavailable
+/// by design: the caller surfaces this message as an
+/// `ConnectionErrorKind::Authentication` error telling the deployment to use
+/// TLS or re-enable the feature.
+#[cfg(not(feature = "rsa-auth"))]
+pub fn sha256_password_rsa(
+    _password: &str,
+    _seed: &[u8],
+    _public_key_pem: &[u8],
+    _use_oaep: bool,
+) -> Result<Vec<u8>, String> {
+    Err(
+        "MySQL full authentication requires TLS (SslMode::Required or stronger) \
+         or the `rsa-auth` feature; the server requested RSA password exchange \
+         on a plaintext connection"
+            .to_owned(),
+    )
 }
 
 /// XOR password with seed for cleartext transmission over TLS.
@@ -410,6 +435,7 @@ mod tests {
         assert_eq!(recovered, password.as_bytes());
     }
 
+    #[cfg(feature = "rsa-auth")]
     /// Test-only RSA public key in SPKI (`BEGIN PUBLIC KEY`) form — the shape
     /// MySQL serves for `caching_sha2_password`/`sha256_password` full auth.
     const SPKI_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\
@@ -421,7 +447,7 @@ FknazXZxL5aoAG+cJIoHKsf9NcGTzj0Hewb36YlgVi+yZ5NRkhgjklQ8E6IL+aaW\n\
 yEOsCBtS8kCd/nHP4t6ZeyExdpggPGQ2nJq18jG+sttI+3AnzQhXtR2Adq9LKVdN\n\
 RQIDAQAB\n\
 -----END PUBLIC KEY-----\n";
-
+    #[cfg(feature = "rsa-auth")]
     /// The same key in PKCS#1 (`BEGIN RSA PUBLIC KEY`) form — the fallback
     /// encoding `sha256_password_rsa` accepts.
     const PKCS1_PUBLIC_KEY: &str = "-----BEGIN RSA PUBLIC KEY-----\n\
@@ -437,6 +463,7 @@ nJq18jG+sttI+3AnzQhXtR2Adq9LKVdNRQIDAQAB\n\
     /// `pem` feature was folded into `encoding` in 0.10, so both PEM encodings
     /// MySQL can serve must still parse, and both padding modes must produce a
     /// modulus-sized, randomized ciphertext.
+    #[cfg(feature = "rsa-auth")]
     #[test]
     fn test_sha256_password_rsa_accepts_both_pem_encodings() {
         let seed = [
@@ -458,10 +485,27 @@ nJq18jG+sttI+3AnzQhXtR2Adq9LKVdNRQIDAQAB\n\
         }
     }
 
+    #[cfg(feature = "rsa-auth")]
     #[test]
     fn test_sha256_password_rsa_rejects_bad_input() {
         assert!(sha256_password_rsa("pw", &[], SPKI_PUBLIC_KEY.as_bytes(), true).is_err());
         assert!(sha256_password_rsa("pw", &[1, 2, 3], b"not a pem", true).is_err());
+    }
+
+    /// Without the `rsa-auth` feature the helper refuses by name, and the
+    /// caller (`auth_error`) surfaces that message as an Authentication
+    /// connection error.
+    #[cfg(not(feature = "rsa-auth"))]
+    #[test]
+    fn test_sha256_password_rsa_requires_tls_or_feature() {
+        let error = sha256_password_rsa("pw", &[1, 2, 3], b"unused", true)
+            .expect_err("no-TLS full auth is unavailable without the rsa-auth feature");
+        assert!(
+            error.contains("requires TLS")
+                && error.contains("rsa-auth")
+                && error.contains("RSA password exchange"),
+            "error must name the remediation: {error}"
+        );
     }
 
     #[test]
