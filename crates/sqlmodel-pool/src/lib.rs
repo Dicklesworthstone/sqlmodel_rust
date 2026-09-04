@@ -1405,12 +1405,18 @@ impl<C: Connection + std::fmt::Debug> std::fmt::Debug for PooledConnection<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::lab::explorer::{DporExplorer, ExplorerConfig};
     use asupersync::lab::{LabConfig, LabRuntime};
     use asupersync::time::VirtualClock;
     use asupersync::types::RegionId;
     use asupersync::{Budget, Time};
-    use sqlmodel_core::connection::{IsolationLevel, PreparedStatement, TransactionOps};
-    use sqlmodel_core::error::{ConnectionError, ConnectionErrorKind};
+    use sqlmodel_core::connection::{
+        Dialect, IsolationLevel, PreparedStatement, TransactionMode, TransactionOps,
+    };
+    use sqlmodel_core::error::{
+        ConnectionError, ConnectionErrorKind, QueryError, QueryErrorKind, TransactionErrorKind,
+    };
+    use sqlmodel_core::{RetryPolicy, TransactionOptions, retry_transaction};
     use sqlmodel_core::{Row, Value};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -3642,5 +3648,505 @@ mod tests {
             Some((10_000, true)),
             "drain completes exactly at the last release"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Bounded schedule exploration under asupersync's lab runtime
+    // (`bd-x6jl.3`).
+    //
+    // asupersync 0.4.10 exposes no complete DPOR enumerator: what it ships
+    // is a deterministic lab runtime whose scheduler permutes task
+    // interleavings by seed, a race-informed seed-sweep explorer
+    // (`DporExplorer::explore`), per-run invariant checks, and
+    // forced-schedule artifacts for exact replay of a failing seed. These
+    // programs use exactly that: every explored run checks the pool's
+    // interleaving oracles, violations are collected (never panicked inside
+    // a run) and asserted after the sweep with the offending seeds printed.
+    // `SQLMODEL_DPOR_SEED=<n>` re-runs a single seed for reproduction.
+    //
+    // Session identity-map note (per the bead): every state-mutating
+    // `Session` operation takes `&mut self`, so two tasks cannot share one
+    // Session through the public API at all — Rust's aliasing rules make
+    // the identity-map interleaving problem unrepresentable without an
+    // external futures-aware mutex, which the crate's design forbids in
+    // favor of one Session per task over pooled connections. The pool
+    // programs below therefore cover the realistic shared-state surface.
+    // ------------------------------------------------------------------
+
+    /// Collects oracle violations across explored runs; a run that records
+    /// a violation still lets the sweep finish so the report can name every
+    /// offending seed.
+    #[derive(Default)]
+    struct Violations {
+        list: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Violations {
+        fn lock(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+            self.list
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn record(&self, message: String) {
+            self.lock().push(message);
+        }
+
+        fn take(&self, label: &str, seeds: &[u64]) {
+            let violations = self.lock();
+            assert!(
+                violations.is_empty(),
+                "{label}: {} oracle violation(s) across explored schedules (seeds {seeds:?}):\n{}",
+                violations.len(),
+                violations.join("\n")
+            );
+        }
+    }
+
+    /// Single-seed replay hook: `SQLMODEL_DPOR_SEED=<n>` runs exactly one
+    /// seed instead of the sweep.
+    fn exploration_seed(base: u64, runs: usize) -> (u64, usize) {
+        match std::env::var("SQLMODEL_DPOR_SEED") {
+            Ok(seed) => {
+                let seed = seed.parse::<u64>().unwrap_or_else(|error| {
+                    panic!("SQLMODEL_DPOR_SEED must be an integer: {error}")
+                });
+                (seed, 1)
+            }
+            Err(_) => (base, runs),
+        }
+    }
+
+    #[test]
+    fn dpor_pool_close_and_drain_never_loses_wakeups_or_resurrects() {
+        let (base_seed, runs) = exploration_seed(0x50F1_0001, 48);
+        let mut explorer = DporExplorer::new(
+            ExplorerConfig::new(base_seed, runs)
+                .worker_count(1)
+                .max_steps(2_000),
+        );
+        let violations = Arc::new(Violations::default());
+        let report = explorer.explore(|runtime| {
+            let pool = Arc::new(Pool::with_timer_driver(
+                PoolConfig::new(2)
+                    .test_on_checkout(false)
+                    .acquire_timeout(60_000),
+                runtime
+                    .state
+                    .timer_driver_handle()
+                    .expect("lab runtime timer driver"),
+            ));
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            let violations = Arc::new(Violations::default());
+            // Outcome flags: u8 codes (0 pending, 1 ok, 2 closed, 3 other).
+            let waiter_outcome = Arc::new(AtomicU64::new(0));
+            let ok_after_close = Arc::new(AtomicU64::new(0));
+            let holders_done = Arc::new(AtomicU64::new(0));
+            let waiter_done = Arc::new(AtomicBool::new(false));
+            let drain_done = Arc::new(AtomicBool::new(false));
+
+            // Two holders: take both leases and release them after a short
+            // virtual delay, so the drain always races the retirement.
+            for holder in 0..2u64 {
+                let (pool, violations, holders_done, ok_after_close) = (
+                    Arc::clone(&pool),
+                    Arc::clone(&violations),
+                    Arc::clone(&holders_done),
+                    Arc::clone(&ok_after_close),
+                );
+                let hold_ms = if holder == 0 { 5 } else { 3 };
+                let (task, _) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let cx = Cx::current().expect("lab task cx");
+                        match pool
+                            .acquire(&cx, || async {
+                                Outcome::Ok(MockConnection::new(
+                                    u32::try_from(holder).expect("holder fits u32") + 1,
+                                ))
+                            })
+                            .await
+                        {
+                            Outcome::Ok(lease) => {
+                                if pool.is_closed() {
+                                    ok_after_close.fetch_add(1, Ordering::Relaxed);
+                                }
+                                asupersync::time::sleep(cx.now(), Duration::from_millis(hold_ms))
+                                    .await;
+                                drop(lease);
+                            }
+                            other => violations.record(format!(
+                                "holder {holder}: acquire before close returned {other:?}"
+                            )),
+                        }
+                        holders_done.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .expect("spawn holder");
+                runtime.scheduler.lock().schedule(task, 0);
+            }
+
+            // The waiter: acquires while both leases are held, so it can only
+            // ever end with a lease from before the close or the closed error.
+            {
+                let (pool, violations, ok_after_close) = (
+                    Arc::clone(&pool),
+                    Arc::clone(&violations),
+                    Arc::clone(&ok_after_close),
+                );
+                let (waiter_outcome, waiter_done) =
+                    (Arc::clone(&waiter_outcome), Arc::clone(&waiter_done));
+                let (task, _) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let cx = Cx::current().expect("lab task cx");
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                        match pool
+                            .acquire(&cx, || async { Outcome::Ok(MockConnection::new(9)) })
+                            .await
+                        {
+                            Outcome::Ok(lease) => {
+                                if pool.is_closed() {
+                                    ok_after_close.fetch_add(1, Ordering::Relaxed);
+                                }
+                                drop(lease);
+                                waiter_outcome.store(1, Ordering::Relaxed);
+                            }
+                            Outcome::Err(Error::Pool(PoolError {
+                                kind: PoolErrorKind::Closed,
+                                ..
+                            })) => waiter_outcome.store(2, Ordering::Relaxed),
+                            other => {
+                                waiter_outcome.store(3, Ordering::Relaxed);
+                                violations.record(format!("waiter: unexpected outcome {other:?}"));
+                            }
+                        }
+                        waiter_done.store(true, Ordering::Relaxed);
+                    })
+                    .expect("spawn waiter");
+                runtime.scheduler.lock().schedule(task, 0);
+            }
+
+            // The drainer: closes admission and waits for both retirements.
+            {
+                let (pool, violations, drain_done) = (
+                    Arc::clone(&pool),
+                    Arc::clone(&violations),
+                    Arc::clone(&drain_done),
+                );
+                let (task, _) = runtime
+                    .state
+                    .create_task(region, Budget::INFINITE, async move {
+                        let cx = Cx::current().expect("lab task cx");
+                        let outcome = pool.close_and_drain(&cx).await;
+                        if !matches!(outcome, Outcome::Ok(())) {
+                            violations.record(format!("drain: expected Ok, got {outcome:?}"));
+                        }
+                        drain_done.store(true, Ordering::Relaxed);
+                    })
+                    .expect("spawn drainer");
+                runtime.scheduler.lock().schedule(task, 0);
+            }
+
+            runtime.run_with_auto_advance();
+
+            // Oracles (a), (b), (c): everyone finished, the drain completed,
+            // the pool stayed closed, and no lease crossed the close line.
+            if holders_done.load(Ordering::Relaxed) != 2 {
+                violations.record(format!(
+                    "holders did not all finish (hang or step exhaustion): {}",
+                    holders_done.load(Ordering::Relaxed)
+                ));
+            }
+            if !waiter_done.load(Ordering::Relaxed) {
+                violations
+                    .record("waiter did not finish (blocked forever after close?)".to_owned());
+            }
+            if waiter_outcome.load(Ordering::Relaxed) == 0 {
+                violations.record("waiter outcome never recorded".to_owned());
+            }
+            if !drain_done.load(Ordering::Relaxed) {
+                violations.record("close_and_drain never completed".to_owned());
+            }
+            if !pool.is_closed() {
+                violations.record("pool not closed after drain".to_owned());
+            }
+            if ok_after_close.load(Ordering::Relaxed) > 0 {
+                violations.record("a lease was handed out after the pool closed".to_owned());
+            }
+            // Oracle (e): stats invariants after the drain. Every lease was
+            // either already dropped pre-close (idle) or retired post-close
+            // (closed), so the pool must be empty with balanced counters.
+            let stats = pool.stats();
+            if stats.total_connections != 0
+                || stats.idle_connections != 0
+                || stats.active_connections != 0
+            {
+                violations.record(format!("stats: pool did not drain empty: {stats:?}"));
+            }
+            if stats.connections_created != 2 || stats.connections_closed != 2 {
+                violations.record(format!(
+                    "stats: created/closed unbalanced (2 expected): {stats:?}"
+                ));
+            }
+        });
+
+        eprintln!(
+            "dpor pool drain: {} runs, {} schedule classes",
+            report.total_runs, report.unique_classes
+        );
+        // DporExplorer may stop before `runs` when race-guided candidate
+        // derivation is exhausted (sleep-set dedup prunes the rest); require
+        // meaningful exploration rather than an exact count.
+        assert!(
+            report.total_runs >= 8,
+            "exploration must actually sweep schedules, ran {}",
+            report.total_runs
+        );
+        let seeds = report.violation_seeds();
+        violations.take("dpor pool close_and_drain", &seeds);
+        assert!(
+            !report.has_violations(),
+            "lab runtime invariants violated (seeds {seeds:?})"
+        );
+    }
+
+    /// A connection whose `begin_with` fails with a retryable
+    /// serialization error for the first `failures` attempts (shared
+    /// counter, so two concurrent callers drain the budget together —
+    /// exactly the interleaving that decides who exhausts their retries).
+    struct FlakyBegin {
+        inner: MockConnection,
+        failures_left: Arc<AtomicU64>,
+    }
+
+    impl FlakyBegin {
+        fn new(failures: u64) -> Self {
+            Self {
+                inner: MockConnection::new(70 + u32::try_from(failures).expect("failures fit u32")),
+                failures_left: Arc::new(AtomicU64::new(failures)),
+            }
+        }
+    }
+
+    impl Connection for FlakyBegin {
+        type Tx<'conn>
+            = <MockConnection as Connection>::Tx<'conn>
+        where
+            Self: 'conn;
+
+        fn dialect(&self) -> Dialect {
+            self.inner.dialect()
+        }
+
+        async fn begin_with(
+            &self,
+            cx: &Cx,
+            isolation: IsolationLevel,
+        ) -> Outcome<Self::Tx<'_>, Error> {
+            if self.failures_left.load(Ordering::Relaxed) > 0 {
+                self.failures_left.fetch_sub(1, Ordering::Relaxed);
+                return Outcome::Err(Error::Query(QueryError {
+                    kind: QueryErrorKind::Serialization,
+                    sql: Some("BEGIN".to_owned()),
+                    sqlstate: Some("40001".to_owned()),
+                    message: "injected serialization failure".to_owned(),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                    source: None,
+                }));
+            }
+            self.inner.begin_with(cx, isolation).await
+        }
+
+        async fn query(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<Vec<Row>, Error> {
+            self.inner.query(cx, sql, params).await
+        }
+
+        async fn query_one(
+            &self,
+            cx: &Cx,
+            sql: &str,
+            params: &[Value],
+        ) -> Outcome<Option<Row>, Error> {
+            self.inner.query_one(cx, sql, params).await
+        }
+
+        async fn execute(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<u64, Error> {
+            self.inner.execute(cx, sql, params).await
+        }
+
+        async fn insert(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<i64, Error> {
+            self.inner.insert(cx, sql, params).await
+        }
+
+        async fn batch(
+            &self,
+            cx: &Cx,
+            statements: &[(String, Vec<Value>)],
+        ) -> Outcome<Vec<u64>, Error> {
+            self.inner.batch(cx, statements).await
+        }
+
+        async fn begin(&self, cx: &Cx) -> Outcome<Self::Tx<'_>, Error> {
+            self.begin_with(cx, IsolationLevel::ReadCommitted).await
+        }
+
+        fn supports_transaction_mode(&self, mode: TransactionMode) -> bool {
+            self.inner.supports_transaction_mode(mode)
+        }
+
+        async fn prepare(&self, cx: &Cx, sql: &str) -> Outcome<PreparedStatement, Error> {
+            self.inner.prepare(cx, sql).await
+        }
+
+        async fn query_prepared(
+            &self,
+            cx: &Cx,
+            stmt: &PreparedStatement,
+            params: &[Value],
+        ) -> Outcome<Vec<Row>, Error> {
+            self.inner.query_prepared(cx, stmt, params).await
+        }
+
+        async fn execute_prepared(
+            &self,
+            cx: &Cx,
+            stmt: &PreparedStatement,
+            params: &[Value],
+        ) -> Outcome<u64, Error> {
+            self.inner.execute_prepared(cx, stmt, params).await
+        }
+
+        async fn ping(&self, cx: &Cx) -> Outcome<(), Error> {
+            self.inner.ping(cx).await
+        }
+
+        async fn close(self, cx: &Cx) -> Result<(), Error> {
+            self.inner.close(cx).await
+        }
+
+        async fn close_for_pool(self, cx: &Cx) -> Result<(), Error>
+        where
+            Self: Sized,
+        {
+            self.inner.close_for_pool(cx).await
+        }
+    }
+
+    /// Two concurrent `retry_transaction` callers share one connection whose
+    /// begin path fails with a retryable serialization error `failures`
+    /// times. Oracles: every caller ends in `Ok` or `RetriesExhausted`,
+    /// never hangs, and the lab invariants hold under every explored
+    /// schedule.
+    #[test]
+    fn dpor_retry_combinator_callers_always_terminate() {
+        for (failures, expect_ok) in [(2, true), (11, false)] {
+            let (base_seed, runs) = exploration_seed(0x50F1_0002 + failures, 32);
+            let mut explorer = DporExplorer::new(
+                ExplorerConfig::new(base_seed, runs)
+                    .worker_count(1)
+                    .max_steps(4_000),
+            );
+            let violations = Arc::new(Violations::default());
+            let report = explorer.explore(|runtime| {
+                let conn = Arc::new(FlakyBegin::new(failures));
+                let region = runtime.state.create_root_region(Budget::INFINITE);
+                let violations = Arc::new(Violations::default());
+                let callers_done = Arc::new(AtomicU64::new(0));
+                let oks = Arc::new(AtomicU64::new(0));
+                let exhausted = Arc::new(AtomicU64::new(0));
+
+                for caller in 0..2u64 {
+                    let (conn, violations, callers_done, oks, exhausted) = (
+                        Arc::clone(&conn),
+                        Arc::clone(&violations),
+                        Arc::clone(&callers_done),
+                        Arc::clone(&oks),
+                        Arc::clone(&exhausted),
+                    );
+                    let (task, _) = runtime
+                        .state
+                        .create_task(region, Budget::INFINITE, async move {
+                            let cx = Cx::current().expect("lab task cx");
+                            let outcome = retry_transaction(
+                                &cx,
+                                conn.as_ref(),
+                                TransactionOptions::new(),
+                                &RetryPolicy::default(),
+                                async |cx: &Cx, tx| {
+                                    tx.execute(cx, "INSERT INTO t VALUES (1)", &[])
+                                        .await
+                                        .map(|_| ())
+                                },
+                            )
+                            .await;
+                            match outcome {
+                                Outcome::Ok(()) => {
+                                    oks.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Outcome::Err(Error::Transaction(e))
+                                    if e.kind == TransactionErrorKind::RetriesExhausted =>
+                                {
+                                    exhausted.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Outcome::Err(e) => violations.record(format!(
+                                    "retry caller {caller}: unexpected Err {e:?}"
+                                )),
+                                Outcome::Cancelled(r) => violations.record(format!(
+                                    "retry caller {caller}: unexpected Cancelled {r:?}"
+                                )),
+                                Outcome::Panicked(p) => violations.record(format!(
+                                    "retry caller {caller}: panicked {p:?}"
+                                )),
+                            }
+                            callers_done.fetch_add(1, Ordering::Relaxed);
+                        })
+                        .expect("spawn retry caller");
+                    runtime.scheduler.lock().schedule(task, 0);
+                }
+
+                runtime.run_with_auto_advance();
+
+                if callers_done.load(Ordering::Relaxed) != 2 {
+                    violations.record(format!(
+                        "retry callers did not finish (hung future?): {}",
+                        callers_done.load(Ordering::Relaxed)
+                    ));
+                }
+                let oks = oks.load(Ordering::Relaxed);
+                let exhausted = exhausted.load(Ordering::Relaxed);
+                if expect_ok && oks != 2 {
+                    violations.record(format!(
+                        "with {failures} injected failures both callers must eventually commit, got {oks} ok"
+                    ));
+                }
+                if !expect_ok && oks + exhausted != 2 {
+                    violations.record(format!(
+                        "with {failures} injected failures every caller must end Ok or exhausted, got {oks} ok / {exhausted} exhausted"
+                    ));
+                }
+            });
+
+            eprintln!(
+                "dpor retry ({failures} injected failures): {} runs, {} classes",
+                report.total_runs, report.unique_classes
+            );
+            assert!(
+                report.total_runs >= 8,
+                "exploration must actually sweep schedules, ran {}",
+                report.total_runs
+            );
+            let seeds = report.violation_seeds();
+            violations.take(
+                &format!("dpor retry ({failures} injected failures)"),
+                &seeds,
+            );
+            assert!(
+                !report.has_violations(),
+                "lab runtime invariants violated (seeds {seeds:?})"
+            );
+            let _ = expect_ok;
+        }
     }
 }
