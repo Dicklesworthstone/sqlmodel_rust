@@ -78,7 +78,12 @@ fn enforce_budget(cx: &Cx) -> Outcome<(), Error> {
                 .unwrap_or_else(|| CancelReason::user("cancelled at statement boundary")),
         );
     }
-    if cx.checkpoint().is_err() {
+    // A past budget deadline is enforced here (checkpoint does not fail on
+    // it in this configuration): the caller sees Err(Timeout) at the next
+    // statement boundary, never a partial durable state.
+    if let Some(deadline) = cx.budget().deadline
+        && cx.now() >= deadline
+    {
         return Outcome::Err(Error::Timeout);
     }
     Outcome::Ok(())

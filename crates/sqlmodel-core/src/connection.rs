@@ -344,6 +344,25 @@ impl Dialect {
     }
 }
 
+/// Budget and timeout semantics (`bd-x6jl.4`)
+/// ============================================
+///
+/// A `Cx` carries an optional [`Budget`] deadline. Components that wait
+/// (pool) or loop over statements (session) must honor the earlier of their
+/// own timeout and that deadline, and must surface exhaustion as a
+/// `Timeout`-kind error (retryable), never as a partial durable state.
+///
+/// | Operation | Outcome at exhaustion | Atomicity | Server-side cancel |
+/// |---|---|---|---|
+/// | `Pool::acquire` | `Err(PoolError{Timeout})` at exactly `min(acquire_timeout, budget)` | n/a (no statement issued) | n/a |
+/// | `Session::flush` | `Err(Error::Timeout)` at the next statement boundary | transactional: rollback restores pre-flush state | SQLite: none (in-memory/instant); Postgres/MySQL: statement runs to completion, then gate fires |
+/// | `Session::commit` | `Err(Error::Timeout)` before `COMMIT` is issued | transaction stays open; caller rolls back | same note |
+/// | `retry_transaction` | deadline past → `Err(RetriesExhausted)`; cancelled → `Cancelled` immediately | best-effort rollback | same note |
+/// | Long-running query | driver-dependent; C SQLite lacks `sqlite3_interrupt` (queries run to completion); `pg_cancel_backend`/`KILL QUERY` require a second connection | driver-dependent | yes on Postgres/MySQL with a second connection |
+///
+/// Enforcement is cooperative: statement-boundary gates call
+/// [`Cx::checkpoint`] / read [`Cx::budget`], and a budget deadline that has
+/// already passed fails the gate before the next statement executes.
 pub trait Connection: Send + Sync {
     /// The transaction type returned by this connection.
     type Tx<'conn>: TransactionOps

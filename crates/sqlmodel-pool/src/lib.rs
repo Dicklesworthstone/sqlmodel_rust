@@ -713,11 +713,11 @@ impl<C: Connection> Pool<C> {
         // budget never extends the pool's own timeout.
         let mut deadline = clock.now() + Duration::from_millis(self.config().acquire_timeout_ms);
         let mut budget_limited = false;
-        if let Some(budget_deadline) = cx.budget().deadline {
-            if budget_deadline < deadline {
-                deadline = budget_deadline;
-                budget_limited = true;
-            }
+        if let Some(budget_deadline) = cx.budget().deadline
+            && budget_deadline < deadline
+        {
+            deadline = budget_deadline;
+            budget_limited = true;
         }
         let test_on_checkout = self.config().test_on_checkout;
         let max_lifetime = Duration::from_millis(self.config().max_lifetime_ms);
@@ -4176,14 +4176,15 @@ mod tests {
 
     #[test]
     fn lab_acquire_budget_deadline_wins_over_acquire_timeout() {
-        let mut runtime =
-            LabRuntime::new(LabConfig::new(0x50F1_0004).max_steps(200_000));
+        let mut runtime = LabRuntime::new(LabConfig::new(0x50F1_0004).max_steps(200_000));
         let driver = runtime
             .state
             .timer_driver_handle()
             .expect("lab runtime timer driver");
         let pool = Arc::new(Pool::with_timer_driver(
-            PoolConfig::new(1).acquire_timeout(5_000).test_on_checkout(false),
+            PoolConfig::new(1)
+                .acquire_timeout(5_000)
+                .test_on_checkout(false),
             driver,
         ));
         let outcome_record = Arc::new(std::sync::Mutex::new(None::<(u64, bool, bool)>));
@@ -4198,7 +4199,7 @@ mod tests {
                     .acquire(&cx, || async { Outcome::Ok(MockConnection::new(1)) })
                     .await
                     .expect("holder acquires the only lease");
-                asupersync::time::sleep(cx.now(), Duration::from_millis(30_000)).await;
+                asupersync::time::sleep(cx.now(), Duration::from_secs(30)).await;
                 drop(lease);
             })
             .expect("spawn holder");
@@ -4241,8 +4242,10 @@ mod tests {
             .expect("waiter recorded an outcome");
         assert_eq!(instant, 2_000, "budget deadline fires at exactly T+2000ms");
         assert!(timed_out, "waiter must observe PoolErrorKind::Timeout");
-        assert!(budget_limited, "the timeout message must attribute the budget");
+        assert!(
+            budget_limited,
+            "the timeout message must attribute the budget"
+        );
         assert_eq!(pool.stats().timeouts, 1);
     }
 }
-

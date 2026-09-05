@@ -15,10 +15,10 @@
 //! per statement, so each cutoff lands on a statement boundary.
 
 use asupersync::runtime::RuntimeBuilder;
-use asupersync::{Budget, CancelReason, Cx, Outcome};
+use asupersync::{Budget, Cx, Outcome};
 use serde::{Deserialize, Serialize};
-use sqlmodel::prelude::*;
 use sqlmodel::Session;
+use sqlmodel::prelude::*;
 use sqlmodel_core::PreparedStatement;
 use sqlmodel_e2e::expect_outcome;
 use sqlmodel_sqlite::SqliteConnection;
@@ -26,24 +26,6 @@ use std::time::Duration;
 
 /// Wall-clock cost attributed to each statement by [`SleepingConnection`].
 const STMT_MS: u64 = 3;
-
-/// Budget/cancellation gate mirroring `Session`'s own `enforce_budget`: an
-/// expired budget deadline is `Error::Timeout`; a cancelled `Cx` is
-/// `Outcome::Cancelled`.
-fn enforce_budget(cx: &Cx) -> Outcome<(), Error> {
-    if cx.is_cancel_requested() {
-        return Outcome::Cancelled(
-            cx.cancel_reason()
-                .unwrap_or_else(|| CancelReason::user("cancelled at statement boundary")),
-        );
-    }
-    if let Some(deadline) = cx.budget().deadline {
-        if cx.now() >= deadline {
-            return Outcome::Err(Error::Timeout);
-        }
-    }
-    Outcome::Ok(())
-}
 
 struct SleepingConnection {
     inner: SqliteConnection,
@@ -74,12 +56,7 @@ impl Connection for SleepingConnection {
         self.inner.query(cx, sql, params).await
     }
 
-    async fn query_one(
-        &self,
-        cx: &Cx,
-        sql: &str,
-        params: &[Value],
-    ) -> Outcome<Option<Row>, Error> {
+    async fn query_one(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<Option<Row>, Error> {
         std::thread::sleep(Duration::from_millis(STMT_MS));
         self.inner.query_one(cx, sql, params).await
     }
@@ -107,11 +84,7 @@ impl Connection for SleepingConnection {
         self.inner.begin(cx).await
     }
 
-    async fn begin_with(
-        &self,
-        cx: &Cx,
-        isolation: IsolationLevel,
-    ) -> Outcome<Self::Tx<'_>, Error> {
+    async fn begin_with(&self, cx: &Cx, isolation: IsolationLevel) -> Outcome<Self::Tx<'_>, Error> {
         self.inner.begin_with(cx, isolation).await
     }
 
@@ -198,7 +171,7 @@ async fn flush_three(cx: &Cx, s: &mut Session<SleepingConnection>) -> Outcome<()
 fn fixture_ddl() -> [&'static str; 2] {
     [
         "CREATE TABLE e2e_budget_rows (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, extra TEXT)",
-        "INSERT INTO e2e_budget_rows (id, payload) VALUES (1, 'seed-a'), (2, 'seed-b')",
+        "INSERT INTO e2e_budget_rows (id, payload) VALUES (7, 'seed-a'), (8, 'seed-b')",
     ]
 }
 
@@ -222,15 +195,17 @@ fn flush_budget_deadline_boundary_sweep() {
             let before = state_dump(&fixture_cx, &conn).await;
             let expected_after_flush = vec![
                 "1|alpha-one|x".to_owned(),
-                "2|beta-two|".to_owned(),
+                "2|beta-two|?".to_owned(),
                 "3|gamma-three|y".to_owned(),
+                "7|seed-a|?".to_owned(),
+                "8|seed-b|?".to_owned(),
             ];
-
-            let start = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock");
+            // The deadline anchors to the budgeted Cx's own virtual clock:
+            // for_testing contexts start their clock near zero, so compute
+            // the window from a probe read on an identical clock.
+            let t0 = Cx::for_testing().now();
             let deadline = asupersync::types::Time::from_nanos(
-                start.as_nanos() as u64 + budget_ms * 1_000_000,
+                t0.as_nanos() + budget_ms * 1_000_000,
             );
             let budget = Budget::new().with_deadline(deadline);
             let cx = Cx::for_testing_with_budget(budget);
