@@ -8,17 +8,18 @@
 //! # Role In The Architecture
 //!
 //! - Implements `sqlmodel-core::Connection` for FrankenSQLite
-//! - No FFI or `unsafe` code (beyond the Send/Sync wrappers)
+//! - No FFI and no `unsafe` code
 //! - Enables `sqlmodel-query` and `sqlmodel-session` to run against FrankenSQLite
 //! - Supports `BEGIN CONCURRENT` for parallel write throughput
 //!
 //! # Thread Safety
 //!
-//! `FrankenConnection` is both `Send` and `Sync`, using internal mutex
-//! synchronization to protect the underlying FrankenSQLite connection.
-//! This allows connections to be shared across async tasks safely.
-
-#![allow(unsafe_code)] // Only for Send/Sync impls on the mutex-guarded inner type
+//! `FrankenConnection` is both `Send` and `Sync`. The fsqlite engine handle is
+//! owned by a dedicated worker thread and reached through a channel handle
+//! (`fsqlite::AsyncConnection`), so no `Rc`/`RefCell` engine state ever crosses
+//! a thread boundary; the mutex only guards the adapter's own bookkeeping
+//! (`in_transaction`, `last_insert_rowid`). Connections can be shared across
+//! async tasks safely without any `unsafe impl Send/Sync` wrappers.
 
 pub mod connection;
 pub mod value;
