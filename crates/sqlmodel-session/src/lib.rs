@@ -63,6 +63,27 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 
+/// Budget/cancellation gate used at statement boundaries of multi-statement
+/// operations (`flush`, `commit`).
+///
+/// An already-cancelled `Cx` yields [`Outcome::Cancelled`]; a `Cx` whose
+/// budget the runtime has exhausted (deadline passed or poll quota spent)
+/// yields [`Outcome::Err`]([`Error::Timeout`]), which [`Error::is_retryable`]
+/// accepts — the caller may retry the operation with a live budget after
+/// rolling back.
+fn enforce_budget(cx: &Cx) -> Outcome<(), Error> {
+    if cx.is_cancel_requested() {
+        return Outcome::Cancelled(
+            cx.cancel_reason()
+                .unwrap_or_else(|| CancelReason::user("cancelled at statement boundary")),
+        );
+    }
+    if cx.checkpoint().is_err() {
+        return Outcome::Err(Error::Timeout);
+    }
+    Outcome::Ok(())
+}
+
 // ============================================================================
 // Session Events
 // ============================================================================
@@ -1418,7 +1439,12 @@ impl<C: Connection> Session<C> {
             );
         }
 
-        // Fire before_flush event
+        // Same for an exhausted `Cx` budget: nothing executes and nothing is
+        // taken from the pending sets. A live budget is re-checked at every
+        // statement boundary below.
+        if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+            return outcome;
+        }
         if let Err(e) = self.event_callbacks.fire(SessionEvent::BeforeFlush) {
             return Outcome::Err(e);
         }
@@ -1551,6 +1577,10 @@ impl<C: Connection> Session<C> {
                 placeholders.join(", ")
             );
 
+            if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                self.pending_delete = deletes;
+                return outcome;
+            }
             match self.connection.execute(cx, &sql, &pks).await {
                 Outcome::Ok(_) => {}
                 Outcome::Err(e) => {
@@ -1640,6 +1670,10 @@ impl<C: Connection> Session<C> {
                 tuple_sql.join(", ")
             );
 
+            if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                self.pending_delete = deletes;
+                return outcome;
+            }
             match self.connection.execute(cx, &sql, &params).await {
                 Outcome::Ok(_) => {}
                 Outcome::Err(e) => {
@@ -1705,6 +1739,11 @@ impl<C: Connection> Session<C> {
                 placeholders.join(", ")
             );
 
+            if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                self.pending_delete = deletes;
+                return outcome;
+            }
+
             match self.connection.execute(cx, &sql, &pks).await {
                 Outcome::Ok(_) => {}
                 Outcome::Err(e) => {
@@ -1769,6 +1808,10 @@ impl<C: Connection> Session<C> {
                 tuple_sql.join(", ")
             );
 
+            if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                self.pending_delete = deletes;
+                return outcome;
+            }
             match self.connection.execute(cx, &sql, &params).await {
                 Outcome::Ok(_) => {}
                 Outcome::Err(e) => {
@@ -1828,6 +1871,10 @@ impl<C: Connection> Session<C> {
                     where_parts.join(" AND ")
                 );
 
+                if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                    self.pending_delete = deletes;
+                    return outcome;
+                }
                 match self.connection.execute(cx, &sql, &pk_values).await {
                     Outcome::Ok(_) => {
                         actually_deleted.push(*key);
@@ -1972,6 +2019,10 @@ impl<C: Connection> Session<C> {
                     placeholders.join(", ")
                 );
 
+                if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                    self.pending_new = inserts;
+                    return outcome;
+                }
                 match self.connection.execute(cx, &sql, &insert_values).await {
                     Outcome::Ok(_) => {
                         tracked.state = ObjectState::Persistent;
@@ -2088,6 +2139,11 @@ impl<C: Connection> Session<C> {
                     where_parts.join(" AND ")
                 );
 
+                if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                    self.pending_dirty = dirty;
+                    return outcome;
+                }
+
                 match self.connection.execute(cx, &sql, &params).await {
                     Outcome::Ok(_) => {
                         // Update original_state to current state
@@ -2136,6 +2192,9 @@ impl<C: Connection> Session<C> {
         }
 
         if self.in_transaction {
+            if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
+                return outcome;
+            }
             match self.connection.execute(cx, "COMMIT", &[]).await {
                 Outcome::Ok(_) => {
                     self.in_transaction = false;
