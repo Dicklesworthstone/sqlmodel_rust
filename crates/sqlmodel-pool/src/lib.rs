@@ -707,7 +707,18 @@ impl<C: Connection> Pool<C> {
         Fut: Future<Output = Outcome<C, Error>>,
     {
         let clock = self.shared.clock.clone();
-        let deadline = clock.now() + Duration::from_millis(self.config().acquire_timeout_ms);
+        // The effective wait deadline is the earlier of the configured
+        // acquire timeout and the `Cx` budget deadline (if the caller set
+        // one): a budget smaller than `acquire_timeout_ms` wins, a larger
+        // budget never extends the pool's own timeout.
+        let mut deadline = clock.now() + Duration::from_millis(self.config().acquire_timeout_ms);
+        let mut budget_limited = false;
+        if let Some(budget_deadline) = cx.budget().deadline {
+            if budget_deadline < deadline {
+                deadline = budget_deadline;
+                budget_limited = true;
+            }
+        }
         let test_on_checkout = self.config().test_on_checkout;
         let max_lifetime = Duration::from_millis(self.config().max_lifetime_ms);
         let idle_timeout = Duration::from_millis(self.config().idle_timeout_ms);
@@ -718,12 +729,18 @@ impl<C: Connection> Pool<C> {
                 return Outcome::Cancelled(CancelReason::user("pool acquire cancelled"));
             }
 
-            // Check timeout
+            // Check timeout (the effective deadline already folds in the
+            // caller's budget when it is the tighter constraint).
             if clock.now() >= deadline {
                 self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
+                let message = if budget_limited {
+                    "acquire timeout: budget deadline reached before a connection was available"
+                } else {
+                    "acquire timeout: no connections available"
+                };
                 return Outcome::Err(Error::Pool(PoolError {
                     kind: PoolErrorKind::Timeout,
-                    message: "acquire timeout: no connections available".to_string(),
+                    message: message.to_string(),
                     source: None,
                 }));
             }
@@ -4149,4 +4166,83 @@ mod tests {
             let _ = expect_ok;
         }
     }
+
+    // ------------------------------------------------------------------
+    // Budget semantics (`bd-x6jl.4`, part 4a): the effective acquire wait
+    // deadline is min(acquire_timeout, Cx budget deadline). A budget
+    // smaller than `acquire_timeout` wins; a larger budget never extends
+    // the pool's own timeout. Verified at the exact virtual instant.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lab_acquire_budget_deadline_wins_over_acquire_timeout() {
+        let mut runtime =
+            LabRuntime::new(LabConfig::new(0x50F1_0004).max_steps(200_000));
+        let driver = runtime
+            .state
+            .timer_driver_handle()
+            .expect("lab runtime timer driver");
+        let pool = Arc::new(Pool::with_timer_driver(
+            PoolConfig::new(1).acquire_timeout(5_000).test_on_checkout(false),
+            driver,
+        ));
+        let outcome_record = Arc::new(std::sync::Mutex::new(None::<(u64, bool, bool)>));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        // The sole lease is taken and held well past the budget deadline.
+        let holder_pool = Arc::clone(&pool);
+        let (holder_task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task cx");
+                let lease = holder_pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(1)) })
+                    .await
+                    .expect("holder acquires the only lease");
+                asupersync::time::sleep(cx.now(), Duration::from_millis(30_000)).await;
+                drop(lease);
+            })
+            .expect("spawn holder");
+        runtime.scheduler.lock().schedule(holder_task, 0);
+
+        // The waiter's task budget expires at virtual T+2000ms: acquire must
+        // return the budget-attributed timeout at exactly that instant, even
+        // though `acquire_timeout` is 5000ms.
+        let waiter_pool = Arc::clone(&pool);
+        let waiter_budget = Budget::new().with_deadline(Time::from_millis(2_000));
+        let outcome_writer = Arc::clone(&outcome_record);
+        let (waiter_task, _) = runtime
+            .state
+            .create_task(region, waiter_budget, async move {
+                let cx = Cx::current().expect("lab task cx");
+                let outcome = waiter_pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await;
+                let instant = cx.now().as_millis();
+                match &outcome {
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        message,
+                        ..
+                    })) => {
+                        let budget_limited = message.contains("budget deadline");
+                        *outcome_writer.lock().unwrap() = Some((instant, true, budget_limited));
+                    }
+                    _ => *outcome_writer.lock().unwrap() = Some((instant, false, false)),
+                }
+            })
+            .expect("spawn waiter");
+        runtime.scheduler.lock().schedule(waiter_task, 0);
+
+        runtime.run_with_auto_advance();
+
+        let (instant, timed_out, budget_limited) = outcome_record
+            .lock()
+            .unwrap()
+            .expect("waiter recorded an outcome");
+        assert_eq!(instant, 2_000, "budget deadline fires at exactly T+2000ms");
+        assert!(timed_out, "waiter must observe PoolErrorKind::Timeout");
+        assert!(budget_limited, "the timeout message must attribute the budget");
+        assert_eq!(pool.stats().timeouts, 1);
+    }
 }
+
