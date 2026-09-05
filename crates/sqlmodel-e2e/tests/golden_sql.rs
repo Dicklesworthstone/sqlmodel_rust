@@ -78,6 +78,34 @@ struct Student {
     grade: String,
 }
 
+/// Concrete-table inheritance: every child owns the full column set in its
+/// own table; the base is abstract (no rows of its own).
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table, inheritance = "concrete")]
+struct CtiContent {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    title: String,
+}
+
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table, inheritance = "concrete", inherits = "CtiContent")]
+struct CtiArticle {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    title: String,
+    body: String,
+}
+
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table, inheritance = "concrete", inherits = "CtiContent")]
+struct CtiVideo {
+    #[sqlmodel(primary_key)]
+    id: i64,
+    title: String,
+    duration: i64,
+}
+
 fn team(id: i64, name: &str, motto: Option<&str>) -> Team {
     Team {
         id,
@@ -316,6 +344,15 @@ fn corpus(dialect: Dialect) -> Vec<(&'static str, String, Vec<Value>)> {
             .polymorphic_joined::<Student>()
             .filter(Expr::qualified("people", "name").like("A%"))
             .order_by(Expr::qualified("people", "id").asc())
+            .build_with_dialect(dialect),
+    );
+    push(
+        "select_polymorphic_concrete",
+        select!(CtiContent)
+            .polymorphic_concrete2::<CtiArticle, CtiVideo>()
+            .filter(Expr::col("title").like("R%"))
+            .order_by(Expr::col("id").asc())
+            .limit(25)
             .build_with_dialect(dialect),
     );
 

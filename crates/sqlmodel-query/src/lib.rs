@@ -36,8 +36,10 @@ pub use expr::{
 };
 pub use join::{Join, JoinType};
 pub use select::{
-    PolymorphicJoined, PolymorphicJoined2, PolymorphicJoined3, PolymorphicJoinedSelect,
-    PolymorphicJoinedSelect2, PolymorphicJoinedSelect3, Select,
+    PolymorphicConcrete, PolymorphicConcrete2, PolymorphicConcrete3, PolymorphicConcreteSelect,
+    PolymorphicConcreteSelect2, PolymorphicConcreteSelect3, PolymorphicJoined, PolymorphicJoined2,
+    PolymorphicJoined3, PolymorphicJoinedSelect, PolymorphicJoinedSelect2,
+    PolymorphicJoinedSelect3, Select,
 };
 pub use set_ops::{
     SetOpType, SetOperation, except, except_all, intersect, intersect_all, union, union_all,

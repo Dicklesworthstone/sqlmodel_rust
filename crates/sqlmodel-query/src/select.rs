@@ -339,6 +339,50 @@ impl<M: Model> Select<M> {
         }
     }
 
+    /// Convert this `Select<M>` into a concrete-table inheritance polymorphic
+    /// query over one child table.
+    ///
+    /// The child tables are combined with `UNION ALL`: every branch projects
+    /// the unified column set (typed `CAST(NULL AS ..)` fillers where a branch
+    /// lacks a column) plus a `__type` tag naming the branch's table, so each
+    /// row hydrates to the right child model in one round trip. Filters apply
+    /// per branch; ORDER BY and LIMIT/OFFSET apply to the union.
+    #[must_use]
+    pub fn polymorphic_concrete<Child: Model>(self) -> PolymorphicConcreteSelect<M, Child> {
+        PolymorphicConcreteSelect {
+            select: self,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Concrete-table inheritance polymorphic query over two child tables.
+    ///
+    /// Returns `PolymorphicConcrete2<M, C1, C2>` rows; see
+    /// [`Select::polymorphic_concrete`] for the shape of the generated SQL.
+    #[must_use]
+    pub fn polymorphic_concrete2<C1: Model, C2: Model>(
+        self,
+    ) -> PolymorphicConcreteSelect2<M, C1, C2> {
+        PolymorphicConcreteSelect2 {
+            select: self,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Concrete-table inheritance polymorphic query over three child tables.
+    ///
+    /// Returns `PolymorphicConcrete3<M, C1, C2, C3>` rows; see
+    /// [`Select::polymorphic_concrete`] for the shape of the generated SQL.
+    #[must_use]
+    pub fn polymorphic_concrete3<C1: Model, C2: Model, C3: Model>(
+        self,
+    ) -> PolymorphicConcreteSelect3<M, C1, C2, C3> {
+        PolymorphicConcreteSelect3 {
+            select: self,
+            _marker: PhantomData,
+        }
+    }
+
     /// Build SQL for eager loading with JOINs using a specific dialect.
     ///
     /// Generates SELECT with aliased columns and LEFT JOINs for included relationships.
@@ -1522,6 +1566,509 @@ impl<Base: Model, C1: Model, C2: Model, C3: Model> PolymorphicJoinedSelect3<Base
     }
 }
 
+// ==================== Concrete-table inheritance polymorphic selects ====================
+
+/// The variant tag column appended to every branch of a concrete-table union.
+/// Its value is the branch child's `TABLE_NAME`, so hydration is
+/// self-describing and independent of branch order.
+const CONCRETE_TYPE_COLUMN: &str = "__type";
+
+/// Ordered union of the children's columns. The first child declaring a name
+/// fixes the unified column's position and type; later children sharing the
+/// name must be type-compatible (the union's branch types must unify).
+fn concrete_union_columns(
+    children: &[&'static [sqlmodel_core::FieldInfo]],
+) -> Vec<(&'static str, &'static sqlmodel_core::FieldInfo)> {
+    let mut unified: Vec<(&'static str, &'static sqlmodel_core::FieldInfo)> = Vec::new();
+    for fields in children {
+        for field in *fields {
+            if !unified.iter().any(|(name, _)| *name == field.column_name) {
+                unified.push((field.column_name, field));
+            }
+        }
+    }
+    unified
+}
+
+/// The `CAST(NULL AS T)` filler for a unified column a branch does not have.
+///
+/// SQLite and PostgreSQL accept the dialect's full type names. MySQL's CAST
+/// only supports a small target set (`SIGNED`, `DOUBLE`, `DECIMAL(p, s)`,
+/// `CHAR(n)`, `DATE`, `TIME`, `DATETIME`, `BINARY`, `JSON`), so those are
+/// mapped explicitly.
+fn concrete_null_filler(field: &sqlmodel_core::FieldInfo, dialect: Dialect) -> String {
+    use sqlmodel_core::SqlType;
+    match dialect {
+        Dialect::Mysql => {
+            let target = match field.sql_type {
+                SqlType::TinyInt
+                | SqlType::SmallInt
+                | SqlType::Integer
+                | SqlType::BigInt
+                | SqlType::Boolean => "SIGNED".to_string(),
+                SqlType::Real | SqlType::Double => "DOUBLE".to_string(),
+                SqlType::Date => "DATE".to_string(),
+                SqlType::Time => "TIME".to_string(),
+                SqlType::DateTime | SqlType::Timestamp | SqlType::TimestampTz => {
+                    "DATETIME".to_string()
+                }
+                SqlType::Json | SqlType::JsonB | SqlType::Array(_) => "JSON".to_string(),
+                SqlType::Binary(len) | SqlType::VarBinary(len) => format!("BINARY({len})"),
+                SqlType::Blob | SqlType::Uuid => "BINARY".to_string(),
+                SqlType::Char(len) | SqlType::VarChar(len) => format!("CHAR({len})"),
+                SqlType::Text | SqlType::Enum(_) | SqlType::Custom(_) => "CHAR".to_string(),
+                // DECIMAL(p, s) / NUMERIC(p, s) pass straight through.
+                SqlType::Numeric { .. } | SqlType::Decimal { .. } => {
+                    return format!("CAST(NULL AS {})", field.effective_sql_type_for(dialect));
+                }
+            };
+            format!("CAST(NULL AS {target})")
+        }
+        _ => format!("CAST(NULL AS {})", field.effective_sql_type_for(dialect)),
+    }
+}
+
+/// The invariant checks shared by every concrete-table polymorphic entry
+/// point: the base is a concrete-table base, each child is a concrete-table
+/// child of that base, and the base has a primary key.
+#[allow(clippy::result_large_err)]
+fn concrete_hierarchy_check<Base: Model>(
+    op: &str,
+    child_tables: &[&'static str],
+) -> Result<(), sqlmodel_core::Error> {
+    let inh_base = Base::inheritance();
+    if inh_base.strategy != sqlmodel_core::InheritanceStrategy::Concrete
+        || inh_base.parent.is_some()
+    {
+        return Err(sqlmodel_core::Error::Custom(format!(
+            "{op} requires a concrete-inheritance base model; got strategy={:?}, parent={:?} for {}",
+            inh_base.strategy,
+            inh_base.parent,
+            Base::TABLE_NAME
+        )));
+    }
+    for table in child_tables {
+        if Base::PRIMARY_KEY.is_empty() {
+            return Err(sqlmodel_core::Error::Custom(format!(
+                "{op} requires base model {} to have a primary key",
+                Base::TABLE_NAME
+            )));
+        }
+        let _ = table;
+    }
+    Ok(())
+}
+
+/// The per-child half of [`concrete_hierarchy_check`].
+#[allow(clippy::result_large_err)]
+fn concrete_child_check<Base: Model, Child: Model>(op: &str) -> Result<(), sqlmodel_core::Error> {
+    let inh_child = Child::inheritance();
+    if inh_child.strategy != sqlmodel_core::InheritanceStrategy::Concrete
+        || inh_child.parent != Some(Base::TABLE_NAME)
+    {
+        return Err(sqlmodel_core::Error::Custom(format!(
+            "{op} requires a concrete-inheritance child with parent={}; got strategy={:?}, parent={:?} for {}",
+            Base::TABLE_NAME,
+            inh_child.strategy,
+            inh_child.parent,
+            Child::TABLE_NAME
+        )));
+    }
+    Ok(())
+}
+
+/// Build the concrete-table UNION ALL for `branches` (table name + fields),
+/// applying the select's filters per branch and its ORDER BY / LIMIT / OFFSET
+/// to the union as a whole. Placeholders stay dense across branches.
+fn build_concrete_union_sql<Base: Model>(
+    select: &Select<Base>,
+    dialect: Dialect,
+    branches: &[(&'static str, &'static [sqlmodel_core::FieldInfo])],
+) -> (String, Vec<Value>) {
+    let unified = concrete_union_columns(&branches.iter().map(|(_, f)| *f).collect::<Vec<_>>());
+    let tag_alias = dialect.quote_identifier(CONCRETE_TYPE_COLUMN);
+
+    let mut sql = String::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    for (index, (table, fields)) in branches.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" UNION ALL ");
+        }
+        sql.push_str("SELECT ");
+        let mut projections: Vec<String> = Vec::with_capacity(unified.len() + 1);
+        for (name, first_field) in &unified {
+            let alias = dialect.quote_identifier(name);
+            let projection = match fields.iter().find(|f| f.column_name == *name) {
+                Some(_) => format!(
+                    "{}.{} AS {alias}",
+                    dialect.quote_identifier(table),
+                    dialect.quote_identifier(name)
+                ),
+                // A column this branch lacks: typed NULL keeps every branch's
+                // projection shape identical without materializing values.
+                None => format!("{} AS {alias}", concrete_null_filler(first_field, dialect)),
+            };
+            projections.push(projection);
+        }
+        projections.push(format!("'{}' AS {tag_alias}", table));
+        sql.push_str(&projections.join(", "));
+
+        sql.push_str(" FROM ");
+        sql.push_str(&dialect.quote_identifier(table));
+
+        if let Some(where_clause) = &select.where_clause {
+            let (where_sql, where_params) = where_clause.build_with_dialect(dialect, params.len());
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_sql);
+            params.extend(where_params);
+        }
+    }
+
+    // ORDER BY / LIMIT / OFFSET written after the last branch scope the whole
+    // union on all three dialects.
+    if !select.order_by.is_empty() {
+        sql.push_str(" ORDER BY ");
+        let param_offset = params.len();
+        let order_strs: Vec<_> = select
+            .order_by
+            .iter()
+            .map(|o| o.build(dialect, &mut params, param_offset))
+            .collect();
+        sql.push_str(&order_strs.join(", "));
+    }
+    if let Some(Limit(n)) = select.limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    if let Some(Offset(n)) = select.offset {
+        sql.push_str(&format!(" OFFSET {n}"));
+    }
+
+    (sql, params)
+}
+
+/// Hydrate one union row by its variant tag.
+#[allow(clippy::result_large_err)]
+fn concrete_tag(row: &Row) -> Result<String, sqlmodel_core::Error> {
+    row.get_named(CONCRETE_TYPE_COLUMN)
+}
+
+/// Output of a concrete-table inheritance polymorphic query with a single child type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolymorphicConcrete<Child: Model> {
+    Child(Child),
+}
+
+/// A concrete-table polymorphic SELECT over base + one child table.
+///
+/// Construct via `select!(Base).polymorphic_concrete::<Child>()`.
+#[derive(Debug, Clone)]
+pub struct PolymorphicConcreteSelect<Base: Model, Child: Model> {
+    select: Select<Base>,
+    _marker: PhantomData<Child>,
+}
+
+impl<Base: Model, Child: Model> PolymorphicConcreteSelect<Base, Child> {
+    /// Add a WHERE condition (applied to this child's branch).
+    #[must_use]
+    pub fn filter(mut self, expr: Expr) -> Self {
+        self.select = self.select.filter(expr);
+        self
+    }
+
+    /// Add ORDER BY (applied to the union).
+    #[must_use]
+    pub fn order_by(mut self, order: OrderBy) -> Self {
+        self.select = self.select.order_by(order);
+        self
+    }
+
+    /// Set LIMIT (applied to the union).
+    #[must_use]
+    pub fn limit(mut self, n: u64) -> Self {
+        self.select = self.select.limit(n);
+        self
+    }
+
+    /// Set OFFSET (applied to the union).
+    #[must_use]
+    pub fn offset(mut self, n: u64) -> Self {
+        self.select = self.select.offset(n);
+        self
+    }
+
+    /// Build the SQL query and parameters.
+    pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        build_concrete_union_sql(
+            &self.select,
+            dialect,
+            &[(Child::TABLE_NAME, Child::fields())],
+        )
+    }
+
+    /// Execute the query and hydrate every row as `Child`.
+    #[tracing::instrument(level = "debug", skip(self, cx, conn))]
+    pub async fn all<C: Connection>(
+        self,
+        cx: &Cx,
+        conn: &C,
+    ) -> Outcome<Vec<PolymorphicConcrete<Child>>, sqlmodel_core::Error> {
+        if let Err(e) =
+            concrete_hierarchy_check::<Base>("polymorphic_concrete", &[Child::TABLE_NAME])
+        {
+            return Outcome::Err(e);
+        }
+        if let Err(e) = concrete_child_check::<Base, Child>("polymorphic_concrete") {
+            return Outcome::Err(e);
+        }
+
+        let (sql, params) = self.build_with_dialect(conn.dialect());
+        let rows = conn.query(cx, &sql, &params).await;
+        rows.and_then(|rows| {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let tag = match concrete_tag(&row) {
+                    Ok(t) => t,
+                    Err(e) => return Outcome::Err(e),
+                };
+                if tag != Child::TABLE_NAME {
+                    return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                        "polymorphic_concrete: unknown {} tag {tag:?} for base {}",
+                        CONCRETE_TYPE_COLUMN,
+                        Base::TABLE_NAME
+                    )));
+                }
+                match Child::from_row(&row) {
+                    Ok(c) => out.push(PolymorphicConcrete::Child(c)),
+                    Err(e) => return Outcome::Err(e),
+                }
+            }
+            Outcome::Ok(out)
+        })
+    }
+}
+
+/// Output of a concrete-table inheritance polymorphic query with two child types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolymorphicConcrete2<C1: Model, C2: Model> {
+    C1(C1),
+    C2(C2),
+}
+
+/// A concrete-table polymorphic SELECT over two child tables.
+///
+/// Construct via `select!(Base).polymorphic_concrete2::<C1, C2>()`.
+#[derive(Debug, Clone)]
+pub struct PolymorphicConcreteSelect2<Base: Model, C1: Model, C2: Model> {
+    select: Select<Base>,
+    _marker: PhantomData<(C1, C2)>,
+}
+
+impl<Base: Model, C1: Model, C2: Model> PolymorphicConcreteSelect2<Base, C1, C2> {
+    /// Add a WHERE condition (applied to every branch).
+    #[must_use]
+    pub fn filter(mut self, expr: Expr) -> Self {
+        self.select = self.select.filter(expr);
+        self
+    }
+
+    /// Add ORDER BY (applied to the union).
+    #[must_use]
+    pub fn order_by(mut self, order: OrderBy) -> Self {
+        self.select = self.select.order_by(order);
+        self
+    }
+
+    /// Set LIMIT (applied to the union).
+    #[must_use]
+    pub fn limit(mut self, n: u64) -> Self {
+        self.select = self.select.limit(n);
+        self
+    }
+
+    /// Set OFFSET (applied to the union).
+    #[must_use]
+    pub fn offset(mut self, n: u64) -> Self {
+        self.select = self.select.offset(n);
+        self
+    }
+
+    /// Build the SQL query and parameters.
+    pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        build_concrete_union_sql(
+            &self.select,
+            dialect,
+            &[
+                (C1::TABLE_NAME, C1::fields()),
+                (C2::TABLE_NAME, C2::fields()),
+            ],
+        )
+    }
+
+    /// Execute the query and hydrate `C1` or `C2` per row via the variant tag.
+    #[tracing::instrument(level = "debug", skip(self, cx, conn))]
+    pub async fn all<C: Connection>(
+        self,
+        cx: &Cx,
+        conn: &C,
+    ) -> Outcome<Vec<PolymorphicConcrete2<C1, C2>>, sqlmodel_core::Error> {
+        if let Err(e) = concrete_hierarchy_check::<Base>(
+            "polymorphic_concrete2",
+            &[C1::TABLE_NAME, C2::TABLE_NAME],
+        ) {
+            return Outcome::Err(e);
+        }
+        if let Err(e) = concrete_child_check::<Base, C1>("polymorphic_concrete2") {
+            return Outcome::Err(e);
+        }
+        if let Err(e) = concrete_child_check::<Base, C2>("polymorphic_concrete2") {
+            return Outcome::Err(e);
+        }
+
+        let (sql, params) = self.build_with_dialect(conn.dialect());
+        let rows = conn.query(cx, &sql, &params).await;
+        rows.and_then(|rows| {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let tag = match concrete_tag(&row) {
+                    Ok(t) => t,
+                    Err(e) => return Outcome::Err(e),
+                };
+                let hydrated = if tag == C1::TABLE_NAME {
+                    C1::from_row(&row).map(PolymorphicConcrete2::C1)
+                } else if tag == C2::TABLE_NAME {
+                    C2::from_row(&row).map(PolymorphicConcrete2::C2)
+                } else {
+                    return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                        "polymorphic_concrete2: unknown {} tag {tag:?} for base {}",
+                        CONCRETE_TYPE_COLUMN,
+                        Base::TABLE_NAME
+                    )));
+                };
+                out.push(match hydrated {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(e),
+                });
+            }
+            Outcome::Ok(out)
+        })
+    }
+}
+
+/// Output of a concrete-table inheritance polymorphic query with three child types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolymorphicConcrete3<C1: Model, C2: Model, C3: Model> {
+    C1(C1),
+    C2(C2),
+    C3(C3),
+}
+
+/// A concrete-table polymorphic SELECT over three child tables.
+///
+/// Construct via `select!(Base).polymorphic_concrete3::<C1, C2, C3>()`.
+#[derive(Debug, Clone)]
+pub struct PolymorphicConcreteSelect3<Base: Model, C1: Model, C2: Model, C3: Model> {
+    select: Select<Base>,
+    _marker: PhantomData<(C1, C2, C3)>,
+}
+
+impl<Base: Model, C1: Model, C2: Model, C3: Model> PolymorphicConcreteSelect3<Base, C1, C2, C3> {
+    /// Add a WHERE condition (applied to every branch).
+    #[must_use]
+    pub fn filter(mut self, expr: Expr) -> Self {
+        self.select = self.select.filter(expr);
+        self
+    }
+
+    /// Add ORDER BY (applied to the union).
+    #[must_use]
+    pub fn order_by(mut self, order: OrderBy) -> Self {
+        self.select = self.select.order_by(order);
+        self
+    }
+
+    /// Set LIMIT (applied to the union).
+    #[must_use]
+    pub fn limit(mut self, n: u64) -> Self {
+        self.select = self.select.limit(n);
+        self
+    }
+
+    /// Set OFFSET (applied to the union).
+    #[must_use]
+    pub fn offset(mut self, n: u64) -> Self {
+        self.select = self.select.offset(n);
+        self
+    }
+
+    /// Build the SQL query and parameters.
+    pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+        build_concrete_union_sql(
+            &self.select,
+            dialect,
+            &[
+                (C1::TABLE_NAME, C1::fields()),
+                (C2::TABLE_NAME, C2::fields()),
+                (C3::TABLE_NAME, C3::fields()),
+            ],
+        )
+    }
+
+    /// Execute the query and hydrate `C1`/`C2`/`C3` per row via the variant tag.
+    #[tracing::instrument(level = "debug", skip(self, cx, conn))]
+    pub async fn all<C: Connection>(
+        self,
+        cx: &Cx,
+        conn: &C,
+    ) -> Outcome<Vec<PolymorphicConcrete3<C1, C2, C3>>, sqlmodel_core::Error> {
+        if let Err(e) = concrete_hierarchy_check::<Base>(
+            "polymorphic_concrete3",
+            &[C1::TABLE_NAME, C2::TABLE_NAME, C3::TABLE_NAME],
+        ) {
+            return Outcome::Err(e);
+        }
+        if let Err(e) = concrete_child_check::<Base, C1>("polymorphic_concrete3") {
+            return Outcome::Err(e);
+        }
+        if let Err(e) = concrete_child_check::<Base, C2>("polymorphic_concrete3") {
+            return Outcome::Err(e);
+        }
+        if let Err(e) = concrete_child_check::<Base, C3>("polymorphic_concrete3") {
+            return Outcome::Err(e);
+        }
+
+        let (sql, params) = self.build_with_dialect(conn.dialect());
+        let rows = conn.query(cx, &sql, &params).await;
+        rows.and_then(|rows| {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let tag = match concrete_tag(&row) {
+                    Ok(t) => t,
+                    Err(e) => return Outcome::Err(e),
+                };
+                let hydrated = if tag == C1::TABLE_NAME {
+                    C1::from_row(&row).map(PolymorphicConcrete3::C1)
+                } else if tag == C2::TABLE_NAME {
+                    C2::from_row(&row).map(PolymorphicConcrete3::C2)
+                } else if tag == C3::TABLE_NAME {
+                    C3::from_row(&row).map(PolymorphicConcrete3::C3)
+                } else {
+                    return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                        "polymorphic_concrete3: unknown {} tag {tag:?} for base {}",
+                        CONCRETE_TYPE_COLUMN,
+                        Base::TABLE_NAME
+                    )));
+                };
+                out.push(match hydrated {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(e),
+                });
+            }
+            Outcome::Ok(out)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2356,5 +2903,218 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert_eq!(params[0], Value::Text("active".to_string()));
         assert_eq!(params[1], Value::Bool(true));
+    }
+
+    // ---- Concrete-table inheritance polymorphic selects ----
+
+    #[derive(Debug, Clone)]
+    struct ConcreteBase;
+
+    impl Model for ConcreteBase {
+        const TABLE_NAME: &'static str = "persons";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            Vec::new()
+        }
+
+        fn from_row(_row: &Row) -> Result<Self> {
+            Err(Error::Custom("not used in tests".to_string()))
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            Vec::new()
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+
+        fn inheritance() -> InheritanceInfo {
+            InheritanceInfo {
+                strategy: InheritanceStrategy::Concrete,
+                parent: None,
+                parent_fields_fn: None,
+                discriminator_column: None,
+                discriminator_value: None,
+            }
+        }
+    }
+
+    /// Concrete child owning columns id/name/office in table `managers`.
+    #[derive(Debug, Clone)]
+    struct ConcreteManager;
+
+    impl Model for ConcreteManager {
+        const TABLE_NAME: &'static str = "managers";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", sqlmodel_core::SqlType::BigInt).primary_key(true),
+                FieldInfo::new("name", "name", sqlmodel_core::SqlType::Text),
+                FieldInfo::new("office", "office", sqlmodel_core::SqlType::Text),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            Vec::new()
+        }
+
+        fn from_row(_row: &Row) -> Result<Self> {
+            Err(Error::Custom("not used in tests".to_string()))
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            Vec::new()
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+
+        fn inheritance() -> InheritanceInfo {
+            InheritanceInfo {
+                strategy: InheritanceStrategy::Concrete,
+                parent: Some("persons"),
+                parent_fields_fn: None,
+                discriminator_column: None,
+                discriminator_value: None,
+            }
+        }
+    }
+
+    /// Concrete child owning columns id/name/badge in table `engineers`; it
+    /// has no `office` column, so its union branch must fill that column with
+    /// a typed NULL.
+    #[derive(Debug, Clone)]
+    struct ConcreteEngineer;
+
+    impl Model for ConcreteEngineer {
+        const TABLE_NAME: &'static str = "engineers";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [FieldInfo] {
+            static FIELDS: &[FieldInfo] = &[
+                FieldInfo::new("id", "id", sqlmodel_core::SqlType::BigInt).primary_key(true),
+                FieldInfo::new("name", "name", sqlmodel_core::SqlType::Text),
+                FieldInfo::new("badge", "badge", sqlmodel_core::SqlType::BigInt),
+            ];
+            FIELDS
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            Vec::new()
+        }
+
+        fn from_row(_row: &Row) -> Result<Self> {
+            Err(Error::Custom("not used in tests".to_string()))
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            Vec::new()
+        }
+
+        fn is_new(&self) -> bool {
+            true
+        }
+
+        fn inheritance() -> InheritanceInfo {
+            InheritanceInfo {
+                strategy: InheritanceStrategy::Concrete,
+                parent: Some("persons"),
+                parent_fields_fn: None,
+                discriminator_column: None,
+                discriminator_value: None,
+            }
+        }
+    }
+
+    #[test]
+    fn test_concrete_polymorphic2_union_fillers_and_dense_placeholders_sqlite() {
+        let query = Select::<ConcreteBase>::new()
+            .polymorphic_concrete2::<ConcreteManager, ConcreteEngineer>()
+            .filter(Expr::col("name").eq("ada"))
+            .order_by(OrderBy::asc(Expr::col("id")))
+            .limit(10);
+        let (sql, params) = query.build_with_dialect(Dialect::Sqlite);
+
+        // Branch 1 owns `office`, branch 2 owns `badge`; the other branch of
+        // each fills the column with a typed NULL. Placeholders stay dense
+        // across branches ($-free dialect: ?1, ?2), and ORDER BY / LIMIT scope
+        // the whole union.
+        assert_eq!(
+            sql,
+            "SELECT \"managers\".\"id\" AS \"id\", \"managers\".\"name\" AS \"name\", \
+             \"managers\".\"office\" AS \"office\", CAST(NULL AS BIGINT) AS \"badge\", \
+             'managers' AS \"__type\" FROM \"managers\" WHERE \"name\" = ?1 \
+             UNION ALL SELECT \"engineers\".\"id\" AS \"id\", \"engineers\".\"name\" AS \"name\", \
+             CAST(NULL AS TEXT) AS \"office\", \"engineers\".\"badge\" AS \"badge\", \
+             'engineers' AS \"__type\" FROM \"engineers\" WHERE \"name\" = ?2 \
+             ORDER BY \"id\" ASC LIMIT 10"
+        );
+        assert_eq!(
+            params,
+            vec![
+                Value::Text("ada".to_string()),
+                Value::Text("ada".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_concrete_polymorphic2_postgres_placeholders_and_casts() {
+        let query = Select::<ConcreteBase>::new()
+            .polymorphic_concrete2::<ConcreteManager, ConcreteEngineer>()
+            .filter(Expr::col("name").eq("grace"));
+        let (sql, params) = query.build_with_dialect(Dialect::Postgres);
+
+        assert!(sql.contains("CAST(NULL AS BIGINT) AS \"badge\""));
+        assert!(sql.contains("CAST(NULL AS TEXT) AS \"office\""));
+        assert!(sql.contains("WHERE \"name\" = $1"));
+        assert!(sql.contains("WHERE \"name\" = $2"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn test_concrete_polymorphic2_mysql_cast_targets() {
+        let query = Select::<ConcreteBase>::new()
+            .polymorphic_concrete2::<ConcreteManager, ConcreteEngineer>();
+        let (sql, params) = query.build_with_dialect(Dialect::Mysql);
+
+        // MySQL's CAST accepts neither BIGINT nor TEXT; integers fill with
+        // SIGNED and text with CHAR.
+        assert!(sql.contains("CAST(NULL AS SIGNED) AS `badge`"));
+        assert!(sql.contains("CAST(NULL AS CHAR) AS `office`"));
+        assert!(sql.contains("'managers' AS `__type`"));
+        assert!(sql.contains("'engineers' AS `__type`"));
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_concrete_polymorphic_single_child_builds_one_branch() {
+        let query = Select::<ConcreteBase>::new().polymorphic_concrete::<ConcreteManager>();
+        let (sql, params) = query.build_with_dialect(Dialect::Sqlite);
+
+        assert!(!sql.contains("UNION ALL"));
+        assert!(sql.contains("'managers' AS \"__type\""));
+        assert_eq!(params.len(), 0);
+    }
+
+    #[test]
+    fn test_concrete_polymorphic3_three_branches_with_renumbering() {
+        let query = Select::<ConcreteBase>::new()
+            .polymorphic_concrete3::<ConcreteManager, ConcreteEngineer, ConcreteManager>()
+            .filter(Expr::col("name").eq("x"));
+        let (sql, _) = query.build_with_dialect(Dialect::Sqlite);
+
+        assert_eq!(sql.matches(" UNION ALL ").count(), 2);
+        // Filters are applied per branch: three branches, three placeholders.
+        assert_eq!(sql.matches('?').count(), 3);
     }
 }
