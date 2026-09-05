@@ -46,6 +46,38 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
 
+      - name: Per-crate publish dry-run
+        run: |
+          # Packaging rehearsal in the same dependency order as the publish
+          # job's loop. A dry-run that reaches "Uploading ... aborting upload
+          # due to dry run" has verified the manifest metadata (readme,
+          # description, license), the packaged file set, and a full compile
+          # of the packaged sources - it uploads nothing and needs no token.
+          #
+          # Registry caveat: a crate whose workspace dependencies are not yet
+          # at this version on crates.io fails resolution with "failed to
+          # select a version". During a version bump that is expected (the
+          # publish loop has not run), so only sqlmodel-core - which has no
+          # workspace dependencies - can always be fully verified here; every
+          # other crate then falls back to `cargo package --list`, which
+          # still asserts the manifest parses and every packaged file
+          # (including the readme) exists.
+          crates=(sqlmodel-core sqlmodel-macros sqlmodel-query sqlmodel-schema sqlmodel-session sqlmodel-pool sqlmodel-console sqlmodel-postgres sqlmodel-mysql sqlmodel-sqlite sqlmodel-frankensqlite sqlmodel)
+          for crate in "${crates[@]}"; do
+            echo "=== Publish dry-run: ${crate} ==="
+            out=$(cargo publish --dry-run -p "${crate}" 2>&1)
+            status=$?
+            if [ ${status} -eq 0 ]; then
+              echo "=== ${crate}: dry-run ok ==="
+            elif echo "${out}" | grep -q "failed to select a version"; then
+              echo "=== ${crate}: workspace deps not yet on the registry at this version; asserting manifest and package file list instead ==="
+              cargo package --list -p "${crate}" > /dev/null
+            else
+              echo "${out}"
+              exit ${status}
+            fi
+          done
+
   publish:
     name: Publish to crates.io
     needs: validate
