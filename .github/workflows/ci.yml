@@ -246,7 +246,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: [lint, test, security]
+    needs: [lint, test, security, integration]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:

@@ -323,14 +323,33 @@ impl PgAsyncConnection {
     /// Establish a new async connection to the PostgreSQL server.
     pub async fn connect(_cx: &Cx, config: PgConfig) -> Outcome<Self, Error> {
         let addr = config.socket_addr();
+        // `host` may be a hostname ("localhost") or a literal IP; resolve
+        // through the OS resolver so both work. The first resolved address
+        // wins.
         let socket_addr: std::net::SocketAddr = match addr.parse() {
             Ok(a) => a,
-            Err(e) => {
-                return Outcome::Err(Error::Connection(ConnectionError {
-                    kind: ConnectionErrorKind::Connect,
-                    message: format!("Invalid socket address: {}", e),
-                    source: None,
-                }));
+            Err(_) => {
+                use std::net::ToSocketAddrs;
+                let mut candidates = match addr.to_socket_addrs() {
+                    Ok(candidates) => candidates,
+                    Err(e) => {
+                        return Outcome::Err(Error::Connection(ConnectionError {
+                            kind: ConnectionErrorKind::Connect,
+                            message: format!("Failed to resolve {}: {}", addr, e),
+                            source: Some(Box::new(e)),
+                        }));
+                    }
+                };
+                match candidates.next() {
+                    Some(a) => a,
+                    None => {
+                        return Outcome::Err(Error::Connection(ConnectionError {
+                            kind: ConnectionErrorKind::Connect,
+                            message: format!("host {} resolved to no addresses", addr),
+                            source: None,
+                        }));
+                    }
+                }
             }
         };
 
