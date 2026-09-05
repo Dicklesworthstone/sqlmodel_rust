@@ -276,3 +276,39 @@ jobs:
 
       - name: Build release
         run: cargo build --workspace --release --target ${{ matrix.target }}
+
+  size-and-startup:
+    name: Size and startup (bd-4ttf.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release examples
+        run: |
+          cargo build --release -p sqlmodel-e2e --example minimal_app
+          cargo build --release -p sqlmodel-e2e --example minimal_app_franken
+
+      - name: Size and startup gate (C SQLite driver — hard gate, PLAN targets)
+        run: scripts/size_and_startup.sh target/release/examples/minimal_app 20 5 10
+
+      - name: Size and startup report (FrankenSQLite driver — informational, 16 MiB pure-Rust target)
+        run: scripts/size_and_startup.sh target/release/examples/minimal_app_franken 20 16 10
+
+      - name: Where the bytes go (cargo-bloat report)
+        run: |
+          cargo install cargo-bloat || true
+          cargo bloat --release --crates -p sqlmodel-e2e --example minimal_app > bloat_report.txt || true
+          tail -40 bloat_report.txt
+
+      - name: Upload bloat report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloat-report
+          path: bloat_report.txt
