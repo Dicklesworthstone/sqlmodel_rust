@@ -3,9 +3,8 @@
 //!
 //! Semantics (documented in `sqlmodel-core/src/connection.rs`):
 //!
-//! * A `Cx` whose budget the runtime has exhausted (deadline passed) makes
-//!   `Session::flush` stop at the next statement boundary with
-//!   `Outcome::Err(Error::Timeout)`.
+//! * A `Cx` whose budget deadline has passed makes `Session::flush` stop at
+//!   the next statement boundary with `Outcome::Err(Error::Timeout)`.
 //! * The flush's open transaction is left for the caller: rolling it back
 //!   restores the pre-flush state exactly — a budget can never produce a
 //!   partially-flushed durable state.
@@ -16,7 +15,7 @@
 //! per statement, so each cutoff lands on a statement boundary.
 
 use asupersync::runtime::RuntimeBuilder;
-use asupersync::{Budget, Cx, Outcome};
+use asupersync::{Budget, CancelReason, Cx, Outcome};
 use serde::{Deserialize, Serialize};
 use sqlmodel::prelude::*;
 use sqlmodel::Session;
@@ -27,6 +26,24 @@ use std::time::Duration;
 
 /// Wall-clock cost attributed to each statement by [`SleepingConnection`].
 const STMT_MS: u64 = 3;
+
+/// Budget/cancellation gate mirroring `Session`'s own `enforce_budget`: an
+/// expired budget deadline is `Error::Timeout`; a cancelled `Cx` is
+/// `Outcome::Cancelled`.
+fn enforce_budget(cx: &Cx) -> Outcome<(), Error> {
+    if cx.is_cancel_requested() {
+        return Outcome::Cancelled(
+            cx.cancel_reason()
+                .unwrap_or_else(|| CancelReason::user("cancelled at statement boundary")),
+        );
+    }
+    if let Some(deadline) = cx.budget().deadline {
+        if cx.now() >= deadline {
+            return Outcome::Err(Error::Timeout);
+        }
+    }
+    Outcome::Ok(())
+}
 
 struct SleepingConnection {
     inner: SqliteConnection,
@@ -67,25 +84,13 @@ impl Connection for SleepingConnection {
         self.inner.query_one(cx, sql, params).await
     }
 
-    async fn close(self, cx: &Cx) -> sqlmodel_core::Result<()> {
-        self.inner.close(cx).await
+    async fn execute(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<u64, Error> {
+        std::thread::sleep(Duration::from_millis(STMT_MS));
+        self.inner.execute(cx, sql, params).await
     }
-}
 
-fn enforce_budget(cx: &Cx) -> Outcome<(), Error> {
-    if cx.is_cancel_requested() {
-        return Outcome::Cancelled(
-            cx.cancel_reason()
-                .unwrap_or_else(|| CancelReason::user("cancelled at statement boundary")),
-        );
-    }
-    if let Some(deadline) = cx.budget().deadline {
-        if cx.now() >= deadline {
-            return Outcome::Err(Error::Timeout);
-        }
-    }
-    Outcome::Ok(())
-}
+    async fn insert(&self, cx: &Cx, sql: &str, params: &[Value]) -> Outcome<i64, Error> {
+        std::thread::sleep(Duration::from_millis(STMT_MS));
         self.inner.insert(cx, sql, params).await
     }
 
@@ -224,8 +229,9 @@ fn flush_budget_deadline_boundary_sweep() {
             let start = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock");
-            let deadline =
-                asupersync::types::Time::from_nanos(start.as_nanos() as u64 + budget_ms * 1_000_000);
+            let deadline = asupersync::types::Time::from_nanos(
+                start.as_nanos() as u64 + budget_ms * 1_000_000,
+            );
             let budget = Budget::new().with_deadline(deadline);
             let cx = Cx::for_testing_with_budget(budget);
 
@@ -239,7 +245,7 @@ fn flush_budget_deadline_boundary_sweep() {
                         !prev_ok || first_ok.is_some_and(|first| budget_ms >= first),
                         "budget {budget_ms}ms: Ok after a Timeout violates monotonicity"
                     );
-                    let after = state_dump(&cx, s.connection().inner()).await;
+                    let after = state_dump(&fixture_cx, s.connection().inner()).await;
                     assert_eq!(
                         after, expected_after_flush,
                         "budget {budget_ms}ms: successful flush must commit all rows"
@@ -249,7 +255,7 @@ fn flush_budget_deadline_boundary_sweep() {
                     // The flush's transaction stays open; the caller rolls it
                     // back and the state is exactly the pre-flush snapshot.
                     expect_outcome(s.rollback(&cx).await, "rollback after budget timeout");
-                    let after = state_dump(&cx, s.connection().inner()).await;
+                    let after = state_dump(&fixture_cx, s.connection().inner()).await;
                     assert_eq!(
                         after, before,
                         "budget {budget_ms}ms: timed-out flush left partial state"
