@@ -8,12 +8,12 @@
 #![allow(unsafe_code)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use sqlmodel::SchemaBuilder;
 use sqlmodel::prelude::*;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct CountingAlloc;
@@ -26,7 +26,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        System.dealloc(ptr, layout);
     }
 }
 
@@ -82,7 +82,7 @@ fn select_filtered_per_dialect(c: &mut Criterion) {
                     .limit(50)
                     .build_with_dialect(dialect);
                 black_box((sql, params))
-            })
+            });
         });
     }
     group.finish();
@@ -97,7 +97,7 @@ fn insert_many_emission(c: &mut Criterion) {
                 let (sql, params) =
                     insert_many!(black_box(&heroes)).build_with_dialect(Dialect::Sqlite);
                 black_box((sql, params))
-            })
+            });
         });
     }
     group.finish();
@@ -112,7 +112,7 @@ fn create_table_emission(c: &mut Criterion) {
                 .create_table::<Hero>()
                 .build();
             black_box(stmts)
-        })
+        });
     });
     group.finish();
 }
@@ -133,7 +133,7 @@ fn select_filtered_allocation_count(c: &mut Criterion) {
                 });
             }
             std::time::Duration::from_nanos(total)
-        })
+        });
     });
     group.finish();
 }

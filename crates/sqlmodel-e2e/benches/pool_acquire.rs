@@ -4,9 +4,9 @@
 //!
 //! Runs with `cargo bench -p sqlmodel-e2e --bench pool_acquire`.
 
-use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use sqlmodel::prelude::*;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -51,13 +51,13 @@ fn acquire_release_sequential(c: &mut Criterion) {
             // Warm the pool to `max_size` leases so the bench measures the
             // acquire/release fast path, not connection creation.
             rt.block_on(async {
-                let mut warm: Vec<sqlmodel_pool::PooledConnection<
-                    sqlmodel_sqlite::SqliteConnection,
-                >> = Vec::new();
+                let mut warm: Vec<
+                    sqlmodel_pool::PooledConnection<sqlmodel_sqlite::SqliteConnection>,
+                > = Vec::new();
                 for _ in 0..max_size {
                     match acquire_once(&cx, &pool).await {
                         Outcome::Ok(lease) => warm.push(lease),
-                        other => panic!("warm acquire failed with non-Ok outcome"),
+                        _other => panic!("warm acquire failed with non-Ok outcome"),
                     }
                 }
                 warm.clear();
@@ -67,7 +67,7 @@ fn acquire_release_sequential(c: &mut Criterion) {
                 rt.block_on(async {
                     match acquire_once(&cx, &pool).await {
                         Outcome::Ok(lease) => black_box(lease),
-                        other => panic!("acquire failed with non-Ok outcome"),
+                        _other => panic!("acquire failed with non-Ok outcome"),
                     }
                 });
             });
@@ -78,7 +78,6 @@ fn acquire_release_sequential(c: &mut Criterion) {
 
 /// Contended acquire/release: `threads` threads each pull their share of
 /// leases from the shared pool; wall time is reported per operation.
-
 fn acquire_release_contended(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool_acquire_contended");
     for threads in [4usize, 16] {
@@ -113,7 +112,7 @@ fn acquire_release_contended(c: &mut Criterion) {
                     }
                 });
                 start.elapsed() / u32::try_from(iters).unwrap_or(1)
-            })
+            });
         });
     }
     group.finish();

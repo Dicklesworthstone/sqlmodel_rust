@@ -5,10 +5,14 @@
 //!
 //! Runs with `cargo bench -p sqlmodel-e2e --bench row_conversion`.
 
-use std::hint::black_box;
+// `from_row` returns `sqlmodel::Error`, which is large by design (the same
+// pattern `sqlmodel-core` allows internally); benching it is the point.
+#![allow(clippy::result_large_err)]
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use sqlmodel::prelude::*;
+use std::hint::black_box;
 
 #[derive(sqlmodel::Model, Debug, Clone, Serialize, Deserialize)]
 #[sqlmodel(table = "bench_wide")]
@@ -116,7 +120,7 @@ fn build_row(values: &[Value]) -> Row {
 fn derive_to_row(c: &mut Criterion) {
     let w = wide(7);
     c.bench_function("row_conversion/derive_to_row", |b| {
-        b.iter(|| black_box(w.to_row()))
+        b.iter(|| black_box(w.to_row()));
     });
 }
 
@@ -125,7 +129,7 @@ fn derive_from_row(c: &mut Criterion) {
     let values = hand_to_row(&w);
     let row = build_row(&values);
     c.bench_function("row_conversion/derive_from_row", |b| {
-        b.iter(|| black_box(Wide::from_row(&row)))
+        b.iter(|| black_box(Wide::from_row(&row)));
     });
     black_box(row);
 }
@@ -133,7 +137,7 @@ fn derive_from_row(c: &mut Criterion) {
 fn hand_to_row_bench(c: &mut Criterion) {
     let w = wide(7);
     c.bench_function("row_conversion/hand_to_row", |b| {
-        b.iter(|| black_box(hand_to_row(&w)))
+        b.iter(|| black_box(hand_to_row(&w)));
     });
 }
 
@@ -142,13 +146,12 @@ fn hand_from_row_bench(c: &mut Criterion) {
     let values = hand_to_row(&w);
     let row = build_row(&values);
     c.bench_function("row_conversion/hand_from_row", |b| {
-        b.iter(|| black_box(hand_from_row(&row)))
+        b.iter(|| black_box(hand_from_row(&row)));
     });
     black_box(w);
 }
 
 /// Derive vs hand side by side in one group so criterion prints the delta.
-
 fn to_row_ratio(c: &mut Criterion) {
     let w = wide(7);
     let mut group = c.benchmark_group("row_conversion_ratio_to_row");

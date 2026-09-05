@@ -3,7 +3,6 @@
 //!
 //! Runs with `cargo bench -p sqlmodel-e2e --bench session_flush`.
 
-use std::hint::black_box;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use sqlmodel::Session;
@@ -35,6 +34,8 @@ fn runtime() -> asupersync::runtime::Runtime {
 
 const ROWS: usize = 1_000;
 
+const FLUSH_DDL: &str = "CREATE TABLE bench_flush (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, bucket INTEGER NOT NULL)";
+
 /// Flush of 1k new objects: the whole BEGIN + INSERT loop is the measured
 /// operation (per-iteration setup builds a fresh session with the rows
 /// already added).
@@ -45,6 +46,11 @@ fn bench_flush_new(c: &mut Criterion) {
                 let rt = runtime();
                 let cx = Cx::for_testing();
                 let conn = SqliteConnection::open_memory().expect(":memory:");
+                rt.block_on(async {
+                    if let sqlmodel::Outcome::Err(e) = conn.execute(&cx, FLUSH_DDL, &[]).await {
+                        panic!("fixture ddl failed: {e:?}");
+                    }
+                });
                 let mut s = Session::new(conn);
                 for i in 0..ROWS {
                     s.add(&bench_row(i));
@@ -56,11 +62,10 @@ fn bench_flush_new(c: &mut Criterion) {
                     if let sqlmodel::Outcome::Err(e) = s.flush(&cx).await {
                         panic!("flush failed: {e:?}");
                     }
-                    black_box(s.pending_counts());
                 });
             },
             BatchSize::PerIteration,
-        )
+        );
     });
 }
 
@@ -73,6 +78,11 @@ fn bench_flush_deletes(c: &mut Criterion) {
                 let rt = runtime();
                 let cx = Cx::for_testing();
                 let conn = SqliteConnection::open_memory().expect(":memory:");
+                rt.block_on(async {
+                    if let sqlmodel::Outcome::Err(e) = conn.execute(&cx, FLUSH_DDL, &[]).await {
+                        panic!("fixture ddl failed: {e:?}");
+                    }
+                });
                 let mut s = Session::new(conn);
                 for i in 0..ROWS {
                     s.add(&bench_row(i));
@@ -100,11 +110,10 @@ fn bench_flush_deletes(c: &mut Criterion) {
                     if let sqlmodel::Outcome::Err(e) = s.flush(&cx).await {
                         panic!("delete flush failed: {e:?}");
                     }
-                    black_box(s.pending_counts());
                 });
             },
             BatchSize::PerIteration,
-        )
+        );
     });
 }
 

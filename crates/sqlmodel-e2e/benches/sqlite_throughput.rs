@@ -7,11 +7,11 @@
 
 #![allow(unsafe_code)]
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use std::hint::black_box;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use libsqlite3_sys as ffi;
 use serde::{Deserialize, Serialize};
 use sqlmodel::prelude::*;
+use std::hint::black_box;
 
 #[derive(sqlmodel::Model, Debug, Clone, Serialize, Deserialize)]
 #[sqlmodel(table = "bench_thru")]
@@ -40,23 +40,149 @@ fn orm_runtime() -> asupersync::runtime::Runtime {
         .expect("asupersync runtime")
 }
 
-fn orm_fixture(cx: &Cx, conn: &sqlmodel_sqlite::SqliteConnection) {
-    if let sqlmodel::Outcome::Err(e) = conn.execute(cx, FIXTURE_DDL, &[]) {
-        panic!("fixture ddl failed: {e:?}");
-    }
-}
-
-    fn seed_orm_rows(cx: &Cx, conn: &sqlmodel_sqlite::SqliteConnection, rows: usize) {
-        for i in 0..rows {
-            let row = thru(i);
+fn orm_fixture<C: Connection>(cx: &Cx, rt: &asupersync::runtime::Runtime, conn: &C) {
+    rt.block_on(async {
+        if let sqlmodel::Outcome::Err(e) = conn.execute(cx, FIXTURE_DDL, &[]).await {
+            panic!("fixture ddl failed: {e:?}");
+        }
+        for i in 0..200usize {
+            let mut row = thru(i);
+            row.id = Some(i as i64);
             if let sqlmodel::Outcome::Err(e) = insert!(&row).execute(cx, conn).await {
-                panic!("seed insert {i} failed: {e:?}");
+                panic!("fixture seed {i} failed: {e:?}");
             }
         }
-    }
+    });
+}
 
 // ---------------------------------------------------------------------------
-// Raw C-API baseline
+// ORM benches
+// ---------------------------------------------------------------------------
+
+fn orm_single_inserts(c: &mut Criterion) {
+    c.bench_function("sqlite_orm/inserts_2000_single", |b| {
+        b.iter_batched(
+            || {
+                let rt = orm_runtime();
+                let cx = Cx::for_testing();
+                let conn = sqlmodel_sqlite::SqliteConnection::open_memory().expect(":memory:");
+                rt.block_on(async {
+                    orm_fixture(&cx, &rt, &conn);
+                });
+                (rt, cx, conn)
+            },
+            |(rt, cx, conn)| {
+                rt.block_on(async {
+                    for i in 0..ROWS {
+                        let row = thru(i);
+                        if let sqlmodel::Outcome::Err(e) = insert!(&row).execute(&cx, &conn).await {
+                            panic!("insert {i} failed: {e:?}");
+                        }
+                        black_box(());
+                    }
+                });
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+fn orm_batched_inserts(c: &mut Criterion) {
+    c.bench_function("sqlite_orm/inserts_2000_batched_x100", |b| {
+        b.iter_batched(
+            || {
+                let rt = orm_runtime();
+                let cx = Cx::for_testing();
+                let conn = sqlmodel_sqlite::SqliteConnection::open_memory().expect(":memory:");
+                rt.block_on(async {
+                    orm_fixture(&cx, &rt, &conn);
+                });
+                let batches: Vec<Vec<Thru>> = (0..20usize)
+                    .map(|b| (0..100usize).map(|i| thru(b * 100 + i)).collect())
+                    .collect();
+                (rt, cx, conn, batches)
+            },
+            |(rt, cx, conn, batches)| {
+                rt.block_on(async {
+                    for batch in &batches {
+                        if let sqlmodel::Outcome::Err(e) =
+                            insert_many!(batch).execute(&cx, &conn).await
+                        {
+                            panic!("batch insert failed: {e:?}");
+                        }
+                    }
+                    black_box(());
+                });
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+fn orm_point_selects(c: &mut Criterion) {
+    c.bench_function("sqlite_orm/selects_200_by_pk", |b| {
+        b.iter_batched(
+            || {
+                let rt = orm_runtime();
+                let cx = Cx::for_testing();
+                let conn = sqlmodel_sqlite::SqliteConnection::open_memory().expect(":memory:");
+                rt.block_on(async {
+                    orm_fixture(&cx, &rt, &conn);
+                });
+                (rt, cx, conn)
+            },
+            |(rt, cx, conn)| {
+                rt.block_on(async {
+                    for i in 0..200usize {
+                        match select!(Thru)
+                            .filter(Expr::col("id").eq(i as i64))
+                            .one_or_none(&cx, &conn)
+                            .await
+                        {
+                            sqlmodel::Outcome::Ok(Some(row)) => {
+                                black_box(row.payload.as_str());
+                            }
+                            other => panic!("select {i} failed: {other:?}"),
+                        }
+                    }
+                });
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+fn franken_single_inserts(c: &mut Criterion) {
+    c.bench_function("franken_orm/inserts_500_single", |b| {
+        b.iter_batched(
+            || {
+                let rt = orm_runtime();
+                let cx = Cx::for_testing();
+                let conn =
+                    sqlmodel_frankensqlite::FrankenConnection::open_memory().expect(":memory:");
+                rt.block_on(async {
+                    orm_fixture(&cx, &rt, &conn);
+                });
+                (rt, cx, conn)
+            },
+            |(rt, cx, conn)| {
+                rt.block_on(async {
+                    for i in 0..500usize {
+                        let row = thru(i);
+                        if let sqlmodel::Outcome::Err(e) = insert!(&row).execute(&cx, &conn).await {
+                            panic!("insert {i} failed: {e:?}");
+                        }
+                        black_box(());
+                    }
+                });
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Native C-API baseline
 // ---------------------------------------------------------------------------
 
 struct RawDb {
@@ -65,41 +191,53 @@ struct RawDb {
 
 impl RawDb {
     fn open_memory() -> Self {
+        let path = std::ffi::CString::new(":memory:").expect("nul");
         let mut db: *mut ffi::sqlite3 = std::ptr::null_mut();
-        let rc = unsafe { ffi::sqlite3_open(":memory:".as_ptr().cast(), &mut db) };
+        let rc = unsafe { ffi::sqlite3_open(path.as_ptr(), &raw mut db) };
         assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_open failed: rc={rc}");
         Self { db }
     }
 
     fn exec(&self, sql: &str) {
+        let csql = std::ffi::CString::new(sql).expect("sql contains nul");
         let mut err: *mut std::os::raw::c_char = std::ptr::null_mut();
         let rc = unsafe {
             ffi::sqlite3_exec(
                 self.db,
-                sql.as_ptr().cast(),
+                csql.as_ptr(),
                 None,
                 std::ptr::null_mut(),
-                &mut err,
+                &raw mut err,
             )
         };
-        assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_exec failed: rc={rc}");
+        if rc != ffi::SQLITE_OK {
+            let msg = unsafe { ffi::sqlite3_errmsg(self.db) };
+            let msg = if msg.is_null() {
+                "unknown".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(msg) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            panic!("sqlite3_exec failed: rc={rc}: {msg}");
+        }
     }
 
     /// Prepares `sql` once and runs it `n` times binding (text, int) pairs.
     fn run_bound_inserts(&self, sql: &str, rows: usize) {
         unsafe {
             let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let csql = std::ffi::CString::new(sql).expect("sql contains nul");
             let rc = ffi::sqlite3_prepare_v2(
                 self.db,
-                sql.as_ptr().cast(),
+                csql.as_ptr(),
                 -1,
-                &mut stmt,
+                &raw mut stmt,
                 std::ptr::null_mut(),
             );
             assert_eq!(rc, ffi::SQLITE_OK, "prepare failed: rc={rc}");
-            let transient: Option<
-                unsafe extern "C" fn(*mut std::os::raw::c_void),
-            > = Some(-1isize as unsafe extern "C" fn(*mut std::os::raw::c_void));
+            let transient: Option<unsafe extern "C" fn(*mut std::os::raw::c_void)> =
+                std::mem::transmute(-1isize);
             for i in 0..rows {
                 let payload = format!("payload-{i}");
                 let bucket = (i % 16) as i64;
@@ -109,7 +247,7 @@ impl RawDb {
                     stmt,
                     1,
                     payload.as_ptr().cast(),
-                    payload.len() as i32,
+                    i32::try_from(payload.len()).expect("payload length fits i32"),
                     transient,
                 );
                 ffi::sqlite3_bind_int64(stmt, 2, bucket);
@@ -124,11 +262,12 @@ impl RawDb {
     fn run_point_selects(&self, sql: &str, rows: usize) {
         unsafe {
             let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let csql = std::ffi::CString::new(sql).expect("sql contains nul");
             let rc = ffi::sqlite3_prepare_v2(
                 self.db,
-                sql.as_ptr().cast(),
+                csql.as_ptr(),
                 -1,
-                &mut stmt,
+                &raw mut stmt,
                 std::ptr::null_mut(),
             );
             assert_eq!(rc, ffi::SQLITE_OK, "prepare failed: rc={rc}");
@@ -151,133 +290,6 @@ impl Drop for RawDb {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ORM benches
-// ---------------------------------------------------------------------------
-
-fn orm_single_inserts(c: &mut Criterion) {
-    c.bench_function("sqlite_orm/inserts_2000_single", |b| {
-        b.iter_batched(
-            || {
-                let rt = orm_runtime();
-                let cx = Cx::for_testing();
-                let conn = sqlmodel_sqlite::SqliteConnection::open_memory().expect(":memory:");
-                orm_fixture(&cx, &conn);
-                (rt, cx, conn)
-            },
-            |(rt, cx, conn)| {
-                rt.block_on(async {
-                    for i in 0..ROWS {
-                        let row = thru(i);
-                        if let sqlmodel::Outcome::Err(e) =
-                            insert!(&row).execute(&cx, &conn).await
-                        {
-                            panic!("insert {i} failed: {e:?}");
-                        }
-                        black_box(());
-                    }
-                });
-            },
-            BatchSize::PerIteration,
-        )
-    });
-}
-
-fn orm_batched_inserts(c: &mut Criterion) {
-    c.bench_function("sqlite_orm/inserts_2000_batched_x100", |b| {
-        b.iter_batched(
-            || {
-                let rt = orm_runtime();
-                let cx = Cx::for_testing();
-                let conn = sqlmodel_sqlite::SqliteConnection::open_memory().expect(":memory:");
-                orm_fixture(&cx, &conn);
-                let batches: Vec<Vec<Thru>> = (0..20usize)
-                    .map(|b| (0..100usize).map(|i| thru(b * 100 + i)).collect())
-                    .collect();
-                (rt, cx, conn, batches)
-            },
-            |(rt, cx, conn, batches)| {
-                rt.block_on(async {
-                    for batch in &batches {
-                        if let sqlmodel::Outcome::Err(e) =
-                            insert_many!(batch).execute(&cx, &conn).await
-                        {
-                            panic!("batch insert failed: {e:?}");
-                        }
-                    }
-                    black_box(());
-                });
-            },
-            BatchSize::PerIteration,
-        )
-    });
-}
-
-fn orm_point_selects(c: &mut Criterion) {
-    c.bench_function("sqlite_orm/selects_200_by_pk", |b| {
-        b.iter_batched(
-            || {
-                let rt = orm_runtime();
-                let cx = Cx::for_testing();
-                let conn = sqlmodel_sqlite::SqliteConnection::open_memory().expect(":memory:");
-                orm_fixture(&cx, &conn);
-                seed_orm_rows(&cx, &conn, 200);
-                (rt, cx, conn)
-            },
-            |(rt, cx, conn)| {
-                rt.block_on(async {
-                    for i in 0..200usize {
-                        match select!(Thru)
-                            .filter(Expr::col("id").eq(i as i64))
-                            .one_or_none(cx, conn)
-                            .await
-                        {
-                            sqlmodel::Outcome::Ok(Some(row)) => {
-                                black_box(row.payload.as_str());
-                            }
-                            other => panic!("select {i} failed: {other:?}"),
-                        }
-                    }
-                });
-            },
-            BatchSize::PerIteration,
-        )
-    });
-}
-
-fn franken_single_inserts(c: &mut Criterion) {
-    c.bench_function("franken_orm/inserts_500_single", |b| {
-        b.iter_batched(
-            || {
-                let rt = orm_runtime();
-                let cx = Cx::for_testing();
-                let conn =
-                    sqlmodel_frankensqlite::FrankenConnection::open_memory().expect(":memory:");
-                orm_fixture(&cx, &conn);
-                (rt, cx, conn)
-            },
-            |(rt, cx, conn)| {
-                rt.block_on(async {
-                    for i in 0..500usize {
-                        let row = thru(i);
-                        if let sqlmodel::Outcome::Err(e) =
-                            insert!(&row).execute(&cx, &conn).await
-                        {
-                            panic!("insert {i} failed: {e:?}");
-                        }
-                        black_box(());
-                    }
-                });
-            },
-            BatchSize::PerIteration,
-        )
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Native C-API baselines
-// ---------------------------------------------------------------------------
-
 fn native_single_inserts(c: &mut Criterion) {
     c.bench_function("native_c_api/inserts_2000_single", |b| {
         b.iter_batched(
@@ -293,7 +305,7 @@ fn native_single_inserts(c: &mut Criterion) {
                 );
             },
             BatchSize::PerIteration,
-        )
+        );
     });
 }
 
@@ -313,7 +325,7 @@ fn native_point_selects(c: &mut Criterion) {
                 );
             },
             BatchSize::PerIteration,
-        )
+        );
     });
 }
 

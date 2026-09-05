@@ -326,29 +326,28 @@ impl PgAsyncConnection {
         // `host` may be a hostname ("localhost") or a literal IP; resolve
         // through the OS resolver so both work. The first resolved address
         // wins.
-        let socket_addr: std::net::SocketAddr = match addr.parse() {
-            Ok(a) => a,
-            Err(_) => {
-                use std::net::ToSocketAddrs;
-                let mut candidates = match addr.to_socket_addrs() {
-                    Ok(candidates) => candidates,
-                    Err(e) => {
-                        return Outcome::Err(Error::Connection(ConnectionError {
-                            kind: ConnectionErrorKind::Connect,
-                            message: format!("Failed to resolve {}: {}", addr, e),
-                            source: Some(Box::new(e)),
-                        }));
-                    }
-                };
-                match candidates.next() {
-                    Some(a) => a,
-                    None => {
-                        return Outcome::Err(Error::Connection(ConnectionError {
-                            kind: ConnectionErrorKind::Connect,
-                            message: format!("host {} resolved to no addresses", addr),
-                            source: None,
-                        }));
-                    }
+        let socket_addr: std::net::SocketAddr = if let Ok(a) = addr.parse() {
+            a
+        } else {
+            use std::net::ToSocketAddrs;
+            let mut candidates = match addr.to_socket_addrs() {
+                Ok(candidates) => candidates,
+                Err(e) => {
+                    return Outcome::Err(Error::Connection(ConnectionError {
+                        kind: ConnectionErrorKind::Connect,
+                        message: format!("Failed to resolve {}: {}", addr, e),
+                        source: Some(Box::new(e)),
+                    }));
+                }
+            };
+            match candidates.next() {
+                Some(a) => a,
+                None => {
+                    return Outcome::Err(Error::Connection(ConnectionError {
+                        kind: ConnectionErrorKind::Connect,
+                        message: format!("host {} resolved to no addresses", addr),
+                        source: None,
+                    }));
                 }
             }
         };
