@@ -507,6 +507,11 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
                             ));
                         }
                         table_name = Some(lit_str.value());
+                        // `table = "name"` is the table flag plus an explicit
+                        // name; without setting the flag here, the
+                        // joined-inheritance child inference (which requires
+                        // `table`) never fires for such models.
+                        config.table = true;
                     } else {
                         return Err(Error::new_spanned(
                             value,
@@ -3173,7 +3178,10 @@ mod tests {
 
     #[test]
     fn test_model_config_table_with_name() {
-        // table = "custom_name" should set table name, not config.table
+        // table = "custom_name" sets both the explicit table name and the
+        // table flag: a named table is a table, so every table-gated behavior
+        // (e.g. joined-inheritance child inference) sees the same shape as
+        // the bare flag form.
         let input: DeriveInput = parse_quote! {
             #[sqlmodel(table = "custom_users")]
             struct User {
@@ -3185,8 +3193,7 @@ mod tests {
 
         let def = parse_model(&input).unwrap();
         assert_eq!(def.table_name, "custom_users");
-        // config.table remains false because only the flag form sets it
-        assert!(!def.config.table);
+        assert!(def.config.table);
     }
 
     #[test]

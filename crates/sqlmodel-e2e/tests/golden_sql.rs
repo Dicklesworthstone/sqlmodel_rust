@@ -78,6 +78,36 @@ struct Student {
     grade: String,
 }
 
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table, inherits = "Person")]
+struct Teacher {
+    #[sqlmodel(parent)]
+    person: Person,
+    #[sqlmodel(primary_key)]
+    id: i64,
+    subject: String,
+}
+
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table = "staff", inherits = "Person")]
+struct Staff {
+    #[sqlmodel(parent)]
+    person: Person,
+    #[sqlmodel(primary_key)]
+    id: i64,
+    office: String,
+}
+
+#[derive(sqlmodel::Model, Debug, Clone)]
+#[sqlmodel(table = "alumni", inherits = "Person")]
+struct Alumni {
+    #[sqlmodel(parent)]
+    person: Person,
+    #[sqlmodel(primary_key)]
+    id: i64,
+    graduation_year: i64,
+}
+
 /// Concrete-table inheritance: every child owns the full column set in its
 /// own table; the base is abstract (no rows of its own).
 #[derive(sqlmodel::Model, Debug, Clone)]
@@ -342,6 +372,14 @@ fn corpus(dialect: Dialect) -> Vec<(&'static str, String, Vec<Value>)> {
         "select_polymorphic_joined",
         select!(Person)
             .polymorphic_joined::<Student>()
+            .filter(Expr::qualified("people", "name").like("A%"))
+            .order_by(Expr::qualified("people", "id").asc())
+            .build_with_dialect(dialect),
+    );
+    push(
+        "select_polymorphic_joined4",
+        select!(Person)
+            .polymorphic_joined4::<Student, Teacher, Staff, Alumni>()
             .filter(Expr::qualified("people", "name").like("A%"))
             .order_by(Expr::qualified("people", "id").asc())
             .build_with_dialect(dialect),

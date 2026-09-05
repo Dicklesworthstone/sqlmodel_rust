@@ -146,6 +146,42 @@ pub struct Select<M: Model> {
     _marker: PhantomData<M>,
 }
 
+/// Generate one `Select::<Base>::polymorphic_joinedN` entry method: project
+/// full base + child columns and `LEFT JOIN` every child table on its primary
+/// key, which is what deterministic prefixed hydration requires.
+macro_rules! polymorphic_joined_entry {
+    ($method_name:ident, $select_name:ident, $op:expr; $( ($child:ident) ),+ $(,)?) => {
+        #[doc = concat!(
+            "Convert this `Select<M>` into a joined-table inheritance polymorphic query (",
+            stringify!($op),
+            ")."
+        )]
+        ///
+        /// This LEFT JOINs every child table and returns the matching
+        #[doc = concat!("`", stringify!($select_name), "`.")]
+        ///
+        /// Notes:
+        /// - Requires `M` to be a joined-inheritance base model (`inheritance="joined"`).
+        /// - Requires every child to be a joined-inheritance child with `inherits="M"`.
+        /// - This always projects full base + child columns (ignores custom `columns(...)`),
+        ///   since hydration depends on a complete prefixed projection.
+        #[must_use]
+        pub fn $method_name<$($child: Model),+>(mut self) -> $select_name<M, $($child),+> {
+            self.aliased_projection = [table_columns::<M>(), $(table_columns::<$child>()),+].concat();
+            $(
+                if let Some(join) = polymorphic_joined_left_join::<M, $child>() {
+                    self.joins.push(join);
+                }
+            )+
+
+            $select_name {
+                select: self,
+                _marker: PhantomData,
+            }
+        }
+    };
+}
+
 impl<M: Model> Select<M> {
     /// Create a new SELECT query for the model's table.
     pub fn new() -> Self {
@@ -256,88 +292,21 @@ impl<M: Model> Select<M> {
         self
     }
 
-    /// Convert this `Select<M>` into a joined-table inheritance polymorphic query.
-    ///
-    /// For joined-table inheritance, polymorphic queries need an explicit `LEFT JOIN`
-    /// and explicit `table__col` projections for *both* base and child tables so that
-    /// row hydration can be deterministic and collision-free.
-    ///
-    /// This returns a query that hydrates either `M` (base) or `Child` depending on
-    /// whether the child-side columns are all NULL.
-    ///
-    /// Notes:
-    /// - Requires `M` to be a joined-inheritance base model (`inheritance="joined"`).
-    /// - Requires `Child` to be a joined-inheritance child with `inherits="M"`.
-    /// - This always projects full base + child columns (ignores custom `columns(...)`),
-    ///   since hydration depends on a complete prefixed projection.
-    #[must_use]
-    pub fn polymorphic_joined<Child: Model>(mut self) -> PolymorphicJoinedSelect<M, Child> {
-        self.aliased_projection = [table_columns::<M>(), table_columns::<Child>()].concat();
-        if let Some(join) = polymorphic_joined_left_join::<M, Child>() {
-            self.joins.push(join);
-        }
+    polymorphic_joined_entry!(polymorphic_joined, PolymorphicJoinedSelect, "polymorphic_joined"; (Child),);
 
-        PolymorphicJoinedSelect {
-            select: self,
-            _marker: PhantomData,
-        }
-    }
+    polymorphic_joined_entry!(polymorphic_joined2, PolymorphicJoinedSelect2, "polymorphic_joined2"; (C1), (C2));
 
-    /// Convert this `Select<M>` into a joined-table inheritance polymorphic query with two child types.
-    ///
-    /// This LEFT JOINs both child tables and returns `PolymorphicJoined2<M, C1, C2>`.
-    #[must_use]
-    pub fn polymorphic_joined2<C1: Model, C2: Model>(
-        mut self,
-    ) -> PolymorphicJoinedSelect2<M, C1, C2> {
-        self.aliased_projection = [
-            table_columns::<M>(),
-            table_columns::<C1>(),
-            table_columns::<C2>(),
-        ]
-        .concat();
-        if let Some(join) = polymorphic_joined_left_join::<M, C1>() {
-            self.joins.push(join);
-        }
-        if let Some(join) = polymorphic_joined_left_join::<M, C2>() {
-            self.joins.push(join);
-        }
+    polymorphic_joined_entry!(polymorphic_joined3, PolymorphicJoinedSelect3, "polymorphic_joined3"; (C1), (C2), (C3));
 
-        PolymorphicJoinedSelect2 {
-            select: self,
-            _marker: PhantomData,
-        }
-    }
+    polymorphic_joined_entry!(polymorphic_joined4, PolymorphicJoinedSelect4, "polymorphic_joined4"; (C1), (C2), (C3), (C4));
 
-    /// Convert this `Select<M>` into a joined-table inheritance polymorphic query with three child types.
-    ///
-    /// This LEFT JOINs three child tables and returns `PolymorphicJoined3<M, C1, C2, C3>`.
-    #[must_use]
-    pub fn polymorphic_joined3<C1: Model, C2: Model, C3: Model>(
-        mut self,
-    ) -> PolymorphicJoinedSelect3<M, C1, C2, C3> {
-        self.aliased_projection = [
-            table_columns::<M>(),
-            table_columns::<C1>(),
-            table_columns::<C2>(),
-            table_columns::<C3>(),
-        ]
-        .concat();
-        if let Some(join) = polymorphic_joined_left_join::<M, C1>() {
-            self.joins.push(join);
-        }
-        if let Some(join) = polymorphic_joined_left_join::<M, C2>() {
-            self.joins.push(join);
-        }
-        if let Some(join) = polymorphic_joined_left_join::<M, C3>() {
-            self.joins.push(join);
-        }
+    polymorphic_joined_entry!(polymorphic_joined5, PolymorphicJoinedSelect5, "polymorphic_joined5"; (C1), (C2), (C3), (C4), (C5));
 
-        PolymorphicJoinedSelect3 {
-            select: self,
-            _marker: PhantomData,
-        }
-    }
+    polymorphic_joined_entry!(polymorphic_joined6, PolymorphicJoinedSelect6, "polymorphic_joined6"; (C1), (C2), (C3), (C4), (C5), (C6));
+
+    polymorphic_joined_entry!(polymorphic_joined7, PolymorphicJoinedSelect7, "polymorphic_joined7"; (C1), (C2), (C3), (C4), (C5), (C6), (C7));
+
+    polymorphic_joined_entry!(polymorphic_joined8, PolymorphicJoinedSelect8, "polymorphic_joined8"; (C1), (C2), (C3), (C4), (C5), (C6), (C7), (C8));
 
     /// Convert this `Select<M>` into a concrete-table inheritance polymorphic
     /// query over one child table.
@@ -1150,421 +1119,255 @@ fn polymorphic_joined_left_join<Base: Model, Child: Model>() -> Option<Join> {
     Some(Join::left(Child::TABLE_NAME, on))
 }
 
-/// Output of a joined-table inheritance polymorphic query with a single child type.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PolymorphicJoined<Base: Model, Child: Model> {
-    Base(Base),
-    Child(Child),
+// ==================== Joined-table inheritance polymorphic selects ====================
+//
+// One definition generates the arity family (N = 1..8). The public names of
+// the original hand-written arities (`PolymorphicJoined{,2,3}` /
+// `PolymorphicJoinedSelect{,2,3}` / `Select::polymorphic_joined{,2,3}`) are
+// kept as generated instances.
+
+/// The ambiguity guard shared by every arity: errors when more than one
+/// child prefix is non-NULL. Returning cleanly means hydration may proceed
+/// with "first non-NULL child, else base" semantics.
+#[allow(clippy::result_large_err)]
+fn joined_row_guard(
+    row: &Row,
+    child_tables: &[&'static str],
+    op: &str,
+) -> Result<(), sqlmodel_core::Error> {
+    let non_null: Vec<&'static str> = child_tables
+        .iter()
+        .filter(|table| !row.prefix_is_all_null(table))
+        .copied()
+        .collect();
+    if non_null.len() > 1 {
+        return Err(sqlmodel_core::Error::Custom(format!(
+            "{op} ambiguous row: multiple child prefixes are non-NULL: {}",
+            non_null.join(", ")
+        )));
+    }
+    Ok(())
 }
 
-/// A polymorphic SELECT for joined-table inheritance base + single child.
-///
-/// Construct via `select!(Base).polymorphic_joined::<Child>()`.
-#[derive(Debug, Clone)]
-pub struct PolymorphicJoinedSelect<Base: Model, Child: Model> {
-    select: Select<Base>,
-    _marker: PhantomData<Child>,
+#[allow(clippy::result_large_err)]
+fn joined_base_check<Base: Model>(op: &str) -> Result<(), sqlmodel_core::Error> {
+    let inh_base = Base::inheritance();
+    if inh_base.strategy != sqlmodel_core::InheritanceStrategy::Joined || inh_base.parent.is_some()
+    {
+        return Err(sqlmodel_core::Error::Custom(format!(
+            "{op} requires a joined-inheritance base model; got strategy={:?}, parent={:?} for {}",
+            inh_base.strategy,
+            inh_base.parent,
+            Base::TABLE_NAME
+        )));
+    }
+    Ok(())
 }
 
-impl<Base: Model, Child: Model> PolymorphicJoinedSelect<Base, Child> {
-    /// Add a WHERE condition (delegates to the underlying base select).
-    #[must_use]
-    pub fn filter(mut self, expr: Expr) -> Self {
-        self.select = self.select.filter(expr);
-        self
+#[allow(clippy::result_large_err)]
+fn joined_child_check<Base: Model, Child: Model>(op: &str) -> Result<(), sqlmodel_core::Error> {
+    let inh_child = Child::inheritance();
+    if inh_child.strategy != sqlmodel_core::InheritanceStrategy::Joined
+        || inh_child.parent != Some(Base::TABLE_NAME)
+    {
+        return Err(sqlmodel_core::Error::Custom(format!(
+            "{op} requires a joined-inheritance child with parent={}; got strategy={:?}, parent={:?} for {}",
+            Base::TABLE_NAME,
+            inh_child.strategy,
+            inh_child.parent,
+            Child::TABLE_NAME
+        )));
     }
+    Ok(())
+}
 
-    /// Add ORDER BY clause (delegates to the underlying base select).
-    #[must_use]
-    pub fn order_by(mut self, order: OrderBy) -> Self {
-        self.select = self.select.order_by(order);
-        self
-    }
-
-    /// Set LIMIT (delegates to the underlying base select).
-    #[must_use]
-    pub fn limit(mut self, n: u64) -> Self {
-        self.select = self.select.limit(n);
-        self
-    }
-
-    /// Set OFFSET (delegates to the underlying base select).
-    #[must_use]
-    pub fn offset(mut self, n: u64) -> Self {
-        self.select = self.select.offset(n);
-        self
-    }
-
-    /// Build the SQL query and parameters.
-    pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        self.select.build_with_dialect(dialect)
-    }
-
-    /// Execute the polymorphic query and hydrate either `Base` or `Child` per row.
-    #[tracing::instrument(level = "debug", skip(self, cx, conn))]
-    pub async fn all<C: Connection>(
-        self,
-        cx: &Cx,
-        conn: &C,
-    ) -> Outcome<Vec<PolymorphicJoined<Base, Child>>, sqlmodel_core::Error> {
-        // Validate invariants. Return a structured error rather than panicking.
-        let inh_base = Base::inheritance();
-        if inh_base.strategy != sqlmodel_core::InheritanceStrategy::Joined
-            || inh_base.parent.is_some()
-        {
-            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "polymorphic_joined requires a joined-inheritance base model; got strategy={:?}, parent={:?} for {}",
-                inh_base.strategy,
-                inh_base.parent,
-                Base::TABLE_NAME
-            )));
+/// Generate one joined-table polymorphic arity: the result enum, the select
+/// wrapper, and its `all()` execution. The `(variant, child)` pairs pair each
+/// enum variant name with the child model type.
+macro_rules! define_polymorphic_joined {
+    (
+        $(#[$enum_meta:meta])*
+        enum $enum_name:ident, select $select_name:ident,
+        method $method_name:ident = $op:expr,
+        base $base:ident, children [ $( ($variant:ident, $child:ident) ),+ $(,)? ]
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum $enum_name<Base: Model, $($child: Model),+> {
+            Base(Base),
+            $($variant($child),)+
         }
 
-        let inh_child = Child::inheritance();
-        if inh_child.strategy != sqlmodel_core::InheritanceStrategy::Joined
-            || inh_child.parent != Some(Base::TABLE_NAME)
-        {
-            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "polymorphic_joined requires a joined-inheritance child with parent={}; got strategy={:?}, parent={:?} for {}",
-                Base::TABLE_NAME,
-                inh_child.strategy,
-                inh_child.parent,
-                Child::TABLE_NAME
-            )));
+        /// A polymorphic SELECT for joined-table inheritance: the base plus
+        /// every child type, one `LEFT JOIN` per child.
+        #[derive(Debug, Clone)]
+        pub struct $select_name<Base: Model, $($child: Model),+> {
+            select: Select<Base>,
+            _marker: PhantomData<($($child,)+)>,
         }
 
-        if Base::PRIMARY_KEY.is_empty() {
-            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "polymorphic_joined requires base model {} to have a primary key",
-                Base::TABLE_NAME
-            )));
-        }
+        impl<Base: Model, $($child: Model),+> $select_name<Base, $($child),+> {
+            /// Add a WHERE condition (delegates to the underlying base select).
+            #[must_use]
+            pub fn filter(mut self, expr: Expr) -> Self {
+                self.select = self.select.filter(expr);
+                self
+            }
 
-        let (sql, params) = self.select.build_with_dialect(conn.dialect());
-        tracing::debug!(
-            sql = %sql,
-            base = Base::TABLE_NAME,
-            child = Child::TABLE_NAME,
-            "Executing polymorphic joined SELECT"
-        );
+            /// Add ORDER BY clause (delegates to the underlying base select).
+            #[must_use]
+            pub fn order_by(mut self, order: OrderBy) -> Self {
+                self.select = self.select.order_by(order);
+                self
+            }
 
-        let rows = conn.query(cx, &sql, &params).await;
-        rows.and_then(|rows| {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                if row.prefix_is_all_null(Child::TABLE_NAME) {
-                    match Base::from_row(&row) {
-                        Ok(b) => out.push(PolymorphicJoined::Base(b)),
-                        Err(e) => return Outcome::Err(e),
-                    }
-                } else {
-                    match Child::from_row(&row) {
-                        Ok(c) => out.push(PolymorphicJoined::Child(c)),
-                        Err(e) => return Outcome::Err(e),
-                    }
+            /// Set LIMIT (delegates to the underlying base select).
+            #[must_use]
+            pub fn limit(mut self, n: u64) -> Self {
+                self.select = self.select.limit(n);
+                self
+            }
+
+            /// Set OFFSET (delegates to the underlying base select).
+            #[must_use]
+            pub fn offset(mut self, n: u64) -> Self {
+                self.select = self.select.offset(n);
+                self
+            }
+
+            /// Build the SQL query and parameters.
+            pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
+                self.select.build_with_dialect(dialect)
+            }
+
+            /// Execute the polymorphic query and hydrate the base or a child
+            /// per row: exactly one non-NULL child prefix selects the child,
+            /// all-NULL selects the base, and more than one is an error.
+            #[tracing::instrument(level = "debug", skip(self, cx, conn))]
+            pub async fn all<C: Connection>(
+                self,
+                cx: &Cx,
+                conn: &C,
+            ) -> Outcome<Vec<$enum_name<Base, $($child),+>>, sqlmodel_core::Error> {
+                if let Err(e) = joined_base_check::<Base>($op) {
+                    return Outcome::Err(e);
                 }
-            }
-            Outcome::Ok(out)
-        })
-    }
-}
+                $(
+                    if let Err(e) = joined_child_check::<Base, $child>($op) {
+                        return Outcome::Err(e);
+                    }
+                )+
 
-/// Output of a joined-table inheritance polymorphic query with two child types.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PolymorphicJoined2<Base: Model, C1: Model, C2: Model> {
-    Base(Base),
-    C1(C1),
-    C2(C2),
-}
-
-/// A polymorphic SELECT for joined-table inheritance base + two children.
-///
-/// Construct via `select!(Base).polymorphic_joined2::<C1, C2>()`.
-#[derive(Debug, Clone)]
-pub struct PolymorphicJoinedSelect2<Base: Model, C1: Model, C2: Model> {
-    select: Select<Base>,
-    _marker: PhantomData<(C1, C2)>,
-}
-
-impl<Base: Model, C1: Model, C2: Model> PolymorphicJoinedSelect2<Base, C1, C2> {
-    /// Add a WHERE condition (delegates to the underlying base select).
-    #[must_use]
-    pub fn filter(mut self, expr: Expr) -> Self {
-        self.select = self.select.filter(expr);
-        self
-    }
-
-    /// Add ORDER BY clause (delegates to the underlying base select).
-    #[must_use]
-    pub fn order_by(mut self, order: OrderBy) -> Self {
-        self.select = self.select.order_by(order);
-        self
-    }
-
-    /// Set LIMIT (delegates to the underlying base select).
-    #[must_use]
-    pub fn limit(mut self, n: u64) -> Self {
-        self.select = self.select.limit(n);
-        self
-    }
-
-    /// Set OFFSET (delegates to the underlying base select).
-    #[must_use]
-    pub fn offset(mut self, n: u64) -> Self {
-        self.select = self.select.offset(n);
-        self
-    }
-
-    /// Build the SQL query and parameters.
-    pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        self.select.build_with_dialect(dialect)
-    }
-
-    /// Execute the polymorphic query and hydrate either `Base` or `C1` or `C2` per row.
-    #[tracing::instrument(level = "debug", skip(self, cx, conn))]
-    pub async fn all<C: Connection>(
-        self,
-        cx: &Cx,
-        conn: &C,
-    ) -> Outcome<Vec<PolymorphicJoined2<Base, C1, C2>>, sqlmodel_core::Error> {
-        let inh_base = Base::inheritance();
-        if inh_base.strategy != sqlmodel_core::InheritanceStrategy::Joined
-            || inh_base.parent.is_some()
-        {
-            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "polymorphic_joined2 requires a joined-inheritance base model; got strategy={:?}, parent={:?} for {}",
-                inh_base.strategy,
-                inh_base.parent,
-                Base::TABLE_NAME
-            )));
-        }
-
-        for (child_table, inh_child) in [
-            (C1::TABLE_NAME, C1::inheritance()),
-            (C2::TABLE_NAME, C2::inheritance()),
-        ] {
-            if inh_child.strategy != sqlmodel_core::InheritanceStrategy::Joined
-                || inh_child.parent != Some(Base::TABLE_NAME)
-            {
-                return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                    "polymorphic_joined2 requires joined-inheritance children with parent={}; got strategy={:?}, parent={:?} for {}",
-                    Base::TABLE_NAME,
-                    inh_child.strategy,
-                    inh_child.parent,
-                    child_table
-                )));
-            }
-        }
-
-        if Base::PRIMARY_KEY.is_empty() {
-            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "polymorphic_joined2 requires base model {} to have a primary key",
-                Base::TABLE_NAME
-            )));
-        }
-
-        let (sql, params) = self.select.build_with_dialect(conn.dialect());
-        tracing::debug!(
-            sql = %sql,
-            base = Base::TABLE_NAME,
-            c1 = C1::TABLE_NAME,
-            c2 = C2::TABLE_NAME,
-            "Executing polymorphic joined2 SELECT"
-        );
-
-        let rows = conn.query(cx, &sql, &params).await;
-        rows.and_then(|rows| {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let has_c1 = !row.prefix_is_all_null(C1::TABLE_NAME);
-                let has_c2 = !row.prefix_is_all_null(C2::TABLE_NAME);
-                if has_c1 && has_c2 {
+                if Base::PRIMARY_KEY.is_empty() {
                     return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                        "polymorphic_joined2 ambiguous row: both {} and {} prefixes are non-NULL",
-                        C1::TABLE_NAME,
-                        C2::TABLE_NAME
+                        "{} requires base model {} to have a primary key",
+                        $op,
+                        Base::TABLE_NAME
                     )));
                 }
 
-                if has_c2 {
-                    match C2::from_row(&row) {
-                        Ok(c) => out.push(PolymorphicJoined2::C2(c)),
-                        Err(e) => return Outcome::Err(e),
+                let (sql, params) = self.select.build_with_dialect(conn.dialect());
+                tracing::debug!(
+                    sql = %sql,
+                    base = Base::TABLE_NAME,
+                    $($child = $child::TABLE_NAME,)+
+                    "Executing polymorphic joined SELECT"
+                );
+
+                let rows = conn.query(cx, &sql, &params).await;
+                rows.and_then(|rows| {
+                    let mut out = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        if let Err(e) =
+                            joined_row_guard(&row, &[$($child::TABLE_NAME),+], $op)
+                        {
+                            return Outcome::Err(e);
+                        }
+                        let mut hydrated: Option<
+                            sqlmodel_core::Result<$enum_name<Base, $($child),+>>,
+                        > = None;
+                        $(
+                            if hydrated.is_none()
+                                && !row.prefix_is_all_null($child::TABLE_NAME)
+                            {
+                                hydrated = Some(
+                                    $child::from_row(&row).map(|c| $enum_name::$variant(c))
+                                );
+                            }
+                        )+
+                        let hydrated = match hydrated {
+                            Some(h) => h,
+                            // No child prefix matched: a base-only row.
+                            None => Base::from_row(&row).map($enum_name::Base),
+                        };
+                        out.push(match hydrated {
+                            Ok(v) => v,
+                            Err(e) => return Outcome::Err(e),
+                        });
                     }
-                } else if has_c1 {
-                    match C1::from_row(&row) {
-                        Ok(c) => out.push(PolymorphicJoined2::C1(c)),
-                        Err(e) => return Outcome::Err(e),
-                    }
-                } else {
-                    match Base::from_row(&row) {
-                        Ok(b) => out.push(PolymorphicJoined2::Base(b)),
-                        Err(e) => return Outcome::Err(e),
-                    }
-                }
-            }
-            Outcome::Ok(out)
-        })
-    }
-}
-
-/// Output of a joined-table inheritance polymorphic query with three child types.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PolymorphicJoined3<Base: Model, C1: Model, C2: Model, C3: Model> {
-    Base(Base),
-    C1(C1),
-    C2(C2),
-    C3(C3),
-}
-
-/// A polymorphic SELECT for joined-table inheritance base + three children.
-///
-/// Construct via `select!(Base).polymorphic_joined3::<C1, C2, C3>()`.
-#[derive(Debug, Clone)]
-pub struct PolymorphicJoinedSelect3<Base: Model, C1: Model, C2: Model, C3: Model> {
-    select: Select<Base>,
-    _marker: PhantomData<(C1, C2, C3)>,
-}
-
-impl<Base: Model, C1: Model, C2: Model, C3: Model> PolymorphicJoinedSelect3<Base, C1, C2, C3> {
-    /// Add a WHERE condition (delegates to the underlying base select).
-    #[must_use]
-    pub fn filter(mut self, expr: Expr) -> Self {
-        self.select = self.select.filter(expr);
-        self
-    }
-
-    /// Add ORDER BY clause (delegates to the underlying base select).
-    #[must_use]
-    pub fn order_by(mut self, order: OrderBy) -> Self {
-        self.select = self.select.order_by(order);
-        self
-    }
-
-    /// Set LIMIT (delegates to the underlying base select).
-    #[must_use]
-    pub fn limit(mut self, n: u64) -> Self {
-        self.select = self.select.limit(n);
-        self
-    }
-
-    /// Set OFFSET (delegates to the underlying base select).
-    #[must_use]
-    pub fn offset(mut self, n: u64) -> Self {
-        self.select = self.select.offset(n);
-        self
-    }
-
-    /// Build the SQL query and parameters.
-    pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        self.select.build_with_dialect(dialect)
-    }
-
-    /// Execute the polymorphic query and hydrate either `Base` or one of the three child types.
-    #[tracing::instrument(level = "debug", skip(self, cx, conn))]
-    pub async fn all<C: Connection>(
-        self,
-        cx: &Cx,
-        conn: &C,
-    ) -> Outcome<Vec<PolymorphicJoined3<Base, C1, C2, C3>>, sqlmodel_core::Error> {
-        let inh_base = Base::inheritance();
-        if inh_base.strategy != sqlmodel_core::InheritanceStrategy::Joined
-            || inh_base.parent.is_some()
-        {
-            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "polymorphic_joined3 requires a joined-inheritance base model; got strategy={:?}, parent={:?} for {}",
-                inh_base.strategy,
-                inh_base.parent,
-                Base::TABLE_NAME
-            )));
-        }
-
-        for (child_table, inh_child) in [
-            (C1::TABLE_NAME, C1::inheritance()),
-            (C2::TABLE_NAME, C2::inheritance()),
-            (C3::TABLE_NAME, C3::inheritance()),
-        ] {
-            if inh_child.strategy != sqlmodel_core::InheritanceStrategy::Joined
-                || inh_child.parent != Some(Base::TABLE_NAME)
-            {
-                return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                    "polymorphic_joined3 requires joined-inheritance children with parent={}; got strategy={:?}, parent={:?} for {}",
-                    Base::TABLE_NAME,
-                    inh_child.strategy,
-                    inh_child.parent,
-                    child_table
-                )));
+                    Outcome::Ok(out)
+                })
             }
         }
-
-        if Base::PRIMARY_KEY.is_empty() {
-            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                "polymorphic_joined3 requires base model {} to have a primary key",
-                Base::TABLE_NAME
-            )));
-        }
-
-        let (sql, params) = self.select.build_with_dialect(conn.dialect());
-        tracing::debug!(
-            sql = %sql,
-            base = Base::TABLE_NAME,
-            c1 = C1::TABLE_NAME,
-            c2 = C2::TABLE_NAME,
-            c3 = C3::TABLE_NAME,
-            "Executing polymorphic joined3 SELECT"
-        );
-
-        let rows = conn.query(cx, &sql, &params).await;
-        rows.and_then(|rows| {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let has_c1 = !row.prefix_is_all_null(C1::TABLE_NAME);
-                let has_c2 = !row.prefix_is_all_null(C2::TABLE_NAME);
-                let has_c3 = !row.prefix_is_all_null(C3::TABLE_NAME);
-
-                let mut matched_children = Vec::new();
-                if has_c1 {
-                    matched_children.push(C1::TABLE_NAME);
-                }
-                if has_c2 {
-                    matched_children.push(C2::TABLE_NAME);
-                }
-                if has_c3 {
-                    matched_children.push(C3::TABLE_NAME);
-                }
-                if matched_children.len() > 1 {
-                    return Outcome::Err(sqlmodel_core::Error::Custom(format!(
-                        "polymorphic_joined3 ambiguous row: multiple child prefixes are non-NULL: {}",
-                        matched_children.join(", ")
-                    )));
-                }
-
-                if has_c1 {
-                    match C1::from_row(&row) {
-                        Ok(c) => out.push(PolymorphicJoined3::C1(c)),
-                        Err(e) => return Outcome::Err(e),
-                    }
-                } else if has_c2 {
-                    match C2::from_row(&row) {
-                        Ok(c) => out.push(PolymorphicJoined3::C2(c)),
-                        Err(e) => return Outcome::Err(e),
-                    }
-                } else if has_c3 {
-                    match C3::from_row(&row) {
-                        Ok(c) => out.push(PolymorphicJoined3::C3(c)),
-                        Err(e) => return Outcome::Err(e),
-                    }
-                } else {
-                    match Base::from_row(&row) {
-                        Ok(b) => out.push(PolymorphicJoined3::Base(b)),
-                        Err(e) => return Outcome::Err(e),
-                    }
-                }
-            }
-            Outcome::Ok(out)
-        })
-    }
+    };
 }
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with a single child type.
+    enum PolymorphicJoined, select PolymorphicJoinedSelect,
+    method polymorphic_joined = "polymorphic_joined",
+    base Base, children [(Child, Child)]
+);
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with two child types.
+    enum PolymorphicJoined2, select PolymorphicJoinedSelect2,
+    method polymorphic_joined2 = "polymorphic_joined2",
+    base Base, children [(C1, C1), (C2, C2)]
+);
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with three child types.
+    enum PolymorphicJoined3, select PolymorphicJoinedSelect3,
+    method polymorphic_joined3 = "polymorphic_joined3",
+    base Base, children [(C1, C1), (C2, C2), (C3, C3)]
+);
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with four child types.
+    enum PolymorphicJoined4, select PolymorphicJoinedSelect4,
+    method polymorphic_joined4 = "polymorphic_joined4",
+    base Base, children [(C1, C1), (C2, C2), (C3, C3), (C4, C4)]
+);
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with five child types.
+    enum PolymorphicJoined5, select PolymorphicJoinedSelect5,
+    method polymorphic_joined5 = "polymorphic_joined5",
+    base Base, children [(C1, C1), (C2, C2), (C3, C3), (C4, C4), (C5, C5)]
+);
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with six child types.
+    enum PolymorphicJoined6, select PolymorphicJoinedSelect6,
+    method polymorphic_joined6 = "polymorphic_joined6",
+    base Base, children [(C1, C1), (C2, C2), (C3, C3), (C4, C4), (C5, C5), (C6, C6)]
+);
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with seven child types.
+    enum PolymorphicJoined7, select PolymorphicJoinedSelect7,
+    method polymorphic_joined7 = "polymorphic_joined7",
+    base Base, children [(C1, C1), (C2, C2), (C3, C3), (C4, C4), (C5, C5), (C6, C6), (C7, C7)]
+);
+
+define_polymorphic_joined!(
+    /// Output of a joined-table inheritance polymorphic query with eight child types.
+    enum PolymorphicJoined8, select PolymorphicJoinedSelect8,
+    method polymorphic_joined8 = "polymorphic_joined8",
+    base Base,
+    children [(C1, C1), (C2, C2), (C3, C3), (C4, C4), (C5, C5), (C6, C6), (C7, C7), (C8, C8)]
+);
 
 // ==================== Concrete-table inheritance polymorphic selects ====================
 
@@ -3116,5 +2919,124 @@ mod tests {
         assert_eq!(sql.matches(" UNION ALL ").count(), 2);
         // Filters are applied per branch: three branches, three placeholders.
         assert_eq!(sql.matches('?').count(), 3);
+    }
+
+    #[test]
+    fn test_joined_row_guard_reports_ambiguity_and_allows_base() {
+        // All child prefixes NULL -> base row, guard passes.
+        let base_row = Row::new(
+            vec!["persons__id".to_string(), "students__id".to_string()],
+            vec![Value::Int(1), Value::Null],
+        );
+        joined_row_guard(&base_row, &["students"], "polymorphic_joined").expect("base row passes");
+
+        // Exactly one non-NULL prefix -> guard passes.
+        let student_row = Row::new(
+            vec!["persons__id".to_string(), "students__id".to_string()],
+            vec![Value::Int(1), Value::Int(1)],
+        );
+        joined_row_guard(&student_row, &["students"], "polymorphic_joined")
+            .expect("single match passes");
+
+        // Two non-NULL prefixes -> the ambiguity error names both prefixes.
+        let ambiguous = Row::new(
+            vec!["students__id".to_string(), "teachers__id".to_string()],
+            vec![Value::Int(1), Value::Int(1)],
+        );
+        let error = joined_row_guard(&ambiguous, &["students", "teachers"], "polymorphic_joined2")
+            .expect_err("ambiguous row errors");
+        let Error::Custom(message) = error else {
+            panic!("expected Custom error, got {error:?}");
+        };
+        assert!(
+            message.contains("multiple child prefixes are non-NULL: students, teachers"),
+            "message names both prefixes: {message}"
+        );
+    }
+
+    // Eight joined children, macro-generated so the N=8 entry point has real
+    // models to join without eight hand-written copies.
+    macro_rules! define_test_joined_child {
+        ($name:ident, $table:literal) => {
+            #[derive(Debug, Clone)]
+            struct $name;
+
+            impl Model for $name {
+                const TABLE_NAME: &'static str = $table;
+                const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+                fn fields() -> &'static [FieldInfo] {
+                    static FIELDS: &[FieldInfo] =
+                        &[FieldInfo::new("id", "id", sqlmodel_core::SqlType::BigInt)
+                            .primary_key(true)];
+                    FIELDS
+                }
+
+                fn to_row(&self) -> Vec<(&'static str, Value)> {
+                    Vec::new()
+                }
+
+                fn from_row(_row: &Row) -> Result<Self> {
+                    Err(Error::Custom("not used in tests".to_string()))
+                }
+
+                fn primary_key_value(&self) -> Vec<Value> {
+                    Vec::new()
+                }
+
+                fn is_new(&self) -> bool {
+                    true
+                }
+
+                fn inheritance() -> InheritanceInfo {
+                    InheritanceInfo {
+                        strategy: InheritanceStrategy::Joined,
+                        parent: Some(JoinedParent::TABLE_NAME),
+                        parent_fields_fn: Some(<JoinedParent as Model>::fields),
+                        discriminator_column: None,
+                        discriminator_value: None,
+                    }
+                }
+            }
+        };
+    }
+
+    define_test_joined_child!(JoinedChildA, "jc_a");
+    define_test_joined_child!(JoinedChildB, "jc_b");
+    define_test_joined_child!(JoinedChildC, "jc_c");
+    define_test_joined_child!(JoinedChildD, "jc_d");
+    define_test_joined_child!(JoinedChildE, "jc_e");
+    define_test_joined_child!(JoinedChildF, "jc_f");
+    define_test_joined_child!(JoinedChildG, "jc_g");
+    define_test_joined_child!(JoinedChildH, "jc_h");
+
+    #[test]
+    fn test_polymorphic_joined8_left_joins_every_child() {
+        let query = Select::<JoinedParent>::new().polymorphic_joined8::<
+            JoinedChildA,
+            JoinedChildB,
+            JoinedChildC,
+            JoinedChildD,
+            JoinedChildE,
+            JoinedChildF,
+            JoinedChildG,
+            JoinedChildH,
+        >();
+        let (sql, params) = query.build_with_dialect(Dialect::Sqlite);
+
+        for table in [
+            "jc_a", "jc_b", "jc_c", "jc_d", "jc_e", "jc_f", "jc_g", "jc_h",
+        ] {
+            assert!(
+                sql.contains(&format!("LEFT JOIN \"{table}\"")),
+                "missing join for {table}: {sql}"
+            );
+            assert!(
+                sql.contains(&format!("\"{table}\".\"id\" AS \"{table}__id\"")),
+                "missing projection for {table}: {sql}"
+            );
+        }
+        assert_eq!(sql.matches("LEFT JOIN").count(), 8);
+        assert!(params.is_empty());
     }
 }
