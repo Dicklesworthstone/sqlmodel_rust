@@ -37,3 +37,25 @@ serde.workspace = true
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
+criterion = "0.8"
+libsqlite3-sys = { workspace = true, features = ["bundled"] }
+
+[[bench]]
+name = "sql_emission"
+harness = false
+
+[[bench]]
+name = "row_conversion"
+harness = false
+
+[[bench]]
+name = "sqlite_throughput"
+harness = false
+
+[[bench]]
+name = "pool_acquire"
+harness = false
+
+[[bench]]
+name = "session_flush"
+harness = false
