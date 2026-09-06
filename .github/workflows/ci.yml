@@ -280,7 +280,7 @@ jobs:
   size-and-startup:
     name: Size and startup (bd-4ttf.2)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -312,3 +312,9 @@ jobs:
         with:
           name: bloat-report
           path: bloat_report.txt
+
+      - name: Bench regression guard (2x thresholds, CPU benches only)
+        timeout-minutes: 40
+        run: |
+          cargo bench -p sqlmodel-e2e --bench sql_emission --bench row_conversion -- --noplot
+          scripts/bench_guard.sh crates/sqlmodel-e2e/benches/thresholds.toml target/criterion

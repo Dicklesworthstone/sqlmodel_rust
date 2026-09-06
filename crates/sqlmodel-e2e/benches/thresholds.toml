@@ -1,0 +1,34 @@
+# Bench regression thresholds (bd-4ttf.4).
+#
+# Values are MAX mean ns/op with a 2x margin over the recorded baseline
+# means, rounded up. `scripts/bench_guard.sh` fails CI when a guarded
+# benchmark's criterion mean exceeds its threshold.
+#
+# Baseline machine: RCH worker hz3 (shared EPYC host), recorded 2026-09-06
+# from `cargo bench -p sqlmodel-e2e --bench sql_emission --bench row_conversion
+# -- --noplot`. CI runners are slower and noisier than the baseline machine;
+# the 2x margin absorbs that. Update thresholds deliberately:
+# `SQLMODEL_UPDATE_THRESHOLDS=1 scripts/bench_guard.sh` prints a fresh table
+# from a local run - multiply stable means by 2, note the machine, commit with
+# justification (mirrors the golden-SQL regeneration rule).
+#
+# Guarded: pure CPU benches (SQL emission, row conversion).
+# Excluded by design: I/O-bound benches (sqlite throughput, pool acquire,
+# session flush) - they are exercised by the monthly full-suite report
+# workflow instead.
+
+[thresholds]
+"row_conversion/derive_from_row" = 3000
+"row_conversion/derive_to_row" = 500
+"row_conversion/hand_from_row" = 500
+"row_conversion/hand_to_row" = 400
+"row_conversion/ratio_to_row/derive" = 500
+"row_conversion/ratio_to_row/hand" = 400
+"sql_emission_allocations/select_filtered_bytes_allocated" = 4000
+"sql_emission_batches/insert_many_100" = 450000
+"sql_emission_batches/insert_many_10" = 50000
+"sql_emission_batches/insert_many_500" = 2200000
+"sql_emission/create_table" = 8000
+"sql_emission/select_filtered_Mysql" = 6000
+"sql_emission/select_filtered_Postgres" = 6000
+"sql_emission/select_filtered_Sqlite" = 6000
