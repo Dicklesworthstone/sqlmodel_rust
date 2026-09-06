@@ -60,7 +60,8 @@ pub use connection::{
     TransactionMode, TransactionOps, TransactionOptions,
 };
 pub use error::{
-    Error, FieldValidationError, Result, TransactionErrorKind, ValidationError, ValidationErrorKind,
+    Error, FieldValidationError, Result, TransactionErrorKind, TypeError, ValidationError,
+    ValidationErrorKind,
 };
 pub use field::{
     Column, Field, FieldInfo, InheritanceInfo, InheritanceStrategy, ReferentialAction,

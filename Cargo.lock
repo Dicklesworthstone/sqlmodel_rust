@@ -2717,6 +2717,7 @@ dependencies = [
  "sqlmodel-schema",
  "sqlmodel-session",
  "sqlmodel-sqlite",
+ "tracing",
  "trybuild",
  "uuid",
 ]

@@ -167,6 +167,26 @@ macro_rules! polymorphic_joined_entry {
         ///   since hydration depends on a complete prefixed projection.
         #[must_use]
         pub fn $method_name<$($child: Model),+>(mut self) -> $select_name<M, $($child),+> {
+            let inh_base = M::inheritance();
+            tracing::debug!(
+                target: "sqlmodel_query::inheritance",
+                model = %M::TABLE_NAME,
+                strategy = ?inh_base.strategy,
+                parent = ?inh_base.parent,
+                discriminator = ?inh_base.discriminator_column,
+                "resolved inheritance mapping"
+            );
+            $(
+                let inh_child = $child::inheritance();
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    model = %$child::TABLE_NAME,
+                    strategy = ?inh_child.strategy,
+                    parent = ?inh_child.parent,
+                    discriminator = ?inh_child.discriminator_column,
+                    "resolved inheritance mapping"
+                );
+            )+
             self.aliased_projection = [table_columns::<M>(), $(table_columns::<$child>()),+].concat();
             $(
                 if let Some(join) = polymorphic_joined_left_join::<M, $child>() {
@@ -185,6 +205,17 @@ macro_rules! polymorphic_joined_entry {
 impl<M: Model> Select<M> {
     /// Create a new SELECT query for the model's table.
     pub fn new() -> Self {
+        let inh = M::inheritance();
+        if inh.strategy != sqlmodel_core::InheritanceStrategy::None {
+            tracing::debug!(
+                target: "sqlmodel_query::inheritance",
+                model = %M::TABLE_NAME,
+                strategy = ?inh.strategy,
+                parent = ?inh.parent,
+                discriminator = ?inh.discriminator_column,
+                "resolved inheritance mapping"
+            );
+        }
         Self {
             columns: Vec::new(),
             aliased_projection: Vec::new(),
@@ -1141,6 +1172,12 @@ fn joined_row_guard(
         .copied()
         .collect();
     if non_null.len() > 1 {
+        tracing::warn!(
+            target: "sqlmodel_query::inheritance",
+            op = op,
+            prefixes = ?non_null,
+            "ambiguous row in polymorphic hydration: multiple child prefixes are non-NULL"
+        );
         return Err(sqlmodel_core::Error::Custom(format!(
             "{op} ambiguous row: multiple child prefixes are non-NULL: {}",
             non_null.join(", ")
@@ -1237,7 +1274,17 @@ macro_rules! define_polymorphic_joined {
 
             /// Build the SQL query and parameters.
             pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-                self.select.build_with_dialect(dialect)
+                let (sql, params) = self.select.build_with_dialect(dialect);
+                let prefixes: &[&str] = &[$($child::TABLE_NAME),+];
+                tracing::trace!(
+                    target: "sqlmodel_query::polymorphic",
+                    dialect = ?dialect,
+                    sql = %sql,
+                    params = ?params,
+                    children = ?prefixes,
+                    "polymorphic select"
+                );
+                (sql, params)
             }
 
             /// Execute the polymorphic query and hydrate the base or a child
@@ -1266,7 +1313,7 @@ macro_rules! define_polymorphic_joined {
                     )));
                 }
 
-                let (sql, params) = self.select.build_with_dialect(conn.dialect());
+                let (sql, params) = self.build_with_dialect(conn.dialect());
                 tracing::debug!(
                     sql = %sql,
                     base = Base::TABLE_NAME,
@@ -1602,11 +1649,21 @@ impl<Base: Model, Child: Model> PolymorphicConcreteSelect<Base, Child> {
 
     /// Build the SQL query and parameters.
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        build_concrete_union_sql(
+        let (sql, params) = build_concrete_union_sql(
             &self.select,
             dialect,
             &[(Child::TABLE_NAME, Child::fields())],
-        )
+        );
+        let prefixes: &[&str] = &[Child::TABLE_NAME];
+        tracing::trace!(
+            target: "sqlmodel_query::polymorphic",
+            dialect = ?dialect,
+            sql = %sql,
+            params = ?params,
+            children = ?prefixes,
+            "polymorphic select"
+        );
+        (sql, params)
     }
 
     /// Execute the query and hydrate every row as `Child`.
@@ -1698,14 +1755,24 @@ impl<Base: Model, C1: Model, C2: Model> PolymorphicConcreteSelect2<Base, C1, C2>
 
     /// Build the SQL query and parameters.
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        build_concrete_union_sql(
+        let (sql, params) = build_concrete_union_sql(
             &self.select,
             dialect,
             &[
                 (C1::TABLE_NAME, C1::fields()),
                 (C2::TABLE_NAME, C2::fields()),
             ],
-        )
+        );
+        let prefixes: &[&str] = &[C1::TABLE_NAME, C2::TABLE_NAME];
+        tracing::trace!(
+            target: "sqlmodel_query::polymorphic",
+            dialect = ?dialect,
+            sql = %sql,
+            params = ?params,
+            children = ?prefixes,
+            "polymorphic select"
+        );
+        (sql, params)
     }
 
     /// Execute the query and hydrate `C1` or `C2` per row via the variant tag.
@@ -1806,7 +1873,7 @@ impl<Base: Model, C1: Model, C2: Model, C3: Model> PolymorphicConcreteSelect3<Ba
 
     /// Build the SQL query and parameters.
     pub fn build_with_dialect(&self, dialect: Dialect) -> (String, Vec<Value>) {
-        build_concrete_union_sql(
+        let (sql, params) = build_concrete_union_sql(
             &self.select,
             dialect,
             &[
@@ -1814,7 +1881,17 @@ impl<Base: Model, C1: Model, C2: Model, C3: Model> PolymorphicConcreteSelect3<Ba
                 (C2::TABLE_NAME, C2::fields()),
                 (C3::TABLE_NAME, C3::fields()),
             ],
-        )
+        );
+        let prefixes: &[&str] = &[C1::TABLE_NAME, C2::TABLE_NAME, C3::TABLE_NAME];
+        tracing::trace!(
+            target: "sqlmodel_query::polymorphic",
+            dialect = ?dialect,
+            sql = %sql,
+            params = ?params,
+            children = ?prefixes,
+            "polymorphic select"
+        );
+        (sql, params)
     }
 
     /// Execute the query and hydrate `C1`/`C2`/`C3` per row via the variant tag.

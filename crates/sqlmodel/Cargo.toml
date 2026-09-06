@@ -51,3 +51,5 @@ trybuild = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 rust_decimal = { workspace = true }
+tracing = { workspace = true }
+

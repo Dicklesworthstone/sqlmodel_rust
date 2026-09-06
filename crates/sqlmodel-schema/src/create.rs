@@ -57,6 +57,12 @@ impl<M: Model> CreateTable<M> {
             && inheritance.parent.is_some()
             && inheritance.discriminator_value.is_some()
         {
+            tracing::debug!(
+                target: "sqlmodel_schema::inheritance",
+                model = %M::TABLE_NAME,
+                parent = ?inheritance.parent,
+                "skipping table creation for STI child model"
+            );
             // This is a single table inheritance child - no table to create
             // Child-specific columns are handled by higher-level schema planning (e.g. SchemaBuilder)
             return String::new();
@@ -154,6 +160,13 @@ impl<M: Model> CreateTable<M> {
                     quoted_child_cols.join(", "),
                     q(parent_table),
                     quoted_parent_cols.join(", ")
+                );
+                tracing::debug!(
+                    target: "sqlmodel_schema::inheritance",
+                    model = %M::TABLE_NAME,
+                    parent = %parent_table,
+                    fk_constraint = %constraint_name,
+                    "added joined inheritance foreign key to parent primary key"
                 );
                 constraints.push(fk_sql);
             }
@@ -1434,6 +1447,11 @@ impl SchemaBuilder {
     /// parent's physical table.
     pub fn create_table<M: Model>(mut self) -> Self {
         if CreateTable::<M>::should_skip_table_creation() {
+            tracing::debug!(
+                target: "sqlmodel_schema::inheritance",
+                model = %M::TABLE_NAME,
+                "skipping physical table creation in SchemaBuilder for STI child"
+            );
             let inheritance = M::inheritance();
             let Some(parent_table) = inheritance.parent else {
                 return self;

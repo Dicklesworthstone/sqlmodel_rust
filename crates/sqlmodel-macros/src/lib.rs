@@ -732,7 +732,17 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
                         )));
                     }
                     let prow = row.subset_by_prefix(parent_table);
-                    <#ty as sqlmodel_core::Model>::from_row(&prow)?
+                    <#ty as sqlmodel_core::Model>::from_row(&prow).map_err(|e| {
+                        sqlmodel_core::Error::Type(sqlmodel_core::TypeError {
+                            expected: "valid parent model row",
+                            actual: format!(
+                                "failed to hydrate joined inheritance parent table '{}' with prefix '{}__': {e}",
+                                parent_table, parent_table
+                            ),
+                            column: Some(format!("{}__*", parent_table)),
+                            rust_type: Some(stringify!(#ty)),
+                        })
+                    })?
                 }
             }
         })

@@ -21,6 +21,20 @@ fn is_joined_inheritance_child<M: Model>() -> bool {
     inh.strategy == InheritanceStrategy::Joined && inh.parent.is_some()
 }
 
+fn log_inheritance_mapping<M: Model>() {
+    let inh = M::inheritance();
+    if inh.strategy != InheritanceStrategy::None {
+        tracing::debug!(
+            target: "sqlmodel_query::inheritance",
+            model = %M::TABLE_NAME,
+            strategy = ?inh.strategy,
+            parent = ?inh.parent,
+            discriminator = ?inh.discriminator_column,
+            "resolved inheritance mapping"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinedTableTarget {
     Parent,
@@ -639,6 +653,12 @@ fn assemble_parent_upsert(
     pk_col: &str,
     action: &OnConflict,
 ) -> (String, ParentUpsertIdSource) {
+    tracing::debug!(
+        target: "sqlmodel_query::inheritance",
+        table = table_q,
+        op = "assemble_parent_upsert",
+        "assembled parent upsert statement"
+    );
     let pk_q = dialect.quote_identifier(pk_col);
     match dialect {
         Dialect::Mysql => match action {
@@ -864,6 +884,13 @@ async fn insert_joined_model_in_tx<Tx: TransactionOps, M: Model>(
             &parent_row,
             Some(pk_col),
         );
+        tracing::debug!(
+            target: "sqlmodel_query::inheritance",
+            table = parent_table,
+            op = "insert",
+            pk_values = ?effective_pk_vals,
+            "joined DML statement"
+        );
         match tx.query_one(cx, &sql, &params).await {
             Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
                 Ok(v) => inserted_id = Some(v),
@@ -885,6 +912,13 @@ async fn insert_joined_model_in_tx<Tx: TransactionOps, M: Model>(
             parent_fields,
             &parent_row,
             None,
+        );
+        tracing::debug!(
+            target: "sqlmodel_query::inheritance",
+            table = parent_table,
+            op = "insert",
+            pk_values = ?effective_pk_vals,
+            "joined DML statement"
         );
         match tx.execute(cx, &sql, &params).await {
             Outcome::Ok(_) => {}
@@ -941,6 +975,13 @@ async fn insert_joined_model_in_tx<Tx: TransactionOps, M: Model>(
         &child_row,
         None,
     );
+    tracing::debug!(
+        target: "sqlmodel_query::inheritance",
+        table = M::TABLE_NAME,
+        op = "insert",
+        pk_values = ?effective_pk_vals,
+        "joined DML statement"
+    );
     match tx.execute(cx, &child_sql, &child_params).await {
         Outcome::Ok(count) => Outcome::Ok((count, effective_pk_vals)),
         Outcome::Err(e) => Outcome::Err(e),
@@ -995,6 +1036,7 @@ pub struct InsertBuilder<'a, M: Model> {
 impl<'a, M: Model> InsertBuilder<'a, M> {
     /// Create a new INSERT builder for the given model instance.
     pub fn new(model: &'a M) -> Self {
+        log_inheritance_mapping::<M>();
         Self {
             model,
             returning: false,
@@ -1291,6 +1333,13 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     pk_col,
                     action,
                 );
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = "upsert",
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match source {
                     ParentUpsertIdSource::Returning => {
                         match tx.query_one(cx, &sql, &params).await {
@@ -1390,6 +1439,13 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                         &parent_row,
                         Some(pk_col),
                     );
+                    tracing::debug!(
+                        target: "sqlmodel_query::inheritance",
+                        table = parent_table,
+                        op = "insert",
+                        pk_values = ?pk_vals,
+                        "joined DML statement"
+                    );
                     match tx.query_one(cx, &sql, &params).await {
                         Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
                             Ok(v) => inserted_id = Some(v),
@@ -1428,6 +1484,13 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     if let Some(oc) = &parent_on_conflict {
                         append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
                     }
+                    tracing::debug!(
+                        target: "sqlmodel_query::inheritance",
+                        table = parent_table,
+                        op = if parent_on_conflict.is_some() { "upsert" } else { "insert" },
+                        pk_values = ?pk_vals,
+                        "joined DML statement"
+                    );
                     match tx.execute(cx, &sql, &params).await {
                         Outcome::Ok(affected) => {
                             // DO NOTHING on an existing row affects nothing.
@@ -1460,6 +1523,13 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                 if let Some(oc) = &parent_on_conflict {
                     append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
                 }
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = if parent_on_conflict.is_some() { "upsert" } else { "insert" },
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &sql, &params).await {
                     Outcome::Ok(affected) => {
                         // INSERT IGNORE on an existing row affects nothing.
@@ -1560,6 +1630,23 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             if let Some(oc) = &child_on_conflict {
                 append_on_conflict_clause(dialect, &mut child_sql, M::PRIMARY_KEY, &child_cols, oc);
             }
+
+            let child_pk_vals = if let (Some(_), Some(id)) = (pk_col, inserted_id) {
+                let mut vals = pk_vals.clone();
+                if vals.len() == 1 && vals[0].is_null() {
+                    vals[0] = Value::BigInt(id);
+                }
+                vals
+            } else {
+                pk_vals.clone()
+            };
+            tracing::debug!(
+                target: "sqlmodel_query::inheritance",
+                table = M::TABLE_NAME,
+                op = if child_on_conflict.is_some() { "upsert" } else { "insert" },
+                pk_values = ?child_pk_vals,
+                "joined DML statement"
+            );
 
             match tx.execute(cx, &child_sql, &child_params).await {
                 Outcome::Ok(_) => {}
@@ -1779,6 +1866,13 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     pk_col,
                     action,
                 );
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = "upsert",
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match source {
                     ParentUpsertIdSource::Returning => {
                         match tx.query_one(cx, &sql, &params).await {
@@ -1878,6 +1972,13 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                 }
                 sql.push_str(" RETURNING ");
                 sql.push_str(&dialect.quote_identifier(pk_col));
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = if parent_on_conflict.is_some() { "upsert" } else { "insert" },
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match tx.query_one(cx, &sql, &params).await {
                     Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
                         Ok(v) => inserted_id = Some(v),
@@ -1912,6 +2013,13 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                 if let Some(oc) = &parent_on_conflict {
                     append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
                 }
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = if parent_on_conflict.is_some() { "upsert" } else { "insert" },
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &sql, &params).await {
                     Outcome::Ok(affected) => {
                         // DO NOTHING / INSERT IGNORE on an existing row
@@ -2010,6 +2118,24 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             if let Some(oc) = &child_on_conflict {
                 append_on_conflict_clause(dialect, &mut child_sql, M::PRIMARY_KEY, &child_cols, oc);
             }
+
+            let child_pk_vals = if let (Some(_), Some(id)) = (pk_col, inserted_id) {
+                let mut vals = pk_vals.clone();
+                if vals.len() == 1 && vals[0].is_null() {
+                    vals[0] = Value::BigInt(id);
+                }
+                vals
+            } else {
+                pk_vals.clone()
+            };
+            tracing::debug!(
+                target: "sqlmodel_query::inheritance",
+                table = M::TABLE_NAME,
+                op = if child_on_conflict.is_some() { "upsert" } else { "insert" },
+                pk_values = ?child_pk_vals,
+                "joined DML statement"
+            );
+
             match tx.execute(cx, &child_sql, &child_params).await {
                 Outcome::Ok(_) => {}
                 Outcome::Err(e) => {
@@ -2141,6 +2267,7 @@ pub struct InsertManyBuilder<'a, M: Model> {
 impl<'a, M: Model> InsertManyBuilder<'a, M> {
     /// Create a new bulk INSERT builder for the given model instances.
     pub fn new(models: &'a [M]) -> Self {
+        log_inheritance_mapping::<M>();
         Self {
             models,
             returning: false,
@@ -2704,6 +2831,7 @@ pub struct UpdateBuilder<'a, M: Model> {
 impl<'a, M: Model> UpdateBuilder<'a, M> {
     /// Create a new UPDATE builder for the given model instance.
     pub fn new(model: &'a M) -> Self {
+        log_inheritance_mapping::<M>();
         Self {
             model: Some(model),
             where_clause: None,
@@ -2717,6 +2845,7 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
     ///
     /// Use this when you want to update specific columns without a model instance.
     pub fn empty() -> Self {
+        log_inheritance_mapping::<M>();
         Self {
             model: None,
             where_clause: None,
@@ -2943,6 +3072,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                         &parent_sets,
                     );
                     if !parent_sql.is_empty() {
+                        tracing::debug!(
+                            target: "sqlmodel_query::inheritance",
+                            table = parent_table,
+                            op = "update",
+                            pk_values = ?pk_values,
+                            "joined DML statement"
+                        );
                         match tx.execute(cx, &parent_sql, &parent_params).await {
                             Outcome::Ok(n) => total = total.saturating_add(n),
                             Outcome::Err(e) => {
@@ -2970,6 +3106,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                         &child_sets,
                     );
                     if !child_sql.is_empty() {
+                        tracing::debug!(
+                            target: "sqlmodel_query::inheritance",
+                            table = M::TABLE_NAME,
+                            op = "update",
+                            pk_values = ?pk_values,
+                            "joined DML statement"
+                        );
                         match tx.execute(cx, &child_sql, &child_params).await {
                             Outcome::Ok(n) => total = total.saturating_add(n),
                             Outcome::Err(e) => {
@@ -3054,6 +3197,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
             let (parent_sql, parent_params) =
                 build_update_sql_for_table(dialect, parent_table, pk_cols, &pk_vals, &parent_sets);
             if !parent_sql.is_empty() {
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = "update",
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &parent_sql, &parent_params).await {
                     Outcome::Ok(n) => total = total.saturating_add(n),
                     Outcome::Err(e) => {
@@ -3088,6 +3238,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
             let (child_sql, child_params) =
                 build_update_sql_for_table(dialect, M::TABLE_NAME, pk_cols, &pk_vals, &child_sets);
             if !child_sql.is_empty() {
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = M::TABLE_NAME,
+                    op = "update",
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &child_sql, &child_params).await {
                     Outcome::Ok(n) => total = total.saturating_add(n),
                     Outcome::Err(e) => {
@@ -3199,6 +3356,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                         &parent_sets,
                     );
                     if !parent_sql.is_empty() {
+                        tracing::debug!(
+                            target: "sqlmodel_query::inheritance",
+                            table = parent_table,
+                            op = "update",
+                            pk_values = ?pk_values,
+                            "joined DML statement"
+                        );
                         match tx.execute(cx, &parent_sql, &parent_params).await {
                             Outcome::Ok(_) => {}
                             Outcome::Err(e) => {
@@ -3226,6 +3390,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
                         &child_sets,
                     );
                     if !child_sql.is_empty() {
+                        tracing::debug!(
+                            target: "sqlmodel_query::inheritance",
+                            table = M::TABLE_NAME,
+                            op = "update",
+                            pk_values = ?pk_values,
+                            "joined DML statement"
+                        );
                         match tx.execute(cx, &child_sql, &child_params).await {
                             Outcome::Ok(_) => {}
                             Outcome::Err(e) => {
@@ -3339,6 +3510,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
             let (parent_sql, parent_params) =
                 build_update_sql_for_table(dialect, parent_table, pk_cols, &pk_vals, &parent_sets);
             if !parent_sql.is_empty() {
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = "update",
+                    pk_values = ?pk_vals,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &parent_sql, &parent_params).await {
                     Outcome::Ok(_) => {}
                     Outcome::Err(e) => {
@@ -3378,6 +3556,13 @@ impl<'a, M: Model> UpdateBuilder<'a, M> {
             }
             child_sql.push_str(" RETURNING *");
 
+            tracing::debug!(
+                target: "sqlmodel_query::inheritance",
+                table = M::TABLE_NAME,
+                op = "update",
+                pk_values = ?pk_vals,
+                "joined DML statement"
+            );
             let rows = match tx.query(cx, &child_sql, &child_params).await {
                 Outcome::Ok(rows) => rows,
                 Outcome::Err(e) => {
@@ -3548,6 +3733,7 @@ pub struct DeleteBuilder<'a, M: Model> {
 impl<'a, M: Model> DeleteBuilder<'a, M> {
     /// Create a new DELETE builder for the model type.
     pub fn new() -> Self {
+        log_inheritance_mapping::<M>();
         Self {
             model: None,
             where_clause: None,
@@ -3560,6 +3746,7 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
     ///
     /// This automatically adds a WHERE clause matching the primary key.
     pub fn from_model(model: &'a M) -> Self {
+        log_inheritance_mapping::<M>();
         Self {
             model: Some(model),
             where_clause: None,
@@ -3701,6 +3888,13 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
             let mut total = 0_u64;
 
             if !child_sql.is_empty() {
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = M::TABLE_NAME,
+                    op = "delete",
+                    pk_values = ?pk_values,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &child_sql, &child_params).await {
                     Outcome::Ok(n) => total = total.saturating_add(n),
                     Outcome::Err(e) => {
@@ -3719,6 +3913,13 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
             }
 
             if !parent_sql.is_empty() {
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = "delete",
+                    pk_values = ?pk_values,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &parent_sql, &parent_params).await {
                     Outcome::Ok(n) => total = total.saturating_add(n),
                     Outcome::Err(e) => {
@@ -3861,6 +4062,13 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
                 build_delete_sql_for_table_pk_in(dialect, parent_table, M::PRIMARY_KEY, &pk_values);
 
             if !child_sql.is_empty() {
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = M::TABLE_NAME,
+                    op = "delete",
+                    pk_values = ?pk_values,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &child_sql, &child_params).await {
                     Outcome::Ok(_) => {}
                     Outcome::Err(e) => {
@@ -3879,6 +4087,13 @@ impl<'a, M: Model> DeleteBuilder<'a, M> {
             }
 
             if !parent_sql.is_empty() {
+                tracing::debug!(
+                    target: "sqlmodel_query::inheritance",
+                    table = parent_table,
+                    op = "delete",
+                    pk_values = ?pk_values,
+                    "joined DML statement"
+                );
                 match tx.execute(cx, &parent_sql, &parent_params).await {
                     Outcome::Ok(_) => {}
                     Outcome::Err(e) => {
