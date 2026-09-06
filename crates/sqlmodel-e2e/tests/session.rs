@@ -756,9 +756,9 @@ async fn statement_counter<C: Connection>(
 
 /// What server-side statement reuse a `Session` actually gets, read from the
 /// server: MySQL prepares each distinct statement once (the driver's
-/// per-connection cache) and executes it per call; PostgreSQL parses every
-/// query as the unnamed statement, so `pg_prepared_statements` stays empty;
-/// the SQLite drivers keep no statement cache. The README says exactly this.
+/// per-connection cache) and executes it per call; PostgreSQL prepares each
+/// distinct statement once (the driver's 64-entry LRU cache) and executes it
+/// per call; the SQLite drivers keep no statement cache. The README says exactly this.
 struct StatementReuse;
 
 impl OwnedScenario for StatementReuse {
@@ -833,11 +833,11 @@ impl OwnedScenario for StatementReuse {
             }
             Dialect::Postgres => {
                 assert_eq!(
-                    (prepares_before, prepares_after),
-                    (Some(0), Some(0)),
-                    "{d}: the driver uses the unnamed statement; nothing is cached on the server"
+                    prepares_after.unwrap() - prepares_before.unwrap(),
+                    1,
+                    "{d}: the session's SELECT by key is prepared once"
                 );
-                eprintln!("{d}: 20 gets left pg_prepared_statements empty (unnamed statements)");
+                eprintln!("{d}: 20 gets = 1 Parse + 20 Execute (driver cache)");
             }
             Dialect::Sqlite => {
                 eprintln!("{d}: no statement cache in the driver; every query is prepared afresh");

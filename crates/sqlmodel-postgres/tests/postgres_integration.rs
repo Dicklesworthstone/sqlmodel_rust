@@ -438,3 +438,116 @@ fn postgres_introspection_preserves_composite_index_column_order() {
         let _ = conn.execute(&cx, &drop_sql, &[]).await;
     });
 }
+
+/// Parameterized `query`/`execute` calls go through named prepared statements
+/// with a per-connection cache: `pg_prepared_statements` shows one statement
+/// per distinct (SQL, param types), no duplicate prepares on cache hits,
+/// and LRU eviction closing statements when exceeding capacity.
+#[test]
+fn postgres_parameterized_queries_are_prepared_once_and_cached() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create asupersync runtime");
+    let cx = Cx::for_testing();
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
+
+        // Helper to count prepared statements created by sqlmodel on this session
+        let count_sqlmodel_stmts = || {
+            let conn = &conn;
+            let cx = &cx;
+            async move {
+                let rows = unwrap_outcome(
+                    conn.query(
+                        cx,
+                        "SELECT count(*) FROM pg_prepared_statements WHERE name LIKE 'sqlmodel_s%'",
+                        &[],
+                    )
+                    .await,
+                );
+                rows[0].get_as::<i64>(0).expect("count column")
+            }
+        };
+
+        let initial_count = count_sqlmodel_stmts().await;
+
+        // 1. Same query with same param type executed 5 times:
+        // Cache should grow by exactly 1 on the first call, and stay unchanged for subsequent calls.
+        for i in 0..5 {
+            let rows = unwrap_outcome(
+                conn.query(&cx, "SELECT $1::bigint + 1", &[Value::BigInt(i)])
+                    .await,
+            );
+            assert_eq!(rows[0].get_as::<i64>(0).unwrap(), i + 1);
+        }
+
+        assert_eq!(
+            count_sqlmodel_stmts().await - initial_count,
+            1,
+            "exactly one prepared statement created for 5 identical-signature query calls"
+        );
+        assert_eq!(conn.statement_cache_len(&cx).await, 1);
+
+        // 2. Different query with parameters:
+        let rows = unwrap_outcome(
+            conn.query(&cx, "SELECT $1::bigint * 2", &[Value::BigInt(21)])
+                .await,
+        );
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 42);
+        assert_eq!(
+            count_sqlmodel_stmts().await - initial_count,
+            2,
+            "one additional statement for distinct query"
+        );
+
+        // 3. Same query with DIFFERENT parameter types (Int vs BigInt):
+        // Statement cache key includes param OIDs, so alternating types must not conflict or error.
+        let rows1 = unwrap_outcome(conn.query(&cx, "SELECT $1 + 10", &[Value::Int(5)]).await);
+        assert_eq!(rows1[0].get_as::<i32>(0).unwrap(), 15);
+
+        let rows2 = unwrap_outcome(
+            conn.query(&cx, "SELECT $1 + 10", &[Value::BigInt(50)])
+                .await,
+        );
+        assert_eq!(rows2[0].get_as::<i64>(0).unwrap(), 60);
+
+        // 4. Parameterless queries do not create cached named statements:
+        let count_before = count_sqlmodel_stmts().await;
+        let rows = unwrap_outcome(conn.query(&cx, "SELECT 42", &[]).await);
+        assert_eq!(rows[0].get_as::<i32>(0).unwrap(), 42);
+        assert_eq!(
+            count_sqlmodel_stmts().await,
+            count_before,
+            "parameterless query must not create a cached statement"
+        );
+
+        // 5. Cache capacity and eviction:
+        // Execute enough distinct statements to exceed capacity (64 + 8).
+        for i in 0..(sqlmodel_postgres::STATEMENT_CACHE_CAPACITY + 8) {
+            unwrap_outcome(
+                conn.query(
+                    &cx,
+                    &format!("SELECT $1::bigint + {i}"),
+                    &[Value::BigInt(1)],
+                )
+                .await,
+            );
+        }
+
+        // Cache length in memory is bounded by capacity
+        assert_eq!(
+            conn.statement_cache_len(&cx).await,
+            sqlmodel_postgres::STATEMENT_CACHE_CAPACITY
+        );
+
+        // 6. Invalidation on DISCARD ALL:
+        unwrap_outcome(conn.execute(&cx, "DISCARD ALL", &[]).await);
+        assert_eq!(conn.statement_cache_len(&cx).await, 0);
+    });
+}

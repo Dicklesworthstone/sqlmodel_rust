@@ -50,7 +50,9 @@ pub mod protocol;
 pub mod tls;
 pub mod types;
 
-pub use async_connection::{PgAsyncConnection, SharedPgConnection, SharedPgTransaction};
+pub use async_connection::{
+    PgAsyncConnection, STATEMENT_CACHE_CAPACITY, SharedPgConnection, SharedPgTransaction,
+};
 pub use config::{PgConfig, SslMode};
 pub use connection::{ConnectionState, PgConnection, TransactionStatusState};
 pub use types::{Format, TypeCategory, TypeInfo, TypeRegistry};

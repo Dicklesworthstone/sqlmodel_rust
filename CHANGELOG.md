@@ -134,14 +134,22 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
   `Com_stmt_close` counters: one prepare per distinct statement, one execute per call, closes on
   eviction. The whole e2e crate (types, attributes, operations, session, migrations, pool) runs
   MySQL on this path.
+- **PostgreSQL prepared statements are cached per connection.** `Connection::query` / `execute`
+  with parameters now use named prepared statements (`sqlmodel_sN`) cached in a 64-entry LRU
+  cache (`STATEMENT_CACHE_CAPACITY`), keyed by `(sql, param_oids)`. On a cache hit, the `Parse`
+  step is skipped entirely and `Bind` + `Describe Portal` + `Execute` + `Sync` are executed directly.
+  When capacity is exceeded, the least recently used statement is closed on the server via `Close(Statement)`.
+  Parameterless queries continue using the unnamed statement without caching to avoid polluting
+  server statement tables with DDL or utility commands. Reset commands (`DISCARD ALL`, `RESET ALL`)
+  and connection close clear the cache. An integration test validates cache reuse, distinct statement
+  isolation, OID sensitivity on type alternation, 64-entry eviction bounds, and cache invalidation.
 - **Statement reuse stated per driver, from the servers' own counters.** The e2e `session`
   scenario runs 20 `Session::get` calls on one connection and reads the server: MySQL shows one
-  `Com_stmt_prepare` and 20 `Com_stmt_execute` (the driver's cache), PostgreSQL leaves
-  `pg_prepared_statements` empty (the driver runs every query as the unnamed statement; named
-  statements exist only through `Connection::prepare`), and the SQLite drivers keep no statement
-  cache. The README's new "Prepared statements" row and the `sqlmodel_query::cache` docs say the
-  same; that module caches SQL text and is not connected to any driver. A PostgreSQL
-  named-statement cache is tracked as bd-vsyd.
+  `Com_stmt_prepare` and 20 `Com_stmt_execute` (the driver's cache), PostgreSQL shows one
+  statement in `pg_prepared_statements` and 20 executions (the driver's cache; bd-vsyd), and the
+  SQLite drivers keep no statement cache. The README's "Prepared statements" row and the
+  `sqlmodel_query::cache` docs reflect this; that module caches SQL text and is not connected to any
+  driver.
 - **Compile-time diagnostics that name the feature.** A model with a `chrono`, `uuid`, or
   `rust_decimal` field built without the matching `sqlmodel` feature now fails with
   "`chrono::NaiveDateTime` cannot be read from a database row" plus a note naming the feature to

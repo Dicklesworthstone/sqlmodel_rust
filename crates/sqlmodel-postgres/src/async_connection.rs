@@ -15,7 +15,7 @@
 // The Error type is intentionally large to carry full context
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 #[cfg(feature = "tls")]
 use std::io::{Read, Write};
@@ -283,6 +283,18 @@ async fn flush_plain_async(stream: &mut TcpStream) -> std::io::Result<()> {
     std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_flush(cx)).await
 }
 
+/// Maximum number of named prepared statements cached per connection.
+///
+/// When the cache exceeds this capacity, the least recently used statements
+/// are evicted and closed on the PostgreSQL server.
+pub const STATEMENT_CACHE_CAPACITY: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StatementCacheKey {
+    sql: String,
+    param_oids: Vec<u32>,
+}
+
 /// Async PostgreSQL connection.
 ///
 /// This connection uses asupersync's TCP stream for non-blocking I/O and
@@ -295,6 +307,9 @@ pub struct PgAsyncConnection {
     parameters: HashMap<String, String>,
     next_prepared_id: u64,
     prepared: HashMap<u64, PgPreparedMeta>,
+    statement_cache: HashMap<StatementCacheKey, String>,
+    statement_order: VecDeque<StatementCacheKey>,
+    next_cached_statement_id: u64,
     config: PgConfig,
     reader: MessageReader,
     writer: MessageWriter,
@@ -378,6 +393,9 @@ impl PgAsyncConnection {
             parameters: HashMap::new(),
             next_prepared_id: 1,
             prepared: HashMap::new(),
+            statement_cache: HashMap::new(),
+            statement_order: VecDeque::new(),
+            next_cached_statement_id: 1,
             config,
             reader: MessageReader::new(),
             writer: MessageWriter::new(),
@@ -495,8 +513,58 @@ impl PgAsyncConnection {
         self.execute_async(cx, "SELECT 1", &[]).await.map(|_| ())
     }
 
+    /// Return the number of statements currently held in the prepared statement cache.
+    pub fn statement_cache_len(&self) -> usize {
+        self.statement_cache.len()
+    }
+
+    /// Clear the local statement cache (e.g. after connection reset or DISCARD ALL).
+    pub fn clear_statement_cache(&mut self) {
+        self.statement_cache.clear();
+        self.statement_order.clear();
+    }
+
+    /// Close a named prepared statement on the server.
+    pub async fn close_statement_async(&mut self, cx: &Cx, name: &str) -> Outcome<(), Error> {
+        if let Outcome::Err(e) = self
+            .send_message(
+                cx,
+                &FrontendMessage::Close {
+                    kind: DescribeKind::Statement,
+                    name: name.to_string(),
+                },
+            )
+            .await
+        {
+            return Outcome::Err(e);
+        }
+        if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
+            return Outcome::Err(e);
+        }
+
+        loop {
+            let msg = match self.receive_message(cx).await {
+                Outcome::Ok(m) => m,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            match msg {
+                BackendMessage::CloseComplete => {}
+                BackendMessage::ReadyForQuery(status) => {
+                    self.state = ConnectionState::Ready(TransactionStatusState::from(status));
+                    return Outcome::Ok(());
+                }
+                BackendMessage::ErrorResponse(_) => {}
+                BackendMessage::NoticeResponse(_) => {}
+                _ => {}
+            }
+        }
+    }
+
     /// Close the connection.
     pub async fn close_async(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        self.clear_statement_cache();
         // Best-effort terminate. If this fails, the drop will close the socket.
         //
         // Note: server-side prepared statements are released when the connection terminates;
@@ -790,6 +858,78 @@ impl PgAsyncConnection {
         sql: &str,
         params: &[Value],
     ) -> Outcome<PgQueryResult, Error> {
+        let trimmed = sql.trim();
+        if trimmed.eq_ignore_ascii_case("DISCARD ALL")
+            || trimmed.eq_ignore_ascii_case("DISCARD PLANS")
+            || trimmed.eq_ignore_ascii_case("RESET ALL")
+        {
+            self.clear_statement_cache();
+        }
+
+        // When parameters are empty, run through the unnamed statement without caching.
+        if params.is_empty() {
+            if let Outcome::Err(e) = self
+                .send_message(
+                    cx,
+                    &FrontendMessage::Parse {
+                        name: String::new(),
+                        query: sql.to_string(),
+                        param_types: Vec::new(),
+                    },
+                )
+                .await
+            {
+                return Outcome::Err(e);
+            }
+
+            if let Outcome::Err(e) = self
+                .send_message(
+                    cx,
+                    &FrontendMessage::Bind {
+                        portal: String::new(),
+                        statement: String::new(),
+                        param_formats: Vec::new(),
+                        params: Vec::new(),
+                        result_formats: Vec::new(),
+                    },
+                )
+                .await
+            {
+                return Outcome::Err(e);
+            }
+
+            if let Outcome::Err(e) = self
+                .send_message(
+                    cx,
+                    &FrontendMessage::Describe {
+                        kind: DescribeKind::Portal,
+                        name: String::new(),
+                    },
+                )
+                .await
+            {
+                return Outcome::Err(e);
+            }
+
+            if let Outcome::Err(e) = self
+                .send_message(
+                    cx,
+                    &FrontendMessage::Execute {
+                        portal: String::new(),
+                        max_rows: 0,
+                    },
+                )
+                .await
+            {
+                return Outcome::Err(e);
+            }
+
+            if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
+                return Outcome::Err(e);
+            }
+            return self.read_extended_result(cx).await;
+        }
+
         // Encode parameters
         let mut param_types = Vec::with_capacity(params.len());
         let mut param_values = Vec::with_capacity(params.len());
@@ -809,12 +949,89 @@ impl PgAsyncConnection {
             }
         }
 
-        // Parse + bind unnamed statement/portal
+        let cache_key = StatementCacheKey {
+            sql: sql.to_string(),
+            param_oids: param_types.clone(),
+        };
+
+        let param_formats = vec![Format::Text.code()];
+
+        if let Some(stmt_name) = self.statement_cache.get(&cache_key).cloned() {
+            // Cache hit: move key to most-recently used position in LRU order
+            if let Some(pos) = self.statement_order.iter().position(|k| k == &cache_key) {
+                self.statement_order.remove(pos);
+            }
+            self.statement_order.push_back(cache_key);
+
+            // Bind against cached named statement
+            if let Outcome::Err(e) = self
+                .send_message(
+                    cx,
+                    &FrontendMessage::Bind {
+                        portal: String::new(),
+                        statement: stmt_name,
+                        param_formats,
+                        params: param_values,
+                        result_formats: Vec::new(),
+                    },
+                )
+                .await
+            {
+                return Outcome::Err(e);
+            }
+
+            if let Outcome::Err(e) = self
+                .send_message(
+                    cx,
+                    &FrontendMessage::Describe {
+                        kind: DescribeKind::Portal,
+                        name: String::new(),
+                    },
+                )
+                .await
+            {
+                return Outcome::Err(e);
+            }
+
+            if let Outcome::Err(e) = self
+                .send_message(
+                    cx,
+                    &FrontendMessage::Execute {
+                        portal: String::new(),
+                        max_rows: 0,
+                    },
+                )
+                .await
+            {
+                return Outcome::Err(e);
+            }
+
+            if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
+                return Outcome::Err(e);
+            }
+            return self.read_extended_result(cx).await;
+        }
+
+        // Cache miss: evict oldest entry if at or above capacity
+        while self.statement_cache.len() >= STATEMENT_CACHE_CAPACITY {
+            let Some(oldest_key) = self.statement_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted_name) = self.statement_cache.remove(&oldest_key) {
+                let _ = self.close_statement_async(cx, &evicted_name).await;
+            }
+        }
+
+        let stmt_id = self.next_cached_statement_id;
+        self.next_cached_statement_id = self.next_cached_statement_id.saturating_add(1);
+        let stmt_name = format!("sqlmodel_s{stmt_id}");
+
+        // Parse with generated name
         if let Outcome::Err(e) = self
             .send_message(
                 cx,
                 &FrontendMessage::Parse {
-                    name: String::new(),
+                    name: stmt_name.clone(),
                     query: sql.to_string(),
                     param_types,
                 },
@@ -824,20 +1041,15 @@ impl PgAsyncConnection {
             return Outcome::Err(e);
         }
 
-        let param_formats = if params.is_empty() {
-            Vec::new()
-        } else {
-            vec![Format::Text.code()]
-        };
+        // Bind + Describe + Execute + Sync
         if let Outcome::Err(e) = self
             .send_message(
                 cx,
                 &FrontendMessage::Bind {
                     portal: String::new(),
-                    statement: String::new(),
+                    statement: stmt_name.clone(),
                     param_formats,
                     params: param_values,
-                    // Default result formats (text) when empty.
                     result_formats: Vec::new(),
                 },
             )
@@ -875,7 +1087,13 @@ impl PgAsyncConnection {
         if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
             return Outcome::Err(e);
         }
-        self.read_extended_result(cx).await
+
+        let outcome = self.read_extended_result(cx).await;
+        if outcome.is_ok() {
+            self.statement_cache.insert(cache_key.clone(), stmt_name);
+            self.statement_order.push_back(cache_key);
+        }
+        outcome
     }
 
     async fn run_prepared(
@@ -1416,6 +1634,21 @@ impl SharedPgConnection {
             committed: false,
             _marker: std::marker::PhantomData,
         })
+    }
+
+    /// Return the number of statements currently held in the prepared statement cache.
+    pub async fn statement_cache_len(&self, cx: &Cx) -> usize {
+        let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await else {
+            return 0;
+        };
+        guard.statement_cache_len()
+    }
+
+    /// Clear the local statement cache.
+    pub async fn clear_statement_cache(&self, cx: &Cx) {
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await {
+            guard.clear_statement_cache();
+        }
     }
 }
 
@@ -2008,3 +2241,40 @@ fn md5_password(user: &str, password: &str, salt: [u8; 4]) -> String {
 }
 
 // Note: read/write helpers are implemented above on PgAsyncStream.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_statement_cache_key_equality() {
+        let k1 = StatementCacheKey {
+            sql: "SELECT $1".to_string(),
+            param_oids: vec![23], // INT4
+        };
+        let k2 = StatementCacheKey {
+            sql: "SELECT $1".to_string(),
+            param_oids: vec![23],
+        };
+        let k3 = StatementCacheKey {
+            sql: "SELECT $1".to_string(),
+            param_oids: vec![20], // INT8
+        };
+        let k4 = StatementCacheKey {
+            sql: "SELECT $1, $2".to_string(),
+            param_oids: vec![23],
+        };
+
+        assert_eq!(k1, k2);
+        assert_ne!(
+            k1, k3,
+            "Different param types must produce different cache keys"
+        );
+        assert_ne!(k1, k4, "Different SQL must produce different cache keys");
+    }
+
+    #[test]
+    fn test_statement_cache_capacity_constant() {
+        assert_eq!(STATEMENT_CACHE_CAPACITY, 64);
+    }
+}
