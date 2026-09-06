@@ -141,14 +141,17 @@ fn accounts_q(conn: &FrankenConnection) -> String {
 }
 
 #[test]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
     let db = TestDb::fresh("main");
 
     // ---- Scenario 1: disjoint writers ----
+    let conflicts = Arc::new(AtomicU32::new(0));
     let barrier = Arc::new(Barrier::new(WRITERS));
     let handles: Vec<_> = (0..WRITERS)
         .map(|writer| {
             let barrier = barrier.clone();
+            let conflicts = conflicts.clone();
             let path = db.path.clone();
             std::thread::spawn(move || {
                 let rt = RuntimeBuilder::current_thread().build().expect("runtime");
@@ -156,30 +159,41 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
                 let conn =
                     FrankenConnection::open_file(path.to_str().expect("utf-8")).expect("worker");
                 let accounts = accounts_q(&conn);
+                let policy = RetryPolicy::default()
+                    .max_attempts(200)
+                    .base_delay(Duration::from_millis(1))
+                    .max_delay(Duration::from_millis(25));
                 barrier.wait();
                 let started = Instant::now();
                 for i in 0..TX_PER_WRITER {
-                    // Disjoint key ranges: writer w only touches accounts
-                    // where (id % WRITERS) == w.
+                    // Disjoint ROW ranges: writer w only touches accounts
+                    // where (id % WRITERS) == w. fsqlite's MVCC is
+                    // page-granular, so rows sharing a page still conflict at
+                    // commit; every conflict must be retryable and the
+                    // combinator must resolve it.
                     let target = writer as i64 + (i as i64 % 4) * WRITERS as i64 + 1;
                     let sql = format!("UPDATE {accounts} SET balance = balance + 1 WHERE id = ?1");
-                    let tx = match rt
-                        .block_on(conn.begin_with_options(&cx, TransactionOptions::concurrent()))
-                    {
-                        Outcome::Ok(t) => t,
-                        Outcome::Err(e) => panic!("disjoint begin failed: {e}"),
-                        Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
-                        Outcome::Panicked(p) => panic!("panicked: {p:?}"),
-                    };
-                    match rt.block_on(tx.execute(&cx, &sql, &[Value::BigInt(target)])) {
-                        Outcome::Ok(_) => {}
-                        Outcome::Err(e) => {
-                            panic!("disjoint writers must never conflict: {e}")
-                        }
-                        Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
-                        Outcome::Panicked(p) => panic!("panicked: {p:?}"),
-                    }
-                    expect_outcome(rt.block_on(tx.commit(&cx)), "disjoint commit");
+                    let outcome = rt.block_on(retry_transaction(
+                        &cx,
+                        &conn,
+                        TransactionOptions::concurrent(),
+                        &policy,
+                        async |exec_cx, tx| match tx
+                            .execute(exec_cx, &sql, &[Value::BigInt(target)])
+                            .await
+                        {
+                            Outcome::Ok(_) => Outcome::Ok(()),
+                            Outcome::Err(e) => {
+                                if e.is_retryable() {
+                                    conflicts.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Outcome::Err(e)
+                            }
+                            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                            Outcome::Panicked(p) => Outcome::Panicked(p),
+                        },
+                    ));
+                    expect_outcome(outcome, &format!("disjoint w{writer}-t{i}"));
                 }
                 started.elapsed()
             })
@@ -220,9 +234,10 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
     }
     let serialized = baseline_started.elapsed();
     let ratio = concurrent_max.as_secs_f64() / serialized.as_secs_f64().max(0.001);
+    let disjoint_conflicts = conflicts.load(Ordering::Relaxed);
     eprintln!(
         "mvcc disjoint: concurrent_max={concurrent_max:?} serialized={serialized:?} ratio={ratio:.2} \
-         (set SQLMODEL_MVCC_ASSERT_RATIO=1 to assert concurrent <= 0.8x serialized)"
+         page_conflicts={disjoint_conflicts} (SQLMODEL_MVCC_ASSERT_RATIO=1 asserts <= 0.8x)"
     );
     if std::env::var_os("SQLMODEL_MVCC_ASSERT_RATIO").is_some() {
         assert!(
@@ -231,16 +246,19 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
              {concurrent_max:?} vs {serialized:?}"
         );
     }
-
     // ---- Scenario 2: overlapping writers (fixed transfer pairs) ----
-    let conflicts = Arc::new(AtomicU32::new(0));
+    // Scenario 1 and the baseline each add +1 per transaction by design, so
+    // conservation is asserted against the snapshot taken right here.
+    let total_before_transfers = db.total_balance();
+    let attempts = Arc::new(AtomicU32::new(0));
     let applied = Arc::new(AtomicU32::new(0));
     let barrier = Arc::new(Barrier::new(WRITERS));
     let transfers_per_writer = 25;
     let handles: Vec<_> = (0..WRITERS)
         .map(|writer| {
-            let barrier = barrier.clone();
             let conflicts = conflicts.clone();
+            let barrier = barrier.clone();
+            let attempts = attempts.clone();
             let applied = applied.clone();
             let path = db.path.clone();
             std::thread::spawn(move || {
@@ -255,7 +273,7 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
                     .max_delay(Duration::from_millis(25));
                 barrier.wait();
                 for i in 0..transfers_per_writer {
-                    let from = ((writer as i64 * 7 + i as i64 * 3) % ACCOUNTS) + 1;
+                    let from = ((writer as i64 * 7 + i64::from(i) * 3) % ACCOUNTS) + 1;
                     let to = (from + 13) % ACCOUNTS + 1;
                     if from == to {
                         continue;
@@ -267,6 +285,7 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
                         TransactionOptions::concurrent(),
                         &policy,
                         async |cx, tx| {
+                            attempts.fetch_add(1, Ordering::Relaxed);
                             // Idempotency: an existing token row means this
                             // transfer was already applied; commit a no-op.
                             let insert = format!(
@@ -330,11 +349,20 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
     }
 
     let total_conflicts = conflicts.load(Ordering::Relaxed);
+    let total_attempts = attempts.load(Ordering::Relaxed);
     let total_applied = applied.load(Ordering::Relaxed);
-    eprintln!("mvcc overlapping: conflicts={total_conflicts} applied={total_applied}");
+    eprintln!(
+        "mvcc overlapping: statement_conflicts={total_conflicts} attempts={total_attempts} applied={total_applied}"
+    );
+    // Conflict detection is live: either a statement surfaced a retryable
+    // conflict directly, or the combinator retried at commit (attempt count
+    // exceeds applied transfers). A run with zero retries would mean the
+    // writers never contended.
+    let total_retries = total_attempts.saturating_sub(total_applied);
     assert!(
-        total_conflicts > 0,
-        "MVCC conflict detection must trigger under overlapping writers"
+        total_conflicts > 0 || total_retries > 0,
+        "MVCC conflict detection must trigger under overlapping writers: \
+         statement_conflicts={total_conflicts} retries={total_retries}"
     );
 
     // No transfer applied twice: the token rows are unique and every applied
@@ -351,7 +379,8 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
             let distinct: i64 = row.get_as(1).expect("distinct");
             assert_eq!(total, distinct, "no transfer token applied twice");
             assert_eq!(
-                total as u32, total_applied,
+                total,
+                i64::from(total_applied),
                 "applied counter matches token rows"
             );
         });
@@ -359,8 +388,8 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
 
     let total_after = db.total_balance();
     assert_eq!(
-        total_after, TOTAL_BALANCE,
-        "balance must be conserved: {total_after} vs {TOTAL_BALANCE}"
+        total_after, total_before_transfers,
+        "transfers must conserve the balance: {total_after} vs {total_before_transfers}"
     );
 }
 
@@ -378,32 +407,43 @@ fn franken_mvcc_reader_sees_conserved_balance_during_writes() {
                 let conn =
                     FrankenConnection::open_file(path.to_str().expect("utf-8")).expect("worker");
                 let accounts = accounts_q(&conn);
+                let policy = RetryPolicy::default()
+                    .max_attempts(200)
+                    .base_delay(Duration::from_millis(1))
+                    .max_delay(Duration::from_millis(25));
                 for i in 0..50 {
                     // Pure transfers inside one account pair per writer: the
                     // total never changes.
                     let from = ((writer + i) % 2) as i64 + 1;
                     let to = ((writer + i) % 2) as i64 + 3;
-                    let tx = match rt
-                        .block_on(conn.begin_with_options(&cx, TransactionOptions::concurrent()))
-                    {
-                        Outcome::Ok(t) => t,
-                        Outcome::Err(e) => panic!("begin failed: {e}"),
-                        Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
-                        Outcome::Panicked(p) => panic!("panicked: {p:?}"),
-                    };
-                    let debit =
-                        format!("UPDATE {accounts} SET balance = balance - 1 WHERE id = ?1");
-                    let credit =
-                        format!("UPDATE {accounts} SET balance = balance + 1 WHERE id = ?1");
-                    expect_outcome(
-                        rt.block_on(tx.execute(&cx, &debit, &[Value::BigInt(from)])),
-                        "debit",
-                    );
-                    expect_outcome(
-                        rt.block_on(tx.execute(&cx, &credit, &[Value::BigInt(to)])),
-                        "credit",
-                    );
-                    expect_outcome(rt.block_on(tx.commit(&cx)), "transfer commit");
+                    let outcome = rt.block_on(retry_transaction(
+                        &cx,
+                        &conn,
+                        TransactionOptions::concurrent(),
+                        &policy,
+                        async |cx, tx| {
+                            let debit = format!(
+                                "UPDATE {accounts} SET balance = balance - 1 WHERE id = ?1"
+                            );
+                            let credit = format!(
+                                "UPDATE {accounts} SET balance = balance + 1 WHERE id = ?1"
+                            );
+                            match tx.execute(cx, &debit, &[Value::BigInt(from)]).await {
+                                Outcome::Ok(_) => {}
+                                Outcome::Err(e) => return Outcome::Err(e),
+                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            }
+                            match tx.execute(cx, &credit, &[Value::BigInt(to)]).await {
+                                Outcome::Ok(_) => {}
+                                Outcome::Err(e) => return Outcome::Err(e),
+                                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                            }
+                            Outcome::Ok(())
+                        },
+                    ));
+                    expect_outcome(outcome, &format!("reader-writer transfer {i}"));
                 }
             })
         })
@@ -469,9 +509,12 @@ fn franken_mvcc_cancellation_rolls_back_and_write_skew_stays_consistent() {
         }
         drop(tx);
 
+        // The cancelled Cx stays cancelled; verification uses a fresh
+        // context (a real client would open or reuse another one).
+        let verify_cx = Cx::for_testing();
         let sql = format!("SELECT balance FROM {accounts} WHERE id = 1");
         let row = expect_outcome(
-            rt.block_on(async { conn.query_one(&cx, &sql, &[]).await }),
+            rt.block_on(async { conn.query_one(&verify_cx, &sql, &[]).await }),
             "post-cancel read",
         );
         let balance = row.expect("row").get_as::<i64>(0).expect("balance i64");
@@ -525,7 +568,7 @@ fn franken_mvcc_cancellation_rolls_back_and_write_skew_stays_consistent() {
                 if sum < 100 {
                     return format!("w{w}: abstained (sum {sum} too low)");
                 }
-                let account = (w + 1) as i64;
+                let account = i64::from(w + 1);
                 let sql = format!("UPDATE {accounts} SET balance = balance - 100 WHERE id = ?1");
                 match rt.block_on(tx.execute(&cx, &sql, &[Value::BigInt(account)])) {
                     Outcome::Ok(_) => {}
@@ -620,8 +663,8 @@ fn c_sqlite_control_serialized_transfers_conserve_balance() {
                 let accounts = conn.dialect().quote_identifier("e2e_mvcc_accounts");
                 barrier.wait();
                 for _ in 0..25 {
-                    let from = (writer as i64 % 2) + 1;
-                    let to = ((writer as i64 + 1) % 2) + 1;
+                    let from = i64::from(writer % 2) + 1;
+                    let to = (i64::from(writer + 1) % 2) + 1;
                     let tx = match rt.block_on(conn.begin_with_options(
                         &cx,
                         TransactionOptions::default().with_mode(TransactionMode::Immediate),
