@@ -616,6 +616,94 @@ fn append_on_conflict_clause(
     }
 }
 
+/// How the surviving parent key can be learned after a joined-table parent
+/// upsert with a generated (auto-increment) key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentUpsertIdSource {
+    /// The statement itself RETURNINGs the key (PostgreSQL, SQLite).
+    Returning,
+    /// MySQL: the `pk = LAST_INSERT_ID(pk)` clause makes a follow-up
+    /// `SELECT LAST_INSERT_ID()` report the surviving key.
+    LastInsertId,
+    /// The conflict action reports no key (`INSERT IGNORE` / DO NOTHING).
+    Unavailable,
+}
+
+/// Assemble the parent half of a joined-table upsert with a generated key:
+/// the plain `insert_sql` (key column omitted, `DEFAULT` applied) plus the
+/// dialect's conflict clause and, where supported, its key-return mechanism.
+fn assemble_parent_upsert(
+    dialect: Dialect,
+    table_q: &str,
+    insert_sql: &str,
+    pk_col: &str,
+    action: &OnConflict,
+) -> (String, ParentUpsertIdSource) {
+    let pk_q = dialect.quote_identifier(pk_col);
+    match dialect {
+        Dialect::Mysql => match action {
+            OnConflict::DoNothing => {
+                let mut sql = insert_sql.to_string();
+                rewrite_insert_as_ignore(&mut sql);
+                (sql, ParentUpsertIdSource::Unavailable)
+            }
+            OnConflict::DoUpdate { columns, .. } => {
+                let mut sql = insert_sql.to_string();
+                sql.push_str(" ON DUPLICATE KEY UPDATE ");
+                let mut parts = vec![format!("{pk_q} = LAST_INSERT_ID({pk_q})")];
+                parts.extend(columns.iter().map(|c| {
+                    let q = dialect.quote_identifier(c);
+                    format!("{q} = VALUES({q})")
+                }));
+                sql.push_str(&parts.join(", "));
+                (sql, ParentUpsertIdSource::LastInsertId)
+            }
+        },
+        Dialect::Postgres | Dialect::Sqlite => {
+            let mut sql = insert_sql.to_string();
+            match action {
+                OnConflict::DoNothing => {
+                    sql.push_str(" ON CONFLICT DO NOTHING");
+                    (sql, ParentUpsertIdSource::Unavailable)
+                }
+                OnConflict::DoUpdate { columns, target } => {
+                    sql.push_str(" ON CONFLICT (");
+                    let effective: Vec<String> = if target.is_empty() {
+                        vec![pk_col.to_string()]
+                    } else {
+                        target.clone()
+                    };
+                    sql.push_str(
+                        &effective
+                            .iter()
+                            .map(|c| dialect.quote_identifier(c))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    sql.push_str(") DO UPDATE SET ");
+                    let mut parts: Vec<String> = columns
+                        .iter()
+                        .map(|c| {
+                            let q = dialect.quote_identifier(c);
+                            format!("{q} = EXCLUDED.{q}")
+                        })
+                        .collect();
+                    if parts.is_empty() {
+                        // No parent columns to update: a no-op self assignment
+                        // keeps the statement an upsert so RETURNING still
+                        // reports the surviving key.
+                        parts.push(format!("{pk_q} = {table_q}.{pk_q}"));
+                    }
+                    sql.push_str(&parts.join(", "));
+                    sql.push_str(" RETURNING ");
+                    sql.push_str(&pk_q);
+                    (sql, ParentUpsertIdSource::Returning)
+                }
+            }
+        }
+    }
+}
+
 fn build_insert_sql_for_table_with_columns(
     dialect: Dialect,
     table: &str,
@@ -678,18 +766,6 @@ fn build_insert_sql_for_table_with_columns(
     }
 
     (sql, params, columns)
-}
-
-fn build_insert_sql_for_table(
-    dialect: Dialect,
-    table: &str,
-    fields: &[FieldInfo],
-    row: &[(&'static str, Value)],
-    returning: Option<&str>,
-) -> (String, Vec<Value>) {
-    let (sql, params, _cols) =
-        build_insert_sql_for_table_with_columns(dialect, table, fields, row, returning);
-    (sql, params)
 }
 
 fn build_update_sql_for_table(
@@ -1089,32 +1165,45 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     .is_some_and(|f| f.auto_increment)
                 && pk_vals[0].is_null();
 
-            if on_conflict.is_some() {
-                if needs_generated_id || pk_vals.iter().any(|v| v.is_null()) {
-                    return Outcome::Err(sqlmodel_core::Error::Custom(
-                        "joined-table inheritance insert ON CONFLICT requires explicit primary key values (auto-increment upsert is not supported yet)"
-                            .to_string(),
-                    ));
-                }
-                // For joined-table inheritance, we currently only support conflict targets that
-                // align across both tables (primary key).
-                if let Some(OnConflict::DoUpdate { target, .. }) = &on_conflict {
-                    let pk_target: Vec<String> =
-                        M::PRIMARY_KEY.iter().map(|c| (*c).to_string()).collect();
-                    if !target.is_empty() && target != &pk_target {
-                        return Outcome::Err(sqlmodel_core::Error::Custom(
-                            "joined-table inheritance insert ON CONFLICT currently only supports the primary key as conflict target"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-
             let parent_allowed: HashSet<&'static str> =
                 parent_fields.iter().map(|f| f.column_name).collect();
             let child_allowed: HashSet<&'static str> =
                 M::fields().iter().map(|f| f.column_name).collect();
 
+            // Conflict-target validation: a joined upsert resolves the parent
+            // row first, so the target must be a parent-table column (its
+            // primary key or a UNIQUE constraint on the parent). Child-table
+            // targets are rejected specifically - child uniqueness cannot be
+            // resolved before the parent id is known; the child half of the
+            // upsert is instead always keyed by the propagated primary key.
+            if let Some(OnConflict::DoUpdate { target, .. }) = &on_conflict {
+                for t in target {
+                    if parent_allowed.contains(t.as_str()) {
+                        continue;
+                    }
+                    if child_allowed.contains(t.as_str()) {
+                        return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                            "joined-table inheritance ON CONFLICT target '{t}' is a child-table column; child uniqueness cannot be resolved before the parent id is known - use a parent-table unique column as the target"
+                        )));
+                    }
+                    return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                        "unknown joined-table inheritance ON CONFLICT target column '{t}'"
+                    )));
+                }
+            }
+
+            // Composite primary keys must be complete for an upsert; the
+            // generated-key flow below covers the single-column auto-
+            // increment case.
+            if on_conflict.is_some() && !needs_generated_id && pk_vals.iter().any(|v| v.is_null()) {
+                return Outcome::Err(sqlmodel_core::Error::Custom(
+                    "joined-table inheritance insert ON CONFLICT requires complete primary key values for composite primary keys"
+                        .to_string(),
+                ));
+            }
+
+            let child_pk_target: Vec<String> =
+                M::PRIMARY_KEY.iter().map(|c| (*c).to_string()).collect();
             let (parent_on_conflict, child_on_conflict) = match &on_conflict {
                 None => (None, None),
                 Some(OnConflict::DoNothing) => {
@@ -1150,7 +1239,9 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                         }),
                         Some(OnConflict::DoUpdate {
                             columns: child_cols,
-                            target: target.clone(),
+                            // The child is upserted by its propagated primary
+                            // key, never by the parent's conflict target.
+                            target: child_pk_target.clone(),
                         }),
                     )
                 }
@@ -1164,9 +1255,125 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             };
 
-            // 1) Insert base row (parent table), possibly retrieving the generated PK.
+            // 1) Insert or upsert the parent row, learning the surviving key.
+            //
+            // Auto-increment upsert: the parent statement must report the key
+            // of the surviving row even when it already existed. The dialects
+            // do that differently (RETURNING on PostgreSQL/SQLite, the
+            // `pk = LAST_INSERT_ID(pk)` idiom on MySQL); when the conflict
+            // action reports no key (DO NOTHING on an existing row) the
+            // statement affected the parent only and the child half is
+            // skipped, matching DO NOTHING semantics.
             let mut inserted_id: Option<i64> = None;
-            if dialect == Dialect::Postgres {
+            let mut conflict_skipped_child = false;
+            if needs_generated_id && on_conflict.is_some() {
+                let Some(pk_col) = pk_col else {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(sqlmodel_core::Error::Custom(
+                        "joined-table inheritance insert requires a primary key column".to_string(),
+                    ));
+                };
+                let action = on_conflict
+                    .as_ref()
+                    .expect("on_conflict is Some in this branch");
+                let (plain_sql, params, _cols) = build_insert_sql_for_table_with_columns(
+                    dialect,
+                    parent_table,
+                    parent_fields,
+                    &parent_row,
+                    None,
+                );
+                let (sql, source) = assemble_parent_upsert(
+                    dialect,
+                    &dialect.quote_table(parent_table),
+                    &plain_sql,
+                    pk_col,
+                    action,
+                );
+                match source {
+                    ParentUpsertIdSource::Returning => {
+                        match tx.query_one(cx, &sql, &params).await {
+                            Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
+                                Ok(v) => inserted_id = Some(v),
+                                Err(e) => {
+                                    tx_rollback_best_effort(tx, cx).await;
+                                    return Outcome::Err(e);
+                                }
+                            },
+                            // DO NOTHING hit an existing row: no key reported.
+                            Outcome::Ok(None) => conflict_skipped_child = true,
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                    ParentUpsertIdSource::LastInsertId => {
+                        match tx.execute(cx, &sql, &params).await {
+                            Outcome::Ok(_) => {}
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                        match tx.query_one(cx, "SELECT LAST_INSERT_ID()", &[]).await {
+                            Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
+                                Ok(v) => inserted_id = Some(v),
+                                Err(e) => {
+                                    tx_rollback_best_effort(tx, cx).await;
+                                    return Outcome::Err(e);
+                                }
+                            },
+                            Outcome::Ok(None) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(sqlmodel_core::Error::Custom(
+                                    "failed to read LAST_INSERT_ID() after joined-table upsert"
+                                        .to_string(),
+                                ));
+                            }
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                    ParentUpsertIdSource::Unavailable => {
+                        // MySQL INSERT IGNORE does not update LAST_INSERT_ID
+                        // on a conflict, so the surviving key is unknowable;
+                        // refuse rather than risk patching the child row onto
+                        // the wrong parent.
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(sqlmodel_core::Error::Custom(
+                            "MySQL joined-table inheritance auto-increment upsert with ON CONFLICT DO NOTHING cannot report the surviving key; use DO UPDATE or explicit primary key values"
+                                .to_string(),
+                        ));
+                    }
+                }
+            } else if dialect == Dialect::Postgres {
                 let Some(pk_col) = pk_col else {
                     tx_rollback_best_effort(tx, cx).await;
                     return Outcome::Err(sqlmodel_core::Error::Custom(
@@ -1221,7 +1428,12 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                         append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
                     }
                     match tx.execute(cx, &sql, &params).await {
-                        Outcome::Ok(_) => {}
+                        Outcome::Ok(affected) => {
+                            // DO NOTHING on an existing row affects nothing.
+                            if affected == 0 && matches!(on_conflict, Some(OnConflict::DoNothing)) {
+                                conflict_skipped_child = true;
+                            }
+                        }
                         Outcome::Err(e) => {
                             tx_rollback_best_effort(tx, cx).await;
                             return Outcome::Err(e);
@@ -1248,7 +1460,12 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
                 }
                 match tx.execute(cx, &sql, &params).await {
-                    Outcome::Ok(_) => {}
+                    Outcome::Ok(affected) => {
+                        // INSERT IGNORE on an existing row affects nothing.
+                        if affected == 0 && matches!(on_conflict, Some(OnConflict::DoNothing)) {
+                            conflict_skipped_child = true;
+                        }
+                    }
                     Outcome::Err(e) => {
                         tx_rollback_best_effort(tx, cx).await;
                         return Outcome::Err(e);
@@ -1296,6 +1513,21 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                             return Outcome::Panicked(p);
                         }
                     }
+                }
+            }
+
+            // DO NOTHING hit an existing parent row: the statement affected
+            // the parent only, the child half is skipped, and the result is
+            // the model's own key (or 0 for a skipped generated key),
+            // matching the single-table ON CONFLICT contract.
+            if conflict_skipped_child {
+                match tx.commit(cx).await {
+                    Outcome::Ok(()) => {
+                        return Outcome::Ok(extract_single_pk_i64(&pk_vals).unwrap_or(0));
+                    }
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
                 }
             }
 
@@ -1403,12 +1635,10 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
     ) -> Outcome<Option<Row>, sqlmodel_core::Error> {
         self.returning = true;
         if is_joined_inheritance_child::<M>() {
-            if self.on_conflict.is_some() {
-                return Outcome::Err(sqlmodel_core::Error::Custom(
-                    "joined-table inheritance insert_returning does not support ON CONFLICT; use execute() for ON CONFLICT semantics"
-                        .to_string(),
-                ));
-            }
+            // ON CONFLICT is supported: the upsert flow below runs both
+            // halves in one transaction and then re-reads the surviving row
+            // in the joined `parent__*`/`child__*` shape, so RETURNING works
+            // uniformly for plain inserts, DO UPDATE, and DO NOTHING.
 
             let dialect = conn.dialect();
             let inh = M::inheritance();
@@ -1441,6 +1671,78 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     .is_some_and(|f| f.auto_increment)
                 && pk_vals[0].is_null();
 
+            let parent_allowed: HashSet<&'static str> =
+                parent_fields.iter().map(|f| f.column_name).collect();
+            let child_allowed: HashSet<&'static str> =
+                M::fields().iter().map(|f| f.column_name).collect();
+
+            // Same conflict-target contract as `execute`: the parent is
+            // resolved first, so targets are parent-table columns.
+            if let Some(OnConflict::DoUpdate { target, .. }) = &self.on_conflict {
+                for t in target {
+                    if parent_allowed.contains(t.as_str()) {
+                        continue;
+                    }
+                    if child_allowed.contains(t.as_str()) {
+                        return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                            "joined-table inheritance ON CONFLICT target '{t}' is a child-table column; child uniqueness cannot be resolved before the parent id is known - use a parent-table unique column as the target"
+                        )));
+                    }
+                    return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                        "unknown joined-table inheritance ON CONFLICT target column '{t}'"
+                    )));
+                }
+            }
+            if self.on_conflict.is_some()
+                && !needs_generated_id
+                && pk_vals.iter().any(|v| v.is_null())
+            {
+                return Outcome::Err(sqlmodel_core::Error::Custom(
+                    "joined-table inheritance insert ON CONFLICT requires complete primary key values for composite primary keys"
+                        .to_string(),
+                ));
+            }
+
+            let child_pk_target: Vec<String> =
+                M::PRIMARY_KEY.iter().map(|c| (*c).to_string()).collect();
+            let (parent_on_conflict, child_on_conflict) = match &self.on_conflict {
+                None => (None, None),
+                Some(OnConflict::DoNothing) => {
+                    (Some(OnConflict::DoNothing), Some(OnConflict::DoNothing))
+                }
+                Some(OnConflict::DoUpdate { columns, target }) => {
+                    for c in columns {
+                        if !parent_allowed.contains(c.as_str())
+                            && !child_allowed.contains(c.as_str())
+                        {
+                            return Outcome::Err(sqlmodel_core::Error::Custom(format!(
+                                "unknown joined-table inheritance ON CONFLICT update column '{c}'"
+                            )));
+                        }
+                    }
+                    let parent_cols: Vec<String> = columns
+                        .iter()
+                        .filter(|c| parent_allowed.contains(c.as_str()))
+                        .cloned()
+                        .collect();
+                    let child_cols: Vec<String> = columns
+                        .iter()
+                        .filter(|c| child_allowed.contains(c.as_str()))
+                        .cloned()
+                        .collect();
+                    (
+                        Some(OnConflict::DoUpdate {
+                            columns: parent_cols,
+                            target: target.clone(),
+                        }),
+                        Some(OnConflict::DoUpdate {
+                            columns: child_cols,
+                            target: child_pk_target.clone(),
+                        }),
+                    )
+                }
+            };
+
             let tx_out = conn.begin(cx).await;
             let tx = match tx_out {
                 Outcome::Ok(t) => t,
@@ -1450,7 +1752,112 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
             };
 
             let mut inserted_id: Option<i64> = None;
-            if dialect == Dialect::Postgres {
+            let mut conflict_skipped_child = false;
+            if needs_generated_id && self.on_conflict.is_some() {
+                let Some(pk_col) = pk_col else {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(sqlmodel_core::Error::Custom(
+                        "joined-table inheritance insert requires a primary key column".to_string(),
+                    ));
+                };
+                let action = self
+                    .on_conflict
+                    .as_ref()
+                    .expect("on_conflict is Some in this branch");
+                let (plain_sql, params, _cols) = build_insert_sql_for_table_with_columns(
+                    dialect,
+                    parent_table,
+                    parent_fields,
+                    &parent_row,
+                    None,
+                );
+                let (sql, source) = assemble_parent_upsert(
+                    dialect,
+                    &dialect.quote_table(parent_table),
+                    &plain_sql,
+                    pk_col,
+                    action,
+                );
+                match source {
+                    ParentUpsertIdSource::Returning => {
+                        match tx.query_one(cx, &sql, &params).await {
+                            Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
+                                Ok(v) => inserted_id = Some(v),
+                                Err(e) => {
+                                    tx_rollback_best_effort(tx, cx).await;
+                                    return Outcome::Err(e);
+                                }
+                            },
+                            // DO NOTHING hit an existing row: no key reported.
+                            Outcome::Ok(None) => conflict_skipped_child = true,
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                    ParentUpsertIdSource::LastInsertId => {
+                        match tx.execute(cx, &sql, &params).await {
+                            Outcome::Ok(_) => {}
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                        match tx.query_one(cx, "SELECT LAST_INSERT_ID()", &[]).await {
+                            Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
+                                Ok(v) => inserted_id = Some(v),
+                                Err(e) => {
+                                    tx_rollback_best_effort(tx, cx).await;
+                                    return Outcome::Err(e);
+                                }
+                            },
+                            Outcome::Ok(None) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(sqlmodel_core::Error::Custom(
+                                    "failed to read LAST_INSERT_ID() after joined-table upsert"
+                                        .to_string(),
+                                ));
+                            }
+                            Outcome::Err(e) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Err(e);
+                            }
+                            Outcome::Cancelled(r) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Cancelled(r);
+                            }
+                            Outcome::Panicked(p) => {
+                                tx_rollback_best_effort(tx, cx).await;
+                                return Outcome::Panicked(p);
+                            }
+                        }
+                    }
+                    ParentUpsertIdSource::Unavailable => {
+                        tx_rollback_best_effort(tx, cx).await;
+                        return Outcome::Err(sqlmodel_core::Error::Custom(
+                            "MySQL joined-table inheritance auto-increment upsert with ON CONFLICT DO NOTHING cannot report the surviving key; use DO UPDATE or explicit primary key values"
+                                .to_string(),
+                        ));
+                    }
+                }
+            } else if dialect == Dialect::Postgres {
                 let Some(pk_col) = pk_col else {
                     tx_rollback_best_effort(tx, cx).await;
                     return Outcome::Err(sqlmodel_core::Error::Custom(
@@ -1458,13 +1865,18 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     ));
                 };
 
-                let (sql, params) = build_insert_sql_for_table(
+                let (mut sql, params, cols) = build_insert_sql_for_table_with_columns(
                     dialect,
                     parent_table,
                     parent_fields,
                     &parent_row,
-                    Some(pk_col),
+                    None,
                 );
+                if let Some(oc) = &parent_on_conflict {
+                    append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
+                }
+                sql.push_str(" RETURNING ");
+                sql.push_str(&dialect.quote_identifier(pk_col));
                 match tx.query_one(cx, &sql, &params).await {
                     Outcome::Ok(Some(row)) => match row.get_as::<i64>(0) {
                         Ok(v) => inserted_id = Some(v),
@@ -1473,12 +1885,8 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                             return Outcome::Err(e);
                         }
                     },
-                    Outcome::Ok(None) => {
-                        tx_rollback_best_effort(tx, cx).await;
-                        return Outcome::Err(sqlmodel_core::Error::Custom(
-                            "base insert returned no row".to_string(),
-                        ));
-                    }
+                    // DO NOTHING on an existing row reports no key.
+                    Outcome::Ok(None) => conflict_skipped_child = true,
                     Outcome::Err(e) => {
                         tx_rollback_best_effort(tx, cx).await;
                         return Outcome::Err(e);
@@ -1493,15 +1901,25 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                     }
                 }
             } else {
-                let (sql, params) = build_insert_sql_for_table(
+                let (mut sql, params, cols) = build_insert_sql_for_table_with_columns(
                     dialect,
                     parent_table,
                     parent_fields,
                     &parent_row,
                     None,
                 );
+                if let Some(oc) = &parent_on_conflict {
+                    append_on_conflict_clause(dialect, &mut sql, M::PRIMARY_KEY, &cols, oc);
+                }
                 match tx.execute(cx, &sql, &params).await {
-                    Outcome::Ok(_) => {}
+                    Outcome::Ok(affected) => {
+                        // DO NOTHING / INSERT IGNORE on an existing row
+                        // affects nothing.
+                        if affected == 0 && matches!(self.on_conflict, Some(OnConflict::DoNothing))
+                        {
+                            conflict_skipped_child = true;
+                        }
+                    }
                     Outcome::Err(e) => {
                         tx_rollback_best_effort(tx, cx).await;
                         return Outcome::Err(e);
@@ -1569,14 +1987,64 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                 }
             }
 
-            let (child_sql, child_params) = build_insert_sql_for_table(
+            // DO NOTHING hit an existing parent row: nothing was inserted,
+            // so there is no row to return (matching single-table RETURNING
+            // semantics where a skipped insert returns nothing).
+            if conflict_skipped_child {
+                match tx.commit(cx).await {
+                    Outcome::Ok(()) => return Outcome::Ok(None),
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                }
+            }
+
+            let (mut child_sql, child_params, child_cols) = build_insert_sql_for_table_with_columns(
                 dialect,
                 M::TABLE_NAME,
                 M::fields(),
                 &child_row,
-                Some("*"),
+                None,
             );
-            let row_out = match tx.query_one(cx, &child_sql, &child_params).await {
+            if let Some(oc) = &child_on_conflict {
+                append_on_conflict_clause(dialect, &mut child_sql, M::PRIMARY_KEY, &child_cols, oc);
+            }
+            match tx.execute(cx, &child_sql, &child_params).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+
+            // Re-read the surviving row in the joined `parent__*`/`child__*`
+            // shape so RETURNING is uniform across dialects (MySQL has no
+            // RETURNING) and matches the joined UPDATE returning shape.
+            let surviving_pk: Vec<Value> = match (pk_col, inserted_id) {
+                (_, Some(id)) => vec![Value::BigInt(id)],
+                (Some(_), None) => pk_vals,
+                (None, None) => pk_vals,
+            };
+            let (select_sql, select_params) = match build_joined_child_select_sql_by_pk_in::<M>(
+                dialect,
+                M::PRIMARY_KEY,
+                &[surviving_pk],
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tx_rollback_best_effort(tx, cx).await;
+                    return Outcome::Err(e);
+                }
+            };
+            let row_out = match tx.query_one(cx, &select_sql, &select_params).await {
                 Outcome::Ok(row) => Outcome::Ok(row),
                 Outcome::Err(e) => {
                     tx_rollback_best_effort(tx, cx).await;
@@ -4023,5 +4491,113 @@ mod tests {
         // MySQL uses ? without numbers
         assert!(sql.contains('?'));
         assert!(!sql.contains("$1"));
+    }
+
+    // ---- Joined-table parent upsert assembly (bd-kzp1.4) ----
+
+    const UPSERT_INSERT: &str = "INSERT INTO \"people\" (\"name\") VALUES ($1)";
+
+    #[test]
+    fn test_parent_upsert_sqlite_do_update_returns_key() {
+        let action = OnConflict::DoUpdate {
+            columns: vec!["name".to_string()],
+            target: vec!["name".to_string()],
+        };
+        let (sql, source) =
+            assemble_parent_upsert(Dialect::Sqlite, "\"people\"", UPSERT_INSERT, "id", &action);
+        assert_eq!(source, ParentUpsertIdSource::Returning);
+        assert!(
+            sql.contains(
+                "ON CONFLICT (\"name\") DO UPDATE SET \"name\" = EXCLUDED.\"name\" RETURNING \"id\""
+            ),
+            "sqlite upsert must RETURNING the surviving key: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_parent_upsert_sqlite_empty_columns_is_noop_with_returning() {
+        let action = OnConflict::DoUpdate {
+            columns: vec![],
+            target: vec![],
+        };
+        let (sql, source) =
+            assemble_parent_upsert(Dialect::Sqlite, "\"people\"", UPSERT_INSERT, "id", &action);
+        assert_eq!(source, ParentUpsertIdSource::Returning);
+        assert!(
+            sql.contains("DO UPDATE SET \"id\" = \"people\".\"id\" RETURNING \"id\""),
+            "empty update columns must degrade to a no-op assignment, not DO NOTHING: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_parent_upsert_sqlite_do_nothing_reports_unavailable() {
+        let (sql, source) = assemble_parent_upsert(
+            Dialect::Sqlite,
+            "\"people\"",
+            UPSERT_INSERT,
+            "id",
+            &OnConflict::DoNothing,
+        );
+        assert_eq!(source, ParentUpsertIdSource::Unavailable);
+        assert!(sql.ends_with("ON CONFLICT DO NOTHING"));
+        assert!(!sql.contains("RETURNING"));
+    }
+
+    #[test]
+    fn test_parent_upsert_mysql_do_update_uses_last_insert_id_idiom() {
+        let action = OnConflict::DoUpdate {
+            columns: vec!["name".to_string()],
+            target: vec!["name".to_string()],
+        };
+        let (sql, source) = assemble_parent_upsert(
+            Dialect::Mysql,
+            "`people`",
+            "INSERT INTO `people` (`name`) VALUES (?)",
+            "id",
+            &action,
+        );
+        assert_eq!(source, ParentUpsertIdSource::LastInsertId);
+        assert!(
+            sql.contains(
+                "ON DUPLICATE KEY UPDATE `id` = LAST_INSERT_ID(`id`), `name` = VALUES(`name`)"
+            ),
+            "mysql upsert must use the LAST_INSERT_ID idiom to learn the surviving key: {sql}"
+        );
+        assert!(!sql.contains("RETURNING"), "MySQL has no RETURNING: {sql}");
+    }
+
+    #[test]
+    fn test_parent_upsert_mysql_do_nothing_is_insert_ignore() {
+        let (sql, source) = assemble_parent_upsert(
+            Dialect::Mysql,
+            "`people`",
+            "INSERT INTO `people` (`name`) VALUES (?)",
+            "id",
+            &OnConflict::DoNothing,
+        );
+        assert_eq!(source, ParentUpsertIdSource::Unavailable);
+        assert!(sql.starts_with("INSERT IGNORE"));
+    }
+
+    #[test]
+    fn test_parent_upsert_postgres_do_update_returns_key() {
+        let action = OnConflict::DoUpdate {
+            columns: vec![],
+            target: vec!["name".to_string()],
+        };
+        let (sql, source) = assemble_parent_upsert(
+            Dialect::Postgres,
+            "\"people\"",
+            UPSERT_INSERT,
+            "id",
+            &action,
+        );
+        assert_eq!(source, ParentUpsertIdSource::Returning);
+        assert!(
+            sql.contains(
+                "ON CONFLICT (\"name\") DO UPDATE SET \"id\" = \"people\".\"id\" RETURNING \"id\""
+            ),
+            "postgres upsert must RETURNING the surviving key: {sql}"
+        );
     }
 }

@@ -24,6 +24,8 @@ fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
 struct Person {
     #[sqlmodel(primary_key, auto_increment)]
     id: Option<i64>,
+    // UNIQUE so it can serve as a non-PK conflict target for the upserts.
+    #[sqlmodel(unique)]
     name: String,
 }
 
@@ -222,18 +224,98 @@ fn sqlite_joined_inheritance_dml_inserts_updates_deletes_base_and_child() {
             other => panic!("expected ambiguity error, got {other:?}"),
         }
 
-        // ON CONFLICT with insert_returning is explicitly unsupported for joined inheritance.
-        let conflict_returning = insert!(&upsert_model)
-            .on_conflict_do_nothing()
-            .execute_returning(&cx, &conn)
+        // RETURNING with ON CONFLICT now works for joined inheritance and
+        // returns the joined parent__*/child__* row shape. DO NOTHING on an
+        // existing row returns no row (the insert was skipped).
+        let conflict_returning = unwrap_outcome(
+            insert!(&upsert_model)
+                .on_conflict_do_nothing()
+                .execute_returning(&cx, &conn)
+                .await,
+        );
+        assert!(conflict_returning.is_none(), "DO NOTHING skips: {conflict_returning:?}");
+
+        // DO UPDATE + RETURNING re-reads the surviving joined row.
+        let upsert_rows = unwrap_outcome(
+            insert!(&upsert_model)
+                .on_conflict_do_update(&["name", "grade"])
+                .execute_returning(&cx, &conn)
+                .await,
+        );
+        let upsert_row = upsert_rows.expect("DO UPDATE returns the surviving row");
+        assert_eq!(
+            upsert_row
+                .get_named::<String>(&format!("{}__name", <Person as Model>::TABLE_NAME))
+                .unwrap(),
+            "Alice4"
+        );
+        assert_eq!(
+            upsert_row
+                .get_named::<String>(&format!("{}__grade", <Student as Model>::TABLE_NAME))
+                .unwrap(),
+            "A*"
+        );
+
+        // Auto-increment upsert keyed by a non-PK parent UNIQUE column
+        // (person.name): the surviving parent id is learned via the conflict
+        // clause and propagated to the child row; parent and child columns
+        // both update.
+        let auto_upsert = Student {
+            person: Person {
+                id: None,
+                name: "Alice".to_string(),
+            },
+            id: None,
+            grade: "B".to_string(),
+        };
+        let upsert_by_name_id = unwrap_outcome(
+            insert!(&auto_upsert)
+                .on_conflict_target_do_update(&["name"], &["grade"])
+                .execute(&cx, &conn)
+                .await,
+        );
+        assert_eq!(upsert_by_name_id, id, "surviving parent id is reused");
+        let name_after = unwrap_outcome(
+            conn.query(
+                &cx,
+                &format!("SELECT grade FROM {student_table} WHERE id = ?1"),
+                &[Value::BigInt(id)],
+            )
+            .await,
+        );
+        assert_eq!(name_after[0].get_as::<String>(0).unwrap(), "B");
+
+        // Auto-increment upsert that lands on an unused unique value inserts
+        // a brand-new parent+child pair and returns the generated id.
+        let auto_insert = Student {
+            person: Person {
+                id: None,
+                name: "Newname".to_string(),
+            },
+            id: None,
+            grade: "F".to_string(),
+        };
+        let fresh_id = unwrap_outcome(
+            insert!(&auto_insert)
+                .on_conflict_target_do_update(&["name"], &["grade"])
+                .execute(&cx, &conn)
+                .await,
+        );
+        assert!(fresh_id > 0 && fresh_id != id, "new row got a new id");
+
+        // The child-table column cannot be a conflict target: uniqueness
+        // cannot be resolved before the parent id is known.
+        let child_target = insert!(&auto_insert)
+            .on_conflict_target_do_update(&["grade"], &["grade"])
+            .execute(&cx, &conn)
             .await;
-        match conflict_returning {
+        match child_target {
             Outcome::Err(e) => assert!(
                 e.to_string()
-                    .contains("insert_returning does not support ON CONFLICT"),
+                    .contains("is a child-table column; child uniqueness cannot be resolved"),
                 "unexpected error: {e}"
             ),
-            other => panic!("expected insert_returning ON CONFLICT error, got {other:?}"),
+            other => panic!("expected child-target rejection, got {other:?}"),
         }
 
         // Insert two more rows for explicit DELETE semantics checks.
