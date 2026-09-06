@@ -98,6 +98,21 @@ impl SqlModelConsole {
         }
     }
 
+    /// Create a console using an environment variable reader and terminal indicator.
+    ///
+    /// This allows caller-injected environments without mutating global process state.
+    #[must_use]
+    pub fn with_env<F>(env_lookup: F, is_terminal: bool) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self {
+            mode: OutputMode::detect_with_env(env_lookup, is_terminal),
+            theme: Theme::default(),
+            plain_width: 80,
+        }
+    }
+
     /// Builder method to set the theme.
     #[must_use]
     pub fn theme(mut self, theme: Theme) -> Self {

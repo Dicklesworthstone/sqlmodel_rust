@@ -13,74 +13,43 @@
 
 use super::output_capture::CapturedOutput;
 use sqlmodel_console::{OutputMode, SqlModelConsole};
-use std::env;
+use std::collections::HashMap;
 
 // ============================================================================
-// Environment Variable Helpers (same as agent_compat.rs)
+// Environment Variable Mock Helper
 // ============================================================================
 
-/// All environment variables that affect output mode detection.
-const MODE_VARS: &[&str] = &[
-    "SQLMODEL_PLAIN",
-    "SQLMODEL_JSON",
-    "SQLMODEL_RICH",
-    "NO_COLOR",
-    "CI",
-    "TERM",
-    "CLAUDE_CODE",
-    "CODEX_CLI",
-    "CODEX_SESSION",
-    "CURSOR_SESSION",
-    "CURSOR_EDITOR",
-    "AIDER_MODEL",
-    "AIDER_REPO",
-    "AGENT_MODE",
-    "AI_AGENT",
-    "GITHUB_COPILOT",
-    "GEMINI_CLI",
-];
-
-/// Wrapper for env::set_var (unsafe in Rust 2024).
-#[allow(unsafe_code)]
-fn set_var(key: &str, value: &str) {
-    unsafe { env::set_var(key, value) };
+#[derive(Default, Clone)]
+struct MockEnv {
+    vars: HashMap<&'static str, &'static str>,
 }
 
-/// Wrapper for env::remove_var.
-#[allow(unsafe_code)]
-fn remove_var(key: &str) {
-    unsafe { env::remove_var(key) };
-}
-
-/// RAII guard for clean environment state.
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
-}
-
-impl EnvGuard {
+impl MockEnv {
     fn new() -> Self {
-        let saved = MODE_VARS
-            .iter()
-            .map(|&var| (var, env::var(var).ok()))
-            .collect();
-
-        // Clear all mode-affecting vars
-        for &var in MODE_VARS {
-            remove_var(var);
-        }
-
-        Self { saved }
+        Self::default()
     }
-}
 
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for &(var, ref val) in &self.saved {
-            match val {
-                Some(v) => set_var(var, v),
-                None => remove_var(var),
-            }
-        }
+    fn with(key: &'static str, value: &'static str) -> Self {
+        let mut env = Self::new();
+        env.set(key, value);
+        env
+    }
+
+    fn set(&mut self, key: &'static str, value: &'static str) -> &mut Self {
+        self.vars.insert(key, value);
+        self
+    }
+
+    fn lookup(&self, key: &str) -> Option<String> {
+        self.vars.get(key).map(|v| (*v).to_string())
+    }
+
+    fn console(&self) -> SqlModelConsole {
+        SqlModelConsole::with_env(|k| self.lookup(k), true)
+    }
+
+    fn is_agent(&self) -> bool {
+        OutputMode::is_agent_environment_with(|k| self.lookup(k))
     }
 }
 
@@ -91,10 +60,8 @@ impl Drop for EnvGuard {
 /// E2E test: Plain mode produces no ANSI escape codes.
 #[test]
 fn e2e_plain_mode_produces_no_ansi() {
-    let _guard = EnvGuard::new();
-    set_var("SQLMODEL_PLAIN", "1");
-
-    let console = SqlModelConsole::new();
+    let env = MockEnv::with("SQLMODEL_PLAIN", "1");
+    let console = env.console();
     assert!(console.is_plain(), "Console should be in plain mode");
     assert!(
         !console.mode().supports_ansi(),
@@ -112,13 +79,7 @@ fn e2e_plain_mode_produces_no_ansi() {
 }
 
 /// E2E test: Agent detection triggers plain mode.
-///
-/// Note: The `console.is_plain()` assertion validates behavior. We don't separately
-/// assert `is_agent_environment()` because in test environments, plain mode might
-/// be triggered by stdout not being a TTY (piped output) rather than agent detection.
-/// The behavior is correct either way - the console produces plain output.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn e2e_agent_detection_triggers_plain_mode() {
     let agents = [
         ("CLAUDE_CODE", "1"),
@@ -130,33 +91,24 @@ fn e2e_agent_detection_triggers_plain_mode() {
     ];
 
     for (var, value) in agents {
-        let _guard = EnvGuard::new();
-        set_var(var, value);
-
-        let console = SqlModelConsole::new();
+        let env = MockEnv::with(var, value);
+        let console = env.console();
         assert!(
             console.is_plain(),
             "{var}={value} should trigger plain mode, got {:?}",
             console.mode()
-        );
-
-        // Verify the environment variable was actually set
-        assert!(
-            std::env::var(var).is_ok(),
-            "{var} should be set in environment"
         );
     }
 }
 
 /// E2E test: Force rich mode even in agent environment.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests (CI sets CI=true)"]
 fn e2e_force_rich_overrides_agent() {
-    let _guard = EnvGuard::new();
-    set_var("CLAUDE_CODE", "1");
-    set_var("SQLMODEL_RICH", "1");
+    let mut env = MockEnv::new();
+    env.set("CLAUDE_CODE", "1");
+    env.set("SQLMODEL_RICH", "1");
 
-    let console = SqlModelConsole::new();
+    let console = env.console();
     assert!(
         console.is_rich(),
         "SQLMODEL_RICH should override agent detection"
@@ -165,13 +117,10 @@ fn e2e_force_rich_overrides_agent() {
 
 /// E2E test: JSON mode for structured output.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 #[allow(clippy::items_after_statements)]
 fn e2e_json_mode_for_structured_output() {
-    let _guard = EnvGuard::new();
-    set_var("SQLMODEL_JSON", "1");
-
-    let console = SqlModelConsole::new();
+    let env = MockEnv::with("SQLMODEL_JSON", "1");
+    let console = env.console();
     assert!(console.is_json(), "Console should be in JSON mode");
     assert!(
         console.mode().is_structured(),
@@ -197,20 +146,16 @@ fn e2e_json_mode_for_structured_output() {
 /// E2E test: CI environment triggers plain mode.
 #[test]
 fn e2e_ci_environment_triggers_plain() {
-    let _guard = EnvGuard::new();
-    set_var("CI", "true");
-
-    let console = SqlModelConsole::new();
+    let env = MockEnv::with("CI", "true");
+    let console = env.console();
     assert!(console.is_plain(), "CI=true should trigger plain mode");
 }
 
 /// E2E test: NO_COLOR standard convention.
 #[test]
 fn e2e_no_color_triggers_plain() {
-    let _guard = EnvGuard::new();
-    set_var("NO_COLOR", "");
-
-    let console = SqlModelConsole::new();
+    let env = MockEnv::with("NO_COLOR", "");
+    let console = env.console();
     assert!(
         console.is_plain(),
         "NO_COLOR presence should trigger plain mode"
@@ -220,10 +165,8 @@ fn e2e_no_color_triggers_plain() {
 /// E2E test: Dumb terminal triggers plain mode.
 #[test]
 fn e2e_dumb_terminal_triggers_plain() {
-    let _guard = EnvGuard::new();
-    set_var("TERM", "dumb");
-
-    let console = SqlModelConsole::new();
+    let env = MockEnv::with("TERM", "dumb");
+    let console = env.console();
     assert!(console.is_plain(), "TERM=dumb should trigger plain mode");
 }
 
@@ -318,8 +261,6 @@ fn e2e_console_builder_methods() {
 /// E2E test: Console default equals new.
 #[test]
 fn e2e_console_default_equals_new() {
-    let _guard = EnvGuard::new();
-
     let c1 = SqlModelConsole::default();
     let c2 = SqlModelConsole::new();
 
@@ -334,44 +275,44 @@ fn e2e_console_default_equals_new() {
 /// E2E test: Full workflow with mode detection.
 #[test]
 fn e2e_full_mode_detection_workflow() {
-    let _guard = EnvGuard::new();
+    let mut env = MockEnv::new();
 
     // Start clean - no agent vars
-    assert!(!OutputMode::is_agent_environment());
+    assert!(!env.is_agent());
 
     // Simulate agent environment
-    set_var("CLAUDE_CODE", "1");
-    assert!(OutputMode::is_agent_environment());
+    env.set("CLAUDE_CODE", "1");
+    assert!(env.is_agent());
 
     // Create console - should detect agent
-    let console = SqlModelConsole::new();
+    let console = env.console();
     assert!(console.is_plain());
 
     // Force override to rich
-    set_var("SQLMODEL_RICH", "1");
-    let console2 = SqlModelConsole::new();
+    env.set("SQLMODEL_RICH", "1");
+    let console2 = env.console();
     assert!(console2.is_rich());
 
     // Plain override takes precedence
-    set_var("SQLMODEL_PLAIN", "1");
-    let console3 = SqlModelConsole::new();
+    env.set("SQLMODEL_PLAIN", "1");
+    let console3 = env.console();
     assert!(console3.is_plain());
 }
 
 /// E2E test: Multiple agent markers don't conflict.
 #[test]
 fn e2e_multiple_agent_markers() {
-    let _guard = EnvGuard::new();
+    let mut env = MockEnv::new();
 
-    set_var("CLAUDE_CODE", "1");
-    set_var("CODEX_CLI", "1");
-    set_var("CURSOR_SESSION", "test");
-    set_var("GEMINI_CLI", "1");
+    env.set("CLAUDE_CODE", "1");
+    env.set("CODEX_CLI", "1");
+    env.set("CURSOR_SESSION", "test");
+    env.set("GEMINI_CLI", "1");
 
     // Should still detect as agent environment
-    assert!(OutputMode::is_agent_environment());
+    assert!(env.is_agent());
 
     // Should use plain mode
-    let console = SqlModelConsole::new();
+    let console = env.console();
     assert!(console.is_plain());
 }

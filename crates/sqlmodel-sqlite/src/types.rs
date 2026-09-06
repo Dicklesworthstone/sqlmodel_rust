@@ -24,6 +24,7 @@ use std::ffi::{CStr, c_int};
 /// # Safety
 /// - `stmt` must be a valid, non-null prepared statement handle
 /// - `index` must be a valid 1-based parameter index
+// SAFETY: Caller guarantees `stmt` is a valid prepared statement and `index` is in range.
 pub unsafe fn bind_value(stmt: *mut ffi::sqlite3_stmt, index: c_int, value: &Value) -> c_int {
     // SAFETY: All FFI calls require unsafe in Rust 2024
     unsafe {
@@ -161,6 +162,7 @@ pub unsafe fn bind_value(stmt: *mut ffi::sqlite3_stmt, index: c_int, value: &Val
 /// # Safety
 /// - `stmt` must be a valid prepared statement that has just returned SQLITE_ROW
 /// - `index` must be a valid 0-based column index
+// SAFETY: Caller guarantees `stmt` is a valid prepared statement on SQLITE_ROW and `index` is in range.
 pub unsafe fn read_column(stmt: *mut ffi::sqlite3_stmt, index: c_int) -> Value {
     // SAFETY: All FFI calls require unsafe in Rust 2024
     unsafe {
@@ -217,6 +219,7 @@ pub unsafe fn read_column(stmt: *mut ffi::sqlite3_stmt, index: c_int) -> Value {
 /// # Safety
 /// - `stmt` must be a valid prepared statement
 /// - `index` must be a valid 0-based column index
+// SAFETY: Caller guarantees `stmt` is a valid prepared statement and `index` is in range.
 pub unsafe fn column_name(stmt: *mut ffi::sqlite3_stmt, index: c_int) -> Option<String> {
     // SAFETY: All FFI calls require unsafe in Rust 2024
     unsafe {

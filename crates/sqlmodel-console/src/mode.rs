@@ -89,39 +89,58 @@ impl OutputMode {
     /// ```
     #[must_use]
     pub fn detect() -> Self {
+        Self::detect_with_env(|var| env::var(var).ok(), std::io::stdout().is_terminal())
+    }
+
+    /// Detect the appropriate output mode using an environment variable reader and terminal indicator.
+    ///
+    /// This allows caller-injected environments (e.g. mock environments in tests)
+    /// without mutating global process state.
+    #[must_use]
+    pub fn detect_with_env<F>(env_lookup: F, is_terminal: bool) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let is_truthy = |var: &str| -> bool {
+            env_lookup(var).is_some_and(|val| {
+                let v = val.trim().to_lowercase();
+                v == "1" || v == "true" || v == "yes" || v == "on"
+            })
+        };
+
         // Explicit overrides (highest priority)
-        if env_is_truthy("SQLMODEL_PLAIN") {
+        if is_truthy("SQLMODEL_PLAIN") {
             return Self::Plain;
         }
-        if env_is_truthy("SQLMODEL_JSON") {
+        if is_truthy("SQLMODEL_JSON") {
             return Self::Json;
         }
-        if env_is_truthy("SQLMODEL_RICH") {
+        if is_truthy("SQLMODEL_RICH") {
             return Self::Rich; // Force rich even for agents
         }
 
         // Standard "no color" convention (https://no-color.org/)
-        if env::var("NO_COLOR").is_ok() {
+        if env_lookup("NO_COLOR").is_some() {
             return Self::Plain;
         }
 
         // CI environments
-        if env_is_truthy("CI") {
+        if is_truthy("CI") {
             return Self::Plain;
         }
 
         // Dumb terminal
-        if env::var("TERM").is_ok_and(|t| t == "dumb") {
+        if env_lookup("TERM").is_some_and(|t| t == "dumb") {
             return Self::Plain;
         }
 
         // Agent detection
-        if Self::is_agent_environment() {
+        if Self::is_agent_environment_with(&env_lookup) {
             return Self::Plain;
         }
 
         // Not a TTY (piped, redirected)
-        if !std::io::stdout().is_terminal() {
+        if !is_terminal {
             return Self::Plain;
         }
 
@@ -163,6 +182,15 @@ impl OutputMode {
     /// ```
     #[must_use]
     pub fn is_agent_environment() -> bool {
+        Self::is_agent_environment_with(|var| env::var(var).ok())
+    }
+
+    /// Check if we're running in an AI coding agent environment using a custom environment lookup.
+    #[must_use]
+    pub fn is_agent_environment_with<F>(env_lookup: F) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         const AGENT_MARKERS: &[&str] = &[
             // Claude/Anthropic
             "CLAUDE_CODE",
@@ -197,7 +225,7 @@ impl OutputMode {
             "AMAZON_Q_SESSION",
         ];
 
-        AGENT_MARKERS.iter().any(|var| env::var(var).is_ok())
+        AGENT_MARKERS.iter().any(|var| env_lookup(var).is_some())
     }
 
     /// Check if this mode should use ANSI escape codes.
@@ -297,80 +325,16 @@ impl std::fmt::Display for OutputMode {
     }
 }
 
-/// Check if an environment variable is set to a truthy value.
-///
-/// Recognizes: `1`, `true`, `yes`, `on` (case-insensitive).
-fn env_is_truthy(name: &str) -> bool {
-    env::var(name).is_ok_and(|v| {
-        let v = v.to_lowercase();
-        v == "1" || v == "true" || v == "yes" || v == "on"
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
-    /// Environment variables to clean before each test.
-    const VARS_TO_CLEAR: &[&str] = &[
-        "SQLMODEL_PLAIN",
-        "SQLMODEL_JSON",
-        "SQLMODEL_RICH",
-        "NO_COLOR",
-        "CI",
-        "TERM",
-        "CLAUDE_CODE",
-        "CODEX_CLI",
-        "CURSOR_SESSION",
-        "AIDER_MODEL",
-        "AGENT_MODE",
-        "GITHUB_COPILOT",
-        "CONTINUE_SESSION",
-    ];
-
-    /// Wrapper for env::set_var (unsafe in Rust 2024 edition).
-    ///
-    /// # Safety
-    /// This is only safe in single-threaded test contexts with #[test].
-    /// Tests must be run with `--test-threads=1` for safety.
-    #[allow(unsafe_code)]
-    fn test_set_var(key: &str, value: &str) {
-        // SAFETY: Tests are run single-threaded via `cargo test -- --test-threads=1`
-        // or the env manipulation is isolated to a single test function.
-        unsafe { env::set_var(key, value) };
-    }
-
-    /// Wrapper for env::remove_var (unsafe in Rust 2024 edition).
-    #[allow(unsafe_code)]
-    fn test_remove_var(key: &str) {
-        // SAFETY: Same as test_set_var
-        unsafe { env::remove_var(key) };
-    }
-
-    /// Helper to run test with clean environment.
-    fn with_clean_env<F: FnOnce()>(f: F) {
-        // Save current values
-        let saved: Vec<_> = VARS_TO_CLEAR
+    fn mock_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = vars
             .iter()
-            .map(|&v| (v, env::var(v).ok()))
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-
-        // Clear all relevant vars
-        for &var in VARS_TO_CLEAR {
-            test_remove_var(var);
-        }
-
-        // Run the test
-        f();
-
-        // Restore original values
-        for (var, val) in saved {
-            match val {
-                Some(v) => test_set_var(var, &v),
-                None => test_remove_var(var),
-            }
-        }
+        move |key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     #[test]
@@ -380,130 +344,121 @@ mod tests {
 
     #[test]
     fn test_explicit_plain_override() {
-        with_clean_env(|| {
-            test_set_var("SQLMODEL_PLAIN", "1");
-            assert_eq!(OutputMode::detect(), OutputMode::Plain);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("SQLMODEL_PLAIN", "1")]), true),
+            OutputMode::Plain
+        );
     }
 
     #[test]
     fn test_explicit_plain_override_true() {
-        with_clean_env(|| {
-            test_set_var("SQLMODEL_PLAIN", "true");
-            assert_eq!(OutputMode::detect(), OutputMode::Plain);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("SQLMODEL_PLAIN", "true")]), true),
+            OutputMode::Plain
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_explicit_json_override() {
-        with_clean_env(|| {
-            test_set_var("SQLMODEL_JSON", "1");
-            assert_eq!(OutputMode::detect(), OutputMode::Json);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("SQLMODEL_JSON", "1")]), true),
+            OutputMode::Json
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests (CI sets CI=true)"]
     fn test_explicit_rich_override() {
-        with_clean_env(|| {
-            test_set_var("SQLMODEL_RICH", "1");
-            // Note: This test runs in a non-TTY context (cargo test),
-            // but SQLMODEL_RICH should still force rich mode
-            assert_eq!(OutputMode::detect(), OutputMode::Rich);
-        });
+        // Note: Even when terminal is false, SQLMODEL_RICH forces rich mode
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("SQLMODEL_RICH", "1")]), false),
+            OutputMode::Rich
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_plain_takes_priority_over_json() {
-        with_clean_env(|| {
-            test_set_var("SQLMODEL_PLAIN", "1");
-            test_set_var("SQLMODEL_JSON", "1");
-            assert_eq!(OutputMode::detect(), OutputMode::Plain);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(
+                mock_env(&[("SQLMODEL_PLAIN", "1"), ("SQLMODEL_JSON", "1")]),
+                true
+            ),
+            OutputMode::Plain
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_agent_detection_claude() {
-        with_clean_env(|| {
-            test_set_var("CLAUDE_CODE", "1");
-            assert!(OutputMode::is_agent_environment());
-        });
+        assert!(OutputMode::is_agent_environment_with(mock_env(&[(
+            "CLAUDE_CODE",
+            "1"
+        )])));
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_agent_detection_codex() {
-        with_clean_env(|| {
-            test_set_var("CODEX_CLI", "1");
-            assert!(OutputMode::is_agent_environment());
-        });
+        assert!(OutputMode::is_agent_environment_with(mock_env(&[(
+            "CODEX_CLI",
+            "1"
+        )])));
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_agent_detection_cursor() {
-        with_clean_env(|| {
-            test_set_var("CURSOR_SESSION", "active");
-            assert!(OutputMode::is_agent_environment());
-        });
+        assert!(OutputMode::is_agent_environment_with(mock_env(&[(
+            "CURSOR_SESSION",
+            "active"
+        )])));
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_agent_detection_aider() {
-        with_clean_env(|| {
-            test_set_var("AIDER_MODEL", "gpt-4");
-            assert!(OutputMode::is_agent_environment());
-        });
+        assert!(OutputMode::is_agent_environment_with(mock_env(&[(
+            "AIDER_MODEL",
+            "gpt-4"
+        )])));
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_agent_causes_plain_mode() {
-        with_clean_env(|| {
-            test_set_var("CLAUDE_CODE", "1");
-            assert_eq!(OutputMode::detect(), OutputMode::Plain);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("CLAUDE_CODE", "1")]), true),
+            OutputMode::Plain
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests (CI sets CI=true)"]
     fn test_rich_override_beats_agent() {
-        with_clean_env(|| {
-            test_set_var("CLAUDE_CODE", "1");
-            test_set_var("SQLMODEL_RICH", "1");
-            assert_eq!(OutputMode::detect(), OutputMode::Rich);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(
+                mock_env(&[("CLAUDE_CODE", "1"), ("SQLMODEL_RICH", "1")]),
+                true
+            ),
+            OutputMode::Rich
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_no_color_causes_plain() {
-        with_clean_env(|| {
-            test_set_var("NO_COLOR", "");
-            assert_eq!(OutputMode::detect(), OutputMode::Plain);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("NO_COLOR", "")]), true),
+            OutputMode::Plain
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_ci_causes_plain() {
-        with_clean_env(|| {
-            test_set_var("CI", "true");
-            assert_eq!(OutputMode::detect(), OutputMode::Plain);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("CI", "true")]), true),
+            OutputMode::Plain
+        );
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_dumb_terminal_causes_plain() {
-        with_clean_env(|| {
-            test_set_var("TERM", "dumb");
-            assert_eq!(OutputMode::detect(), OutputMode::Plain);
-        });
+        assert_eq!(
+            OutputMode::detect_with_env(mock_env(&[("TERM", "dumb")]), true),
+            OutputMode::Plain
+        );
     }
 
     #[test]
@@ -550,45 +505,33 @@ mod tests {
 
     #[test]
     fn test_env_is_truthy() {
-        with_clean_env(|| {
-            // Not set
-            assert!(!env_is_truthy("SQLMODEL_TEST_VAR"));
+        // Empty / unset
+        let empty = mock_env(&[]);
+        assert_eq!(OutputMode::detect_with_env(&empty, true), OutputMode::Rich);
 
-            // Various truthy values
-            test_set_var("SQLMODEL_TEST_VAR", "1");
-            assert!(env_is_truthy("SQLMODEL_TEST_VAR"));
+        // Various truthy values
+        for truthy in ["1", "true", "TRUE", "yes", "on"] {
+            let env = mock_env(&[("SQLMODEL_PLAIN", truthy)]);
+            assert_eq!(
+                OutputMode::detect_with_env(&env, true),
+                OutputMode::Plain,
+                "truthy check failed for {truthy}"
+            );
+        }
 
-            test_set_var("SQLMODEL_TEST_VAR", "true");
-            assert!(env_is_truthy("SQLMODEL_TEST_VAR"));
-
-            test_set_var("SQLMODEL_TEST_VAR", "TRUE");
-            assert!(env_is_truthy("SQLMODEL_TEST_VAR"));
-
-            test_set_var("SQLMODEL_TEST_VAR", "yes");
-            assert!(env_is_truthy("SQLMODEL_TEST_VAR"));
-
-            test_set_var("SQLMODEL_TEST_VAR", "on");
-            assert!(env_is_truthy("SQLMODEL_TEST_VAR"));
-
-            // Falsy values
-            test_set_var("SQLMODEL_TEST_VAR", "0");
-            assert!(!env_is_truthy("SQLMODEL_TEST_VAR"));
-
-            test_set_var("SQLMODEL_TEST_VAR", "false");
-            assert!(!env_is_truthy("SQLMODEL_TEST_VAR"));
-
-            test_set_var("SQLMODEL_TEST_VAR", "");
-            assert!(!env_is_truthy("SQLMODEL_TEST_VAR"));
-
-            test_remove_var("SQLMODEL_TEST_VAR");
-        });
+        // Falsy values
+        for falsy in ["0", "false", "no", "off", ""] {
+            let env = mock_env(&[("SQLMODEL_PLAIN", falsy)]);
+            assert_eq!(
+                OutputMode::detect_with_env(&env, true),
+                OutputMode::Rich,
+                "falsy check failed for {falsy}"
+            );
+        }
     }
 
     #[test]
-    #[ignore = "flaky: env var race conditions in parallel tests"]
     fn test_no_agent_when_clean() {
-        with_clean_env(|| {
-            assert!(!OutputMode::is_agent_environment());
-        });
+        assert!(!OutputMode::is_agent_environment_with(mock_env(&[])));
     }
 }

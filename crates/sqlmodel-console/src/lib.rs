@@ -48,9 +48,8 @@
 //! }
 //! ```
 
-// Forbid unsafe code in production, but allow in tests for env manipulation
-#![cfg_attr(not(test), forbid(unsafe_code))]
-#![cfg_attr(test, allow(unsafe_code))]
+// Forbid unsafe code unconditionally throughout sqlmodel-console
+#![forbid(unsafe_code)]
 
 pub mod console;
 pub mod logging;

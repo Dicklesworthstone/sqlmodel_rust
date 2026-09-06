@@ -20,11 +20,14 @@ struct CountingAlloc;
 
 static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
+// SAFETY: CountingAlloc delegates memory allocation to System and tracks bytes allocated.
 unsafe impl GlobalAlloc for CountingAlloc {
+    // SAFETY: Forwarded directly to System allocator.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
         System.alloc(layout)
     }
+    // SAFETY: Forwarded directly to System allocator.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         System.dealloc(ptr, layout);
     }

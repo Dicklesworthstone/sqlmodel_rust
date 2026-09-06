@@ -103,6 +103,7 @@ pub fn sqlite_transient() -> sqlite3_destructor_type {
 // dependency. Its bundled feature compiles the vendored amalgamation and emits
 // the correct static `cargo:rustc-link-*` metadata; lib.rs keeps that dependency
 // linked even though these bindings are declared manually here.
+// SAFETY: Foreign C declarations match the official SQLite 3 C API and symbols provided by libsqlite3-sys.
 unsafe extern "C" {
     // Connection management
     pub fn sqlite3_open(filename: *const c_char, ppDb: *mut *mut sqlite3) -> c_int;

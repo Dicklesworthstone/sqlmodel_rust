@@ -193,6 +193,7 @@ impl RawDb {
     fn open_memory() -> Self {
         let path = std::ffi::CString::new(":memory:").expect("nul");
         let mut db: *mut ffi::sqlite3 = std::ptr::null_mut();
+        // SAFETY: path is null-terminated and db is a valid pointer.
         let rc = unsafe { ffi::sqlite3_open(path.as_ptr(), &raw mut db) };
         assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_open failed: rc={rc}");
         Self { db }
@@ -201,6 +202,7 @@ impl RawDb {
     fn exec(&self, sql: &str) {
         let csql = std::ffi::CString::new(sql).expect("sql contains nul");
         let mut err: *mut std::os::raw::c_char = std::ptr::null_mut();
+        // SAFETY: self.db is an open connection and csql is null-terminated.
         let rc = unsafe {
             ffi::sqlite3_exec(
                 self.db,
@@ -211,10 +213,12 @@ impl RawDb {
             )
         };
         if rc != ffi::SQLITE_OK {
+            // SAFETY: self.db is an open connection.
             let msg = unsafe { ffi::sqlite3_errmsg(self.db) };
             let msg = if msg.is_null() {
                 "unknown".to_string()
             } else {
+                // SAFETY: sqlite3_errmsg returns a valid C string.
                 unsafe { std::ffi::CStr::from_ptr(msg) }
                     .to_string_lossy()
                     .into_owned()
@@ -225,6 +229,7 @@ impl RawDb {
 
     /// Prepares `sql` once and runs it `n` times binding (text, int) pairs.
     fn run_bound_inserts(&self, sql: &str, rows: usize) {
+        // SAFETY: self.db is open, csql is null-terminated, and bindings/step follow sqlite contract.
         unsafe {
             let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
             let csql = std::ffi::CString::new(sql).expect("sql contains nul");
@@ -260,6 +265,7 @@ impl RawDb {
 
     /// Prepares `sql` (point select by id) and steps it `n` times.
     fn run_point_selects(&self, sql: &str, rows: usize) {
+        // SAFETY: self.db is open, csql is null-terminated, and bindings/step follow sqlite contract.
         unsafe {
             let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
             let csql = std::ffi::CString::new(sql).expect("sql contains nul");
@@ -284,6 +290,7 @@ impl RawDb {
 
 impl Drop for RawDb {
     fn drop(&mut self) {
+        // SAFETY: self.db was opened by sqlite3_open and is closed on drop.
         unsafe {
             ffi::sqlite3_close(self.db);
         }

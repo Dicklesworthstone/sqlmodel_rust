@@ -410,7 +410,6 @@ pub type ModelWriteGuard<'a, M> = std::sync::RwLockWriteGuard<'a, M>;
 // ============================================================================
 
 #[cfg(test)]
-#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use sqlmodel_core::{FieldInfo, Row, SqlType};
@@ -455,10 +454,6 @@ mod tests {
             self.id.is_none()
         }
     }
-
-    // Mark TestUser as Send + Sync for testing
-    unsafe impl Send for TestUser {}
-    unsafe impl Sync for TestUser {}
 
     #[test]
     fn test_identity_map_insert_and_get() {
@@ -645,9 +640,6 @@ mod tests {
                 self.id.is_none()
             }
         }
-
-        unsafe impl Send for TestTeam {}
-        unsafe impl Sync for TestTeam {}
 
         let mut map = IdentityMap::new();
 

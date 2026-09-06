@@ -18,90 +18,43 @@
 //! ```
 
 use sqlmodel_console::{OutputMode, SqlModelConsole};
-use std::env;
+use std::collections::HashMap;
 
 // ============================================================================
-// Environment Variable Helpers
+// Environment Variable Mock Helper
 // ============================================================================
 
-/// All environment variables that affect output mode detection.
-const MODE_VARS: &[&str] = &[
-    // SQLModel explicit overrides
-    "SQLMODEL_PLAIN",
-    "SQLMODEL_JSON",
-    "SQLMODEL_RICH",
-    // Standard conventions
-    "NO_COLOR",
-    "CI",
-    "TERM",
-    // Agent markers
-    "CLAUDE_CODE",
-    "CODEX_CLI",
-    "CODEX_SESSION",
-    "CURSOR_SESSION",
-    "CURSOR_EDITOR",
-    "AIDER_MODEL",
-    "AIDER_REPO",
-    "AGENT_MODE",
-    "AI_AGENT",
-    "GITHUB_COPILOT",
-    "COPILOT_SESSION",
-    "CONTINUE_SESSION",
-    "CODY_AGENT",
-    "CODY_SESSION",
-    "WINDSURF_SESSION",
-    "CODEIUM_AGENT",
-    "GEMINI_CLI",
-    "GEMINI_SESSION",
-    "CODEWHISPERER_SESSION",
-    "AMAZON_Q_SESSION",
-];
-
-/// Wrapper for env::set_var (unsafe in Rust 2024 edition).
-///
-/// # Safety
-/// Tests must be run with `--test-threads=1` for safety.
-#[allow(unsafe_code)]
-fn set_var(key: &str, value: &str) {
-    unsafe { env::set_var(key, value) };
+#[derive(Default, Clone)]
+struct MockEnv {
+    vars: HashMap<&'static str, &'static str>,
 }
 
-/// Wrapper for env::remove_var (unsafe in Rust 2024 edition).
-#[allow(unsafe_code)]
-fn remove_var(key: &str) {
-    unsafe { env::remove_var(key) };
-}
-
-/// RAII guard for clean environment state.
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
-}
-
-impl EnvGuard {
+impl MockEnv {
     fn new() -> Self {
-        let saved = MODE_VARS
-            .iter()
-            .map(|&var| (var, env::var(var).ok()))
-            .collect();
-
-        // Clear all mode-affecting vars
-        for &var in MODE_VARS {
-            remove_var(var);
-        }
-
-        Self { saved }
+        Self::default()
     }
-}
 
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        // Restore original values
-        for &(var, ref val) in &self.saved {
-            match val {
-                Some(v) => set_var(var, v),
-                None => remove_var(var),
-            }
-        }
+    fn with(key: &'static str, value: &'static str) -> Self {
+        let mut env = Self::new();
+        env.set(key, value);
+        env
+    }
+
+    fn set(&mut self, key: &'static str, value: &'static str) -> &mut Self {
+        self.vars.insert(key, value);
+        self
+    }
+
+    fn lookup(&self, key: &str) -> Option<String> {
+        self.vars.get(key).map(|v| (*v).to_string())
+    }
+
+    fn detect(&self) -> OutputMode {
+        OutputMode::detect_with_env(|k| self.lookup(k), true)
+    }
+
+    fn is_agent(&self) -> bool {
+        OutputMode::is_agent_environment_with(|k| self.lookup(k))
     }
 }
 
@@ -111,209 +64,169 @@ impl Drop for EnvGuard {
 
 /// Test that Claude Code environment is detected correctly.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_claude_code() {
-    let _guard = EnvGuard::new();
-    set_var("CLAUDE_CODE", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CLAUDE_CODE", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that OpenAI Codex CLI is detected correctly.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_codex_cli() {
-    let _guard = EnvGuard::new();
-    set_var("CODEX_CLI", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CODEX_CLI", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Codex session marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_codex_session() {
-    let _guard = EnvGuard::new();
-    set_var("CODEX_SESSION", "session-123");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CODEX_SESSION", "session-123");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Cursor IDE is detected correctly.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_cursor_session() {
-    let _guard = EnvGuard::new();
-    set_var("CURSOR_SESSION", "abc123");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CURSOR_SESSION", "abc123");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Cursor editor marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_cursor_editor() {
-    let _guard = EnvGuard::new();
-    set_var("CURSOR_EDITOR", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CURSOR_EDITOR", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Aider is detected via AIDER_MODEL.
 #[test]
-#[ignore = "requires --test-threads=1 due to env var race conditions"]
 fn test_detects_aider_model() {
-    let _guard = EnvGuard::new();
-    set_var("AIDER_MODEL", "gpt-4");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("AIDER_MODEL", "gpt-4");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Aider is detected via AIDER_REPO.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_aider_repo() {
-    let _guard = EnvGuard::new();
-    set_var("AIDER_REPO", "/path/to/repo");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("AIDER_REPO", "/path/to/repo");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that generic AGENT_MODE marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_agent_mode() {
-    let _guard = EnvGuard::new();
-    set_var("AGENT_MODE", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("AGENT_MODE", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that generic AI_AGENT marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_ai_agent() {
-    let _guard = EnvGuard::new();
-    set_var("AI_AGENT", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("AI_AGENT", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that GitHub Copilot is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_github_copilot() {
-    let _guard = EnvGuard::new();
-    set_var("GITHUB_COPILOT", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("GITHUB_COPILOT", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Copilot session marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_copilot_session() {
-    let _guard = EnvGuard::new();
-    set_var("COPILOT_SESSION", "sess-456");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("COPILOT_SESSION", "sess-456");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Continue.dev is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_continue_session() {
-    let _guard = EnvGuard::new();
-    set_var("CONTINUE_SESSION", "cont-789");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CONTINUE_SESSION", "cont-789");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Sourcegraph Cody agent marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_cody_agent() {
-    let _guard = EnvGuard::new();
-    set_var("CODY_AGENT", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CODY_AGENT", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Cody session marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_cody_session() {
-    let _guard = EnvGuard::new();
-    set_var("CODY_SESSION", "cody-abc");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CODY_SESSION", "cody-abc");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Windsurf/Codeium is detected via WINDSURF_SESSION.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_windsurf_session() {
-    let _guard = EnvGuard::new();
-    set_var("WINDSURF_SESSION", "ws-123");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("WINDSURF_SESSION", "ws-123");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Codeium agent is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_codeium_agent() {
-    let _guard = EnvGuard::new();
-    set_var("CODEIUM_AGENT", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CODEIUM_AGENT", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Google Gemini CLI is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_gemini_cli() {
-    let _guard = EnvGuard::new();
-    set_var("GEMINI_CLI", "1");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("GEMINI_CLI", "1");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Gemini session marker is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_gemini_session() {
-    let _guard = EnvGuard::new();
-    set_var("GEMINI_SESSION", "gem-xyz");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("GEMINI_SESSION", "gem-xyz");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Amazon CodeWhisperer is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_codewhisperer() {
-    let _guard = EnvGuard::new();
-    set_var("CODEWHISPERER_SESSION", "cw-123");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("CODEWHISPERER_SESSION", "cw-123");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that Amazon Q is detected.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_detects_amazon_q() {
-    let _guard = EnvGuard::new();
-    set_var("AMAZON_Q_SESSION", "q-456");
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let env = MockEnv::with("AMAZON_Q_SESSION", "q-456");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that no agent is detected in clean environment.
 #[test]
 fn test_no_agent_when_clean() {
-    let _guard = EnvGuard::new();
-    assert!(!OutputMode::is_agent_environment());
+    let env = MockEnv::new();
+    assert!(!env.is_agent());
 }
 
 // ============================================================================
@@ -322,90 +235,82 @@ fn test_no_agent_when_clean() {
 
 /// Test that SQLMODEL_RICH overrides agent detection.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_force_rich_in_agent_environment() {
-    let _guard = EnvGuard::new();
-    set_var("CLAUDE_CODE", "1");
-    set_var("SQLMODEL_RICH", "1");
-    // Despite being in agent environment, SQLMODEL_RICH forces rich mode
-    assert_eq!(OutputMode::detect(), OutputMode::Rich);
+    let mut env = MockEnv::new();
+    env.set("CLAUDE_CODE", "1");
+    env.set("SQLMODEL_RICH", "1");
+    assert_eq!(env.detect(), OutputMode::Rich);
 }
 
 /// Test that SQLMODEL_PLAIN takes priority over agent detection.
 #[test]
 fn test_plain_override_with_agent() {
-    let _guard = EnvGuard::new();
-    set_var("CLAUDE_CODE", "1");
-    set_var("SQLMODEL_PLAIN", "1");
-    // Both want plain, should be plain
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let mut env = MockEnv::new();
+    env.set("CLAUDE_CODE", "1");
+    env.set("SQLMODEL_PLAIN", "1");
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that SQLMODEL_PLAIN takes priority over SQLMODEL_RICH.
 #[test]
 fn test_plain_beats_rich_override() {
-    let _guard = EnvGuard::new();
-    set_var("SQLMODEL_PLAIN", "1");
-    set_var("SQLMODEL_RICH", "1");
-    // PLAIN is checked first
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let mut env = MockEnv::new();
+    env.set("SQLMODEL_PLAIN", "1");
+    env.set("SQLMODEL_RICH", "1");
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that SQLMODEL_PLAIN takes priority over SQLMODEL_JSON.
 #[test]
 fn test_plain_beats_json_override() {
-    let _guard = EnvGuard::new();
-    set_var("SQLMODEL_PLAIN", "1");
-    set_var("SQLMODEL_JSON", "1");
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let mut env = MockEnv::new();
+    env.set("SQLMODEL_PLAIN", "1");
+    env.set("SQLMODEL_JSON", "1");
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that SQLMODEL_JSON comes after PLAIN but before RICH.
 #[test]
 fn test_json_beats_rich_override() {
-    let _guard = EnvGuard::new();
-    set_var("SQLMODEL_JSON", "1");
-    set_var("SQLMODEL_RICH", "1");
-    // JSON is checked before RICH
-    assert_eq!(OutputMode::detect(), OutputMode::Json);
+    let mut env = MockEnv::new();
+    env.set("SQLMODEL_JSON", "1");
+    env.set("SQLMODEL_RICH", "1");
+    assert_eq!(env.detect(), OutputMode::Json);
 }
 
 /// Test that NO_COLOR standard convention works.
 #[test]
 fn test_no_color_causes_plain() {
-    let _guard = EnvGuard::new();
-    set_var("NO_COLOR", ""); // Mere presence triggers it
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let mut env = MockEnv::new();
+    env.set("NO_COLOR", "");
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that CI environment causes plain mode.
 #[test]
 fn test_ci_causes_plain() {
-    let _guard = EnvGuard::new();
-    set_var("CI", "true");
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let mut env = MockEnv::new();
+    env.set("CI", "true");
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that TERM=dumb causes plain mode.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_dumb_terminal_causes_plain() {
-    let _guard = EnvGuard::new();
-    set_var("TERM", "dumb");
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let mut env = MockEnv::new();
+    env.set("TERM", "dumb");
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 /// Test that multiple agent markers don't cause issues.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_multiple_agents_detected() {
-    let _guard = EnvGuard::new();
-    set_var("CLAUDE_CODE", "1");
-    set_var("CODEX_CLI", "1");
-    set_var("CURSOR_SESSION", "test");
-    // Should still detect agent environment
-    assert!(OutputMode::is_agent_environment());
-    assert_eq!(OutputMode::detect(), OutputMode::Plain);
+    let mut env = MockEnv::new();
+    env.set("CLAUDE_CODE", "1");
+    env.set("CODEX_CLI", "1");
+    env.set("CURSOR_SESSION", "test");
+    assert!(env.is_agent());
+    assert_eq!(env.detect(), OutputMode::Plain);
 }
 
 // ============================================================================
@@ -582,10 +487,10 @@ fn test_mode_display() {
 /// Test that console auto-detection works.
 #[test]
 fn test_console_auto_detection() {
-    let _guard = EnvGuard::new();
-    set_var("CLAUDE_CODE", "1");
+    let mut env = MockEnv::new();
+    env.set("CLAUDE_CODE", "1");
 
-    let console = SqlModelConsole::new();
+    let console = SqlModelConsole::with_env(|k| env.lookup(k), true);
     // Should detect agent and use plain mode
     assert!(console.is_plain());
 }
@@ -623,14 +528,11 @@ fn test_console_set_mode() {
 /// Test truthy value detection for env vars.
 #[test]
 fn test_truthy_values() {
-    let _guard = EnvGuard::new();
-
     // Various truthy values
     for truthy in ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON"] {
-        remove_var("SQLMODEL_PLAIN");
-        set_var("SQLMODEL_PLAIN", truthy);
+        let env = MockEnv::with("SQLMODEL_PLAIN", truthy);
         assert_eq!(
-            OutputMode::detect(),
+            env.detect(),
             OutputMode::Plain,
             "Failed for truthy value: {truthy}"
         );
@@ -639,19 +541,13 @@ fn test_truthy_values() {
 
 /// Test falsy value detection for env vars.
 #[test]
-#[ignore = "flaky: env var race conditions in parallel tests"]
 fn test_falsy_values() {
-    // Falsy values should NOT trigger plain mode (without other indicators)
-    // Note: In test environment (non-TTY), we get Plain anyway,
-    // so we test the RICH override instead
     for falsy in ["0", "false", "FALSE", "no", "NO", "off", "OFF", ""] {
-        // Create fresh guard for each iteration to avoid parallel test interference
-        let _guard = EnvGuard::new();
-        set_var("SQLMODEL_PLAIN", falsy);
-        set_var("SQLMODEL_RICH", "1"); // Force rich to check if PLAIN was triggered
+        let mut env = MockEnv::new();
+        env.set("SQLMODEL_PLAIN", falsy);
+        env.set("SQLMODEL_RICH", "1"); // Force rich to check if PLAIN was triggered
 
-        let mode = OutputMode::detect();
-        // If PLAIN was falsely triggered, we'd get Plain. We should get Rich.
+        let mode = env.detect();
         assert_eq!(
             mode,
             OutputMode::Rich,
@@ -662,13 +558,9 @@ fn test_falsy_values() {
 
 /// Test that empty agent marker is still detected (presence matters).
 #[test]
-#[ignore = "flaky: depends on environment variables not being set by CI/agent context"]
 fn test_agent_marker_presence_not_value() {
-    let _guard = EnvGuard::new();
-
-    // Empty value should still trigger detection (presence test)
-    set_var("CLAUDE_CODE", "");
-    assert!(OutputMode::is_agent_environment());
+    let env = MockEnv::with("CLAUDE_CODE", "");
+    assert!(env.is_agent());
 }
 
 /// Test default mode enum value.
@@ -699,8 +591,6 @@ fn test_mode_predicates() {
 /// Test that console default equals new.
 #[test]
 fn test_console_default_equals_new() {
-    let _guard = EnvGuard::new();
-
     let c1 = SqlModelConsole::default();
     let c2 = SqlModelConsole::new();
 
@@ -716,22 +606,7 @@ fn test_console_default_equals_new() {
 ///
 /// This test serves as living documentation of which agents are supported
 /// and how they are detected.
-///
-/// # Note
-///
-/// This test is marked `#[ignore]` because it iterates through many agents
-/// in a single test function, making it susceptible to environment variable
-/// race conditions when run in parallel with other tests.
-///
-/// Individual agent detection is covered by dedicated tests (e.g.,
-/// `test_detects_claude_code`, `test_detects_codex_cli`, etc.).
-///
-/// To run this test specifically:
-/// ```bash
-/// cargo test -p sqlmodel-console --test agent_compat test_documented_agent_support -- --ignored --test-threads=1
-/// ```
 #[test]
-#[ignore = "requires --test-threads=1 due to env var race conditions"]
 fn test_documented_agent_support() {
     struct AgentInfo {
         name: &'static str,
@@ -798,18 +673,17 @@ fn test_documented_agent_support() {
     ];
 
     for agent in agents {
-        let _guard = EnvGuard::new();
-        set_var(agent.env_var, agent.example_value);
+        let env = MockEnv::with(agent.env_var, agent.example_value);
 
         assert!(
-            OutputMode::is_agent_environment(),
+            env.is_agent(),
             "{} should be detected via {} env var",
             agent.name,
             agent.env_var
         );
 
         assert_eq!(
-            OutputMode::detect(),
+            env.detect(),
             OutputMode::Plain,
             "{} should trigger plain mode",
             agent.name

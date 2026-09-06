@@ -267,10 +267,6 @@ pub struct SqliteConnection {
     console: Option<Arc<SqlModelConsole>>,
 }
 
-// SqliteConnection is Send + Sync because all access goes through the Mutex
-unsafe impl Send for SqliteConnection {}
-unsafe impl Sync for SqliteConnection {}
-
 impl SqliteConnection {
     /// Open a new SQLite connection with the given configuration.
     pub fn open(config: &SqliteConfig) -> Result<Self, Error> {
@@ -332,6 +328,7 @@ impl SqliteConnection {
             let busy_rc = unsafe { ffi::sqlite3_busy_timeout(db, busy_timeout_ms) };
             if busy_rc != ffi::SQLITE_OK {
                 let error_code = sqlite_error_code_from_db(db, busy_rc);
+                // SAFETY: db is valid; sqlite3_errmsg returns a valid NUL-terminated C string.
                 let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)) }
                     .to_string_lossy()
                     .into_owned();
@@ -398,10 +395,12 @@ impl SqliteConnection {
         if rc != ffi::SQLITE_OK {
             let error_code = sqlite_error_code_from_db(inner.db, rc);
             let msg = if !errmsg.is_null() {
-                // SAFETY: errmsg is valid
-                let msg = unsafe { CStr::from_ptr(errmsg).to_string_lossy().into_owned() };
-                unsafe { ffi::sqlite3_free(errmsg.cast()) };
-                msg
+                // SAFETY: errmsg is non-null and was allocated by sqlite3_exec. We copy it before freeing.
+                unsafe {
+                    let msg = CStr::from_ptr(errmsg).to_string_lossy().into_owned();
+                    ffi::sqlite3_free(errmsg.cast());
+                    msg
+                }
             } else {
                 ffi::error_string(rc).to_string()
             };
@@ -480,11 +479,15 @@ impl SqliteConnection {
         let backup =
             unsafe { ffi::sqlite3_backup_init(dest_db, main.as_ptr(), source_db, main.as_ptr()) };
         if backup.is_null() {
-            let result_code = unsafe { ffi::sqlite3_errcode(dest_db) };
+            // SAFETY: dest_db is valid; errcode and errmsg read its last error state.
+            let (result_code, msg) = unsafe {
+                let code = ffi::sqlite3_errcode(dest_db);
+                let m = CStr::from_ptr(ffi::sqlite3_errmsg(dest_db))
+                    .to_string_lossy()
+                    .into_owned();
+                (code, m)
+            };
             let error_code = sqlite_error_code_from_db(dest_db, result_code);
-            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
-                .to_string_lossy()
-                .into_owned();
             return Err(Error::Connection(ConnectionError {
                 kind: ConnectionErrorKind::Connect,
                 message: format!("SQLite backup init failed: {msg}"),
@@ -509,12 +512,14 @@ impl SqliteConnection {
             source_busy_timeout_ms,
             dest_busy_timeout_ms,
         );
+        // SAFETY: backup handle was initialized above and verified non-null.
         let mut rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
         loop {
             if rc == ffi::SQLITE_DONE {
                 break;
             }
             if rc == ffi::SQLITE_OK {
+                // SAFETY: backup handle is non-null and valid.
                 rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
                 continue;
             }
@@ -529,6 +534,7 @@ impl SqliteConnection {
                 if Instant::now() >= busy_deadline {
                     break;
                 }
+                // SAFETY: backup handle is non-null and valid.
                 rc = unsafe { ffi::sqlite3_backup_step(backup, 100) };
                 continue;
             }
@@ -546,6 +552,7 @@ impl SqliteConnection {
             None
         };
 
+        // SAFETY: backup handle is non-null and valid; backup_finish releases its resources.
         let finish_rc = unsafe { ffi::sqlite3_backup_finish(backup) };
 
         if let Some(error) = backup_error {
@@ -554,6 +561,7 @@ impl SqliteConnection {
 
         if finish_rc != ffi::SQLITE_OK {
             let error_code = sqlite_error_code_from_db(dest_db, finish_rc);
+            // SAFETY: dest_db is valid; sqlite3_errmsg returns a valid NUL-terminated C string.
             let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(dest_db)) }
                 .to_string_lossy()
                 .into_owned();
@@ -613,6 +621,7 @@ impl SqliteConnection {
         let col_count = unsafe { ffi::sqlite3_column_count(stmt) };
         let mut col_names = Vec::with_capacity(col_count as usize);
         for i in 0..col_count {
+            // SAFETY: stmt is valid and i is within 0..col_count.
             let name =
                 unsafe { types::column_name(stmt, i) }.unwrap_or_else(|| format!("col{}", i));
             col_names.push(name);
@@ -1021,6 +1030,7 @@ impl Connection for SqliteConnection {
 
             let mut columns = Vec::with_capacity(col_count as usize);
             for i in 0..col_count {
+                // SAFETY: stmt is valid and i is within 0..col_count.
                 if let Some(name) = unsafe { types::column_name(stmt, i) } {
                     columns.push(name);
                 }
@@ -1261,17 +1271,22 @@ fn sqlite_busy_timeout_ms(db: *mut ffi::sqlite3) -> Result<c_int, Error> {
     let row_rc = unsafe { ffi::sqlite3_step(stmt) };
     if row_rc != ffi::SQLITE_ROW {
         let error = step_error(db, SQL, row_rc);
+        // SAFETY: stmt is valid and must be finalized to release resources.
         unsafe { ffi::sqlite3_finalize(stmt) };
         return Err(error);
     }
+    // SAFETY: stmt is on a valid row and column 0 contains an integer.
     let timeout_ms = unsafe { ffi::sqlite3_column_int(stmt, 0) };
 
+    // SAFETY: stmt is valid and stepping completes the PRAGMA query.
     let done_rc = unsafe { ffi::sqlite3_step(stmt) };
     if done_rc != ffi::SQLITE_DONE {
         let error = step_error(db, SQL, done_rc);
+        // SAFETY: stmt is valid and must be finalized to release resources.
         unsafe { ffi::sqlite3_finalize(stmt) };
         return Err(error);
     }
+    // SAFETY: stmt is valid and must be finalized to release resources.
     unsafe { ffi::sqlite3_finalize(stmt) };
 
     Ok(timeout_ms.max(0))
@@ -1279,10 +1294,11 @@ fn sqlite_busy_timeout_ms(db: *mut ffi::sqlite3) -> Result<c_int, Error> {
 
 impl Drop for BackupBusyTimeoutGuard {
     fn drop(&mut self) {
-        // sqlite3_busy_timeout returns SQLITE_OK for valid handles. Both
+        // SAFETY: sqlite3_busy_timeout returns SQLITE_OK for valid handles. Both
         // handles are still protected by their connection mutexes here.
         let source_rc =
             unsafe { ffi::sqlite3_busy_timeout(self.source_db, self.source_timeout_ms) };
+        // SAFETY: dest_db handle remains valid and locked by its connection mutex.
         let dest_rc = unsafe { ffi::sqlite3_busy_timeout(self.dest_db, self.dest_timeout_ms) };
         debug_assert_eq!(source_rc, ffi::SQLITE_OK);
         debug_assert_eq!(dest_rc, ffi::SQLITE_OK);
@@ -1382,6 +1398,7 @@ fn backup_step_error(db: *mut ffi::sqlite3, result: c_int) -> Error {
         // SQLite documents backup routine failures on the destination
         // connection. Capture its detailed message while retaining `result`
         // itself as the authoritative exact code.
+        // SAFETY: db is a valid SQLite handle and sqlite3_errmsg returns a valid NUL-terminated C string.
         unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)) }
             .to_string_lossy()
             .into_owned()
