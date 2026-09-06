@@ -19,10 +19,7 @@ set -euo pipefail
 thresholds_file="${1:-crates/sqlmodel-e2e/benches/thresholds.toml}"
 criterion_dir="${2:-target/criterion}"
 
-if [[ -z "${SQLMODEL_UPDATE_THRESHOLDS:-}" && ! -f "$thresholds_file" ]]; then
-    echo "bench_guard: thresholds file not found: $thresholds_file" >&2
-    exit 2
-fi
+if [[ -n "${SQLMODEL_UPDATE_THRESHOLDS:-}" ]]; then
     for est in "$criterion_dir"/*/*/new/estimates.json; do
         [[ -f "$est" ]] || continue
         key="${est#"$criterion_dir"/}"
@@ -33,6 +30,10 @@ fi
         printf '"%s" = %d\n' "$key" "$rounded"
     done | sort
     exit 0
+fi
+if [[ ! -f "$thresholds_file" ]]; then
+    echo "bench_guard: thresholds file not found: $thresholds_file" >&2
+    exit 2
 fi
 
 fail=0
