@@ -3,6 +3,11 @@
 Newest entry first. Each refresh records what moved, why it is safe (release notes read, not
 guessed), and which test run proves it.
 
+## Procedure
+1. **Cargo dependencies:** `cargo update`, evaluate advisories with `cargo audit --deny warnings` and `cargo deny check advisories bans licenses sources`.
+2. **GitHub Actions:** GitHub Actions are part of every dependency refresh: review `.github/workflows/*.yml` actions for new major releases and deprecations; maintain Dependabot configuration in `.github/dependabot.yml`.
+3. **Verification:** Run workspace gates (`cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo doc`).
+
 ---
 
 ## 2026-09-02 refresh
@@ -79,7 +84,7 @@ cargo audit --deny warnings && cargo deny check advisories bans licenses sources
 Builds were invoked as `rch exec -- cargo ...` because the RCH PreToolUse hook refused plain cargo commands on this machine (`force_remote = true`, fleet pressure); see AGENTS.md "RCH".
 
 ### Notes
-- GitHub Actions versions were not reviewed in this refresh; tracked as bd-qz1a.4.
+- GitHub Actions reviewed and updated (bd-qz1a.4): pinning policy documented in ci.yml, dependabot.yml configured with grouped updates, actions updated to current majors (upload-artifact@v7, download-artifact@v8, action-gh-release@v3).
 - The 0.4.2 release is half-published on crates.io (only `sqlmodel-core` and `sqlmodel-frankensqlite`); this refresh changes `Cargo.lock` (not published for libraries) and the frankensqlite/mysql manifest requirements only, so registry consumers are unaffected. See bd-jeof.1.
 
 ---

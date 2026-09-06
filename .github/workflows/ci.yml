@@ -1,5 +1,10 @@
 name: CI
 
+# Action pinning policy: Major version tags with automated weekly Dependabot updates
+# (.github/dependabot.yml). Floating on major tags receives security and bugfix minor
+# and patch updates automatically, while major version transitions are reviewed
+# in grouped pull requests. GitHub Actions currency is reviewed on every dependency refresh.
+#
 # Toolchain note: rust-toolchain.toml pins nightly-2026-08-25 and rustup honors
 # it in every job below; the dtolnay action is used only to add components and
 # targets. All dependencies resolve from crates.io (no local clones since 0.4.0)
@@ -329,7 +334,7 @@ jobs:
           tail -40 bloat_report.txt
 
       - name: Upload bloat report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bloat-report
           path: bloat_report.txt

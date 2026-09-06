@@ -10,8 +10,6 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
-        exclude-patterns:
-          - "asupersync"  # Local path dependency
     commit-message:
       prefix: "deps"
     labels:
@@ -24,6 +22,10 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     commit-message:
       prefix: "ci"
     labels:
