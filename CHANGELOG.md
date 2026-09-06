@@ -1166,7 +1166,7 @@ guarded in CI at 2x by `scripts/bench_guard.sh`; 13-column model):
 | Operation | Mean |
 |-----------|------|
 | `to_row` (derive / hand-written) | 197 ns / 150 ns |
-| `from_row` (derive / hand-written) | 1431 ns / 215 ns -- generated `from_row` resolves columns by name; tracked for codegen work |
+| `from_row` (derive / hand-written) | 491 ns / 206 ns -- single-pass scan via `Row::locate_columns` (bd-n5q4, down from 1431 ns) |
 | Filtered SELECT emission (SQLite / Postgres / MySQL) | 2.83 / 2.79 / 2.73 us |
 | `insert_many!` 10 / 100 / 500 rows (SQLite) | 20.3 us / 198 us / 983 us |
 | Filtered SELECT allocations | 1.67 KiB |

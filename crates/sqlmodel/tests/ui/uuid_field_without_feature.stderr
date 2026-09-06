@@ -48,9 +48,9 @@ error[E0277]: `uuid::Uuid` cannot be read from a database row: it has no `FromVa
             f32
             f64
           and $N others
-note: required by a bound in `Row::get_named`
+note: required by a bound in `Row::get_as`
  --> $WORKSPACE/crates/sqlmodel-core/src/row.rs
   |
-  |     pub fn get_named<T: FromValue>(&self, name: &str) -> Result<T> {
-  |                         ^^^^^^^^^ required by this bound in `Row::get_named`
+  |     pub fn get_as<T: FromValue>(&self, index: usize) -> Result<T> {
+  |                      ^^^^^^^^^ required by this bound in `Row::get_as`
   = note: this error originates in the derive macro `sqlmodel::Model` (in Nightly builds, run with -Z macro-backtrace for more info)

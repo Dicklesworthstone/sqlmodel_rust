@@ -726,7 +726,7 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
             row
         };
         let __sm_slots = #row_ident.locate_columns(#columns_list);
-        #(#slot_decls,)*
+        #(#slot_decls)*
 
         Ok(#name {
             #(#field_extractions,)*
