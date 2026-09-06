@@ -183,16 +183,20 @@ This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
 ---
 
-## 10. Serialization (via Serde)
+## 10. Serialization and Model Dump
 
 | Feature | Python | Rust | Status |
 |---------|--------|------|--------|
-| To dict/struct | `model_dump()` | Native struct | ✅ N/A |
+| To dict/Value | `model_dump()` | `SqlModelDump::sql_model_dump()` / Native struct | ✅ Complete |
 | To JSON | `model_dump_json()` | `serde_json::to_string()` | ✅ Complete |
-| From dict | `Model(**dict)` | `Model { ... }` | ✅ N/A |
-| From JSON | `model_validate_json()` | `serde_json::from_str()` | ✅ Complete |
-| Exclude fields | `exclude=` | `#[serde(skip)]` | ✅ Complete |
-| Rename fields | `alias=` | `#[serde(rename = "...")]` | ✅ Complete |
+| From dict | `Model(**dict)` | `Model { ... }` | ✅ Complete |
+| From JSON | `model_validate_json()` | `serde_json::from_str()` / `SqlModelValidate` | ✅ Complete |
+| Exclude fields | `exclude=` | `#[serde(skip)]` / `#[sqlmodel(exclude)]` / `DumpOptions::exclude()` | ✅ Complete |
+| Include fields | `include=` | `DumpOptions::include()` | ✅ Complete |
+| Exclude unset | `exclude_unset=True` | `DumpOptions::exclude_unset()` with `TrackedModel<T>` / `tracked!` / `sql_model_validate_tracked` | ✅ Complete (wrapper-based) |
+| Exclude defaults | `exclude_defaults=True` | `DumpOptions::exclude_defaults()` | ✅ Complete |
+| Exclude none/null | `exclude_none=True` | `DumpOptions::exclude_none()` | ✅ Complete |
+| Rename fields | `alias=` | `#[serde(rename = "...")]` / `apply_serialization_aliases()` | ✅ Complete |
 
 ---
 
@@ -331,11 +335,12 @@ The Rust SQLModel implementation covers the core ORM functionality (Model derive
 7. **Validate derive macro** - Numeric/string constraints, custom validators
 8. **SQL type override** - `#[sqlmodel(sql_type = "...")]` for DDL customization
 9. **Referential actions** - `on_delete` and `on_update` foreign key actions
-10. **Table inheritance** - Single-table (STI), concrete-table (CTI), and joined-table (JTI) inheritance with polymorphic queries and base+child DML coordination. Joined-table inheritance currently supports single-level hierarchies (`Base <- Child`); multi-level joined hierarchies are rejected at compile time with a clear diagnostic (arbitrary N-level design recorded in bd-kzp1.5).
+10. **Table inheritance** - Single-table (STI), concrete-table (CTI), and joined-table (JTI) inheritance with polymorphic queries, base+child DML coordination, and structured DEBUG/TRACE diagnostics (`sqlmodel_query::inheritance`, `sqlmodel_query::polymorphic`, `sqlmodel_schema::inheritance`). Joined-table inheritance currently supports single-level hierarchies (`Base <- Child`); multi-level joined hierarchies are rejected at compile time with a clear diagnostic (arbitrary N-level design recorded in bd-kzp1.5).
+11. **Exclude unset serialization** - Supported via `TrackedModel<T>` wrapper (`tracked!(...)`, `User::sql_model_validate_tracked()`, `DumpOptions::exclude_unset()`) to preserve plain Rust struct ergonomics while tracking field mutation/presence.
 
 ### Remaining Work
 
-All missing/partial features must be represented as explicit Beads tasks under `bd-162`. This document should not list exclusions. Known open items as of 2026-09-02: table-inheritance completion (bd-kzp1.1-.7), `exclude_unset` without the `TrackedModel` wrapper (bd-3twt), real-database proof for schema/session/pool (bd-slot), and the type-mapping adapters for chrono/uuid/decimal (bd-7wal.1).
+All missing/partial features must be represented as explicit Beads tasks under `bd-162`. This document should not list exclusions. Known open items as of 2026-09-06: real-database proof for schema/session/pool (bd-slot) and documentation/hygiene tasks.
 
 ---
 
