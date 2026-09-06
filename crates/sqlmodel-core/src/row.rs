@@ -241,6 +241,28 @@ impl Row {
         })
     }
 
+    /// Resolve the column index of every name in `names` in a single scan.
+    ///
+    /// `get_named` performs a linear search per call, so hydrating an
+    /// N-column model costs O(rows_fields x row_columns) name comparisons.
+    /// This method makes the same lookups one pass: each row column is
+    /// compared against the not-yet-found names exactly once. The result is
+    /// ordered like `names`; `None` means the row has no such column (the
+    /// same condition `contains_column` reports).
+    #[must_use]
+    pub fn locate_columns(&self, names: &[&str]) -> Vec<Option<usize>> {
+        let mut found: Vec<Option<usize>> = vec![None; names.len()];
+        for (col_idx, col) in self.columns.names().iter().enumerate() {
+            for (slot, want) in found.iter_mut().zip(names) {
+                if slot.is_none() && col.as_str() == *want {
+                    *slot = Some(col_idx);
+                    break;
+                }
+            }
+        }
+        found
+    }
+
     /// Get all column names.
     pub fn column_names(&self) -> impl Iterator<Item = &str> {
         self.columns.names().iter().map(String::as_str)

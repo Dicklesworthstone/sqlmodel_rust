@@ -590,31 +590,58 @@ fn generate_to_row(model: &ModelDef) -> proc_macro2::TokenStream {
 /// Generate the from_row method body.
 fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
     let name = &model.name;
-    let mut field_extractions = Vec::new();
-
-    // Support both "plain" rows (SELECT *) and prefixed/aliased rows (e.g. eager loading,
-    // joined inheritance) by looking for `table__col` prefixes.
     let row_ident = quote::format_ident!("local_row");
 
-    for field in model.select_fields() {
+    // Support both "plain" rows (SELECT *) and prefixed/aliased rows (eager
+    // loading, joined inheritance) by looking for `table__col` prefixes.
+    //
+    // Hydration resolves every column index in ONE pass (`Row::locate_columns`)
+    // instead of a linear `get_named` scan per field, and the unconditional
+    // `Row::clone` of the plain path is gone: the prefixed subset Row is
+    // materialized only when a prefix is actually present (bd-n5q4).
+    let plain_columns: Vec<proc_macro2::Literal> = model
+        .select_fields()
+        .iter()
+        .map(|f| proc_macro2::Literal::string(&f.column_name))
+        .collect();
+    // Static &'static str literals: `locate_columns` takes &[&str] with no
+    // runtime construction.
+    let columns_list = quote::quote! { &[#(#plain_columns),*] };
+
+    let mut field_extractions = Vec::new();
+    for (field_index, field) in model.select_fields().iter().enumerate() {
         let field_name = &field.name;
         let column_name = &field.column_name;
+        let field_ty = &field.ty;
+        // Each field's resolved column index lives in its own local
+        // (`__sm_slot_N`), assigned by the single-pass scan below.
+        let slot = quote::format_ident!("__sm_slot_{}", syn::Index::from(field_index));
 
+        // For Option<T> fields: an absent column (partial projections) or a
+        // NULL hydrates as None, but a value of the wrong type is a real
+        // error and must not be silently turned into None.
         if parse::is_option_type(&field.ty) {
-            // For Option<T> fields: a NULL value or an absent column (partial
-            // projections) hydrates as None, but a value of the wrong type is a
-            // real error and must not be silently turned into None.
             field_extractions.push(quote::quote! {
-                #field_name: if #row_ident.contains_column(#column_name) {
-                    #row_ident.get_named(#column_name)?
-                } else {
-                    None
+                #field_name: match #slot {
+                    Some(__sm_idx) => #row_ident.get_as(__sm_idx)?,
+                    None => None,
                 }
             });
         } else {
-            // For required fields, propagate errors
             field_extractions.push(quote::quote! {
-                #field_name: #row_ident.get_named(#column_name)?
+                #field_name: match #slot {
+                    Some(__sm_idx) => #row_ident.get_as(__sm_idx)?,
+                    None => {
+                        return Err(sqlmodel_core::Error::Type(
+                            sqlmodel_core::error::TypeError {
+                                expected: std::any::type_name::<#field_ty>(),
+                                actual: ::std::format!("column '{}' not found", #column_name),
+                                column: Some(#column_name.to_string()),
+                                rust_type: None,
+                            },
+                        ));
+                    }
+                }
             });
         }
     }
@@ -680,12 +707,26 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
         })
         .collect();
 
+    // The slot locals + single-pass scan that feed the field extractions.
+    let slot_decls: Vec<_> = (0..plain_columns.len())
+        .map(|i| {
+            let slot = quote::format_ident!("__sm_slot_{}", syn::Index::from(i));
+            quote::quote! { let #slot: Option<usize> = __sm_slots[#i]; }
+        })
+        .collect();
+
     quote::quote! {
-        let #row_ident = if row.has_prefix(<Self as sqlmodel_core::Model>::TABLE_NAME) {
-            row.subset_by_prefix(<Self as sqlmodel_core::Model>::TABLE_NAME)
+        let __sm_row_owned;
+        let #row_ident: &sqlmodel_core::Row = if row
+            .has_prefix(<Self as sqlmodel_core::Model>::TABLE_NAME)
+        {
+            __sm_row_owned = row.subset_by_prefix(<Self as sqlmodel_core::Model>::TABLE_NAME);
+            &__sm_row_owned
         } else {
-            row.clone()
+            row
         };
+        let __sm_slots = #row_ident.locate_columns(#columns_list);
+        #(#slot_decls,)*
 
         Ok(#name {
             #(#field_extractions,)*
