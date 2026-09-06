@@ -1273,7 +1273,8 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                         "joined-table inheritance insert requires a primary key column".to_string(),
                     ));
                 };
-                let action = on_conflict
+                // The parent half only: parent columns and parent target.
+                let action = parent_on_conflict
                     .as_ref()
                     .expect("on_conflict is Some in this branch");
                 let (plain_sql, params, _cols) = build_insert_sql_for_table_with_columns(
@@ -1760,8 +1761,8 @@ impl<'a, M: Model> InsertBuilder<'a, M> {
                         "joined-table inheritance insert requires a primary key column".to_string(),
                     ));
                 };
-                let action = self
-                    .on_conflict
+                // The parent half only: parent columns and parent target.
+                let action = parent_on_conflict
                     .as_ref()
                     .expect("on_conflict is Some in this branch");
                 let (plain_sql, params, _cols) = build_insert_sql_for_table_with_columns(

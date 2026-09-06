@@ -12,7 +12,7 @@ use sqlmodel_sqlite::SqliteConnection;
 fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
     match outcome {
         Outcome::Ok(v) => v,
-        Outcome::Err(e) => panic!("unexpected error: {e}"),
+        Outcome::Err(e) => panic!("unexpected error: {e} // DEBUG {e:?}"),
         Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
         Outcome::Panicked(p) => panic!("panicked: {p:?}"),
     }
@@ -179,12 +179,20 @@ fn sqlite_joined_inheritance_dml_inserts_updates_deletes_base_and_child() {
             id: Some(id),
             grade: "A*".to_string(),
         };
-        let upsert_id = unwrap_outcome(
-            insert!(&upsert_model)
-                .on_conflict_do_update(&["name", "grade"])
-                .execute(&cx, &conn)
-                .await,
-        );
+        eprintln!("PHASE: explicit-pk upsert");
+        let upsert_id = match insert!(&upsert_model)
+            .on_conflict_do_update(&["name", "grade"])
+            .execute(&cx, &conn)
+            .await
+        {
+            Outcome::Ok(v) => v,
+            Outcome::Err(ref e) => {
+                eprintln!("FULL ERROR DEBUG: {e:?}");
+                panic!("upsert failed: {e}");
+            }
+            Outcome::Cancelled(r) => panic!("cancelled: {r:?}"),
+            Outcome::Panicked(p) => panic!("panicked: {p:?}"),
+        };
         assert_eq!(upsert_id, id);
 
         let people_after_upsert = unwrap_outcome(
@@ -233,7 +241,10 @@ fn sqlite_joined_inheritance_dml_inserts_updates_deletes_base_and_child() {
                 .execute_returning(&cx, &conn)
                 .await,
         );
-        assert!(conflict_returning.is_none(), "DO NOTHING skips: {conflict_returning:?}");
+        assert!(
+            conflict_returning.is_none(),
+            "DO NOTHING skips: {conflict_returning:?}"
+        );
 
         // DO UPDATE + RETURNING re-reads the surviving joined row.
         let upsert_rows = unwrap_outcome(
@@ -259,11 +270,13 @@ fn sqlite_joined_inheritance_dml_inserts_updates_deletes_base_and_child() {
         // Auto-increment upsert keyed by a non-PK parent UNIQUE column
         // (person.name): the surviving parent id is learned via the conflict
         // clause and propagated to the child row; parent and child columns
-        // both update.
+        // both update. Person 1's name is "Alice4" at this point (the
+        // explicit-PK upsert above renamed it), so this conflicts on that
+        // row and must reuse id 1.
         let auto_upsert = Student {
             person: Person {
                 id: None,
-                name: "Alice".to_string(),
+                name: "Alice4".to_string(),
             },
             id: None,
             grade: "B".to_string(),
