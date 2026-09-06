@@ -212,7 +212,7 @@ Measured by CI's `size-and-startup` job (bd-4ttf.2) against
 | Binary size | < 5MB with LTO | 2.09 MiB (C SQLite driver, release profile) — passes |
 | Binary size (pure-Rust driver) | informational | 12.6 MiB (FrankenSQLite bundles the fsqlite implementation; explicit decision in bd-4ttf.2, see below) |
 | Startup time | < 10ms | 2.4 ms median over 20 runs (C SQLite driver) — passes; FrankenSQLite median 5.5 ms |
-| Query latency | Competitive with native drivers | Not measured (bd-4ttf.1) |
+| Query latency | Competitive with native drivers | Measured (bd-4ttf.1/4, criterion on the RCH hz3 worker, 2026-09-06): filtered SELECT emission ≈2.8 µs (SQLite; 2.7-2.8 µs Postgres/MySQL), 500-row `insert_many!` ≈0.98 ms, `to_row` ≈197 ns. Full tables in `crates/sqlmodel-e2e/benches/thresholds.toml`; guarded in CI at 2x. Concurrent-writer behavior proven in `franken_mvcc_e2e.rs` (bd-slot.10) |
 | Type safety | 100% compile-time checked | Holds by construction for models and builders; raw SQL escape hatches are runtime-checked |
 
 On the pure-Rust driver size: the 5 MiB target applies to the shipped

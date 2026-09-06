@@ -96,7 +96,13 @@ We extracted the *behavior specification* from Python SQLModel/SQLAlchemy/Pydant
 
 ### 2. Zero-Cost Abstractions
 
-All `Model` implementations are generated at compile time via proc macros. No runtime reflection, no vtables, no hidden allocations. The generated code is as fast as hand-written implementations.
+All `Model` implementations are generated at compile time via proc macros. No runtime reflection, no vtables. Measured against hand-written equivalents
+(13-column model, criterion, RCH worker hz3, 2026-09-06): `to_row` runs ≈197 ns
+vs 150 ns hand-written; SQL emission costs ≈0.15–2.8 µs per statement by shape.
+The one measured gap: generated `from_row` resolves every column by name and
+runs ≈1.43 µs vs 215 ns hand-written — tracked as codegen work, not hidden.
+Benchmarks live in `crates/sqlmodel-e2e/benches/`, with CI thresholds in
+`benches/thresholds.toml`.
 
 ### 3. Structured Concurrency
 

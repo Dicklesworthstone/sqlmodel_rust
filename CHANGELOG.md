@@ -1157,6 +1157,25 @@ Bump commit: [`d14218b`](https://github.com/Dicklesworthstone/sqlmodel_rust/comm
 - Console User Guide and Agent Compatibility Guide ([`5cbd35e`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/5cbd35ec185d9cbed2cf270a4219535807a9febc), [`680cace`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/680cace274fe0000178af628b8e178a5a6964170)).
 - MIT License added ([`196f5da`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/196f5da935cdc79397c99044902b5914f16d0c10)).
 
+
+## Measured Performance Snapshot -- 2026-09-06 (bd-4ttf.3)
+
+Criterion benches on the RCH hz3 worker (`crates/sqlmodel-e2e/benches/`,
+guarded in CI at 2x by `scripts/bench_guard.sh`; 13-column model):
+
+| Operation | Mean |
+|-----------|------|
+| `to_row` (derive / hand-written) | 197 ns / 150 ns |
+| `from_row` (derive / hand-written) | 1431 ns / 215 ns -- generated `from_row` resolves columns by name; tracked for codegen work |
+| Filtered SELECT emission (SQLite / Postgres / MySQL) | 2.83 / 2.79 / 2.73 us |
+| `insert_many!` 10 / 100 / 500 rows (SQLite) | 20.3 us / 198 us / 983 us |
+| Filtered SELECT allocations | 1.67 KiB |
+| Minimal-app release binary (C SQLite driver) | 2.10 MiB, 2.5 ms median startup (bd-4ttf.2) |
+
+Concurrent-writer behavior under `BEGIN CONCURRENT` is proven end to end in
+`franken_mvcc_e2e.rs` (bd-slot.10): page-level conflicts detected and resolved
+by `retry_transaction`, balances conserved, cancellation rolled back.
+
 ---
 
 [0.2.1]: https://github.com/Dicklesworthstone/sqlmodel_rust/compare/v0.2.0...main
