@@ -896,7 +896,7 @@ impl InheritanceStrategy {
 ///
 /// This struct captures the inheritance configuration for models that participate
 /// in table inheritance hierarchies.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct InheritanceInfo {
     /// The inheritance strategy for this model.
     pub strategy: InheritanceStrategy,
@@ -975,6 +975,11 @@ impl InheritanceInfo {
             discriminator_column: None,
             discriminator_value: None,
         }
+    }
+
+    /// Check if this model has a parent model in an inheritance hierarchy.
+    pub const fn has_parent(&self) -> bool {
+        self.parent.is_some()
     }
 
     /// Set the discriminator column name (builder pattern, for base models).

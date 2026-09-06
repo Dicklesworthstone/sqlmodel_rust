@@ -157,8 +157,46 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     // Generate model_config implementation
     let model_config_body = generate_model_config(model);
 
+    // Helper: interpret `inherits = "..."` as a Rust type path in the current scope.
+    let parent_ty_ts: Option<proc_macro2::TokenStream> =
+        model.config.inherits.as_deref().map(|p| {
+            if let Ok(path) = syn::parse_str::<syn::Path>(p) {
+                quote::quote! { #path }
+            } else {
+                let ident = syn::Ident::new(p, proc_macro2::Span::call_site());
+                quote::quote! { #ident }
+            }
+        });
+
+    // Multi-level joined inheritance compile-time rejection (bd-kzp1.5):
+    // If this is a joined-table inheritance child, verify that the parent model is NOT
+    // already a child in an inheritance hierarchy.
+    let is_joined_child = model.config.inheritance == InheritanceStrategy::Joined
+        && model.config.inherits.is_some()
+        && model.config.discriminator_value.is_none();
+    let joined_inheritance_check = if is_joined_child {
+        let parent_ty = parent_ty_ts
+            .as_ref()
+            .expect("parent_ty exists for joined child");
+        quote::quote! {
+            const _: () = {
+                if <#parent_ty as sqlmodel_core::Model>::INHERITANCE.has_parent() {
+                    panic!(concat!(
+                        "multi-level joined inheritance is not supported; flatten <",
+                        stringify!(#parent_ty),
+                        "> into <",
+                        stringify!(#name),
+                        "> or use single-table inheritance"
+                    ));
+                }
+            };
+        }
+    } else {
+        quote::quote! {}
+    };
+
     // Generate inheritance implementation
-    let inheritance_body = generate_inheritance(model);
+    let inheritance_body = generate_inheritance(model, parent_ty_ts.as_ref());
 
     // Generate shard_key implementation
     let (shard_key_const, shard_key_value_body) = generate_shard_key(model);
@@ -178,6 +216,7 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
             const PRIMARY_KEY: &'static [&'static str] = #pk_slice;
             const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] = #relationships;
             const SHARD_KEY: Option<&'static str> = #shard_key_const;
+            const INHERITANCE: sqlmodel_core::InheritanceInfo = #inheritance_body;
 
             fn fields() -> &'static [sqlmodel_core::FieldInfo] {
                 static FIELDS: &[sqlmodel_core::FieldInfo] = &[
@@ -215,7 +254,7 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
             }
 
             fn inheritance() -> sqlmodel_core::InheritanceInfo {
-                #inheritance_body
+                Self::INHERITANCE
             }
 
             fn shard_key_value(&self) -> Option<sqlmodel_core::Value> {
@@ -228,6 +267,8 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
         #debug_impl
 
         #hybrid_impl
+
+        #joined_inheritance_check
     }
 }
 
@@ -865,7 +906,10 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
 }
 
 /// Generate the inheritance method body.
-fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_inheritance(
+    model: &ModelDef,
+    parent_ty_ts: Option<&proc_macro2::TokenStream>,
+) -> proc_macro2::TokenStream {
     use crate::parse::InheritanceStrategy;
 
     let config = &model.config;
@@ -886,26 +930,14 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
         }
     };
 
-    // Helper: interpret `inherits = "..."` as a Rust type path in the current scope.
-    // We keep it as a string in parsing so attribute syntax stays simple; here we
-    // translate it into type tokens for codegen.
-    let parent_ty_ts: Option<proc_macro2::TokenStream> = config.inherits.as_deref().map(|p| {
-        if let Ok(path) = syn::parse_str::<syn::Path>(p) {
-            quote::quote! { #path }
-        } else {
-            let ident = syn::Ident::new(p, proc_macro2::Span::call_site());
-            quote::quote! { #ident }
-        }
-    });
-
     // Store parent table name (not parent Rust type name) in metadata so schema/DDL can be correct.
-    let parent_table_ts = if let Some(ref parent_ty) = parent_ty_ts {
+    let parent_table_ts = if let Some(parent_ty) = parent_ty_ts {
         quote::quote! { Some(<#parent_ty as sqlmodel_core::Model>::TABLE_NAME) }
     } else {
         quote::quote! { None }
     };
 
-    let parent_fields_fn_ts = if let Some(ref parent_ty) = parent_ty_ts {
+    let parent_fields_fn_ts = if let Some(parent_ty) = parent_ty_ts {
         quote::quote! { Some(<#parent_ty as sqlmodel_core::Model>::fields) }
     } else {
         quote::quote! { None }
@@ -919,8 +951,8 @@ fn generate_inheritance(model: &ModelDef) -> proc_macro2::TokenStream {
     let discriminator_column_ts = if let Some(ref column) = config.discriminator_column {
         quote::quote! { Some(#column) }
     } else if config.discriminator_value.is_some() {
-        if let Some(parent_ty) = parent_ty_ts.as_ref() {
-            quote::quote! { <#parent_ty as sqlmodel_core::Model>::inheritance().discriminator_column }
+        if let Some(parent_ty) = parent_ty_ts {
+            quote::quote! { <#parent_ty as sqlmodel_core::Model>::INHERITANCE.discriminator_column }
         } else {
             quote::quote! { None }
         }

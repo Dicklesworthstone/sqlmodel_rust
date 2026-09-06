@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: multi-level joined inheritance is not supported; flatten <Employee> into <Manager> or use single-table inheritance
+  --> tests/ui/multilevel_joined_inheritance_rejected.rs:21:10
+   |
+21 | #[derive(sqlmodel::Model)]
+   |          ^^^^^^^^^^^^^^^ evaluation of `_` failed here

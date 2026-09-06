@@ -22,3 +22,9 @@ fn external_type_fields_compile_with_their_feature() {
     let cases = trybuild::TestCases::new();
     cases.pass("tests/ui/*_with_feature.rs");
 }
+
+#[test]
+fn multilevel_joined_inheritance_rejected() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui/multilevel_joined_inheritance_rejected.rs");
+}

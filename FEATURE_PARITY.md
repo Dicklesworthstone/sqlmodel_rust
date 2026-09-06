@@ -331,6 +331,7 @@ The Rust SQLModel implementation covers the core ORM functionality (Model derive
 7. **Validate derive macro** - Numeric/string constraints, custom validators
 8. **SQL type override** - `#[sqlmodel(sql_type = "...")]` for DDL customization
 9. **Referential actions** - `on_delete` and `on_update` foreign key actions
+10. **Table inheritance** - Single-table (STI), concrete-table (CTI), and joined-table (JTI) inheritance with polymorphic queries and base+child DML coordination. Joined-table inheritance currently supports single-level hierarchies (`Base <- Child`); multi-level joined hierarchies are rejected at compile time with a clear diagnostic (arbitrary N-level design recorded in bd-kzp1.5).
 
 ### Remaining Work
 

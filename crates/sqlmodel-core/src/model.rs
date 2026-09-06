@@ -169,13 +169,16 @@ pub trait Model: Sized + Send + Sync {
     /// no relationships can rely on the default empty slice.
     const RELATIONSHIPS: &'static [RelationshipInfo] = &[];
 
+    /// Inheritance metadata for this model as an associated constant.
+    const INHERITANCE: InheritanceInfo = InheritanceInfo::none();
+
     /// Inheritance metadata for this model.
     ///
     /// Returns information about table inheritance if this model participates
     /// in an inheritance hierarchy (single, joined, or concrete table).
-    /// The default implementation returns no inheritance.
+    /// The default implementation returns `Self::INHERITANCE`.
     fn inheritance() -> InheritanceInfo {
-        InheritanceInfo::none()
+        Self::INHERITANCE
     }
 
     /// Get field metadata for all columns.

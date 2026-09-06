@@ -155,6 +155,12 @@ Polymorphic query strategy:
 - Hydration chooses variant based on non-null child prefixes.
 - Ambiguity (more than one child prefix non-null) is treated as an error.
 
+Hierarchy depth:
+
+- Joined-table inheritance currently supports single-level hierarchies (`Base <- Child`).
+- Multi-level joined inheritance (`Base <- Child <- Grandchild`) is rejected at compile time with a diagnostic directing the user to flatten the hierarchy into the child model or use single-table inheritance (`multi-level joined inheritance is not supported; flatten <Parent> into <Child> or use single-table inheritance`).
+- Arbitrary N-level joined inheritance design is preserved in bd-kzp1.5 as the follow-up blueprint when needed.
+
 ## 5.3 Concrete-Table Inheritance
 
 - Each type owns independent table mapping.
