@@ -119,8 +119,13 @@ struct AsyncTlsStream {
 
 #[cfg(feature = "tls")]
 impl AsyncTlsStream {
-    async fn handshake(mut tcp: TcpStream, ssl_mode: SslMode, host: &str) -> Result<Self, Error> {
-        let config = tls::build_client_config(ssl_mode)?;
+    async fn handshake(
+        mut tcp: TcpStream,
+        ssl_mode: SslMode,
+        host: &str,
+        root_cert_path: Option<&std::path::Path>,
+    ) -> Result<Self, Error> {
+        let config = tls::build_client_config(ssl_mode, root_cert_path)?;
         let server_name = tls::server_name(host)?;
         let mut tls = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
             .map_err(|e| connection_error(format!("Failed to create TLS connection: {e}")))?;
@@ -1221,6 +1226,7 @@ impl PgAsyncConnection {
                         plain,
                         self.config.ssl_mode,
                         &self.config.host,
+                        self.config.root_cert_path.as_deref(),
                     )
                     .await
                     {

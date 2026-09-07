@@ -355,16 +355,19 @@ pub(crate) fn build_client_config(
 
         SslMode::Preferred | SslMode::Required => {
             // No certificate verification - accept any server certificate
-            // This is common for MySQL deployments with self-signed certs
+            // In MySQL, Preferred and Required establish TLS without verifying the certificate chain.
+            build_no_verify_config(&provider)
+        }
+
+        SslMode::VerifyCa => {
             if tls_config.danger_skip_verify {
                 build_no_verify_config(&provider)
             } else {
-                // Use webpki-roots for standard CA verification
-                build_webpki_config(&provider, tls_config)
+                build_ca_only_config(&provider, tls_config)
             }
         }
 
-        SslMode::VerifyCa | SslMode::VerifyIdentity => {
+        SslMode::VerifyIdentity => {
             if tls_config.danger_skip_verify {
                 // User explicitly wants to skip verification (dangerous!)
                 build_no_verify_config(&provider)
@@ -470,18 +473,72 @@ fn build_webpki_config(
     Ok(config)
 }
 
-/// Build a ClientConfig using a custom CA certificate.
+/// Certificate verifier for `VerifyCa` mode.
+///
+/// Verifies the certificate chain against the trusted root store, but ignores
+/// any server name / SAN mismatch errors (`NotValidForName`).
+#[derive(Debug)]
 #[cfg(feature = "tls")]
-fn build_custom_ca_config(
-    provider: &Arc<rustls::crypto::CryptoProvider>,
-    tls_config: &TlsConfig,
-    ca_path: &std::path::Path,
-) -> Result<rustls::ClientConfig, Error> {
+struct CaOnlyVerifier {
+    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+}
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for CaOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(v) => Ok(v),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName
+                | rustls::CertificateError::NotValidForNameContext { .. },
+            )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Load root certificates from a custom PEM CA certificate file.
+#[cfg(feature = "tls")]
+fn load_custom_root_store(ca_path: &std::path::Path) -> Result<rustls::RootCertStore, Error> {
     use rustls::RootCertStore;
     use std::fs::File;
     use std::io::BufReader;
 
-    // Load CA certificate(s)
     let ca_file = File::open(ca_path).map_err(|e| {
         tls_error(format!(
             "Failed to open CA certificate '{}': {}",
@@ -508,15 +565,61 @@ fn build_custom_ca_config(
             .map_err(|e| tls_error(format!("Failed to add CA certificate: {}", e)))?;
     }
 
+    Ok(root_store)
+}
+
+/// Build a ClientConfig using a custom CA certificate (enforces hostname match).
+#[cfg(feature = "tls")]
+fn build_custom_ca_config(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    tls_config: &TlsConfig,
+    ca_path: &std::path::Path,
+) -> Result<rustls::ClientConfig, Error> {
+    let root_store = load_custom_root_store(ca_path)?;
+
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
         .map_err(|e| tls_error(format!("Failed to set TLS versions: {}", e)))?
         .with_root_certificates(root_store);
 
-    // Add client certificate if configured
-    let config = add_client_auth(builder, tls_config)?;
+    add_client_auth(builder, tls_config)
+}
 
-    Ok(config)
+/// Build a ClientConfig for `VerifyCa` mode (validates CA, ignores hostname mismatch).
+#[cfg(feature = "tls")]
+fn build_ca_only_config(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    tls_config: &TlsConfig,
+) -> Result<rustls::ClientConfig, Error> {
+    use rustls::RootCertStore;
+
+    let root_store = if let Some(ca_path) = &tls_config.ca_cert_path {
+        load_custom_root_store(ca_path)?
+    } else {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        roots
+    };
+
+    let verifier_builder = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(root_store),
+        provider.clone(),
+    );
+    let inner_verifier = verifier_builder
+        .build()
+        .map_err(|e| tls_error(format!("Failed to build certificate verifier: {e}")))?;
+
+    let ca_verifier = Arc::new(CaOnlyVerifier {
+        inner: inner_verifier,
+    });
+
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+        .map_err(|e| tls_error(format!("Failed to set TLS versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(ca_verifier);
+
+    add_client_auth(builder, tls_config)
 }
 
 /// Add client authentication if configured.
@@ -754,6 +857,20 @@ mod tests {
             .client_cert("/path/to/client.pem")
             .client_key("/path/to/client-key.pem");
         assert!(validate_tls_config(SslMode::VerifyCa, &config).is_ok());
+    }
+
+    #[test]
+    fn test_build_client_config_ssl_modes() {
+        let config = TlsConfig::new();
+        assert!(build_client_config(&config, SslMode::Disable).is_err());
+        assert!(build_client_config(&config, SslMode::Preferred).is_ok());
+        assert!(build_client_config(&config, SslMode::Required).is_ok());
+        assert!(build_client_config(&config, SslMode::VerifyCa).is_ok());
+        assert!(build_client_config(&config, SslMode::VerifyIdentity).is_ok());
+
+        let bad_ca = TlsConfig::new().ca_cert("/nonexistent/file/path/ca.crt");
+        assert!(build_client_config(&bad_ca, SslMode::VerifyCa).is_err());
+        assert!(build_client_config(&bad_ca, SslMode::VerifyIdentity).is_err());
     }
 }
 

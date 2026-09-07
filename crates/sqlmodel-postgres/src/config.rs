@@ -4,6 +4,7 @@
 //! including authentication, SSL, and connection options.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// SSL mode for PostgreSQL connections.
@@ -56,6 +57,8 @@ pub struct PgConfig {
     pub connect_timeout: Duration,
     /// SSL mode
     pub ssl_mode: SslMode,
+    /// Path to custom root CA certificate file (PEM format) for SSL verification
+    pub root_cert_path: Option<PathBuf>,
     /// Additional connection parameters
     pub options: HashMap<String, String>,
 }
@@ -71,6 +74,7 @@ impl Default for PgConfig {
             application_name: None,
             connect_timeout: Duration::from_secs(30),
             ssl_mode: SslMode::default(),
+            root_cert_path: None,
             options: HashMap::new(),
         }
     }
@@ -121,6 +125,17 @@ impl PgConfig {
         self
     }
 
+    /// Set custom root CA certificate path for SSL verification.
+    pub fn root_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.root_cert_path = Some(path.into());
+        self
+    }
+
+    /// Alias for [`Self::root_cert_path`] matching PostgreSQL's `sslrootcert` option name.
+    pub fn ssl_root_cert(self, path: impl Into<PathBuf>) -> Self {
+        self.root_cert_path(path)
+    }
+
     /// Set an additional connection option.
     pub fn option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.options.insert(key.into(), value.into());
@@ -164,6 +179,7 @@ mod tests {
             .application_name("myapp")
             .connect_timeout(Duration::from_secs(10))
             .ssl_mode(SslMode::Prefer)
+            .root_cert_path("/path/to/ca.pem")
             .option("timezone", "UTC");
 
         assert_eq!(config.host, "localhost");
@@ -174,7 +190,14 @@ mod tests {
         assert_eq!(config.application_name, Some("myapp".to_string()));
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert_eq!(config.ssl_mode, SslMode::Prefer);
+        assert_eq!(
+            config.root_cert_path,
+            Some(PathBuf::from("/path/to/ca.pem"))
+        );
         assert_eq!(config.options.get("timezone"), Some(&"UTC".to_string()));
+
+        let config2 = PgConfig::default().ssl_root_cert("/other/ca.pem");
+        assert_eq!(config2.root_cert_path, Some(PathBuf::from("/other/ca.pem")));
     }
 
     #[test]

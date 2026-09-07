@@ -365,7 +365,10 @@ impl PgConnection {
                         }
                     };
 
-                    let config = tls::build_client_config(self.config.ssl_mode)?;
+                    let config = tls::build_client_config(
+                        self.config.ssl_mode,
+                        self.config.root_cert_path.as_deref(),
+                    )?;
                     let server_name = tls::server_name(&self.config.host)?;
                     let conn =
                         rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
