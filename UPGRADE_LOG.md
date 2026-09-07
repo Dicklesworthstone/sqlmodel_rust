@@ -8,6 +8,16 @@ guessed), and which test run proves it.
 2. **GitHub Actions:** GitHub Actions are part of every dependency refresh: review `.github/workflows/*.yml` actions for new major releases and deprecations; maintain Dependabot configuration in `.github/dependabot.yml`.
 3. **Verification:** Run workspace gates (`cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo doc`).
 
+## 2026-09-07 refresh (Dependabot)
+
+**Date:** 2026-09-07  |  **Project:** sqlmodel_rust  |  **Language:** Rust  |  **Manifest:** Cargo.lock (commit `9e035b4`)
+
+### Summary
+- **Updated:** `fsqlite` (0.3.15 → 0.3.16) in `Cargo.lock`.
+- **Breaking:** none for SQLModel adapter or ORM layer.
+- **Verification:** `cargo test -p sqlmodel-frankensqlite` (85 unit tests passed), `cargo test -p sqlmodel-e2e --test sqlite_differential` and `--test franken_mvcc_e2e` pass cleanly.
+- **Gates:** `cargo audit --deny warnings` (clean), `cargo deny check bans advisories licenses sources` (clean), `cargo fmt --check` (clean), `cargo clippy --workspace --all-targets -- -D warnings` (clean).
+
 ---
 
 ## 2026-09-06 refresh (Dependabot)
@@ -136,6 +146,6 @@ Builds were invoked as `rch exec -- cargo ...` because the RCH PreToolUse hook r
 
 ### Pre-Existing Issues
 
-#### sqlmodel-schema test failure (unrelated)
-- `create::tests::test_create_table_sql_type_override` fails on both old and new dependency versions
-- Not caused by any dependency update
+#### sqlmodel-schema test failure (unrelated; resolved)
+- `create::tests::test_create_table_sql_type_override` failed historically on both old and new dependency versions; resolved and passes cleanly.
+
