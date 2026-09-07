@@ -273,8 +273,8 @@ fn mysql_tls_disable_when_secure_transport_required() {
         return;
     };
 
-    let require_secure = std::env::var(MYSQL_REQUIRE_SECURE_TRANSPORT_ENV)
-        .map_or(false, |v| v == "1" || v == "true");
+    let require_secure =
+        std::env::var(MYSQL_REQUIRE_SECURE_TRANSPORT_ENV).is_ok_and(|v| v == "1" || v == "true");
     if !require_secure {
         eprintln!(
             "skipping disable_when_secure_transport_required: {MYSQL_REQUIRE_SECURE_TRANSPORT_ENV} not set"
@@ -338,8 +338,8 @@ fn mysql_auth_caching_sha2_no_tls_rsa() {
         return;
     };
 
-    let require_secure = std::env::var(MYSQL_REQUIRE_SECURE_TRANSPORT_ENV)
-        .map_or(false, |v| v == "1" || v == "true");
+    let require_secure =
+        std::env::var(MYSQL_REQUIRE_SECURE_TRANSPORT_ENV).is_ok_and(|v| v == "1" || v == "true");
     if require_secure {
         eprintln!("skipping no-tls RSA auth test: require_secure_transport is active");
         return;
