@@ -10,6 +10,18 @@ guessed), and which test run proves it.
 
 ---
 
+## 2026-09-06 refresh (Dependabot)
+
+**Date:** 2026-09-06  |  **Project:** sqlmodel_rust  |  **Language:** Rust  |  **Manifest:** Cargo.lock (commit `65e1f23`)
+
+### Summary
+- **Updated:** `fsqlite` (0.3.14 → 0.3.15), `fsqlite-core`, `fsqlite-types`, and `fsqlite-error` (0.3.14 → 0.3.17) in `Cargo.lock`.
+- **Breaking:** none for SQLModel adapter or ORM layer.
+- **Verification:** `cargo test -p sqlmodel-e2e --test sqlite_differential` verified C-SQLite vs FrankenSQLite differential oracle passes cleanly under the new release.
+- **Gates:** `cargo audit --deny warnings` (clean), `cargo deny check bans advisories licenses sources` (clean), `cargo fmt --check` (clean), `cargo clippy --workspace --all-targets -- -D warnings` (clean).
+
+---
+
 ## 2026-09-02 refresh
 
 **Date:** 2026-09-02  |  **Project:** sqlmodel_rust  |  **Language:** Rust  |  **Manifest:** Cargo.toml (workspace, 12 published crates + `sqlmodel-e2e`)  |  **Toolchain:** nightly-2026-08-25 (pinned)
