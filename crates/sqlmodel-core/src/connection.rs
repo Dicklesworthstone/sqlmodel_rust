@@ -13,7 +13,7 @@
 use crate::error::Result;
 use crate::row::Row;
 use crate::value::Value;
-use asupersync::{Budget, Cx, Outcome};
+use asupersync::{Cx, Outcome};
 
 /// Transaction isolation level.
 ///
@@ -347,7 +347,7 @@ impl Dialect {
 /// Budget and timeout semantics (`bd-x6jl.4`)
 /// ============================================
 ///
-/// A `Cx` carries an optional [`Budget`] deadline. Components that wait
+/// A `Cx` carries an optional [`crate::Budget`] deadline. Components that wait
 /// (pool) or loop over statements (session) must honor the earlier of their
 /// own timeout and that deadline, and must surface exhaustion as a
 /// `Timeout`-kind error (retryable), never as a partial durable state.
