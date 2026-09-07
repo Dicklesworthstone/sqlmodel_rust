@@ -37,6 +37,19 @@ ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that rel
 
 ### Added
 
+- **ORM user guide (`docs/guide/`) and facade module `sqlmodel::guide`.** An 11-chapter,
+  comprehensive user guide covering models & field attributes, query building (`select!`, `insert!`,
+  `update!`, `delete!`, `insert_many!`, upserts, RETURNING), sessions & unit of work (identity map,
+  dirty tracking, `Session::with_retry`), relationships (`Related<T>`, `Lazy<T>`, `RelatedMany<T>`,
+  `EagerLoader`, batch loaders, N+1 detection), model inheritance (STI, JTI, CTI, polymorphic queries),
+  schema & migrations (`SchemaBuilder`, introspection, diffing, `MigrationRunner`), database drivers
+  (C-SQLite, FrankenSQLite MVCC, PostgreSQL wire driver, MySQL binary protocol), connection pooling
+  (`Pool`, sizing, `ReplicaPool`, `close_and_drain`), error taxonomy (`Outcome<T, E>`, `is_retryable`,
+  `retry_transaction`), cancellation & structured concurrency (`asupersync` `Cx`, budgets, transaction
+  guards), and testing patterns (in-memory SQLite, isolation, `LabRuntime`, `CancelAt` sweeps).
+  Every chapter ends with "Differences from Python SQLModel". All snippets are verified via doctests
+  rendered in rustdoc as `sqlmodel::guide`, and the prior documentation limitation is retired from
+  the README and protected by the doc-drift guard.
 - **`Session::with_retry`.** Runs a closure-shaped unit of work against the session and commits,
   retrying the whole unit when a flush or the commit fails with a retryable error (serialization,
   deadlock, busy-snapshot conflicts under `TransactionMode::Concurrent`). Between attempts the open

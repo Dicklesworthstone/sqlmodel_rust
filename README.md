@@ -394,6 +394,7 @@ Environment variables for control:
 
 ### Documentation
 
+- [ORM User Guide](docs/guide/README.md) - Comprehensive 11-chapter guide (models, queries, sessions, relationships, inheritance, migrations, drivers, pooling, errors, cancellation, testing)
 - [Console User Guide](docs/console/user-guide.md) - Complete feature guide
 - [Agent Compatibility Guide](docs/console/agent-compatibility.md) - For agent authors
 - [Proposed Rust Architecture](PROPOSED_RUST_ARCHITECTURE.md) - Crate boundaries, invariants, and inheritance/query design
@@ -592,7 +593,6 @@ Expr::case()
 
 - **Rust 1.95+** for the facade and the Postgres/MySQL/SQLite drivers; **nightly** for `sqlmodel-frankensqlite` (fsqlite enables `core_intrinsics` on x86_64) and for building this repo itself (`.cargo/config.toml` passes `-Z threads`)
 - **No stable release yet**: API may change
-- **Limited documentation**: We're working on it
 - **asupersync dependency**: Resolved from crates.io as `^0.4.9` (same 0.4.x line as `fsqlite`), so a single runtime version unifies across the stack
 
 ---

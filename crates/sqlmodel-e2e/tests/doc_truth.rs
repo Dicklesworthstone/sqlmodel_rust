@@ -134,6 +134,13 @@ fn cited_bead_ids_exist_in_the_tracker() {
         "FEATURE_PARITY.md",
         "EXISTING_SQLMODEL_STRUCTURE.md",
     ];
+    let tracker_path = repo_root().join(".beads/issues.jsonl");
+    if !tracker_path.exists() {
+        eprintln!(
+            "skipping cited_bead_ids_exist_in_the_tracker: .beads/issues.jsonl not present (remote worker or stripped closure)"
+        );
+        return;
+    }
     let tracker = read(".beads/issues.jsonl");
     let mut unknown: Vec<(String, String)> = Vec::new();
     for document in documents {
@@ -305,7 +312,7 @@ fn find_date(line: &str) -> Option<String> {
 #[test]
 fn no_markdown_contains_retired_phrases() {
     // Each banned phrase documents why it was retired.
-    const RETIRED: [(&str, &str); 3] = [
+    const RETIRED: [(&str, &str); 4] = [
         (
             "edition 2024 is unstable",
             "the workspace builds on stable-elected Rust 2024; the phrase only ever described a long-gone bootstrap state",
@@ -317,6 +324,10 @@ fn no_markdown_contains_retired_phrases() {
         (
             "raw_query!",
             "the macro was removed from the API surface; raw SQL goes through the connection execute methods",
+        ),
+        (
+            "Limited documentation",
+            "the 11-chapter ORM user guide in docs/guide/ provides comprehensive, doctest-compiled documentation",
         ),
     ];
     let mut documents: Vec<PathBuf> = fs::read_dir(repo_root())

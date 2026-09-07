@@ -156,6 +156,9 @@ pub use sqlmodel_macros::{Model, SqlEnum, Validate};
 #[doc = include_str!("../../../README.md")]
 pub struct ReadmeDoctests;
 
+/// ORM User Guide.
+pub mod guide;
+
 pub use sqlmodel_query::{
     BinaryOp, Cte, CteRef, DeleteBuilder, EagerLoader, Expr, IncludePath, InsertBuilder,
     InsertManyBuilder, Join, JoinType, Limit, Offset, OnConflict, OrderBy, PolymorphicConcrete,
