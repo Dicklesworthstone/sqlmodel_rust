@@ -66,3 +66,108 @@ jobs:
             echo "::warning::workspace is at $ws but the index is at $published — either an unreleased bump (fine while unreleased) or a forgotten publish"
           fi
           exit $fail
+
+  downstream-constitution:
+    name: downstream consumer dependency constitution
+    needs: index-vs-workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Verify downstream dependency constitution from registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          ws=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="sqlmodel") | .version')
+          echo "Testing downstream dependency constitution for version $ws"
+
+          tmp_dir=$(mktemp -d)
+          cd "$tmp_dir"
+          cargo new --bin consumer
+          cd consumer
+
+          # Dynamically derive all publishable crates from workspace metadata
+          crates=$(cargo metadata --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --format-version 1 --no-deps | jq -r '.packages[] | select(.publish == null) | .name')
+
+          cat <<EOF > Cargo.toml
+          [package]
+          name = "consumer"
+          version = "0.1.0"
+          edition = "2024"
+
+          [dependencies]
+          EOF
+
+          for c in $crates; do
+            if [ "$c" = "sqlmodel-console" ]; then
+              echo "$c = { version = \"$ws\", features = [\"rich\"] }" >> Cargo.toml
+            else
+              echo "$c = \"$ws\"" >> Cargo.toml
+            fi
+          done
+
+          echo "Generated consumer Cargo.toml:"
+          cat Cargo.toml
+
+          cargo generate-lockfile
+
+          # 1. Assert visibility proc-macro is NOT pulled in by normal dependencies
+          echo "Checking for visibility proc-macro..."
+          vis=$(cargo tree -e normal -i visibility || true)
+          if [ -n "$vis" ]; then
+            echo "::error::visibility macro present in consumer normal dependencies:"
+            echo "$vis"
+            exit 1
+          fi
+
+          # 2. Assert exactly one version of asupersync resolves
+          echo "Checking for single asupersync version..."
+          asupersync_count=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name=="asupersync") | .version' | sort -u | wc -l)
+          if [ "$asupersync_count" -ne 1 ]; then
+            echo "::error::expected exactly 1 asupersync version in dependency graph, found $asupersync_count"
+            cargo tree -i asupersync
+            exit 1
+          fi
+
+          # 3. Assert tokio is absent from normal dependencies
+          echo "Checking for forbidden tokio crate..."
+          tokio_tree=$(cargo tree -e normal -i tokio || true)
+          if [ -n "$tokio_tree" ]; then
+            echo "::error::forbidden crate tokio detected in consumer normal dependencies:"
+            echo "$tokio_tree"
+            exit 1
+          fi
+
+          # Test 2: default-features = false with sqlmodel/console
+          cat <<EOF > Cargo.toml
+          [package]
+          name = "consumer"
+          version = "0.1.0"
+          edition = "2024"
+
+          [dependencies]
+          sqlmodel = { version = "$ws", default-features = false, features = ["console"] }
+          EOF
+
+          cargo generate-lockfile
+
+          vis2=$(cargo tree -e normal -i visibility || true)
+          if [ -n "$vis2" ]; then
+            echo "::error::visibility macro present with default-features = false:"
+            echo "$vis2"
+            exit 1
+          fi
+
+          tokio_tree2=$(cargo tree -e normal -i tokio || true)
+          if [ -n "$tokio_tree2" ]; then
+            echo "::error::forbidden crate tokio detected with default-features = false:"
+            echo "$tokio_tree2"
+            exit 1
+          fi
+
+          echo "Downstream dependency constitution verified successfully."
+
