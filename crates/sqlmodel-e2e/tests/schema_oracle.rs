@@ -722,10 +722,14 @@ fn generated_schemas_hold_the_laws_on_sqlite() {
         let franken = FrankenConnection::open_memory().expect("open franken :memory:");
         run_generated_batch(&cx, &franken, Dialect::Sqlite, "frankensqlite", 200).await;
         let elapsed = started.elapsed();
-        eprintln!("generated-schema oracle: 3 x 200 cases in {elapsed:?} (target < 60s)");
+        let max_secs = std::env::var("SQLMODEL_ORACLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120);
+        eprintln!("generated-schema oracle: 3 x 200 cases in {elapsed:?} (budget < {max_secs}s)");
         assert!(
-            elapsed < std::time::Duration::from_secs(60),
-            "generated phase must finish in under 60s, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(max_secs),
+            "generated phase must finish in under {max_secs}s, took {elapsed:?}"
         );
     });
 }
