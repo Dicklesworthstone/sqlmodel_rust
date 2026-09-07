@@ -182,6 +182,128 @@ jobs:
             echo "A suite skipped although services are available:"; grep "skipping" integration.log; exit 1
           fi
 
+  tls-matrix:
+    name: TLS & Auth Matrix (Postgres 16 · MySQL 8.4 · MariaDB 11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sqlmodel
+          POSTGRES_PASSWORD: sqlmodel
+          POSTGRES_DB: sqlmodel_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sqlmodel -d sqlmodel_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: sqlmodel
+          MYSQL_DATABASE: sqlmodel_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -psqlmodel"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: sqlmodel
+          MARIADB_DATABASE: sqlmodel_test
+        ports: ["3307:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tls-matrix
+
+      - name: Generate TLS certificates with OpenSSL
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tls-certs
+          cd /tmp/tls-certs
+          # Generate CA key and self-signed CA cert
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 365 -subj "/CN=SQLModel Test CA"
+          # Generate server key and CSR with SAN for localhost and 127.0.0.1
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=localhost"
+          cat <<EOF > server.ext
+          authorityKeyIdentifier=keyid,issuer
+          basicConstraints=CA:FALSE
+          keyUsage = digitalSignature, keyEncipherment
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = localhost
+          IP.1 = 127.0.0.1
+          EOF
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -extfile server.ext
+          chmod 600 server.key ca.key
+          echo "Generated certificates in /tmp/tls-certs"
+
+      - name: Configure PostgreSQL TLS
+        run: |
+          set -euo pipefail
+          PG_CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{.ID}}" | head -n1)
+          echo "PostgreSQL container ID: $PG_CONTAINER"
+          docker cp /tmp/tls-certs/server.crt $PG_CONTAINER:/var/lib/postgresql/server.crt
+          docker cp /tmp/tls-certs/server.key $PG_CONTAINER:/var/lib/postgresql/server.key
+          docker exec $PG_CONTAINER chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key
+          docker exec $PG_CONTAINER chmod 600 /var/lib/postgresql/server.key
+          docker exec $PG_CONTAINER psql -U sqlmodel -d sqlmodel_test -c "ALTER SYSTEM SET ssl = 'on';"
+          docker exec $PG_CONTAINER psql -U sqlmodel -d sqlmodel_test -c "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.crt';"
+          docker exec $PG_CONTAINER psql -U sqlmodel -d sqlmodel_test -c "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key';"
+          docker exec $PG_CONTAINER psql -U sqlmodel -d sqlmodel_test -c "SELECT pg_reload_conf();"
+
+      - name: Configure MySQL TLS and extract CA
+        run: |
+          set -euo pipefail
+          MYSQL_CONTAINER=$(docker ps --filter "ancestor=mysql:8.4" --format "{{.ID}}" | head -n1)
+          echo "MySQL container ID: $MYSQL_CONTAINER"
+          docker cp $MYSQL_CONTAINER:/var/lib/mysql/ca.pem /tmp/tls-certs/mysql-ca.pem
+          # Enable require_secure_transport to test SslMode::Disable rejection
+          docker exec $MYSQL_CONTAINER mysql -uroot -psqlmodel -e "SET GLOBAL require_secure_transport = ON;"
+
+      - name: Run TLS matrix suites (Postgres & MySQL SslMode, MariaDB native auth)
+        env:
+          SQLMODEL_TEST_POSTGRES_URL: postgres://sqlmodel:sqlmodel@127.0.0.1:5432/sqlmodel_test
+          SQLMODEL_TEST_POSTGRES_CA: /tmp/tls-certs/ca.crt
+          SQLMODEL_TEST_POSTGRES_REQUIRE_SSL: "0"
+          SQLMODEL_TEST_MYSQL_URL: mysql://root:sqlmodel@127.0.0.1:3306/sqlmodel_test
+          SQLMODEL_TEST_MYSQL_CA: /tmp/tls-certs/mysql-ca.pem
+          SQLMODEL_TEST_MYSQL_REQUIRE_SECURE_TRANSPORT: "1"
+          SQLMODEL_TEST_MARIADB_URL: mysql://root:sqlmodel@127.0.0.1:3307/sqlmodel_test
+        run: |
+          cargo test -p sqlmodel-postgres -p sqlmodel-mysql --features sqlmodel-postgres/tls,sqlmodel-mysql/tls --test postgres_tls --test mysql_tls -- --nocapture
+
+      - name: Verify Postgres SslMode::Disable rejection with hostssl
+        run: |
+          set -euo pipefail
+          PG_CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{.ID}}" | head -n1)
+          docker exec $PG_CONTAINER sed -i 's/^host all all all/hostssl all all all/' /var/lib/postgresql/data/pg_hba.conf
+          docker exec $PG_CONTAINER sed -i 's/^host.*trust/# &/' /var/lib/postgresql/data/pg_hba.conf
+          docker exec $PG_CONTAINER psql -U sqlmodel -d sqlmodel_test -c "SELECT pg_reload_conf();"
+          SQLMODEL_TEST_POSTGRES_URL="postgres://sqlmodel:sqlmodel@127.0.0.1:5432/sqlmodel_test" \
+          SQLMODEL_TEST_POSTGRES_CA="/tmp/tls-certs/ca.crt" \
+          SQLMODEL_TEST_POSTGRES_REQUIRE_SSL="1" \
+          cargo test -p sqlmodel-postgres --features tls --test postgres_tls postgres_tls_disable_when_ssl_required -- --nocapture
+
+      - name: Test caching_sha2_password without TLS (rsa-auth key exchange)
+        run: |
+          set -euo pipefail
+          MYSQL_CONTAINER=$(docker ps --filter "ancestor=mysql:8.4" --format "{{.ID}}" | head -n1)
+          docker exec $MYSQL_CONTAINER mysql -uroot -psqlmodel -e "SET GLOBAL require_secure_transport = OFF;"
+          SQLMODEL_TEST_MYSQL_URL="mysql://root:sqlmodel@127.0.0.1:3306/sqlmodel_test" \
+          SQLMODEL_TEST_MYSQL_REQUIRE_SECURE_TRANSPORT="0" \
+          cargo test -p sqlmodel-mysql --features tls,rsa-auth --test mysql_tls mysql_auth_caching_sha2_no_tls_rsa -- --nocapture
+
   asan:
     name: AddressSanitizer (SQLite FFI)
     runs-on: ubuntu-latest
@@ -272,7 +394,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: [lint, test, security, integration, asan]
+    needs: [lint, test, security, integration, asan, tls-matrix]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
