@@ -661,13 +661,12 @@ impl FrankenConnection {
             }));
         }
 
-        inner
-            .conn
-            .execute_sync("ROLLBACK")
-            .map_err(|e| franken_to_query_error(&e, "ROLLBACK"))?;
-
         inner.in_transaction = false;
-        Ok(())
+        match inner.conn.execute_sync("ROLLBACK") {
+            Ok(_) => Ok(()),
+            Err(fsqlite_error::FrankenError::NoActiveTransaction) => Ok(()),
+            Err(e) => Err(franken_to_query_error(&e, "ROLLBACK")),
+        }
     }
 
     /// Execute a closure while holding one exclusive database transaction and
@@ -875,19 +874,20 @@ impl FrankenExclusiveTransaction<'_> {
     }
 
     fn rollback(&mut self) -> Result<(), Error> {
-        self.inner
-            .conn
-            .execute_sync("ROLLBACK")
-            .map_err(|error| franken_to_query_error(&error, "ROLLBACK"))?;
-        self.inner.in_transaction = false;
         self.finished = true;
-        Ok(())
+        self.inner.in_transaction = false;
+        match self.inner.conn.execute_sync("ROLLBACK") {
+            Ok(_) => Ok(()),
+            Err(fsqlite_error::FrankenError::NoActiveTransaction) => Ok(()),
+            Err(error) => Err(franken_to_query_error(&error, "ROLLBACK")),
+        }
     }
 }
 
 impl Drop for FrankenExclusiveTransaction<'_> {
     fn drop(&mut self) {
-        if !self.finished && self.inner.conn.execute_sync("ROLLBACK").is_ok() {
+        if !self.finished {
+            let _ = self.inner.conn.execute_sync("ROLLBACK");
             self.inner.in_transaction = false;
         }
     }

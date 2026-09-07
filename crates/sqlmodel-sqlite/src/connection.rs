@@ -800,12 +800,15 @@ impl SqliteConnection {
         }
 
         drop(inner);
-        self.execute_raw("COMMIT")?;
+        let res = self.execute_raw("COMMIT");
+        if res.is_err() {
+            let _ = self.execute_raw("ROLLBACK");
+        }
 
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.in_transaction = false;
         self.emit_transaction_state("COMMIT");
-        Ok(())
+        res
     }
 
     /// Rollback the current transaction.
@@ -825,12 +828,12 @@ impl SqliteConnection {
         }
 
         drop(inner);
-        self.execute_raw("ROLLBACK")?;
+        let res = self.execute_raw("ROLLBACK");
 
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.in_transaction = false;
         self.emit_transaction_state("ROLLBACK");
-        Ok(())
+        res
     }
 }
 
