@@ -860,6 +860,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tls")]
     fn test_build_client_config_ssl_modes() {
         let config = TlsConfig::new();
         assert!(build_client_config(&config, SslMode::Disable).is_err());

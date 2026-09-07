@@ -369,12 +369,9 @@ fn mysql_auth_caching_sha2_no_tls_rsa() {
 
 #[test]
 fn mysql_auth_native_password_mariadb() {
-    let raw = match std::env::var(MARIADB_URL_ENV) {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping MariaDB native_password test: set {MARIADB_URL_ENV}");
-            return;
-        }
+    let Ok(raw) = std::env::var(MARIADB_URL_ENV) else {
+        eprintln!("skipping MariaDB native_password test: set {MARIADB_URL_ENV}");
+        return;
     };
     let Some(cfg) = parse_mysql_url(&raw) else {
         eprintln!("skipping MariaDB test: invalid URL in {MARIADB_URL_ENV}");
