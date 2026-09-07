@@ -1,15 +1,15 @@
 //! Cancellation-injection test support (`bd-x6jl.2`).
 //!
-//! [`CancelAt`] wraps any [`Connection`] and counts every delegated call as a
+//! `CancelAt` wraps any [`Connection`] and counts every delegated call as a
 //! cancellation checkpoint. The k-th delegated call observes
-//! [`Cx::set_cancel_requested`] immediately before it is forwarded, so the
+//! `Cx::set_cancel_requested` immediately before it is forwarded, so the
 //! driver's own pre-flight `cancel_requested(cx)` guard is what returns
 //! [`Outcome::Cancelled`] — the sweep exercises the real code path, not a
 //! mock. A run with `cancel_from_call == 0` injects nothing and simply records
 //! the call sequence, which is how a sweep discovers `K_max` for an operation.
 //!
 //! Transaction calls (commit, rollback, savepoints) are intercepted too:
-//! [`CancelAt::begin*`] hand out a [`CancelAtTx`] that feeds the same call
+//! `CancelAt::begin*` hand out a `CancelAtTx` that feeds the same call
 //! log, so a sweep can assert that no `commit` happens after a cancellation
 //! point and that a dropped transaction rolled back.
 //!

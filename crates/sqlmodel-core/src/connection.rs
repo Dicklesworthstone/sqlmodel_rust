@@ -13,7 +13,7 @@
 use crate::error::Result;
 use crate::row::Row;
 use crate::value::Value;
-use asupersync::{Cx, Outcome};
+use asupersync::{Budget, Cx, Outcome};
 
 /// Transaction isolation level.
 ///
