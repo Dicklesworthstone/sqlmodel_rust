@@ -361,3 +361,37 @@ fn no_markdown_contains_retired_phrases() {
     }
     assert!(offenders.is_empty(), "retired phrases found: {offenders:?}");
 }
+
+#[test]
+fn guide_docs_are_synchronized() {
+    let root_guide = repo_root().join("docs").join("guide");
+    let crate_guide = repo_root()
+        .join("crates")
+        .join("sqlmodel")
+        .join("docs")
+        .join("guide");
+
+    let entries = fs::read_dir(&root_guide).expect("read docs/guide");
+    for entry in entries {
+        let entry = entry.expect("entry");
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "md") {
+            let file_name = path.file_name().expect("file name");
+            let crate_path = crate_guide.join(file_name);
+            assert!(
+                crate_path.is_file(),
+                "missing packaged guide file: {}",
+                crate_path.display()
+            );
+            let root_content = fs::read(&path).expect("read root guide");
+            let crate_content = fs::read(&crate_path).expect("read crate guide");
+            assert_eq!(
+                root_content,
+                crate_content,
+                "guide doc drift between {} and {}",
+                path.display(),
+                crate_path.display()
+            );
+        }
+    }
+}
