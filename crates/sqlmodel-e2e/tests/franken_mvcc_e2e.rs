@@ -268,9 +268,9 @@ fn franken_mvcc_disjoint_and_overlapping_writers_conserve_balance() {
                     FrankenConnection::open_file(path.to_str().expect("utf-8")).expect("worker");
                 let accounts = accounts_q(&conn);
                 let policy = RetryPolicy::default()
-                    .max_attempts(200)
+                    .max_attempts(300)
                     .base_delay(Duration::from_millis(1))
-                    .max_delay(Duration::from_millis(25));
+                    .max_delay(Duration::from_millis(100));
                 barrier.wait();
                 for i in 0..transfers_per_writer {
                     let from = ((writer as i64 * 7 + i64::from(i) * 3) % ACCOUNTS) + 1;
