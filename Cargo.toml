@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 # "MIT License (with OpenAI/Anthropic Rider)" (see ./LICENSE) — restrictive custom
 # license, NOT permissive MIT. Bare "MIT" misrepresented the terms. SPDX LicenseRef form:
@@ -90,18 +90,18 @@ rust_decimal = { version = "1", default-features = false, features = ["std"] }
 trybuild = "1.0.120"
 
 # Internal crates
-sqlmodel = { path = "crates/sqlmodel", version = "0.4.2" }
-sqlmodel-core = { path = "crates/sqlmodel-core", version = "0.4.2" }
-sqlmodel-macros = { path = "crates/sqlmodel-macros", version = "0.4.2" }
-sqlmodel-query = { path = "crates/sqlmodel-query", version = "0.4.2" }
-sqlmodel-schema = { path = "crates/sqlmodel-schema", version = "0.4.2" }
-sqlmodel-session = { path = "crates/sqlmodel-session", version = "0.4.2" }
-sqlmodel-pool = { path = "crates/sqlmodel-pool", version = "0.4.2" }
-sqlmodel-console = { path = "crates/sqlmodel-console", version = "0.4.2" }
-sqlmodel-postgres = { path = "crates/sqlmodel-postgres", version = "0.4.2" }
-sqlmodel-sqlite = { path = "crates/sqlmodel-sqlite", version = "0.4.2" }
-sqlmodel-mysql = { path = "crates/sqlmodel-mysql", version = "0.4.2" }
-sqlmodel-frankensqlite = { path = "crates/sqlmodel-frankensqlite", version = "0.4.2" }
+sqlmodel = { path = "crates/sqlmodel", version = "0.4.3" }
+sqlmodel-core = { path = "crates/sqlmodel-core", version = "0.4.3" }
+sqlmodel-macros = { path = "crates/sqlmodel-macros", version = "0.4.3" }
+sqlmodel-query = { path = "crates/sqlmodel-query", version = "0.4.3" }
+sqlmodel-schema = { path = "crates/sqlmodel-schema", version = "0.4.3" }
+sqlmodel-session = { path = "crates/sqlmodel-session", version = "0.4.3" }
+sqlmodel-pool = { path = "crates/sqlmodel-pool", version = "0.4.3" }
+sqlmodel-console = { path = "crates/sqlmodel-console", version = "0.4.3" }
+sqlmodel-postgres = { path = "crates/sqlmodel-postgres", version = "0.4.3" }
+sqlmodel-sqlite = { path = "crates/sqlmodel-sqlite", version = "0.4.3" }
+sqlmodel-mysql = { path = "crates/sqlmodel-mysql", version = "0.4.3" }
+sqlmodel-frankensqlite = { path = "crates/sqlmodel-frankensqlite", version = "0.4.3" }
 
 [profile.release]
 opt-level = "z"

@@ -159,23 +159,23 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 ```toml
 # Cargo.toml
 [dependencies]
-sqlmodel = "0.4.2"
+sqlmodel = "0.4.3"
 
 # Choose a driver (pick one or more)
-sqlmodel-postgres = "0.4.2"
-# sqlmodel-mysql = "0.4.2"
-# sqlmodel-sqlite = "0.4.2"
-# sqlmodel-frankensqlite = "0.4.2"
+sqlmodel-postgres = "0.4.3"
+# sqlmodel-mysql = "0.4.3"
+# sqlmodel-sqlite = "0.4.3"
+# sqlmodel-frankensqlite = "0.4.3"
 
 # Optional rich console output
-sqlmodel-console = { version = "0.4.2", features = ["rich"] }
+sqlmodel-console = { version = "0.4.3", features = ["rich"] }
 
 # TLS-only MySQL deployments can drop the `rsa` dependency (the no-TLS
 # full-auth path is compiled out; the server must then allow TLS auth):
-# sqlmodel-mysql = { version = "0.4.2", default-features = false, features = ["tls"] }
+# sqlmodel-mysql = { version = "0.4.3", default-features = false, features = ["tls"] }
 ```
 
-All SQLModel crates are released in lockstep at the same version (0.4.2); mix
+All SQLModel crates are released in lockstep at the same version (0.4.3); mix
 and match drivers freely.
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
@@ -353,7 +353,7 @@ Add the console feature to your dependency:
 
 ```toml
 [dependencies]
-sqlmodel-console = { version = "0.4.2", features = ["rich"] }
+sqlmodel-console = { version = "0.4.3", features = ["rich"] }
 ```
 
 Create and use a console:

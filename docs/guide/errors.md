@@ -32,7 +32,7 @@ With `Outcome`, cancellation is an explicit variant that flows up the call stack
 When compiling on Rust nightly with the `nightly-try` feature enabled, `?` works directly on `Outcome`:
 ```toml
 [dependencies]
-sqlmodel = { version = "0.4.2", features = ["nightly-try"] }
+sqlmodel = { version = "0.4.3", features = ["nightly-try"] }
 ```
 This enables seamless error propagation across async functions.
 

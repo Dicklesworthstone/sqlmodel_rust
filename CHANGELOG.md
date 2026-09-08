@@ -17,6 +17,8 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 | Version | Date | Git tag | GitHub Release | crates.io | Notes |
 |---------|------|---------|----------------|-----------|-------|
+| 0.4.3 | 2026-09-08 | [v0.4.3](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://crates.io/crates/sqlmodel/0.4.3) | Lockstep release of all 12 crates; 11-chapter ORM guide, Session::with_retry, multi-statement migrations, MVCC retry hardening |
+| 0.4.2 | 2026-08-31 | no | no | partial | sqlmodel-core & sqlmodel-frankensqlite only; test-internals moved to dev-deps |
 | 0.4.0 | 2026-08-20 | [v0.4.0](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.0) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.0) | [yes](https://crates.io/crates/sqlmodel/0.4.0) | asupersync ^0.4.9 + fsqlite 0.3.7; all 12 crates in lockstep |
 | sqlmodel-sqlite 0.3.3 | 2026-08-02 | [sqlmodel-sqlite-v0.3.3](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-sqlite-v0.3.3) | no | [yes](https://crates.io/crates/sqlmodel-sqlite/0.3.3) | component-only patch |
 | 0.3.2 | 2026-08-02 | [v0.3.2](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/v0.3.2) | no | [yes](https://crates.io/crates/sqlmodel/0.3.2) | asupersync =0.3.10 alignment |
@@ -31,9 +33,10 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ## [Unreleased]
 
-Work from the 2026-09-01/02 reality check (beads labeled `reality-check-2026-09`). Note that as of
-2026-09-02 only `sqlmodel-core` and `sqlmodel-frankensqlite` had been published at 0.4.2; the other
-ten crates were still at 0.4.1 on crates.io (bd-jeof.1 tracks finishing that release).
+## [0.4.3] -- 2026-09-08
+
+Work from the reality check and release hardening (beads labeled `reality-check-2026-09` and `bd-jeof`).
+This release brings all 12 workspace crates to 0.4.3 in unified lockstep, resolving crates.io index divergence.
 
 ### Added
 

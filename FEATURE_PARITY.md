@@ -2,7 +2,7 @@
 
 This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
-**Last Updated:** 2026-09-02 (reality check: verified against the tree at cc8e564; test-coverage table now lists every crate; remaining proof work tracked under the `reality-check-2026-09` beads)
+**Last Updated:** 2026-09-08 (verified for v0.4.3 lockstep release; all 12 crates verified, test-coverage across all drivers and E2E suites passing)
 
 ---
 
