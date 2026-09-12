@@ -156,9 +156,7 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 
 ### From crates.io (recommended)
 
-Version 0.5.0 is being prepared for publication across all 12 crates. The examples
-below describe that release; 0.4.3 remains the latest complete published family
-until the 0.5.0 uploads are verified.
+Version 0.5.0 is available on crates.io for all 12 SQLModel crates.
 
 ```toml
 # Cargo.toml
@@ -179,7 +177,7 @@ sqlmodel-console = { version = "0.5.0", features = ["rich"] }
 # sqlmodel-mysql = { version = "0.5.0", default-features = false, features = ["tls"] }
 ```
 
-All SQLModel crates are prepared for release in lockstep at the same version (0.5.0);
+All SQLModel crates are released in lockstep at the same version (0.5.0);
 mix and match drivers within that release family.
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are

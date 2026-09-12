@@ -6,7 +6,7 @@ This project follows approximate [Semantic Versioning](https://semver.org/). Ver
 
 Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
-Scope window: first commit through preparation of 0.5.0 (2026-09-12).
+Scope window: first commit through 0.5.0 (2026-09-12).
 
 Sources: git history and tags on `main`, GitHub Releases, the crates.io
 version list for `sqlmodel`, and the `.beads` issue records referenced inline.
@@ -17,7 +17,7 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 | Version | Date | Git tag | GitHub Release | crates.io | Notes |
 |---------|------|---------|----------------|-----------|-------|
-| 0.5.0 | pending | no | no | pending | Prepared lockstep release of all 12 crates with Asupersync 0.5 and FrankenSQLite 0.4 |
+| 0.5.0 | 2026-09-12 | [sqlmodel-v0.5.0](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-v0.5.0) | no | [yes](https://crates.io/crates/sqlmodel/0.5.0) | All 12 crates published with Asupersync 0.5 and FrankenSQLite 0.4 |
 | 0.4.3 | 2026-09-08 | [v0.4.3](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://crates.io/crates/sqlmodel/0.4.3) | Lockstep release of all 12 crates; 11-chapter ORM guide, Session::with_retry, multi-statement migrations, MVCC retry hardening |
 | 0.4.2 | 2026-08-31 | no | no | partial | sqlmodel-core & sqlmodel-frankensqlite only; test-internals moved to dev-deps |
 | 0.4.0 | 2026-08-20 | [v0.4.0](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.0) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.0) | [yes](https://crates.io/crates/sqlmodel/0.4.0) | asupersync ^0.4.9 + fsqlite 0.3.7; all 12 crates in lockstep |
@@ -34,11 +34,13 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ## [Unreleased]
 
-## [0.5.0] -- Unreleased
+## [0.5.0] -- 2026-09-12
 
-Publication of all 12 crates is pending. This minor release updates the shared
-runtime types across the workspace; applications that use Asupersync directly
-must use its 0.5 release line alongside SQLModel 0.5.
+All 12 crates are published on crates.io. Downloaded archive checksums, source
+files, and original manifests were verified against the `sqlmodel-v0.5.0` tag.
+This minor release updates the shared runtime types across the workspace;
+applications that use Asupersync directly must use its 0.5 release line alongside
+SQLModel 0.5.
 
 ### Changed
 
@@ -47,6 +49,18 @@ must use its 0.5 release line alongside SQLModel 0.5.
 - `sqlmodel-frankensqlite` uses the FrankenSQLite 0.4.0 family, sharing the same
   Asupersync context types as SQLModel. The workspace lockfile resolves these
   storage dependencies from crates.io.
+
+### Validation
+
+- DSR on Linux with `nightly-2026-08-31`: 1,852 library tests passed across all
+  12 crates, with no failures and one existing retained-file test ignored.
+- Seven E2E tests passed: model CRUD and reserved identifiers on C SQLite
+  (memory and file) and FrankenSQLite; two concurrent FrankenSQLite writers
+  preserved all 50 increments through both transaction and session retries;
+  cancellation sweeps checked 42 checkpoints across 24 operations on C SQLite.
+- These runs covered the prepared sources with the published Asupersync 0.5
+  dependency. They were not a full workspace integration or platform matrix;
+  PostgreSQL, MySQL, and MariaDB services were not configured or exercised.
 
 ## [0.4.3] -- 2026-09-08
 
