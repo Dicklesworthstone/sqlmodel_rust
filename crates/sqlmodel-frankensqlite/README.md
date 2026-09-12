@@ -8,8 +8,8 @@ Pure-Rust SQLite driver for SQLModel Rust, backed by [FrankenSQLite](https://git
 - Keeps the same sync helper family as `sqlmodel-sqlite` (`execute_raw`, `query_sync`, `execute_sync`, `begin_sync`/`commit_sync`/`rollback_sync`, `changes`, `last_insert_rowid`, `close_sync`) so existing call sites move over unchanged.
 
 ## Requirements
-- **Nightly Rust.** `fsqlite-pager` enables `core_intrinsics` on x86_64, so this crate is nightly-only while the rest of the workspace compiles on stable 1.95+. The repository pins `nightly-2026-08-25` in `rust-toolchain.toml`.
-- **fsqlite 0.3.14** (the version the workspace tests against; the lockstep `fsqlite-core`, `fsqlite-types`, and `fsqlite-error` crates are pinned to the same version). FrankenSQLite releases weekly; this crate tracks it in the workspace's dependency refreshes.
+- **Nightly Rust.** `fsqlite-pager` enables `core_intrinsics` on x86_64, so this crate is nightly-only while the rest of the workspace compiles on stable 1.95+. The repository pins `nightly-2026-08-31` in `rust-toolchain.toml`.
+- **fsqlite 0.4.0**, with `fsqlite-core`, `fsqlite-types`, and `fsqlite-error` on the same release line. FrankenSQLite and SQLModel share Asupersync 0.5 context types.
 
 ## Opening a connection
 | Constructor | Use |
