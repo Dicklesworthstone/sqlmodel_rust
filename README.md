@@ -518,7 +518,7 @@ of that type does not compile.
 
 ```toml
 # `nightly-try` enables `?` on `Outcome` (nightly toolchain, see above)
-sqlmodel = { version = "0.4", features = ["chrono", "uuid", "decimal", "nightly-try"] }
+sqlmodel = { version = "0.5.0", features = ["chrono", "uuid", "decimal", "nightly-try"] }
 ```
 
 ---
@@ -595,7 +595,7 @@ Expr::case()
 
 - **Rust 1.95+** for the facade and the Postgres/MySQL/SQLite drivers; **nightly** for `sqlmodel-frankensqlite` (fsqlite enables `core_intrinsics` on x86_64) and for building this repo itself (`.cargo/config.toml` passes `-Z threads`)
 - **No stable release yet**: API may change
-- **asupersync dependency**: Resolved from crates.io as `^0.4.9` (same 0.4.x line as `fsqlite`), so a single runtime version unifies across the stack
+- **asupersync dependency**: Resolved from crates.io as `^0.5.0`, matching the runtime used by `fsqlite` 0.4.x, so a single runtime version unifies across the stack
 
 ---
 
@@ -604,11 +604,11 @@ Expr::case()
 ### "Failed to resolve dependency `asupersync`"
 
 ```bash
-# SQLModel 0.4.x requires asupersync ^0.4.9, the same 0.4.x line fsqlite 0.3.x
+# SQLModel 0.5.x requires asupersync ^0.5.0, the same runtime line fsqlite 0.4.x
 # uses, so one asupersync should resolve for the whole graph. If resolution
-# fails, another dependency is pinning asupersync to an older line (<0.4.9):
+# fails, another dependency may require an older, incompatible runtime line:
 cargo tree -i asupersync     # find who requires the conflicting version
-# then upgrade that crate (or use `cargo update -p asupersync` once it allows 0.4.9)
+# then upgrade that crate (or use `cargo update -p asupersync` once it allows 0.5.0)
 cargo build
 ```
 
