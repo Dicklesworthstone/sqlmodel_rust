@@ -17,12 +17,12 @@ sqlmodel-core.workspace = true
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# The fsqlite family releases in lockstep; keep all four requirements on the
-# same version the workspace tests against (see UPGRADE_LOG.md).
-fsqlite = { version = "0.3.14", default-features = false, features = ["native", "async-api"] }
-fsqlite-core = { version = "0.3.14", default-features = false, features = ["native"] }
-fsqlite-types = { version = "0.3.14", default-features = false, features = ["native"] }
-fsqlite-error = { version = "0.3.14", default-features = false }
+# The engine's public context types use Asupersync 0.5, matching SQLModel.
+# The runtime-independent error crate remains on its existing release line.
+fsqlite = { version = "0.4.0", default-features = false, features = ["native", "async-api"] }
+fsqlite-core = { version = "0.4.0", default-features = false, features = ["native"] }
+fsqlite-types = { version = "0.4.0", default-features = false, features = ["native"] }
+fsqlite-error = { version = "0.3.18", default-features = false }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
