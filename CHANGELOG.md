@@ -6,7 +6,8 @@ This project follows approximate [Semantic Versioning](https://semver.org/). Ver
 
 Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
-Scope window: first commit through 0.5.0 (2026-09-12).
+Scope window: first commit through 0.5.0 (2026-09-12), with catch-up qualification
+notes from 2026-10-04.
 
 Sources: git history and tags on `main`, GitHub Releases, the crates.io
 version list for `sqlmodel`, and the `.beads` issue records referenced inline.
@@ -80,6 +81,26 @@ SQLModel 0.5.
   to resolve generated `sqlmodel_core` paths. This also affects 0.4.3 and is
   tracked in [#37](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/37).
   The catch-up preserves the published crates and tag; it does not fix the macro.
+- MariaDB foreign-key introspection reports an omitted update action as
+  `RESTRICT`, producing unnecessary drop/add pairs in schema comparisons.
+  This reproduces on 0.4.3; the observed failure computed a diff without applying
+  it. See [#38](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/38).
+- The optional `nightly-try` integration-test surface fails Clippy's
+  `semicolon_if_nothing_returned` lint on both 0.4.3 and 0.5.0. Default Clippy
+  passes. See [#39](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/39).
+- The unchanged PostgreSQL schema-oracle fixture declares `INTEGER`/`VARCHAR(255)`
+  while its model expects `BIGINT`/`TEXT`; its 0.4.3 baseline comparison fails.
+  See [#40](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/40).
+- MariaDB rejects the 0.4.3 types suite's first prepared insert before any
+  round-trip assertion. The source is unchanged in 0.5.0; JSON parameter encoding
+  is a candidate cause awaiting a focused protocol reproduction. See
+  [#41](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/41).
+- The historical tag lock resolves optional TLS to vulnerable Rustls 0.23.43
+  ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285/)), as does
+  the 0.4.3 lock. Consumers enabling driver TLS should update Rustls to 0.23.45
+  or later. A fresh registry consumer with both drivers' TLS features resolves
+  patched 0.23.45 and passes audit; the historical lock's audit remains red.
+  See [#42](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/42).
 
 ## [0.4.3] -- 2026-09-08
 
