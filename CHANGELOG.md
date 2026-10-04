@@ -73,6 +73,10 @@ SQLModel 0.5.
   keys were rejected, and fresh FrankenSQLite CRUD passed. The current consumer
   resolved all twelve SQLModel packages at 0.5.0, Asupersync 0.5.0, and the
   compatible FrankenSQLite engine from the registry, without local path patches.
+- Exact-tag formatting, workspace check, default Clippy, doctests and rustdoc
+  passed. The full workspace gate did not complete: a new PostgreSQL pool
+  runtime-handoff failure described below prevents the GitHub catch-up release.
+  The existing published tag and crates remain unchanged.
 
 ### Known limitations
 
@@ -101,6 +105,13 @@ SQLModel 0.5.
   or later. A fresh registry consumer with both drivers' TLS features resolves
   patched 0.23.45 and passes audit; the historical lock's audit remains red.
   See [#42](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/42).
+- PostgreSQL pooled connection reuse across current-thread runtimes regresses
+  with 0.5.0. Production-context cases that pass on 0.4.3 time out during default
+  checkout validation on 0.5.0 after either normal holder exit or holder panic.
+  Matched two-worker multi-thread controls pass on both versions. Same-runtime
+  reuse and other network drivers are not claimed affected by this reproduction;
+  no corruption was observed. The GitHub catch-up is held for this regression.
+  See [#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43).
 
 ## [0.4.3] -- 2026-09-08
 
