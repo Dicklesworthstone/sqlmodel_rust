@@ -62,6 +62,25 @@ SQLModel 0.5.
   dependency. They were not a full workspace integration or platform matrix;
   PostgreSQL, MySQL, and MariaDB services were not configured or exercised.
 
+### GitHub catch-up qualification (2026-10-04)
+
+- All twelve published archives were rechecked against crates.io checksums;
+  179 archived source and original-manifest files matched the existing tag.
+- A registry-only consumer created a persistent C SQLite database with 0.4.3,
+  then used 0.5.0 to read, update, and reopen it. A deliberately wrong persisted
+  marker failed the expected assertion; restoring it passed. Duplicate primary
+  keys were rejected, and fresh FrankenSQLite CRUD passed. The current consumer
+  resolved all twelve SQLModel packages at 0.5.0, Asupersync 0.5.0, and the
+  compatible FrankenSQLite engine from the registry, without local path patches.
+
+### Known limitations
+
+- The facade's `Model` derive requires a matching direct `sqlmodel-core`
+  dependency, for example `sqlmodel-core = "=0.5.0"`. Facade-only consumers fail
+  to resolve generated `sqlmodel_core` paths. This also affects 0.4.3 and is
+  tracked in [#37](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/37).
+  The catch-up preserves the published crates and tag; it does not fix the macro.
+
 ## [0.4.3] -- 2026-09-08
 
 Work from the reality check and release hardening (beads labeled `reality-check-2026-09` and `bd-jeof`).
