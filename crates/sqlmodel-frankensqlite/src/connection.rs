@@ -122,8 +122,10 @@ fn verify_strict_durable_control_plane_profile(
     let microbatch = raw_pragma_value(conn, "PRAGMA fsqlite.stmt_microbatch;")?;
     let journal_is_wal =
         matches!(journal_mode, SqliteValue::Text(ref mode) if mode.eq_ignore_ascii_case("wal"));
-    let synchronous_is_full =
-        matches!(synchronous, SqliteValue::Text(ref mode) if mode.eq_ignore_ascii_case("full"));
+    // PRAGMA synchronous reports the numeric mode even when installed with
+    // the FULL keyword. Require the exact FULL value, not a textual readback
+    // that the resolved FrankenSQLite engine never returns.
+    let synchronous_is_full = synchronous == SqliteValue::Integer(2);
     if !journal_is_wal || !synchronous_is_full || microbatch != SqliteValue::Integer(0) {
         return Err(Error::Custom(format!(
             "strict durable control-plane profile did not hold: journal_mode={journal_mode:?}, synchronous={synchronous:?}, stmt_microbatch={microbatch:?}"
@@ -2218,7 +2220,7 @@ mod tests {
         );
         assert_eq!(
             conn.query_sync("PRAGMA synchronous;", &[]).unwrap()[0].get(0),
-            Some(&Value::Text("FULL".into()))
+            Some(&Value::BigInt(2))
         );
         assert_eq!(
             conn.query_sync("PRAGMA fsqlite.stmt_microbatch;", &[])
@@ -2226,6 +2228,31 @@ mod tests {
                 .get(0),
             Some(&Value::BigInt(0))
         );
+
+        {
+            let inner = conn.inner.lock().expect("lock retained raw connection");
+            for sql in [
+                "PRAGMA synchronous = OFF;",
+                "PRAGMA synchronous = NORMAL;",
+                "PRAGMA synchronous = EXTRA;",
+                "PRAGMA fsqlite.stmt_microbatch = ON;",
+                "PRAGMA journal_mode = DELETE;",
+            ] {
+                inner
+                    .conn
+                    .execute_sync(sql)
+                    .expect("install alternate retained-file profile");
+                let error = verify_strict_durable_control_plane_profile(&inner.conn)
+                    .expect_err("every alternate profile must remain rejected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("strict durable control-plane profile did not hold")
+                );
+                install_strict_durable_control_plane_profile(&inner.conn)
+                    .expect("restore strict profile after each refusal");
+            }
+        }
 
         conn.with_exclusive_transaction(|transaction| {
             transaction.execute_raw(
@@ -2250,6 +2277,26 @@ mod tests {
             .expect("read retained probe");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0), Some(&Value::Text("durable".into())));
+    }
+
+    #[test]
+    fn strict_durable_profile_uses_numeric_synchronous_readback() {
+        let conn = FrankenConnection::open_memory().expect("open real FrankenSQLite engine");
+        let inner = conn.inner.lock().expect("lock raw connection");
+        for (sql, expected) in [
+            ("PRAGMA synchronous = FULL;", 2),
+            ("PRAGMA synchronous = OFF;", 0),
+            ("PRAGMA synchronous = NORMAL;", 1),
+            ("PRAGMA synchronous = EXTRA;", 3),
+            ("PRAGMA synchronous = 2;", 2),
+        ] {
+            inner.conn.execute_sync(sql).expect("set synchronous mode");
+            assert_eq!(
+                raw_pragma_value(&inner.conn, "PRAGMA synchronous;").unwrap(),
+                SqliteValue::Integer(expected),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
