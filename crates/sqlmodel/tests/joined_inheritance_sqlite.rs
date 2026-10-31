@@ -164,7 +164,6 @@ impl Subscriber for TestSubscriber {
     fn record(&self, _span: &Id, _values: &Record<'_>) {}
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
     fn event(&self, event: &Event<'_>) {
-        let meta = event.metadata();
         struct MessageVisitor(String);
         impl tracing::field::Visit for MessageVisitor {
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
@@ -173,6 +172,7 @@ impl Subscriber for TestSubscriber {
                 }
             }
         }
+        let meta = event.metadata();
         let mut visitor = MessageVisitor(String::new());
         event.record(&mut visitor);
         let mut logs = self.capture.0.lock().unwrap();
