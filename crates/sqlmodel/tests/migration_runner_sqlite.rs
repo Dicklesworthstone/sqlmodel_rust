@@ -126,7 +126,7 @@ fn migration_runner_applies_records_is_idempotent_and_rolls_back_on_sqlite() {
         for (_, s) in &status {
             match s {
                 MigrationStatus::Applied { at } => {
-                    assert!(*at > 1_600_000_000, "unix seconds: {at}")
+                    assert!(*at > 1_600_000_000, "unix seconds: {at}");
                 }
                 other => panic!("expected Applied, got {other:?}"),
             }
