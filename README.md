@@ -156,28 +156,28 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 
 ### From crates.io (recommended)
 
-Version 0.5.0 is available on crates.io for all 12 SQLModel crates.
+Version 0.5.1 is available on crates.io for all 12 SQLModel crates.
 
 ```toml
 # Cargo.toml
 [dependencies]
-sqlmodel = "0.5.0"
+sqlmodel = "0.5.1"
 
 # Choose a driver (pick one or more)
-sqlmodel-postgres = "0.5.0"
-# sqlmodel-mysql = "0.5.0"
-# sqlmodel-sqlite = "0.5.0"
-# sqlmodel-frankensqlite = "0.5.0"
+sqlmodel-postgres = "0.5.1"
+# sqlmodel-mysql = "0.5.1"
+# sqlmodel-sqlite = "0.5.1"
+# sqlmodel-frankensqlite = "0.5.1"
 
 # Optional rich console output
-sqlmodel-console = { version = "0.5.0", features = ["rich"] }
+sqlmodel-console = { version = "0.5.1", features = ["rich"] }
 
 # TLS-only MySQL deployments can drop the `rsa` dependency (the no-TLS
 # full-auth path is compiled out; the server must then allow TLS auth):
-# sqlmodel-mysql = { version = "0.5.0", default-features = false, features = ["tls"] }
+# sqlmodel-mysql = { version = "0.5.1", default-features = false, features = ["tls"] }
 ```
 
-All SQLModel crates are released in lockstep at the same version (0.5.0);
+All SQLModel crates are released in lockstep at the same version (0.5.1);
 mix and match drivers within that release family.
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
@@ -355,7 +355,7 @@ Add the console feature to your dependency:
 
 ```toml
 [dependencies]
-sqlmodel-console = { version = "0.5.0", features = ["rich"] }
+sqlmodel-console = { version = "0.5.1", features = ["rich"] }
 ```
 
 Create and use a console:
@@ -518,7 +518,7 @@ of that type does not compile.
 
 ```toml
 # `nightly-try` enables `?` on `Outcome` (nightly toolchain, see above)
-sqlmodel = { version = "0.5.0", features = ["chrono", "uuid", "decimal", "nightly-try"] }
+sqlmodel = { version = "0.5.1", features = ["chrono", "uuid", "decimal", "nightly-try"] }
 ```
 
 ---
