@@ -162,6 +162,9 @@ Version 0.5.1 is available on crates.io for all 12 SQLModel crates.
 # Cargo.toml
 [dependencies]
 sqlmodel = "0.5.1"
+# `#[derive(Model)]` expands to `sqlmodel_core::` paths, so a crate that derives
+# models also needs the core crate directly, at the same version (issue #37):
+sqlmodel-core = "0.5.1"
 
 # Choose a driver (pick one or more)
 sqlmodel-postgres = "0.5.1"
