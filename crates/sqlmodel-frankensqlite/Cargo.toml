@@ -19,10 +19,10 @@ serde.workspace = true
 serde_json.workspace = true
 # The engine's public context types use Asupersync 0.5, matching SQLModel.
 # Keep the engine family aligned so diagnostics identify one qualified version.
-fsqlite = { version = "0.4.0", default-features = false, features = ["native", "async-api"] }
-fsqlite-core = { version = "0.4.0", default-features = false, features = ["native"] }
-fsqlite-types = { version = "0.4.0", default-features = false, features = ["native"] }
-fsqlite-error = { version = "0.4.0", default-features = false }
+fsqlite = { version = "0.4.12", default-features = false, features = ["native", "async-api"] }
+fsqlite-core = { version = "0.4.12", default-features = false, features = ["native"] }
+fsqlite-types = { version = "0.4.12", default-features = false, features = ["native"] }
+fsqlite-error = { version = "0.4.12", default-features = false }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
