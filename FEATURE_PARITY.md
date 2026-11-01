@@ -2,7 +2,7 @@
 
 This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
-**Last Updated:** 2026-09-08 (verified for v0.4.3 lockstep release; all 12 crates verified, test-coverage across all drivers and E2E suites passing)
+**Last Updated:** 2026-11-01 (verified for v0.5.1 lockstep release; all 12 crates verified, full workspace test gate passing on the C SQLite and FrankenSQLite drivers, plus the nightly-try README doctests and the c-sqlite-tests and console suites. The MySQL/PostgreSQL integration and TLS tests need a server and were compiled, not run, for 0.5.1; that driver code is unchanged since 0.5.0)
 
 ---
 

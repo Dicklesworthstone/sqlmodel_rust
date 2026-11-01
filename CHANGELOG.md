@@ -6,7 +6,7 @@ This project follows approximate [Semantic Versioning](https://semver.org/). Ver
 
 Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
-Scope window: first commit through 0.5.0 (2026-09-12), with catch-up qualification
+Scope window: first commit through 0.5.1 (2026-11-01), with catch-up qualification
 notes from 2026-10-04.
 
 Sources: git history and tags on `main`, GitHub Releases, the crates.io
@@ -18,6 +18,7 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 | Version | Date | Git tag | GitHub Release | crates.io | Notes |
 |---------|------|---------|----------------|-----------|-------|
+| 0.5.1 | 2026-11-01 | [sqlmodel-v0.5.1](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-v0.5.1) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/sqlmodel-v0.5.1) | [yes](https://crates.io/crates/sqlmodel/0.5.1) | Strict-durable open fix, FrankenSQLite 0.4.12 floor, lock past four advisories |
 | 0.5.0 | 2026-09-12 | [sqlmodel-v0.5.0](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-v0.5.0) | no | [yes](https://crates.io/crates/sqlmodel/0.5.0) | All 12 crates published with Asupersync 0.5 and FrankenSQLite 0.4 |
 | 0.4.3 | 2026-09-08 | [v0.4.3](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://crates.io/crates/sqlmodel/0.4.3) | Lockstep release of all 12 crates; 11-chapter ORM guide, Session::with_retry, multi-statement migrations, MVCC retry hardening |
 | 0.4.2 | 2026-08-31 | no | no | partial | sqlmodel-core & sqlmodel-frankensqlite only; test-internals moved to dev-deps |
@@ -34,6 +35,117 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 ---
 
 ## [Unreleased]
+
+## [0.5.1] -- 2026-11-01
+
+A patch release of all 12 crates in lockstep. It fixes the FrankenSQLite
+strict-durable open, raises the FrankenSQLite floor to the version the gates
+tested, and refreshes the lock past several advisories. Asupersync stays on 0.5.0.
+
+### Fixed
+
+- `FrankenConnection::open_strict_durable_control_plane_file` now accepts the
+  numeric `PRAGMA synchronous` readback, `2` for `FULL`. 0.5.0 accepted only the
+  text `full`. With the FrankenSQLite 0.4.0 that 0.5.0's lock pins, the readback is
+  `Integer(2)`, so every strict-durable open on 0.5.0 failed with "strict durable
+  control-plane profile did not hold". The retained-file test shows it: red at
+  `sqlmodel-v0.5.0`, green here. Journal mode must still be WAL and
+  `fsqlite.stmt_microbatch` must still be `0`. Each refused profile names all three
+  values in its error.
+- All-features Clippy on the pinned nightly now passes
+  ([#39](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/39)). Two
+  optional test files, both built only with the `c-sqlite-tests` feature,
+  tripped it: the SQLite migration-runner test was missing a semicolon, and the
+  joined-inheritance test declared an item after a statement. Both fixes are test-only, and no lint is allowed.
+
+### Changed
+
+- `sqlmodel-frankensqlite` requires FrankenSQLite 0.4.12 (`fsqlite`,
+  `fsqlite-core`, `fsqlite-types` and `fsqlite-error`), up from 0.4.0, because
+  0.4.12 is the version this release was tested with. With 0.4.12, `sqlite_master`
+  holds the same normalized `CREATE TABLE` text on both SQLite drivers, while
+  under 0.4.0 the FrankenSQLite driver kept `IF NOT EXISTS`. The SQLite
+  differential test no longer lists that difference.
+- On the FrankenSQLite driver, an SQL syntax error is reported as
+  `QueryErrorKind::Syntax`, not `QueryErrorKind::Database`. FrankenSQLite 0.4.4
+  and later report the parse failure as a syntax error; 0.4.0 and 0.4.1 did not.
+  0.5.0 required FrankenSQLite `0.4.0` as a caret range, so 0.5.0 users whose
+  lock resolved 0.4.4 or later already see `Syntax`. 0.5.1 only raises the floor,
+  so every build now does. Code that matches `Database` for syntax errors on this
+  driver should also match `Syntax`. The C SQLite driver still reports
+  `Database`, and the SQLite differential test lists this as a known divergence.
+- The lock moves the FrankenSQLite family from 0.4.0 to 0.4.12 and Rustls from
+  0.23.43 to 0.23.46, which clears RUSTSEC-2026-0285
+  ([#42](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/42)), and takes
+  compatible updates of rsa, webpki-roots, uuid, serde_json and others.
+- The lock also clears three advisories published after 0.5.0, each by a
+  compatible update and with no advisory ignored: crypto-bigint 0.7.5 to 0.7.10
+  ([RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387); 0.7.5 is
+  also yanked), ctutils 0.4.2 to 0.4.7
+  ([RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385)) and
+  rustls-webpki 0.103.15 to 0.103.16
+  ([RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382)).
+- These lock changes don't reach a consumer's own lock. Run `cargo update` to pick
+  them up.
+- `libsqlite3-sys` stays at 0.38.2. It links the system `sqlite3`, so changing it
+  in a patch release would break an application whose graph also uses rusqlite on
+  0.38. It moves in 0.6.
+- The README's install block adds the direct `sqlmodel-core` dependency that
+  `#[derive(Model)]` needs ([#37](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/37)).
+
+### Validation
+
+Gates ran with the pinned nightly toolchain, `--locked`. The release commit
+differs from the commit most rows ran on only in `CHANGELOG.md`,
+`FEATURE_PARITY.md` and the SQLite differential test. The tests those changes
+affect were run again afterwards (the row after the retained-file test):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| Clippy, workspace, all targets, `-D warnings` | passes |
+| Clippy, workspace, all targets, all features, `-D warnings` | passes ([#39](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/39)) |
+| `cargo test --workspace --no-fail-fast`, default features, 4 test threads | 2,162 passed (2,142 ran, 20 returned early at an env check), 2 failed, 157 ignored over 59 test binaries and the doctests of 13 crates. This release fixes both failures. The documentation test that checks `FEATURE_PARITY.md` against the newest release failed because that document was older than 0.5.0; this release's commit updates it. The SQLite differential test failed on the syntax-error kind described under Changed; it now lists that difference as a known divergence, and drops the `sqlite_master` text entry, which no longer differs with FrankenSQLite 0.4.12. Both tests were run again after the fixes (row below). 19 of the 20 are the MySQL (11) and PostgreSQL (8) integration tests: without a server URL each returns at its env check, which the test harness reports as ok, so they are counted as not run. The 20th is the documentation test that checks cited bead IDs against the tracker: the build workers don't receive the tracker file, so it returns early there too. It was run on its own on a full checkout of the release commit, tracker included, and passed with no skip; a separate read-only script found 40 citations of 25 distinct bead IDs, none unknown. 22 binaries ran no tests, each for a known reason: 13 test files build empty without the `c-sqlite-tests`, `console` or `tls` feature and run in the rows below, 7 are examples with no tests (built as a compile check), and 2 crates have no doc examples. Doctests marked `ignore` count as ignored, not passed. |
+| `nightly-try` doctests of the facade (`cargo test -p sqlmodel --doc --features nightly-try`) | 34 passed, 0 failed, 19 ignored (two doctest runs). This includes all 6 Rust blocks of the README: 3 passed, and 3 are marked `rust,ignore` in the README itself |
+| TLS tests of the PostgreSQL and MySQL drivers (`tls` features) | compiled, not run. Each of the 15 tests (9 MySQL, 6 PostgreSQL) needs a MySQL, MariaDB or PostgreSQL server; without one it returns at its env check, which the test harness reports as ok. The TLS code of both drivers is unchanged since 0.5.0. The run with both `tls` features: 209 passed (175 ran, 34 returned early at an env check), 0 failed, 8 ignored. The 175 are the two drivers' unit tests; the 34 are these 15 TLS tests plus the 19 integration tests. |
+| `c-sqlite-tests` and `console` integration tests: 11 files, including the SQLite migration-runner test (`c-sqlite-tests`) and the joined-inheritance test that [#39](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/39) fixed | 15 passed, 0 failed, 0 ignored; each of the 11 files ran at least one test, and none returns early (no env check in these files) |
+| Strict-durable retained-file test (ignored by default; run with a retained database path) | red at `sqlmodel-v0.5.0` (the profile check fails on the numeric readback), green here (1 passed) |
+| SQLite differential and documentation tests, run again after the fixes | The SQLite differential test with the corrected list: 1 passed, 0 failed, over 46 operations with 5 known divergences (C SQLite 3.53.2, FrankenSQLite 0.4.12). The test fails if a listed divergence no longer differs, and none did. Clippy on that test crate, all targets, `-D warnings`: passes. The documentation tests on the release commit, tracker included: 7 passed, 0 failed |
+| `cargo doc --workspace --no-deps` | builds the docs of all 13 crates with no warnings |
+| `cargo audit` | no vulnerabilities, 377 crates in the lock, no advisory ignored |
+| `cargo deny check` | advisories, bans, licenses and sources ok |
+| `cargo publish --workspace --dry-run` | passes on the release commit: all 12 crates package and build |
+
+PostgreSQL, MySQL and MariaDB servers were not run: those drivers are unchanged in
+this release and their known reds would reproduce.
+
+The test of strict model validation (`test_model_validate_strict_mode`) passes in
+either mode. The `strict` option of `model_validate` currently has no effect,
+because strict and non-strict validation share one code path, so the test can't
+tell the two apart. That code is unchanged in this release and is tracked for a
+later one.
+
+No performance comparison is possible for the strict-durable fix: 0.5.0 fails on
+that path, so there is no working baseline. The change replaces a case-insensitive
+text match with one integer comparison.
+
+### Known limitations
+
+- PostgreSQL pooled connection reuse across current-thread runtimes still times
+  out at checkout ([#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43)).
+  The root cause is in Asupersync 0.5
+  ([asupersync#85](https://github.com/Dicklesworthstone/asupersync/issues/85)) and is
+  fixed on Asupersync's main line, which SQLModel will take in 0.6. In the issue's
+  matrix, the same cases pass on a multi-thread runtime with `worker_threads(2)`.
+- The facade's `Model` derive still emits `sqlmodel_core::` paths, so the direct
+  `sqlmodel-core` dependency above is required (#37).
+- MariaDB foreign-key default actions
+  ([#38](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/38)), the
+  PostgreSQL schema-oracle fixture
+  ([#40](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/40)) and the
+  MariaDB first prepared insert
+  ([#41](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/41)) are as
+  described under 0.5.0. That code is unchanged.
 
 ## [0.5.0] -- 2026-09-12
 
