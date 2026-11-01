@@ -29,6 +29,37 @@ permissions:
   contents: read
 
 jobs:
+  pool-checkout:
+    name: Pool checkout deadlines and cancellation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+      RUSTFLAGS: "-Z threads=1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the repository-pinned toolchain
+        run: |
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pool-checkout
+
+      - name: Check pool formatting
+        run: cargo fmt -p sqlmodel-pool -- --check
+
+      - name: Run pool regressions with the locked dependency graph
+        run: cargo test --locked -p sqlmodel-pool --all-targets --config 'profile.dev.package."*".opt-level=0'
+
+      - name: Check pool lints
+        run: cargo clippy --locked -p sqlmodel-pool --all-targets --config 'profile.dev.package."*".opt-level=0' -- -D warnings
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

@@ -36,6 +36,22 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ## [Unreleased]
 
+### Fixed
+
+- Pool acquisition now enforces one deadline across capacity waits, connection
+  creation, checkout validation, and rejected-connection retirement. A stalled
+  ping no longer bypasses `acquire_timeout` or a shorter caller budget
+  ([#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43)). Timeout,
+  cancellation, and hard drop discard an unvalidated connection before
+  releasing its slot, and queued requests unregister on every exit.
+- Checkout validation preserves cancellation and panic outcomes and rechecks
+  pool closure and the acquisition deadline before publishing a lease. A ping
+  finishing after closure or expiry cannot hand out a connection.
+
+These are unreleased pool protections. They do not change the known limitation
+of the published SQLModel 0.5.1 release or establish successful PostgreSQL
+handoff against a fixed runtime dependency.
+
 ## [0.5.1] -- 2026-11-01
 
 A patch release of all 12 crates in lockstep. It fixes the FrankenSQLite

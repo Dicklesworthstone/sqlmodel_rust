@@ -15,7 +15,11 @@
 //!
 //! With `test_on_checkout` (the default) every idle connection is pinged before
 //! it is handed out; one that fails is closed and replaced transparently, so a
-//! server-side kill of an idle connection costs one reconnect, never an error.
+//! server-side kill of an idle connection costs one reconnect when the acquire
+//! budget permits. Waiting, connecting, validation, and retirement share the
+//! earlier of `acquire_timeout` and the caller's budget deadline. A stalled
+//! ping or close cannot extend it. An interrupted validation discards its
+//! connection before releasing the pool slot; it is never returned idle.
 //! Returning a connection runs no check (a return is a synchronous `Drop`), so
 //! a lease whose statement failed with a connection error should be
 //! [`PooledConnection::detach`]ed rather than dropped back into the pool;
@@ -89,7 +93,8 @@ pub struct PoolConfig {
     pub max_connections: usize,
     /// Connection idle timeout in milliseconds
     pub idle_timeout_ms: u64,
-    /// Maximum time to wait for a connection in milliseconds
+    /// Maximum acquisition time in milliseconds, including connection creation,
+    /// checkout validation, and retirement of unusable connections.
     pub acquire_timeout_ms: u64,
     /// Maximum lifetime of a connection in milliseconds
     pub max_lifetime_ms: u64,
@@ -490,6 +495,24 @@ impl<C: Connection> Drop for ActiveSlotGuard<C> {
     }
 }
 
+/// Owns the pending-request count across the wait's cancellation points.
+struct WaiterGuard<C: Connection> {
+    pool: Arc<PoolShared<C>>,
+}
+
+impl<C: Connection> Drop for WaiterGuard<C> {
+    fn drop(&mut self) {
+        let mut inner = self.pool.lock_or_recover();
+        inner.waiter_count = inner.waiter_count.saturating_sub(1);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AcquireDeadline {
+    at: Time,
+    budget_limited: bool,
+}
+
 /// Owns an active connection while checkout validation is in flight.
 ///
 /// On hard cancellation the guard drops the connection resource before it
@@ -686,109 +709,149 @@ impl<C: Connection> Pool<C> {
 
     /// Acquire a connection from the pool.
     ///
-    /// This method will:
-    /// 1. Return an idle connection if one is available
-    /// 2. Create a new connection if below capacity
-    /// 3. Wait for a connection to become available (up to timeout)
+    /// Idle connections are validated before reuse; a new connection is
+    /// created when capacity permits, otherwise the caller waits for a return.
+    /// One deadline covers waiting, the factory, checkout validation, and
+    /// retiring rejected connections. The earlier of `acquire_timeout_ms`
+    /// and `cx.budget().deadline` wins.
+    ///
+    /// On timeout or cancellation, in-flight futures are dropped. A connection
+    /// interrupted during validation is discarded before its slot is released;
+    /// it is never returned to idle inventory.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The pool is closed
-    /// - The acquire timeout is exceeded
-    /// - Cancellation is requested via the `Cx` context
-    ///
-    /// An idle connection that fails its checkout ping (`test_on_checkout`)
-    /// is closed and the acquire moves on to the next idle connection or a
-    /// new one; it is not an error.
+    /// Returns an error if the pool is closed, acquisition times out, or
+    /// connection creation or retirement fails. Cancellation and panic outcomes
+    /// from validation are propagated without retrying. An ordinary failed
+    /// ping closes that connection and retries while acquisition time remains.
     pub async fn acquire<F, Fut>(&self, cx: &Cx, factory: F) -> Outcome<PooledConnection<C>, Error>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Outcome<C, Error>>,
     {
-        let clock = self.shared.clock.clone();
-        // The effective wait deadline is the earlier of the configured
-        // acquire timeout and the `Cx` budget deadline (if the caller set
-        // one): a budget smaller than `acquire_timeout_ms` wins, a larger
-        // budget never extends the pool's own timeout.
-        let mut deadline = clock.now() + Duration::from_millis(self.config().acquire_timeout_ms);
-        let mut budget_limited = false;
+        let config = self.config();
+        let mut deadline = AcquireDeadline {
+            at: self.shared.clock.now() + Duration::from_millis(config.acquire_timeout_ms),
+            budget_limited: false,
+        };
         if let Some(budget_deadline) = cx.budget().deadline
-            && budget_deadline < deadline
+            && budget_deadline < deadline.at
         {
-            deadline = budget_deadline;
-            budget_limited = true;
+            deadline.at = budget_deadline;
+            deadline.budget_limited = true;
         }
-        let test_on_checkout = self.config().test_on_checkout;
-        let max_lifetime = Duration::from_millis(self.config().max_lifetime_ms);
-        let idle_timeout = Duration::from_millis(self.config().idle_timeout_ms);
+
+        // Register wake sources independently of driver cooperation. A ping
+        // parked on a stale reactor may never wake itself; this runtime's timer
+        // and the caller's cancellation waker still wake the acquisition.
+        // Ordered polling makes interruption win over a simultaneously ready
+        // connection. Each publication site also checks after its final await.
+        let cancellation_latch = OnceCell::<()>::new();
+        let mut cancellation = std::pin::pin!(cancellation_latch.wait(cx));
+        let mut timeout = std::pin::pin!(asupersync::time::sleep_until(deadline.at));
+        let mut acquisition = std::pin::pin!(self.acquire_until(cx, factory, config, deadline));
+        std::future::poll_fn(|task_cx| {
+            if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                return std::task::Poll::Ready(outcome);
+            }
+            let cancelled = cancellation.as_mut().poll(task_cx).is_ready();
+            let timer_ready = timeout.as_mut().poll(task_cx).is_ready();
+            if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                return std::task::Poll::Ready(outcome);
+            }
+            if cancelled || timer_ready {
+                // Sleep can finish early when the ambient runtime context is
+                // cancelled, even if the supplied request context is distinct.
+                // Never repoll a completed timer or misclassify that wake as
+                // a timeout. OnceCell also observes non-time budget exhaustion.
+                let reason = cx
+                    .cancel_reason()
+                    .or_else(|| Cx::current().and_then(|ambient| ambient.cancel_reason()))
+                    .unwrap_or_else(|| CancelReason::user("pool acquire interrupted"));
+                return std::task::Poll::Ready(Outcome::Cancelled(reason));
+            }
+            acquisition.as_mut().poll(task_cx)
+        })
+        .await
+        // The owned acquisition future drops before this outcome reaches the
+        // caller. Its guards discard I/O before releasing slots and unregister
+        // queued waiters, including when the outer future is itself dropped.
+    }
+
+    fn acquire_interruption<T>(
+        &self,
+        cx: &Cx,
+        deadline: AcquireDeadline,
+    ) -> Option<Outcome<T, Error>> {
+        // Deadline wins at the boundary, including when a runtime budget
+        // timer has already requested cancellation for the same deadline.
+        if self.shared.clock.now() >= deadline.at {
+            self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
+            let message = if deadline.budget_limited {
+                "acquire timeout: budget deadline reached before a connection was available"
+            } else {
+                "acquire timeout: no connections available"
+            };
+            return Some(Outcome::Err(Error::Pool(PoolError {
+                kind: PoolErrorKind::Timeout,
+                message: message.to_string(),
+                source: None,
+            })));
+        }
+        if cx.is_cancel_requested() {
+            return Some(Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("pool acquire cancelled")),
+            ));
+        }
+        None
+    }
+
+    async fn acquire_until<F, Fut>(
+        &self,
+        cx: &Cx,
+        factory: F,
+        config: PoolConfig,
+        deadline: AcquireDeadline,
+    ) -> Outcome<PooledConnection<C>, Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Outcome<C, Error>>,
+    {
+        let clock = self.shared.clock.clone();
+        let max_lifetime = Duration::from_millis(config.max_lifetime_ms);
+        let idle_timeout = Duration::from_millis(config.idle_timeout_ms);
 
         loop {
-            // Check cancellation
-            if cx.is_cancel_requested() {
-                return Outcome::Cancelled(CancelReason::user("pool acquire cancelled"));
+            if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                return outcome;
             }
 
-            // Check timeout (the effective deadline already folds in the
-            // caller's budget when it is the tighter constraint).
-            if clock.now() >= deadline {
-                self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
-                let message = if budget_limited {
-                    "acquire timeout: budget deadline reached before a connection was available"
-                } else {
-                    "acquire timeout: no connections available"
-                };
-                return Outcome::Err(Error::Pool(PoolError {
-                    kind: PoolErrorKind::Timeout,
-                    message: message.to_string(),
-                    source: None,
-                }));
-            }
-
-            // Try to get an idle connection or determine if we can create new
             let (action, retired) = {
                 let mut inner = match self.shared.lock_or_error("acquire") {
                     Ok(guard) => guard,
-                    Err(e) => return Outcome::Err(e),
+                    Err(error) => return Outcome::Err(error),
                 };
-                // Reserve before moving any idle entry into active retirement
-                // accounting. Every removed entry is immediately protected by
-                // an armed guard, so panic or hard cancellation cannot strand
-                // later entries in a raw vector.
+                // Every removed entry immediately has an armed guard, so hard
+                // cancellation cannot strand later entries during retirement.
                 let mut retired = Vec::with_capacity(inner.idle.len());
-
                 let action = if inner.closed {
                     AcquireAction::PoolClosed
                 } else {
-                    // Try to get an idle connection
                     let mut found_conn = None;
                     while let Some(mut meta) = inner.idle.pop_front() {
-                        // Check if connection is too old
-                        if meta.age() > max_lifetime {
+                        if meta.age() > max_lifetime || meta.idle_time() > idle_timeout {
                             inner.active_count += 1;
                             retired
                                 .push(ActiveConnectionGuard::new(Arc::clone(&self.shared), meta));
                             continue;
                         }
-
-                        // Check if connection has been idle too long
-                        if meta.idle_time() > idle_timeout {
-                            inner.active_count += 1;
-                            retired
-                                .push(ActiveConnectionGuard::new(Arc::clone(&self.shared), meta));
-                            continue;
-                        }
-
                         if !retired.is_empty() {
-                            // Retire removed connections before selecting or
-                            // reserving an active slot. Otherwise dropping the
-                            // acquire future during an async retirement close
-                            // would strand that selected slot forever.
+                            // Finish retirement before reserving another slot.
                             inner.idle.push_front(meta);
                             break;
                         }
-
-                        // Found a valid connection
                         meta.touch();
                         inner.active_count += 1;
                         found_conn = Some(meta);
@@ -800,21 +863,22 @@ impl<C: Connection> Pool<C> {
                     } else if let Some(meta) = found_conn {
                         AcquireAction::ValidateExisting(meta)
                     } else if inner.can_create_new() {
-                        // No idle connections, can we create new?
                         inner.total_count += 1;
                         inner.active_count += 1;
                         AcquireAction::CreateNew
                     } else {
-                        // Must wait
                         inner.waiter_count += 1;
-                        AcquireAction::Wait
+                        AcquireAction::Wait(WaiterGuard {
+                            pool: Arc::clone(&self.shared),
+                        })
                     }
                 };
                 (action, retired)
             };
 
-            // Teardown may perform driver I/O. Keep it outside the pool mutex
-            // so one slow close cannot block returns, acquires, or shutdown.
+            // Teardown runs outside the mutex and inside the same deadline as
+            // validation and creation. Dropping the acquisition drops every
+            // remaining guard, including a close hook that never completes.
             for guard in retired {
                 match guard
                     .close(cx, "expired pooled connection retirement")
@@ -829,9 +893,7 @@ impl<C: Connection> Pool<C> {
             }
 
             match action {
-                AcquireAction::RetireAndRetry => {
-                    continue;
-                }
+                AcquireAction::RetireAndRetry => continue,
                 AcquireAction::PoolClosed => {
                     return Outcome::Err(Error::Pool(PoolError {
                         kind: PoolErrorKind::Closed,
@@ -840,96 +902,54 @@ impl<C: Connection> Pool<C> {
                     }));
                 }
                 AcquireAction::ValidateExisting(meta) => {
-                    // Validate and wrap the connection (lock is released). A
-                    // dead idle connection has been closed by now; go round
-                    // again for the next idle one or a fresh connection.
-                    match self.validate_and_wrap(cx, meta, test_on_checkout).await {
+                    match self
+                        .validate_and_wrap(cx, meta, config.test_on_checkout, deadline)
+                        .await
+                    {
                         Outcome::Ok(Some(pooled)) => return Outcome::Ok(pooled),
                         Outcome::Ok(None) => {
                             tracing::warn!(
                                 "pooled connection failed its checkout ping; closed and replaced"
                             );
-                            continue;
                         }
-                        Outcome::Err(e) => return Outcome::Err(e),
-                        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                        Outcome::Panicked(p) => return Outcome::Panicked(p),
+                        Outcome::Err(error) => return Outcome::Err(error),
+                        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                        Outcome::Panicked(info) => return Outcome::Panicked(info),
                     }
                 }
                 AcquireAction::CreateNew => {
-                    // Create new connection outside of lock
                     let mut slot_guard = ActiveSlotGuard::new(Arc::clone(&self.shared));
                     match factory().await {
                         Outcome::Ok(conn) => {
                             self.shared
                                 .connections_created
                                 .fetch_add(1, Ordering::Relaxed);
-                            let publish = match self.shared.lock_or_error("acquire_publish") {
-                                Ok(inner) if inner.closed => {
-                                    let retirement = ActiveConnectionGuard::new(
-                                        Arc::clone(&self.shared),
-                                        ConnectionMeta::new(conn, clock.clone()),
-                                    );
-                                    slot_guard.disarm();
-                                    FactoryPublish::Retire {
-                                        guard: retirement,
-                                        error: Error::Pool(PoolError {
-                                            kind: PoolErrorKind::Closed,
-                                            message: "pool has been closed".to_string(),
-                                            source: None,
-                                        }),
-                                        context: "acquire publish after pool closure",
-                                    }
-                                }
-                                Ok(_inner) => {
-                                    // Disarming while still holding the pool
-                                    // mutex is the admission publication point.
-                                    // A close either precedes this check and
-                                    // rejects the connection, or follows it and
-                                    // waits for this active checkout.
-                                    self.shared.acquires.fetch_add(1, Ordering::Relaxed);
-                                    let meta = ConnectionMeta::new(conn, clock.clone());
-                                    slot_guard.disarm();
-                                    FactoryPublish::Published(PooledConnection::new(
-                                        meta,
-                                        Arc::downgrade(&self.shared),
-                                    ))
-                                }
-                                Err(error) => {
-                                    let retirement = ActiveConnectionGuard::new(
-                                        Arc::clone(&self.shared),
-                                        ConnectionMeta::new(conn, clock.clone()),
-                                    );
-                                    slot_guard.disarm();
-                                    FactoryPublish::Retire {
-                                        guard: retirement,
-                                        error,
-                                        context: "acquire publish bookkeeping failure",
+                            let guard = ActiveConnectionGuard::new(
+                                Arc::clone(&self.shared),
+                                ConnectionMeta::new(conn, clock.clone()),
+                            );
+                            slot_guard.disarm();
+                            if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                                return outcome;
+                            }
+                            let publish = self.publish_acquired(cx, guard, deadline);
+                            return match publish {
+                                AcquirePublish::Published(pooled) => Outcome::Ok(pooled),
+                                AcquirePublish::Interrupted(outcome) => outcome,
+                                AcquirePublish::Retire { guard, error } => {
+                                    match guard.close(cx, "acquire publication rejected").await {
+                                        RetirementOutcome::Closed => Outcome::Err(error),
+                                        RetirementOutcome::Cancelled(reason) => {
+                                            Outcome::Cancelled(reason)
+                                        }
+                                        RetirementOutcome::Failed(error) => Outcome::Err(error),
                                     }
                                 }
                             };
-                            match publish {
-                                FactoryPublish::Published(pooled) => {
-                                    return Outcome::Ok(pooled);
-                                }
-                                FactoryPublish::Retire {
-                                    guard,
-                                    error,
-                                    context,
-                                } => match guard.close(cx, context).await {
-                                    RetirementOutcome::Closed => return Outcome::Err(error),
-                                    RetirementOutcome::Cancelled(reason) => {
-                                        return Outcome::Cancelled(reason);
-                                    }
-                                    RetirementOutcome::Failed(close_error) => {
-                                        return Outcome::Err(close_error);
-                                    }
-                                },
-                            }
                         }
-                        Outcome::Err(e) => {
+                        Outcome::Err(error) => {
                             slot_guard.release("connection factory error");
-                            return Outcome::Err(e);
+                            return Outcome::Err(error);
                         }
                         Outcome::Cancelled(reason) => {
                             slot_guard.release("connection factory cancellation");
@@ -941,93 +961,102 @@ impl<C: Connection> Pool<C> {
                         }
                     }
                 }
-                AcquireAction::Wait => {
-                    // Wait for a connection to become available
+                AcquireAction::Wait(_waiter_guard) => {
+                    // Notify stores return permits. Retain a short slice to
+                    // observe a pool-close broadcast that raced registration;
+                    // the outer future independently bounds all other awaits.
                     let remaining = Duration::from_nanos(
-                        deadline.as_nanos().saturating_sub(clock.now().as_nanos()),
+                        deadline
+                            .at
+                            .as_nanos()
+                            .saturating_sub(clock.now().as_nanos()),
                     );
-                    if remaining.is_zero() {
-                        if let Ok(mut inner) = self.shared.lock_or_error("acquire_timeout") {
-                            inner.waiter_count -= 1;
-                        }
-                        self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
-                        return Outcome::Err(Error::Pool(PoolError {
-                            kind: PoolErrorKind::Timeout,
-                            message: "acquire timeout: no connections available".to_string(),
-                            source: None,
-                        }));
-                    }
-
-                    // Wait for a return notification or a short slice of the
-                    // deadline (the slice keeps cancellation checks frequent),
-                    // yielding to the runtime instead of blocking its thread.
-                    // A release between the bookkeeping above and this await is
-                    // not lost: `Notify` stores a `notify_one` permit.
                     let wait_time = remaining.min(Duration::from_millis(100));
-                    {
-                        let mut notified = std::pin::pin!(self.shared.conn_available.notified());
-                        let mut slice =
-                            std::pin::pin!(asupersync::time::sleep(cx.now(), wait_time));
-                        let _ = Select::new(notified.as_mut(), slice.as_mut()).await;
-                    }
-
-                    // Decrement waiter count after waking
-                    {
-                        if let Ok(mut inner) = self.shared.lock_or_error("acquire_wake") {
-                            inner.waiter_count = inner.waiter_count.saturating_sub(1);
-                        }
-                    }
-
-                    // Loop back to try again
+                    let mut notified = std::pin::pin!(self.shared.conn_available.notified());
+                    let mut slice = std::pin::pin!(asupersync::time::sleep(cx.now(), wait_time));
+                    let _ = Select::new(notified.as_mut(), slice.as_mut()).await;
+                    // WaiterGuard unregisters on wake, timeout, cancellation,
+                    // and hard drop of the acquisition.
                 }
             }
         }
     }
 
-    /// Validate a connection and wrap it in a PooledConnection.
-    /// Ping (when asked) and hand out an idle connection. `Ok(None)` means the
-    /// ping failed and the connection has been closed; the caller picks
-    /// another.
+    /// Fence admission against closure, cancellation, and deadline expiry.
+    /// The guard predates the lock, so interruption drops the lock before
+    /// destroying the connection and releasing its accounted slot.
+    fn publish_acquired(
+        &self,
+        cx: &Cx,
+        guard: ActiveConnectionGuard<C>,
+        deadline: AcquireDeadline,
+    ) -> AcquirePublish<C> {
+        let inner = match self.shared.lock_or_error("acquire_publish") {
+            Ok(inner) => inner,
+            Err(error) => return AcquirePublish::Retire { guard, error },
+        };
+        if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+            drop(inner);
+            drop(guard);
+            return AcquirePublish::Interrupted(outcome);
+        }
+        if inner.closed {
+            return AcquirePublish::Retire {
+                guard,
+                error: Error::Pool(PoolError {
+                    kind: PoolErrorKind::Closed,
+                    message: "pool has been closed".to_string(),
+                    source: None,
+                }),
+            };
+        }
+        self.shared.acquires.fetch_add(1, Ordering::Relaxed);
+        AcquirePublish::Published(PooledConnection::new(
+            guard.into_meta(),
+            Arc::downgrade(&self.shared),
+        ))
+    }
+
+    /// Validate an idle connection. Ok(None) requests a retry after an
+    /// ordinary unhealthy result; cancellation and panic are terminal.
     async fn validate_and_wrap(
         &self,
         cx: &Cx,
         meta: ConnectionMeta<C>,
         test_on_checkout: bool,
+        deadline: AcquireDeadline,
     ) -> Outcome<Option<PooledConnection<C>>, Error> {
         let guard = ActiveConnectionGuard::new(Arc::clone(&self.shared), meta);
         if test_on_checkout {
-            // Validate the connection
             match guard.connection().ping(cx).await {
-                Outcome::Ok(()) => {
-                    self.shared.acquires.fetch_add(1, Ordering::Relaxed);
-                    Outcome::Ok(Some(PooledConnection::new(
-                        guard.into_meta(),
-                        Arc::downgrade(&self.shared),
-                    )))
-                }
-                Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => {
-                    // Connection is invalid. Keep it active until explicit
-                    // retirement completes so close-and-drain cannot return
-                    // while the driver still owns the resource.
+                Outcome::Ok(()) => {}
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
+                Outcome::Err(_) => {
                     match guard
                         .close(cx, "pooled connection checkout validation failure")
                         .await
                     {
-                        RetirementOutcome::Closed => {}
+                        RetirementOutcome::Closed => return Outcome::Ok(None),
                         RetirementOutcome::Cancelled(reason) => {
                             return Outcome::Cancelled(reason);
                         }
                         RetirementOutcome::Failed(error) => return Outcome::Err(error),
                     }
-                    Outcome::Ok(None)
                 }
             }
-        } else {
-            self.shared.acquires.fetch_add(1, Ordering::Relaxed);
-            Outcome::Ok(Some(PooledConnection::new(
-                guard.into_meta(),
-                Arc::downgrade(&self.shared),
-            )))
+        }
+
+        match self.publish_acquired(cx, guard, deadline) {
+            AcquirePublish::Published(pooled) => Outcome::Ok(Some(pooled)),
+            AcquirePublish::Interrupted(outcome) => outcome.map(Some),
+            AcquirePublish::Retire { guard, error } => {
+                match guard.close(cx, "checkout publication rejected").await {
+                    RetirementOutcome::Closed => Outcome::Err(error),
+                    RetirementOutcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                    RetirementOutcome::Failed(error) => Outcome::Err(error),
+                }
+            }
         }
     }
 
@@ -1255,7 +1284,7 @@ impl<C: Connection> Drop for Pool<C> {
 }
 
 /// Action to take when acquiring a connection.
-enum AcquireAction<C> {
+enum AcquireAction<C: Connection> {
     /// Expired idle connections were removed and must retire before retrying.
     RetireAndRetry,
     /// Pool is closed
@@ -1265,15 +1294,15 @@ enum AcquireAction<C> {
     /// Create a new connection
     CreateNew,
     /// Wait for a connection to become available
-    Wait,
+    Wait(WaiterGuard<C>),
 }
 
-enum FactoryPublish<C: Connection> {
+enum AcquirePublish<C: Connection> {
     Published(PooledConnection<C>),
+    Interrupted(Outcome<PooledConnection<C>, Error>),
     Retire {
         guard: ActiveConnectionGuard<C>,
         error: Error,
-        context: &'static str,
     },
 }
 
@@ -1462,11 +1491,44 @@ mod tests {
             .saturating_sub_nanos(u64::try_from(ago.as_nanos()).expect("duration fits u64 nanos"));
     }
 
+    #[derive(Debug)]
+    enum MockPing {
+        Ready,
+        Pending,
+        Gated(Arc<AtomicBool>),
+        Delay(Duration),
+        Cancelled,
+        Panicked,
+        Unwind,
+        CancelOnReady,
+        AdvanceClock(Arc<VirtualClock>, u64),
+    }
+
+    /// Observes resource destruction itself, before the pool may release its
+    /// active slot. A missing inner snapshot also detects a held pool mutex.
+    #[derive(Debug)]
+    struct ConnectionDropProbe {
+        pool: Weak<PoolShared<MockConnection>>,
+        observed: Arc<OnceCell<Option<PoolStats>>>,
+    }
+
+    impl Drop for ConnectionDropProbe {
+        fn drop(&mut self) {
+            let snapshot = self
+                .pool
+                .upgrade()
+                .and_then(|shared| shared.inner.try_lock().ok().map(|inner| inner.stats()));
+            let _ = self.observed.set(snapshot);
+        }
+    }
+
     /// A mock connection for testing pool behavior.
     #[derive(Debug)]
     struct MockConnection {
         id: u32,
         ping_should_fail: Arc<AtomicBool>,
+        ping: MockPing,
+        _drop_probe: Option<ConnectionDropProbe>,
         /// Incremented each time the pool retires this connection via
         /// `close_for_pool` (as opposed to a caller-owned `close`).
         pool_close_calls: Arc<AtomicUsize>,
@@ -1475,6 +1537,7 @@ mod tests {
         pool_close_pending: bool,
         /// When true, pool retirement returns a deterministic driver error.
         pool_close_should_fail: bool,
+        pool_close_delay: Option<Duration>,
         /// Optional probe used to prove the pool mutex is not held while the
         /// retirement hook runs.
         pool_shared: Option<Weak<PoolShared<MockConnection>>>,
@@ -1486,9 +1549,12 @@ mod tests {
             Self {
                 id,
                 ping_should_fail: Arc::new(AtomicBool::new(false)),
+                ping: MockPing::Ready,
+                _drop_probe: None,
                 pool_close_calls: Arc::new(AtomicUsize::new(0)),
                 pool_close_pending: false,
                 pool_close_should_fail: false,
+                pool_close_delay: None,
                 pool_shared: None,
                 pool_lock_was_free: None,
             }
@@ -1497,25 +1563,15 @@ mod tests {
         #[allow(dead_code)]
         fn with_ping_behavior(id: u32, should_fail: Arc<AtomicBool>) -> Self {
             Self {
-                id,
                 ping_should_fail: should_fail,
-                pool_close_calls: Arc::new(AtomicUsize::new(0)),
-                pool_close_pending: false,
-                pool_close_should_fail: false,
-                pool_shared: None,
-                pool_lock_was_free: None,
+                ..Self::new(id)
             }
         }
 
         fn with_pool_close_counter(id: u32, pool_close_calls: Arc<AtomicUsize>) -> Self {
             Self {
-                id,
-                ping_should_fail: Arc::new(AtomicBool::new(false)),
                 pool_close_calls,
-                pool_close_pending: false,
-                pool_close_should_fail: false,
-                pool_shared: None,
-                pool_lock_was_free: None,
+                ..Self::new(id)
             }
         }
 
@@ -1526,37 +1582,46 @@ mod tests {
             pool_lock_was_free: Arc<AtomicBool>,
         ) -> Self {
             Self {
-                id,
-                ping_should_fail: Arc::new(AtomicBool::new(false)),
                 pool_close_calls,
-                pool_close_pending: false,
-                pool_close_should_fail: false,
                 pool_shared: Some(pool_shared),
                 pool_lock_was_free: Some(pool_lock_was_free),
+                ..Self::new(id)
             }
         }
 
         fn with_pending_pool_close(id: u32, pool_close_calls: Arc<AtomicUsize>) -> Self {
             Self {
-                id,
-                ping_should_fail: Arc::new(AtomicBool::new(false)),
                 pool_close_calls,
                 pool_close_pending: true,
-                pool_close_should_fail: false,
-                pool_shared: None,
-                pool_lock_was_free: None,
+                ..Self::new(id)
             }
         }
 
         fn with_failing_pool_close(id: u32) -> Self {
             Self {
-                id,
-                ping_should_fail: Arc::new(AtomicBool::new(false)),
-                pool_close_calls: Arc::new(AtomicUsize::new(0)),
-                pool_close_pending: false,
                 pool_close_should_fail: true,
-                pool_shared: None,
-                pool_lock_was_free: None,
+                ..Self::new(id)
+            }
+        }
+
+        fn with_ping(id: u32, ping: MockPing) -> Self {
+            Self {
+                ping,
+                ..Self::new(id)
+            }
+        }
+
+        fn observe_drop(
+            self,
+            pool: &Pool<Self>,
+            observed: Arc<OnceCell<Option<PoolStats>>>,
+        ) -> Self {
+            Self {
+                _drop_probe: Some(ConnectionDropProbe {
+                    pool: Arc::downgrade(&pool.shared),
+                    observed,
+                }),
+                ..self
             }
         }
     }
@@ -1711,7 +1776,33 @@ mod tests {
             Outcome::Ok(0)
         }
 
-        async fn ping(&self, _cx: &Cx) -> Outcome<(), Error> {
+        async fn ping(&self, cx: &Cx) -> Outcome<(), Error> {
+            match &self.ping {
+                MockPing::Ready => {}
+                MockPing::Pending => std::future::pending::<()>().await,
+                MockPing::Gated(ready) => {
+                    std::future::poll_fn(|_| {
+                        if ready.load(Ordering::Acquire) {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                MockPing::Delay(delay) => asupersync::time::sleep(cx.now(), *delay).await,
+                MockPing::Cancelled => {
+                    return Outcome::Cancelled(CancelReason::user("mock ping cancelled"));
+                }
+                MockPing::Panicked => {
+                    return Outcome::Panicked(asupersync::types::PanicPayload::new(
+                        "mock ping panicked",
+                    ));
+                }
+                MockPing::Unwind => panic!("mock ping unwound"),
+                MockPing::CancelOnReady => cx.set_cancel_requested(true),
+                MockPing::AdvanceClock(clock, nanos) => clock.advance(*nanos),
+            }
             if self.ping_should_fail.load(Ordering::Relaxed) {
                 Outcome::Err(Error::Connection(ConnectionError {
                     kind: ConnectionErrorKind::Disconnected,
@@ -1727,7 +1818,7 @@ mod tests {
             Ok(())
         }
 
-        async fn close_for_pool(self, _cx: &Cx) -> Result<(), Error> {
+        async fn close_for_pool(self, cx: &Cx) -> Result<(), Error> {
             if let (Some(pool_shared), Some(pool_lock_was_free)) =
                 (self.pool_shared.as_ref(), self.pool_lock_was_free.as_ref())
             {
@@ -1737,6 +1828,9 @@ mod tests {
                 pool_lock_was_free.store(mutex_is_available, Ordering::Relaxed);
             }
             self.pool_close_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(delay) = self.pool_close_delay {
+                asupersync::time::sleep(cx.now(), delay).await;
+            }
             if self.pool_close_pending {
                 std::future::pending::<()>().await;
             }
@@ -1745,6 +1839,312 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    fn seed_idle(pool: &Pool<MockConnection>, conn: MockConnection) {
+        let cx = Cx::for_testing();
+        let conn = Mutex::new(Some(conn));
+        let mut acquire = Box::pin(pool.acquire(&cx, || {
+            std::future::ready(Outcome::Ok(conn.lock().unwrap().take().unwrap()))
+        }));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        match acquire.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Outcome::Ok(lease)) => drop(lease),
+            other => panic!("immediate factory did not create the fixture: {other:?}"),
+        }
+        assert_eq!(pool.stats().idle_connections, 1);
+    }
+
+    fn assert_no_occupied_slots(pool: &Pool<MockConnection>) {
+        let stats = pool.stats();
+        assert_eq!(stats.total_connections, 0, "{stats:?}");
+        assert_eq!(stats.active_connections, 0, "{stats:?}");
+        assert_eq!(stats.idle_connections, 0, "{stats:?}");
+        assert_eq!(stats.pending_requests, 0, "{stats:?}");
+    }
+
+    fn assert_drop_precedes_slot_release(observed: &OnceCell<Option<PoolStats>>) {
+        let at_drop = observed
+            .get()
+            .expect("connection resource was destroyed before acquire returned")
+            .as_ref()
+            .expect("resource was destroyed without holding the pool mutex");
+        assert_eq!(at_drop.active_connections, 1);
+        assert_eq!(at_drop.total_connections, 1);
+        assert_eq!(at_drop.idle_connections, 0);
+    }
+
+    #[test]
+    fn checkout_cancellation_wakes_a_ping_that_never_wakes() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let dropped = Arc::new(OnceCell::new());
+        seed_idle(
+            &pool,
+            MockConnection::with_ping(1, MockPing::Pending)
+                .observe_drop(&pool, Arc::clone(&dropped)),
+        );
+        let cx = Cx::for_testing();
+        let calls = AtomicUsize::new(0);
+        let mut acquire = Box::pin(pool.acquire(&cx, || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ok(MockConnection::new(2))
+        }));
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task_cx = Context::from_waker(&waker);
+        assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(pool.stats().active_connections, 1);
+        assert!(dropped.get().is_none());
+
+        let before = wakes.wakes.load(Ordering::Relaxed);
+        cx.set_cancel_requested(true);
+        assert!(wakes.wakes.load(Ordering::Relaxed) > before);
+        assert!(matches!(
+            acquire.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Cancelled(_))
+        ));
+
+        // Deliberately retain the completed future: cleanup must precede
+        // returning Ready, rather than relying on its caller to drop it.
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.stats().connections_closed, 1);
+        assert_eq!(pool.stats().timeouts, 0);
+        let drain_cx = Cx::for_testing();
+        let mut drain = Box::pin(pool.close_and_drain(&drain_cx));
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Ok(()))
+        ));
+    }
+
+    #[test]
+    fn dropping_checkout_validation_discards_resource_and_wakes_waiter() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let dropped = Arc::new(OnceCell::new());
+        seed_idle(
+            &pool,
+            MockConnection::with_ping(1, MockPing::Pending)
+                .observe_drop(&pool, Arc::clone(&dropped)),
+        );
+        let validating_cx = Cx::for_testing();
+        let waiting_cx = Cx::for_testing();
+        let mut validation = Box::pin(pool.acquire(&validating_cx, || async {
+            Outcome::Ok(MockConnection::new(99))
+        }));
+        let mut waiter = Box::pin(pool.acquire(&waiting_cx, || async {
+            Outcome::Ok(MockConnection::new(2))
+        }));
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task_cx = Context::from_waker(&waker);
+        assert!(validation.as_mut().poll(&mut task_cx).is_pending());
+        assert!(waiter.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(pool.stats().pending_requests, 1);
+        let before = wakes.wakes.load(Ordering::Relaxed);
+
+        drop(validation);
+
+        assert_drop_precedes_slot_release(&dropped);
+        assert!(wakes.wakes.load(Ordering::Relaxed) > before);
+        assert_eq!(pool.stats().total_connections, 0);
+        assert_eq!(pool.stats().pending_requests, 1);
+        let lease = match waiter.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Outcome::Ok(lease)) => lease,
+            other => panic!("freed slot did not let the waiter recover: {other:?}"),
+        };
+        assert_eq!(lease.id, 2);
+        assert_eq!(pool.stats().pending_requests, 0);
+        assert_eq!(pool.stats().connections_created, 2);
+        assert_eq!(pool.stats().connections_closed, 1);
+        drop(lease);
+        let drain_cx = Cx::for_testing();
+        let mut drain = Box::pin(pool.close_and_drain(&drain_cx));
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Ok(()))
+        ));
+        assert_no_occupied_slots(&pool);
+    }
+
+    #[test]
+    fn dropping_queued_acquire_unregisters_only_its_own_waiter() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let holder_cx = Cx::for_testing();
+        let mut holder =
+            Box::pin(pool.acquire(&holder_cx, || async { Outcome::Ok(MockConnection::new(1)) }));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        let lease = match holder.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Outcome::Ok(lease)) => lease,
+            other => panic!("holder did not acquire: {other:?}"),
+        };
+        let waiting_cx = Cx::for_testing();
+        let mut first = Box::pin(pool.acquire(&waiting_cx, || async {
+            Outcome::Ok(MockConnection::new(2))
+        }));
+        let mut second = Box::pin(pool.acquire(&waiting_cx, || async {
+            Outcome::Ok(MockConnection::new(3))
+        }));
+        assert!(first.as_mut().poll(&mut task_cx).is_pending());
+        assert!(second.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(pool.stats().pending_requests, 2);
+        drop(first);
+        assert_eq!(pool.stats().pending_requests, 1);
+        assert_eq!(pool.stats().active_connections, 1);
+        drop(second);
+        assert_eq!(pool.stats().pending_requests, 0);
+        drop(lease);
+        assert_eq!(pool.stats().idle_connections, 1);
+    }
+
+    #[test]
+    fn checkout_driver_cancel_and_panic_outcomes_are_terminal() {
+        for (ping, panicked) in [(MockPing::Cancelled, false), (MockPing::Panicked, true)] {
+            let pool = Pool::new(PoolConfig::new(1));
+            let dropped = Arc::new(OnceCell::new());
+            seed_idle(
+                &pool,
+                MockConnection::with_ping(1, ping).observe_drop(&pool, Arc::clone(&dropped)),
+            );
+            let cx = Cx::for_testing();
+            let calls = AtomicUsize::new(0);
+            let mut acquire = Box::pin(pool.acquire(&cx, || async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Outcome::Ok(MockConnection::new(2))
+            }));
+            let mut task_cx = Context::from_waker(Waker::noop());
+            match acquire.as_mut().poll(&mut task_cx) {
+                Poll::Ready(Outcome::Cancelled(reason)) if !panicked => {
+                    assert_eq!(reason, CancelReason::user("mock ping cancelled"));
+                }
+                Poll::Ready(Outcome::Panicked(payload)) if panicked => {
+                    assert_eq!(payload.message(), "mock ping panicked");
+                }
+                other => panic!("validation outcome must propagate unchanged: {other:?}"),
+            }
+            assert!(
+                !cx.is_cancel_requested(),
+                "the driver outcome is independent of the caller's flag"
+            );
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                0,
+                "terminal outcomes must never retry"
+            );
+            assert_drop_precedes_slot_release(&dropped);
+            assert_no_occupied_slots(&pool);
+            assert_eq!(pool.stats().connections_closed, 1);
+            assert_eq!(pool.stats().acquires, 1);
+            assert_eq!(pool.stats().timeouts, 0);
+        }
+    }
+
+    #[test]
+    fn checkout_unwinding_drops_the_resource_and_pool_recovers() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let dropped = Arc::new(OnceCell::new());
+        seed_idle(
+            &pool,
+            MockConnection::with_ping(1, MockPing::Unwind)
+                .observe_drop(&pool, Arc::clone(&dropped)),
+        );
+        let cx = Cx::for_testing();
+        let mut task_cx = Context::from_waker(Waker::noop());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Owning the future inside this boundary exercises actual unwind
+            // destruction, as opposed to merely returning Outcome::Panicked.
+            let mut acquire =
+                Box::pin(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+            let _ = acquire.as_mut().poll(&mut task_cx);
+        }));
+        assert!(panic.is_err());
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert!(!pool.shared.inner.is_poisoned());
+        seed_idle(&pool, MockConnection::new(2));
+        let mut drain = Box::pin(pool.close_and_drain(&cx));
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Ok(()))
+        ));
+        assert_no_occupied_slots(&pool);
+    }
+
+    #[test]
+    fn checkout_success_that_requests_cancellation_is_not_published() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let dropped = Arc::new(OnceCell::new());
+        seed_idle(
+            &pool,
+            MockConnection::with_ping(1, MockPing::CancelOnReady)
+                .observe_drop(&pool, Arc::clone(&dropped)),
+        );
+        let cx = Cx::for_testing();
+        let mut acquire =
+            Box::pin(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            acquire.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Cancelled(_))
+        ));
+        assert!(cx.is_cancel_requested());
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert_eq!(pool.stats().acquires, 1);
+    }
+
+    #[test]
+    fn checkout_validation_cannot_publish_after_concurrent_pool_close() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let ready = Arc::new(AtomicBool::new(false));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut conn = MockConnection::with_pool_close_counter(1, Arc::clone(&closes));
+        conn.ping = MockPing::Gated(Arc::clone(&ready));
+        seed_idle(&pool, conn);
+        let cx = Cx::for_testing();
+        let mut acquire =
+            Box::pin(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+        pool.close();
+        ready.store(true, Ordering::Release);
+        assert!(matches!(
+            acquire.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Err(Error::Pool(PoolError {
+                kind: PoolErrorKind::Closed,
+                ..
+            })))
+        ));
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.stats().acquires, 1);
+        assert_no_occupied_slots(&pool);
+        let mut drain = Box::pin(pool.close_and_drain(&cx));
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Ok(()))
+        ));
+    }
+
+    #[test]
+    fn checkout_ambient_cancellation_finishes_without_repolling_completed_timer() {
+        let pool = Pool::new(PoolConfig::new(1));
+        seed_idle(&pool, MockConnection::with_ping(1, MockPing::Pending));
+        let request = Cx::for_testing();
+        let ambient = Cx::for_testing();
+        let _ambient_guard = Cx::set_current(Some(ambient.clone()));
+        let mut acquire =
+            Box::pin(pool.acquire(&request, || async { Outcome::Ok(MockConnection::new(2)) }));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+        ambient.set_cancel_requested(true);
+        assert!(!request.is_cancel_requested());
+        assert!(matches!(
+            acquire.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Cancelled(_))
+        ));
+        assert_no_occupied_slots(&pool);
+        assert_eq!(pool.stats().timeouts, 0);
     }
 
     #[test]
@@ -3327,6 +3727,357 @@ mod tests {
         let pool = Arc::new(Pool::with_timer_driver(config, driver));
         let region = runtime.state.create_root_region(Budget::INFINITE);
         (runtime, pool, region)
+    }
+
+    fn run_acquire_lab<F, Fut>(config: PoolConfig, budget: Budget, test: F)
+    where
+        F: FnOnce(Arc<Pool<MockConnection>>, Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (mut runtime, pool, region) = lab_pool(config);
+        let completed = Arc::new(OnceCell::new());
+        let record = Arc::clone(&completed);
+        let (task, _) = runtime
+            .state
+            .create_task(region, budget, async move {
+                let cx = Cx::current().expect("lab task has a context");
+                test(pool, cx).await;
+                let _ = record.set(());
+            })
+            .expect("spawn acquisition regression");
+        runtime.scheduler.lock().schedule(task, 0);
+        runtime.run_with_auto_advance();
+        assert!(
+            completed.get().is_some(),
+            "acquisition regression must finish every assertion"
+        );
+    }
+
+    #[test]
+    fn lab_checkout_validation_deadline_discards_connection_and_pool_recovers() {
+        run_acquire_lab(
+            PoolConfig::new(1).acquire_timeout(200),
+            Budget::INFINITE,
+            |pool, cx| async move {
+                let dropped = Arc::new(OnceCell::new());
+                let first = pool
+                    .acquire(&cx, || async {
+                        Outcome::Ok(
+                            MockConnection::with_ping(1, MockPing::Pending)
+                                .observe_drop(&pool, Arc::clone(&dropped)),
+                        )
+                    })
+                    .await
+                    .expect("create first connection");
+                drop(first);
+                let calls = AtomicUsize::new(0);
+                let mut acquire = Box::pin(pool.acquire(&cx, || async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Outcome::Ok(MockConnection::new(99))
+                }));
+                assert!(matches!(
+                    acquire.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(cx.now(), Time::from_millis(200));
+                assert_eq!(calls.load(Ordering::Relaxed), 0);
+                assert_drop_precedes_slot_release(&dropped);
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().connections_created, 1);
+                assert_eq!(pool.stats().connections_closed, 1);
+                assert_eq!(pool.stats().timeouts, 1);
+                assert_eq!(pool.stats().acquires, 1);
+
+                let replacement = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await
+                    .expect("pool recovers after stalled validation");
+                assert_eq!(replacement.id, 2);
+                drop(replacement);
+                pool.close_and_drain(&cx)
+                    .await
+                    .expect("recovered pool drains");
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().connections_closed, 2);
+            },
+        );
+    }
+
+    #[test]
+    fn lab_checkout_validation_uses_the_shorter_caller_budget() {
+        let budget = Budget::new().with_deadline(Time::from_millis(75));
+        run_acquire_lab(
+            PoolConfig::new(1).acquire_timeout(200),
+            budget,
+            |pool, cx| async move {
+                let first = pool
+                    .acquire(&cx, || async {
+                        Outcome::Ok(MockConnection::with_ping(1, MockPing::Pending))
+                    })
+                    .await
+                    .expect("create first connection");
+                drop(first);
+                let mut acquire =
+                    Box::pin(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+                match acquire.as_mut().await {
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        message,
+                        ..
+                    })) => {
+                        assert!(message.contains("budget deadline"));
+                    }
+                    other => panic!("budget expiry must remain a timeout, got {other:?}"),
+                }
+                assert_eq!(cx.now(), Time::from_millis(75));
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().timeouts, 1);
+                assert_eq!(pool.stats().connections_closed, 1);
+            },
+        );
+    }
+
+    #[test]
+    fn lab_pending_factory_is_bounded_and_drops_its_resource_before_slot_release() {
+        run_acquire_lab(
+            PoolConfig::new(1).acquire_timeout(200),
+            Budget::INFINITE,
+            |pool, cx| async move {
+                let dropped = Arc::new(OnceCell::new());
+                let ready = Arc::new(AtomicBool::new(false));
+                let mut acquire = Box::pin(pool.acquire(&cx, || GatedFactory {
+                    ready: Arc::clone(&ready),
+                    conn: Some(MockConnection::new(1).observe_drop(&pool, Arc::clone(&dropped))),
+                }));
+                assert!(matches!(
+                    acquire.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(cx.now(), Time::from_millis(200));
+                assert_drop_precedes_slot_release(&dropped);
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().connections_created, 0);
+                assert_eq!(pool.stats().connections_closed, 0);
+                assert_eq!(pool.stats().timeouts, 1);
+                let replacement = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await
+                    .expect("timed-out factory releases its reservation");
+                drop(replacement);
+                pool.close_and_drain(&cx)
+                    .await
+                    .expect("drain after replacement");
+                assert_no_occupied_slots(&pool);
+            },
+        );
+    }
+
+    #[test]
+    fn lab_queue_wait_and_checkout_validation_share_one_deadline() {
+        run_acquire_lab(
+            PoolConfig::new(1).acquire_timeout(200),
+            Budget::INFINITE,
+            |pool, cx| async move {
+                let holder = pool
+                    .acquire(&cx, || async {
+                        Outcome::Ok(MockConnection::with_ping(1, MockPing::Pending))
+                    })
+                    .await
+                    .expect("holder creates connection");
+                let mut waiter =
+                    Box::pin(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+                std::future::poll_fn(|task_cx| {
+                    assert!(waiter.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(pool.stats().pending_requests, 1);
+                asupersync::time::sleep(cx.now(), Duration::from_millis(70)).await;
+                drop(holder);
+                assert!(matches!(
+                    waiter.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(
+                    cx.now(),
+                    Time::from_millis(200),
+                    "validation cannot restart the queue's budget"
+                );
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().timeouts, 1);
+                assert_eq!(pool.stats().connections_closed, 1);
+            },
+        );
+    }
+
+    #[test]
+    fn lab_failed_ping_retirement_cannot_extend_the_acquisition_deadline() {
+        run_acquire_lab(
+            PoolConfig::new(1).acquire_timeout(200),
+            Budget::INFINITE,
+            |pool, cx| async move {
+                let dropped = Arc::new(OnceCell::new());
+                let closes = Arc::new(AtomicUsize::new(0));
+                let first = pool
+                    .acquire(&cx, || async {
+                        let mut conn =
+                            MockConnection::with_pending_pool_close(1, Arc::clone(&closes))
+                                .observe_drop(&pool, Arc::clone(&dropped));
+                        conn.ping = MockPing::Delay(Duration::from_millis(50));
+                        conn.ping_should_fail.store(true, Ordering::Relaxed);
+                        Outcome::Ok(conn)
+                    })
+                    .await
+                    .expect("create failing connection");
+                drop(first);
+                let mut acquire =
+                    Box::pin(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+                assert!(matches!(
+                    acquire.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(cx.now(), Time::from_millis(200));
+                assert_eq!(closes.load(Ordering::Relaxed), 1);
+                assert_drop_precedes_slot_release(&dropped);
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().connections_closed, 1);
+                pool.close_and_drain(&cx)
+                    .await
+                    .expect("timed-out retirement is already drained");
+            },
+        );
+    }
+
+    #[test]
+    fn lab_validation_retries_and_close_hooks_share_the_original_deadline() {
+        run_acquire_lab(
+            PoolConfig::new(2).acquire_timeout(200),
+            Budget::INFINITE,
+            |pool, cx| async move {
+                let first = pool
+                    .acquire(&cx, || async {
+                        let mut conn = MockConnection::with_ping(
+                            1,
+                            MockPing::Delay(Duration::from_millis(80)),
+                        );
+                        conn.ping_should_fail.store(true, Ordering::Relaxed);
+                        conn.pool_close_delay = Some(Duration::from_millis(50));
+                        Outcome::Ok(conn)
+                    })
+                    .await
+                    .expect("create first connection");
+                let second = pool
+                    .acquire(&cx, || async {
+                        Outcome::Ok(MockConnection::with_ping(2, MockPing::Pending))
+                    })
+                    .await
+                    .expect("create second connection");
+                drop(first);
+                drop(second);
+                let factories = AtomicUsize::new(0);
+                let mut acquire = Box::pin(pool.acquire(&cx, || async {
+                    factories.fetch_add(1, Ordering::Relaxed);
+                    Outcome::Ok(MockConnection::new(3))
+                }));
+                assert!(matches!(
+                    acquire.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(
+                    cx.now(),
+                    Time::from_millis(200),
+                    "retry must inherit the 130ms already spent"
+                );
+                assert_eq!(factories.load(Ordering::Relaxed), 0);
+                assert_eq!(pool.stats().connections_closed, 2);
+                assert_eq!(pool.stats().connections_created, 2);
+                assert_eq!(pool.stats().timeouts, 1);
+                assert_no_occupied_slots(&pool);
+            },
+        );
+    }
+
+    #[test]
+    fn lab_successful_factory_and_ping_recheck_deadline_after_the_final_poll() {
+        for validate_existing in [false, true] {
+            let (clock, driver) = virtual_clock();
+            let mut runtime = LabRuntime::new(LabConfig::new(0x43_0001));
+            // The same controllable clock drives the pool and the task. The
+            // injected advance represents work performed inside one poll,
+            // before the runtime gets another chance to poll the timeout.
+            runtime.state.set_timer_driver(driver.clone());
+            let pool = Arc::new(Pool::with_timer_driver(
+                PoolConfig::new(1).acquire_timeout(200),
+                driver,
+            ));
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            let completed = Arc::new(OnceCell::new());
+            let record = Arc::clone(&completed);
+            let (task, _) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let cx = Cx::current().expect("lab task context");
+                    let dropped = Arc::new(OnceCell::new());
+                    if validate_existing {
+                        let first = pool
+                            .acquire(&cx, || async {
+                                Outcome::Ok(
+                                    MockConnection::with_ping(
+                                        1,
+                                        MockPing::AdvanceClock(Arc::clone(&clock), 200_000_000),
+                                    )
+                                    .observe_drop(&pool, Arc::clone(&dropped)),
+                                )
+                            })
+                            .await
+                            .expect("create connection before deadline");
+                        drop(first);
+                    }
+                    let mut acquire = Box::pin(pool.acquire(&cx, || async {
+                        assert!(!validate_existing, "existing connection must be validated");
+                        clock.advance(200_000_000);
+                        Outcome::Ok(
+                            MockConnection::new(2).observe_drop(&pool, Arc::clone(&dropped)),
+                        )
+                    }));
+                    assert!(matches!(
+                        acquire.as_mut().await,
+                        Outcome::Err(Error::Pool(PoolError {
+                            kind: PoolErrorKind::Timeout,
+                            ..
+                        }))
+                    ));
+                    assert_eq!(cx.now(), Time::from_millis(200));
+                    assert_drop_precedes_slot_release(&dropped);
+                    assert_no_occupied_slots(&pool);
+                    assert_eq!(pool.stats().acquires, u64::from(validate_existing));
+                    assert_eq!(pool.stats().connections_closed, 1);
+                    assert_eq!(pool.stats().timeouts, 1);
+                    let _ = record.set(());
+                })
+                .expect("spawn final-poll boundary regression");
+            runtime.scheduler.lock().schedule(task, 0);
+            runtime.run_with_auto_advance();
+            assert!(
+                completed.get().is_some(),
+                "both publication sites must recheck time"
+            );
+        }
     }
 
     #[test]
