@@ -60,6 +60,12 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
          C SQLite stores it normalized as `CREATE TABLE`. The introspector's sqlite_master \
          parsing accepts both",
     ),
+    (
+        "syntax error",
+        "fsqlite >= 0.4.4 reports an unexpected token as SyntaxError, which the frankensqlite \
+         driver maps to QueryErrorKind::Syntax; C SQLite returns a plain SQLITE_ERROR \
+         (`near \"SELEC\": syntax error`), which the C driver maps to Database",
+    ),
 ];
 
 #[derive(sqlmodel::Model, Debug, Clone)]
@@ -623,7 +629,7 @@ async fn script<C: Connection>(cx: &Cx, conn: &C) -> Vec<(&'static str, Observed
         },
     ));
 
-    // A syntax error and a missing table report the same error kind.
+    // A syntax error (a known divergence since fsqlite 0.4.4) and a missing table.
     out.push(("syntax error", rows(conn.query(cx, "SELEC 1", &[]).await)));
     out.push((
         "missing table",
