@@ -55,12 +55,6 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
          on UPDATE/DELETE",
     ),
     (
-        "players ddl",
-        "fsqlite stores the CREATE TABLE text verbatim in sqlite_master (keeps `IF NOT EXISTS`); \
-         C SQLite stores it normalized as `CREATE TABLE`. The introspector's sqlite_master \
-         parsing accepts both",
-    ),
-    (
         "syntax error",
         "fsqlite >= 0.4.4 reports an unexpected token as SyntaxError, which the frankensqlite \
          driver maps to QueryErrorKind::Syntax; C SQLite returns a plain SQLITE_ERROR \
