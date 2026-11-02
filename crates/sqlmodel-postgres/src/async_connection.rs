@@ -2284,6 +2284,42 @@ impl Connection for SharedPgConnection {
         }
     }
 
+    fn validate_for_pool(
+        &self,
+        cx: &Cx,
+        check_connection: bool,
+    ) -> impl Future<Output = Outcome<(), Error>> + Send {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
+            };
+            if !matches!(
+                guard.state,
+                ConnectionState::Ready(TransactionStatusState::Idle)
+            ) {
+                // Session and raw SQL can leave a transaction open without a
+                // SharedPgTransaction owner. Retire it before reporting failure,
+                // even when an escaped shared handle keeps the allocation alive.
+                guard.close_stream();
+                return Outcome::Err(disconnected_error(
+                    "PostgreSQL connection is not idle and cannot be reused by the pool",
+                ));
+            }
+            if check_connection {
+                guard.ping_async(cx).await
+            } else {
+                Outcome::Ok(())
+            }
+        }
+    }
+
     async fn close(self, cx: &Cx) -> sqlmodel_core::Result<()> {
         if self.physically_closed.load(Ordering::Acquire) {
             return Ok(());

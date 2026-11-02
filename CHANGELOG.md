@@ -38,6 +38,14 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- Pool checkout now runs driver reuse safeguards even when its optional ping
+  is disabled. PostgreSQL rejects and physically retires open or failed raw
+  transactions left by an abandoned ORM `Session`, so the next borrower
+  cannot observe or commit the previous borrower's uncommitted work.
+  Cancellation, retirement, and replacement remain within the original
+  acquisition deadline. Explicitly committed and rolled-back sessions still
+  reuse their original backend, and ordinary `ping` retains its transaction
+  behavior. Connection wrappers forward the new `validate_for_pool` hook.
 - PostgreSQL transactions now retain exclusive connection ownership through
   finalization. Dropped transactions and abandoned commit/rollback futures
   close their socket before releasing ownership, including holder panic and

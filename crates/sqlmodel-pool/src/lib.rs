@@ -13,6 +13,8 @@
 //!
 //! # Health-check rule
 //!
+//! Every idle candidate passes [`Connection::validate_for_pool`], allowing a
+//! driver to reject state that cannot safely cross borrower boundaries.
 //! With `test_on_checkout` (the default) every idle connection is pinged before
 //! it is handed out; one that fails is closed and replaced transparently, so a
 //! server-side kill of an idle connection costs one reconnect when the acquire
@@ -20,11 +22,15 @@
 //! earlier of `acquire_timeout` and the caller's budget deadline. A stalled
 //! ping or close cannot extend it. An interrupted validation discards its
 //! connection before releasing the pool slot; it is never returned idle.
+//! Disabling the ping retains driver-specific local safeguards. PostgreSQL
+//! rejects an unfinished transaction instead of exposing its uncommitted work
+//! to another borrower. This does not reset arbitrary session configuration.
 //! Returning a connection runs no check (a return is a synchronous `Drop`), so
 //! a lease whose statement failed with a connection error should be
 //! [`PooledConnection::detach`]ed rather than dropped back into the pool;
-//! dropped, it is handed out again and fails its next statement. The e2e pool
-//! scenario asserts both behaviours against PostgreSQL and MySQL.
+//! without a health probe, a driver may still hand an undetected dead socket
+//! out and fail its next statement. The e2e pool scenario asserts server-side
+//! termination with both probe settings against PostgreSQL and MySQL.
 //!
 //! A lease holder that panics returns its connection during unwinding (the
 //! lease's `Drop` runs); the pool's accounting stays consistent, it keeps
@@ -155,8 +161,9 @@ impl PoolConfig {
     }
 
     /// Enable/disable the ping before a connection is handed out (see the
-    /// crate-level "Health-check rule"). There is no test on return: a return
-    /// is a synchronous `Drop`; detach a lease you know to be dead instead.
+    /// crate-level "Health-check rule"). Driver-specific local reuse checks
+    /// still run when disabled. There is no test on return: a return is a
+    /// synchronous `Drop`; detach a lease you know to be dead instead.
     #[must_use]
     pub fn test_on_checkout(mut self, enabled: bool) -> Self {
         self.test_on_checkout = enabled;
@@ -1041,27 +1048,31 @@ impl<C: Connection> Pool<C> {
         deadline: AcquireDeadline,
     ) -> Outcome<Option<PooledConnection<C>>, Error> {
         let guard = ActiveConnectionGuard::new(Arc::clone(&self.shared), meta);
-        if test_on_checkout {
-            match guard.connection().ping(cx).await {
-                Outcome::Ok(()) => {}
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(info) => return Outcome::Panicked(info),
-                Outcome::Err(_) => {
-                    // A driver may consume the remaining budget within one
-                    // poll. Do not begin another I/O operation after expiry.
-                    if let Some(outcome) = self.acquire_interruption(cx, deadline) {
-                        return outcome;
+        // The flag controls the optional health probe, not driver safeguards
+        // against handing another borrower an unfinished transaction.
+        match guard
+            .connection()
+            .validate_for_pool(cx, test_on_checkout)
+            .await
+        {
+            Outcome::Ok(()) => {}
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
+            Outcome::Err(_) => {
+                // A driver may consume the remaining budget within one
+                // poll. Do not begin another I/O operation after expiry.
+                if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                    return outcome;
+                }
+                match guard
+                    .close(cx, "pooled connection checkout validation failure")
+                    .await
+                {
+                    RetirementOutcome::Closed => return Outcome::Ok(None),
+                    RetirementOutcome::Cancelled(reason) => {
+                        return Outcome::Cancelled(reason);
                     }
-                    match guard
-                        .close(cx, "pooled connection checkout validation failure")
-                        .await
-                    {
-                        RetirementOutcome::Closed => return Outcome::Ok(None),
-                        RetirementOutcome::Cancelled(reason) => {
-                            return Outcome::Cancelled(reason);
-                        }
-                        RetirementOutcome::Failed(error) => return Outcome::Err(error),
-                    }
+                    RetirementOutcome::Failed(error) => return Outcome::Err(error),
                 }
             }
         }
@@ -1578,6 +1589,14 @@ mod tests {
         AdvanceClock(Arc<VirtualClock>, u64),
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum MockPoolValidation {
+        Default,
+        Reject,
+        Pending,
+        Cancelled,
+    }
+
     /// Observes resource destruction itself, before the pool may release its
     /// active slot. A missing inner snapshot also detects a held pool mutex.
     #[derive(Debug)]
@@ -1602,6 +1621,8 @@ mod tests {
         id: u32,
         ping_should_fail: Arc<AtomicBool>,
         ping: MockPing,
+        pool_validation: MockPoolValidation,
+        validation_checks: Arc<Mutex<Vec<bool>>>,
         _drop_probe: Option<ConnectionDropProbe>,
         /// Incremented each time the pool retires this connection via
         /// `close_for_pool` (as opposed to a caller-owned `close`).
@@ -1624,6 +1645,8 @@ mod tests {
                 id,
                 ping_should_fail: Arc::new(AtomicBool::new(false)),
                 ping: MockPing::Ready,
+                pool_validation: MockPoolValidation::Default,
+                validation_checks: Arc::new(Mutex::new(Vec::new())),
                 _drop_probe: None,
                 pool_close_calls: Arc::new(AtomicUsize::new(0)),
                 pool_close_pending: false,
@@ -1681,6 +1704,13 @@ mod tests {
         fn with_ping(id: u32, ping: MockPing) -> Self {
             Self {
                 ping,
+                ..Self::new(id)
+            }
+        }
+
+        fn with_pool_validation(id: u32, pool_validation: MockPoolValidation) -> Self {
+            Self {
+                pool_validation,
                 ..Self::new(id)
             }
         }
@@ -1888,6 +1918,27 @@ mod tests {
             }
         }
 
+        async fn validate_for_pool(&self, cx: &Cx, check_connection: bool) -> Outcome<(), Error> {
+            self.validation_checks
+                .lock()
+                .unwrap()
+                .push(check_connection);
+            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
+            match self.pool_validation {
+                MockPoolValidation::Default if check_connection => self.ping(cx).await,
+                MockPoolValidation::Default => Outcome::Ok(()),
+                MockPoolValidation::Reject => Outcome::Err(Error::Custom(
+                    "mock connection is unsuitable for reuse".into(),
+                )),
+                MockPoolValidation::Pending => std::future::pending().await,
+                MockPoolValidation::Cancelled => {
+                    Outcome::Cancelled(CancelReason::user("mock pool validation cancelled"))
+                }
+            }
+        }
+
         async fn close(self, _cx: &Cx) -> Result<(), Error> {
             Ok(())
         }
@@ -1946,6 +1997,112 @@ mod tests {
         assert_eq!(at_drop.active_connections, 1);
         assert_eq!(at_drop.total_connections, 1);
         assert_eq!(at_drop.idle_connections, 0);
+    }
+
+    #[test]
+    fn pool_validation_rejects_unsuitable_connections_without_health_ping() {
+        let pool = Pool::new(PoolConfig::new(1).test_on_checkout(false));
+        let dropped = Arc::new(OnceCell::new());
+        let conn = MockConnection::with_pool_validation(1, MockPoolValidation::Reject);
+        let checks = Arc::clone(&conn.validation_checks);
+        let closes = Arc::clone(&conn.pool_close_calls);
+        seed_idle(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        let replacement_checks = Arc::new(Mutex::new(Vec::new()));
+        let factories = AtomicUsize::new(0);
+        let factory = || async {
+            factories.fetch_add(1, Ordering::Relaxed);
+            // The healthy replacement can be reused without a network ping.
+            // Accidentally probing it would return a terminal panic outcome.
+            let mut conn = MockConnection::with_ping(2, MockPing::Panicked);
+            conn.validation_checks = Arc::clone(&replacement_checks);
+            Outcome::Ok(conn)
+        };
+        let cx = Cx::for_testing();
+        let mut task_cx = Context::from_waker(Waker::noop());
+        let mut acquire = Box::pin(pool.acquire(&cx, &factory));
+        let lease = match acquire.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Outcome::Ok(lease)) => lease,
+            other => panic!("rejected connection must be replaced immediately: {other:?}"),
+        };
+        assert_eq!(
+            lease.id, 2,
+            "local reuse safeguards run with health checks disabled"
+        );
+        assert_eq!(*checks.lock().unwrap(), vec![false]);
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_drop_precedes_slot_release(&dropped);
+        drop(lease);
+
+        let mut reuse = Box::pin(pool.acquire(&cx, &factory));
+        let lease = match reuse.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Outcome::Ok(lease)) => lease,
+            other => panic!("disabled health check must not call ping: {other:?}"),
+        };
+        assert_eq!(lease.id, 2);
+        assert_eq!(*replacement_checks.lock().unwrap(), vec![false]);
+        assert_eq!(factories.load(Ordering::Relaxed), 1);
+        drop(lease);
+        let stats = pool.stats();
+        assert_eq!(stats.connections_created, 2);
+        assert_eq!(stats.connections_closed, 1);
+        assert_eq!(stats.acquires, 3);
+        assert_eq!(stats.timeouts, 0);
+        assert_eq!(stats.total_connections, 1);
+        assert_eq!(stats.idle_connections, 1);
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.pending_requests, 0);
+        let mut drain = Box::pin(pool.close_and_drain(&cx));
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Ok(()))
+        ));
+        assert_no_occupied_slots(&pool);
+    }
+
+    #[test]
+    fn pool_validation_cancellation_is_terminal_without_health_ping() {
+        for validation in [MockPoolValidation::Pending, MockPoolValidation::Cancelled] {
+            let pool = Pool::new(PoolConfig::new(1).test_on_checkout(false));
+            let dropped = Arc::new(OnceCell::new());
+            let conn = MockConnection::with_pool_validation(1, validation);
+            let checks = Arc::clone(&conn.validation_checks);
+            let closes = Arc::clone(&conn.pool_close_calls);
+            seed_idle(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+            let cx = Cx::for_testing();
+            let factories = AtomicUsize::new(0);
+            let mut acquire = Box::pin(pool.acquire(&cx, || async {
+                factories.fetch_add(1, Ordering::Relaxed);
+                Outcome::Ok(MockConnection::new(2))
+            }));
+            let notifications = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&notifications));
+            let mut task_cx = Context::from_waker(&waker);
+            let expected = if matches!(validation, MockPoolValidation::Pending) {
+                assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+                let before = notifications.wakes.load(Ordering::Relaxed);
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("interrupt pending pool validation"),
+                );
+                assert!(notifications.wakes.load(Ordering::Relaxed) > before);
+                cx.cancel_reason().expect("caller cancellation reason")
+            } else {
+                CancelReason::user("mock pool validation cancelled")
+            };
+            match acquire.as_mut().poll(&mut task_cx) {
+                Poll::Ready(Outcome::Cancelled(reason)) => assert_eq!(reason, expected),
+                other => panic!("pool hook cancellation must propagate unchanged: {other:?}"),
+            }
+            assert_eq!(*checks.lock().unwrap(), vec![false]);
+            assert_eq!(factories.load(Ordering::Relaxed), 0);
+            assert_eq!(closes.load(Ordering::Relaxed), 0);
+            assert_drop_precedes_slot_release(&dropped);
+            assert_no_occupied_slots(&pool);
+            assert_eq!(pool.stats().connections_created, 1);
+            assert_eq!(pool.stats().connections_closed, 1);
+            assert_eq!(pool.stats().acquires, 1);
+            assert_eq!(pool.stats().timeouts, 0);
+        }
     }
 
     #[test]
@@ -4033,6 +4190,61 @@ mod tests {
     }
 
     #[test]
+    fn lab_pool_validation_without_health_ping_obeys_acquisition_deadline() {
+        run_acquire_lab(
+            PoolConfig::new(1)
+                .test_on_checkout(false)
+                .acquire_timeout(200),
+            Budget::INFINITE,
+            |pool, cx| async move {
+                let dropped = Arc::new(OnceCell::new());
+                let checks = Arc::new(Mutex::new(Vec::new()));
+                let first = pool
+                    .acquire(&cx, || async {
+                        let mut conn =
+                            MockConnection::with_pool_validation(1, MockPoolValidation::Pending);
+                        conn.validation_checks = Arc::clone(&checks);
+                        Outcome::Ok(conn.observe_drop(&pool, Arc::clone(&dropped)))
+                    })
+                    .await
+                    .expect("create connection before reuse validation");
+                drop(first);
+                let factories = AtomicUsize::new(0);
+                let mut acquire = Box::pin(pool.acquire(&cx, || async {
+                    factories.fetch_add(1, Ordering::Relaxed);
+                    Outcome::Ok(MockConnection::new(99))
+                }));
+                assert!(matches!(
+                    acquire.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(cx.now(), Time::from_millis(200));
+                assert_eq!(*checks.lock().unwrap(), vec![false]);
+                assert_eq!(factories.load(Ordering::Relaxed), 0);
+                assert_drop_precedes_slot_release(&dropped);
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().connections_created, 1);
+                assert_eq!(pool.stats().connections_closed, 1);
+                assert_eq!(pool.stats().acquires, 1);
+                assert_eq!(pool.stats().timeouts, 1);
+                let replacement = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await
+                    .expect("timed-out pool hook releases capacity");
+                assert_eq!(replacement.id, 2);
+                drop(replacement);
+                pool.close_and_drain(&cx)
+                    .await
+                    .expect("replacement drains successfully");
+                assert_no_occupied_slots(&pool);
+            },
+        );
+    }
+
+    #[test]
     fn lab_checkout_validation_deadline_discards_connection_and_pool_recovers() {
         run_acquire_lab(
             PoolConfig::new(1).acquire_timeout(200),
@@ -5238,6 +5450,10 @@ mod tests {
 
         async fn ping(&self, cx: &Cx) -> Outcome<(), Error> {
             self.inner.ping(cx).await
+        }
+
+        async fn validate_for_pool(&self, cx: &Cx, check_connection: bool) -> Outcome<(), Error> {
+            self.inner.validate_for_pool(cx, check_connection).await
         }
 
         async fn close(self, cx: &Cx) -> Result<(), Error> {

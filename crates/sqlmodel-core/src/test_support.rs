@@ -244,6 +244,12 @@ where
         self.inner.ping(cx).await
     }
 
+    async fn validate_for_pool(&self, cx: &Cx, check_connection: bool) -> Outcome<(), Error> {
+        self.state
+            .arm(cx, "validate_for_pool", None, self.cancel_from_call);
+        self.inner.validate_for_pool(cx, check_connection).await
+    }
+
     async fn close(self, cx: &Cx) -> Result<(), Error> {
         self.state.arm(cx, "close", None, self.cancel_from_call);
         self.inner.close(cx).await

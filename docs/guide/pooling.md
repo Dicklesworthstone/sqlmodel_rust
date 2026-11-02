@@ -100,6 +100,20 @@ runtime thread.
 - Connections that exceed `max_lifetime` or `idle_timeout` are retired and replaced automatically.
 - Optional test-on-borrow validation ensures broken server connections are discarded before being handed to application logic.
 
+Every reused connection also passes the driver's `validate_for_pool` hook.
+Disabling `test_on_checkout` skips the network health probe while retaining
+local reuse safeguards. On repository `main`, PostgreSQL physically retires
+an open or failed transaction left by raw SQL or an abandoned ORM `Session`,
+including holder panic. The next borrower receives a fresh connection and
+cannot observe or commit the abandoned work. A surviving shared handle cannot
+keep the rejected backend alive. Explicit commit and rollback preserve normal
+reuse of the original backend. Custom connection wrappers must forward this
+hook to preserve their driver's behavior.
+
+This check does not reset arbitrary session state such as `SET ROLE`,
+`search_path`, temporary tables, or session advisory locks. Applications must
+restore session settings and release such locks before returning a lease.
+
 ### Graceful Drain (`close_and_drain`)
 During application shutdown, calling `pool.close_and_drain(cx)` closes all idle connections and waits for all active leases to be returned before terminating:
 
@@ -196,8 +210,9 @@ native x86_64 Linux, using the published Asupersync 0.5.0 dependency:
 | Dropped PostgreSQL query future | The interrupted socket was closed; checkout replaced it and returned the new query's own result |
 | Abandoned transaction or transaction holder panic, with a surviving shared handle | First checkout replaced the backend; the old server session disappeared, abandoned writes were absent, and draining succeeded |
 | Raw transaction `COMMIT` followed by holder panic | The committed write remained, while the poisoned connection was physically retired and replaced |
+| Abandoned, panicked, or failed ORM `Session`, with checkout ping enabled or disabled | First checkout retired the dirty backend, including surviving shared handles, and returned no abandoned writes; explicit commit and rollback controls reused the original backend |
 
-The 101 native pool tests also passed, including stalled validation,
+The 104 native pool tests also passed, including stalled validation,
 cancellation, and future drain deadlines on both runtime configurations.
 The separate strict current-thread handoff success
 contract still fails on 0.5.0 with a pool timeout: bounding that failure does
@@ -206,7 +221,7 @@ not establish successful migration of the old connection.
 The PostgreSQL suite passed 61 driver unit tests and 16 live integration tests,
 including prepared-statement caching, transaction ownership and isolation,
 pending-I/O and lock-wait cancellation, commit error preservation, and
-introspection. All six production PostgreSQL pool tests and all four
+introspection. All eight production PostgreSQL pool tests and all four
 cancellation sweep tests passed.
 Workspace checking, formatting, and Clippy with warnings denied also passed.
 The native builds used the pinned nightly LLVM toolchain, one Cargo job,

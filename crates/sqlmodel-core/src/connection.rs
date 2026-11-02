@@ -495,6 +495,37 @@ pub trait Connection: Send + Sync {
     /// Check if the connection is still valid by sending a ping.
     fn ping(&self, cx: &Cx) -> impl Future<Output = Outcome<(), crate::Error>> + Send;
 
+    /// Validate an idle connection before a pool gives it to another borrower.
+    ///
+    /// This hook runs on every reused connection, including when the pool's
+    /// optional health probe is disabled. `check_connection` requests that
+    /// probe; disabling it must not bypass a driver's local reuse safeguards.
+    /// For example, an unfinished transaction must not expose the previous
+    /// borrower's uncommitted work to the next borrower.
+    ///
+    /// The default performs the requested ping. Drivers may reject unsuitable
+    /// state or reset it, provided cancellation and the original acquisition
+    /// deadline remain effective throughout. An error retires the connection;
+    /// cancellation, panic, or an interrupted validation also prevent reuse.
+    /// The hook is never called while the pool's internal mutex is held.
+    /// Wrappers must forward it to preserve their underlying driver's checks.
+    fn validate_for_pool(
+        &self,
+        cx: &Cx,
+        check_connection: bool,
+    ) -> impl Future<Output = Outcome<(), crate::Error>> + Send {
+        async move {
+            if let Some(reason) = crate::cancel_requested(cx) {
+                return Outcome::Cancelled(reason);
+            }
+            if check_connection {
+                self.ping(cx).await
+            } else {
+                Outcome::Ok(())
+            }
+        }
+    }
+
     /// Check if the connection is still valid (alias for ping that returns bool).
     fn is_valid(&self, cx: &Cx) -> impl Future<Output = bool> + Send {
         async {

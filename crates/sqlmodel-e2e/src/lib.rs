@@ -462,6 +462,10 @@ impl<C: Connection> Connection for CapturingConnection<C> {
         self.inner.ping(cx).await
     }
 
+    async fn validate_for_pool(&self, cx: &Cx, check_connection: bool) -> Outcome<(), Error> {
+        self.inner.validate_for_pool(cx, check_connection).await
+    }
+
     async fn close(self, cx: &Cx) -> sqlmodel_core::Result<()> {
         self.inner.close(cx).await
     }

@@ -1315,6 +1315,217 @@ fn postgres_pool_retires_abandoned_transactions_after_return_and_panic() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SessionReturn {
+    Abandoned,
+    Panicked,
+    Failed,
+    Committed,
+    RolledBack,
+}
+
+fn exercise_postgres_session_return(
+    cfg: &PgConfig,
+    test_on_checkout: bool,
+    returned: SessionReturn,
+) {
+    const HOLDER_PANIC: &str = "pooled PostgreSQL Session holder panics intentionally";
+    let label =
+        format!("postgres Session return: {returned:?}, test_on_checkout={test_on_checkout}");
+    let retires = matches!(
+        returned,
+        SessionReturn::Abandoned | SessionReturn::Panicked | SessionReturn::Failed
+    );
+    let _watchdog = HandoffWatchdog::start(label.clone());
+    let rt = HandoffRuntime::CurrentThread.build();
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+    let pool = Pool::new(
+        PoolConfig::new(1)
+            .min_connections(0)
+            .acquire_timeout(2_000)
+            .test_on_checkout(test_on_checkout),
+    );
+    let factory = || SharedPgConnection::connect(&cx, cfg.clone());
+    let table = sqlmodel_e2e::unique_table("pool_session_return");
+    let mut original_backend = None;
+    let mut escaped = None;
+
+    // Session starts its transaction through raw SQL. Keep the original
+    // runtime and a shared clone alive across its return to isolate checkout
+    // suitability from runtime handoff and last-Arc destruction.
+    let holder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let lease = expect_outcome(pool.acquire(&cx, &factory).await, "Session holder lease");
+            original_backend =
+                Some(session_id(&cx, &*lease, "SELECT pg_backend_pid()", "Session backend").await);
+            escaped = Some((*lease).clone());
+            expect_outcome(
+                lease
+                    .execute(&cx, &format!("CREATE TABLE {table} (marker INTEGER)"), &[])
+                    .await,
+                "create Session marker table",
+            );
+            let mut session = Session::new((*lease).clone());
+            expect_outcome(session.begin(&cx).await, "Session begins raw transaction");
+            expect_outcome(
+                session
+                    .connection()
+                    .execute(&cx, &format!("INSERT INTO {table} VALUES (1)"), &[])
+                    .await,
+                "Session uncommitted marker",
+            );
+            // Public ping is a liveness operation and remains valid within
+            // the caller's own active transaction.
+            expect_outcome(
+                session.connection().ping(&cx).await,
+                "ping inside active Session transaction",
+            );
+            match returned {
+                SessionReturn::Committed => {
+                    expect_outcome(session.commit(&cx).await, "commit Session");
+                }
+                SessionReturn::RolledBack => {
+                    expect_outcome(session.rollback(&cx).await, "rollback Session");
+                }
+                SessionReturn::Failed => assert!(
+                    matches!(
+                        session.connection().execute(&cx, "SELECT 1 / 0", &[]).await,
+                        Outcome::Err(Error::Query(_))
+                    ),
+                    "create a failed raw transaction"
+                ),
+                SessionReturn::Panicked => std::panic::panic_any(HOLDER_PANIC),
+                SessionReturn::Abandoned => {}
+            }
+            drop(session);
+            drop(lease);
+        });
+    }));
+    match holder {
+        Ok(()) => assert!(
+            !matches!(returned, SessionReturn::Panicked),
+            "{label}: holder must panic"
+        ),
+        Err(payload) => {
+            assert!(
+                matches!(returned, SessionReturn::Panicked),
+                "{label}: unexpected holder panic"
+            );
+            assert_eq!(
+                payload.downcast_ref::<&str>().copied(),
+                Some(HOLDER_PANIC),
+                "{label}"
+            );
+        }
+    }
+    let original_backend = original_backend.expect("holder recorded Session backend");
+    let escaped = escaped.expect("shared clone survives Session return");
+    assert_eq!(pool.stats().active_connections, 0, "{label}");
+    assert_eq!(pool.stats().idle_connections, 1, "{label}");
+
+    rt.block_on(async {
+        let lease = expect_outcome(
+            pool.acquire(&cx, &factory).await,
+            "first checkout after Session return",
+        );
+        let markers = scalar_i64(
+            &cx,
+            &*lease,
+            &format!("SELECT count(*) FROM {table}"),
+            &[],
+            "Session marker persistence",
+        )
+        .await;
+        assert_eq!(
+            markers,
+            i64::from(matches!(returned, SessionReturn::Committed)),
+            "{label}: checkout must not inherit the prior borrower's uncommitted marker"
+        );
+        let backend = session_id(
+            &cx,
+            &*lease,
+            "SELECT pg_backend_pid()",
+            "backend after Session return",
+        )
+        .await;
+        if retires {
+            assert_ne!(
+                backend, original_backend,
+                "{label}: dirty Session connection was reused"
+            );
+            assert_postgres_backend_retired(&cx, &lease, original_backend).await;
+            escaped
+                .clone()
+                .close(&cx)
+                .await
+                .expect("retired shared clone closes idempotently");
+        } else {
+            assert_eq!(
+                backend, original_backend,
+                "{label}: completed Session transaction must preserve the healthy backend"
+            );
+        }
+        expect_outcome(
+            lease
+                .execute(&cx, &format!("DROP TABLE {table}"), &[])
+                .await,
+            "remove Session marker table",
+        );
+        drop(lease);
+        let created = if retires { 2 } else { 1 };
+        let stats = pool.stats();
+        assert_eq!(stats.connections_created, created, "{label}");
+        assert_eq!(stats.connections_closed, created - 1, "{label}");
+        assert_eq!(stats.acquires, 2, "{label}");
+        assert_eq!(stats.timeouts, 0, "{label}");
+        assert_eq!(stats.total_connections, 1, "{label}");
+        assert_eq!(stats.idle_connections, 1, "{label}");
+        assert_eq!(stats.active_connections, 0, "{label}");
+        assert_eq!(stats.pending_requests, 0, "{label}");
+        expect_outcome(
+            pool.close_and_drain(&cx).await,
+            "drain after Session return",
+        );
+        let drained = pool.stats();
+        assert_eq!(drained.connections_created, created, "{label}");
+        assert_eq!(drained.connections_closed, created, "{label}");
+        assert_eq!(drained.total_connections, 0, "{label}");
+        assert_eq!(drained.active_connections, 0, "{label}");
+        assert_eq!(drained.idle_connections, 0, "{label}");
+        assert_eq!(drained.pending_requests, 0, "{label}");
+        eprintln!("{label}: completed with {drained:?}");
+    });
+    drop(escaped);
+}
+
+#[test]
+fn postgres_pool_session_checkout_retires_dirty_transactions_with_or_without_ping() {
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    for test_on_checkout in [true, false] {
+        for returned in [
+            SessionReturn::Abandoned,
+            SessionReturn::Panicked,
+            SessionReturn::Failed,
+        ] {
+            exercise_postgres_session_return(&cfg, test_on_checkout, returned);
+        }
+    }
+}
+
+#[test]
+fn postgres_pool_session_checkout_preserves_clean_transaction_reuse() {
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    for test_on_checkout in [true, false] {
+        for returned in [SessionReturn::Committed, SessionReturn::RolledBack] {
+            exercise_postgres_session_return(&cfg, test_on_checkout, returned);
+        }
+    }
+}
+
 /// A cancelled `close_and_drain` reports `Cancelled` but leaves the pool
 /// closed: acquires are refused, the active lease still returns, and a
 /// later drain completes.
