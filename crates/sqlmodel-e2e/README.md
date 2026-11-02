@@ -45,6 +45,16 @@ cargo test -p sqlmodel-e2e
 Against local Docker databases this must run on this machine (see the RCH
 escape hatch in the root AGENTS.md).
 
+## PostgreSQL runtime-handoff qualification (issue #43)
+
+The separate [production-only runtime-handoff witness](runtime-handoff/README.md)
+checks current-thread handoffs after normal holder exit and intentional panic,
+the explicit two-worker controls, and delayed-peer stale socket registrations.
+Its runner isolates production features, records source/dependency evidence,
+and bounds each child process independently. The guide distinguishes current
+repository protection, staged integration against the published runtime fix,
+and the still-pending all-driver release qualification.
+
 ## Bench regression guard
 
 CI (the `size-and-startup` job) runs the CPU-only benches (`sql_emission`,

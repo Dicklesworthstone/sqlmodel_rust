@@ -52,6 +52,26 @@ These are unreleased pool protections. They do not change the known limitation
 of the published SQLModel 0.5.1 release or establish successful PostgreSQL
 handoff against a fixed runtime dependency.
 
+### Qualification
+
+- Added production-context PostgreSQL runtime-handoff witnesses for normal
+  holder exit and intentional holder panic, retaining the explicit
+  `worker_threads(2)` controls. The witness asserts the original backend PID,
+  pool accounting, and successful drain; a reconnect cannot hide the defect.
+  Separate TCP witnesses force pending readiness across runtime destruction.
+- The standalone runner checks resolved dependency features, enforces a
+  separate process deadline for each case after compilation, and retains
+  manifests, sources, dependency metadata, logs, and results. Missing
+  PostgreSQL, a timeout, or a missing completion marker fails qualification.
+- CI compares the published 0.4.3 / Asupersync 0.4.10 baseline, the published
+  0.5.1 / Asupersync 0.5.0 failing control, and a copied repository candidate
+  with published Asupersync 0.6.1. The candidate changes only its copied runtime
+  requirement. The root dependency remains 0.5.0: the published FrankenSQLite
+  family still requires that runtime line, and the all-driver single-runtime
+  release gate remains in force. See the
+  [qualification instructions](crates/sqlmodel-e2e/runtime-handoff/README.md)
+  for evidence requirements and the remaining integration boundary.
+
 ## [0.5.1] -- 2026-11-01
 
 A patch release of all 12 crates in lockstep. It fixes the FrankenSQLite

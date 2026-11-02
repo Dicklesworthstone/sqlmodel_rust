@@ -599,6 +599,13 @@ Expr::case()
 - **Rust 1.95+** for the facade and the Postgres/MySQL/SQLite drivers; **nightly** for `sqlmodel-frankensqlite` (fsqlite enables `core_intrinsics` on x86_64) and for building this repo itself (`.cargo/config.toml` passes `-Z threads`)
 - **No stable release yet**: API may change
 - **asupersync dependency**: Resolved from crates.io as `^0.5.0`, matching the runtime used by `fsqlite` 0.4.x, so a single runtime version unifies across the stack
+- **PostgreSQL runtime handoff ([#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43))**:
+  published SQLModel 0.5.1 can hang while validating a connection after its
+  holder's current-thread runtime exits on Asupersync 0.5.0. The issue's
+  explicit `worker_threads(2)` controls pass. The repository now bounds
+  checkout validation, but fixed-runtime integration and release qualification
+  remain open. See the [production qualification runner](crates/sqlmodel-e2e/runtime-handoff/README.md)
+  for the staged Asupersync 0.6.1 candidate and the published controls.
 
 ---
 

@@ -60,6 +60,114 @@ jobs:
       - name: Check pool lints
         run: cargo clippy --locked -p sqlmodel-pool --all-targets --config 'profile.dev.package."*".opt-level=0' -- -D warnings
 
+  postgres-runtime-handoff:
+    name: PostgreSQL runtime handoff (${{ matrix.graph }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        graph: [previous-registry, published-unfixed, staged-fixed]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sqlmodel
+          POSTGRES_PASSWORD: sqlmodel
+          POSTGRES_DB: sqlmodel_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sqlmodel -d sqlmodel_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SQLMODEL_TEST_POSTGRES_URL: postgres://sqlmodel:sqlmodel@127.0.0.1:5432/sqlmodel_test
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/runtime-handoff-target
+      RUSTFLAGS: "-Z threads=1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the repository-pinned toolchain
+        run: |
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: runtime-handoff-${{ matrix.graph }}
+
+      - name: Check the standalone witness formatting
+        run: rustfmt --edition 2024 --check crates/sqlmodel-e2e/runtime-handoff/main.rs
+
+      - name: Qualify the staged fixed runtime with production features
+        if: matrix.graph == 'staged-fixed'
+        run: |
+          # Stage only the runtime requirement in a copied source snapshot.
+          # The all-driver workspace still awaits a compatible FrankenSQLite
+          # release; its single-runtime release gate must remain intact.
+          python3 scripts/qualify_postgres_runtime_handoff.py \
+            --source workspace --stage-asupersync-version 0.6.1 --timeout 60 \
+            --evidence-dir "$RUNNER_TEMP/runtime-handoff-evidence"
+
+      - name: Verify the previous published passing control
+        if: matrix.graph == 'previous-registry'
+        run: |
+          python3 scripts/qualify_postgres_runtime_handoff.py \
+            --source registry --sqlmodel-version 0.4.3 --asupersync-version 0.4.10 \
+            --case current-thread-normal --case current-thread-panic \
+            --case two-worker-normal --case two-worker-panic \
+            --timeout 60 \
+            --evidence-dir "$RUNNER_TEMP/runtime-handoff-evidence"
+
+      - name: Verify the published unfixed negative control
+        if: matrix.graph == 'published-unfixed'
+        run: |
+          # A generic failure is insufficient: require both original hangs and
+          # both exact two-worker controls to pass in the same invocation.
+          if python3 scripts/qualify_postgres_runtime_handoff.py \
+            --source registry --sqlmodel-version 0.5.1 --asupersync-version 0.5.0 \
+            --case current-thread-normal --case current-thread-panic \
+            --case two-worker-normal --case two-worker-panic \
+            --timeout 60 --evidence-dir "$RUNNER_TEMP/runtime-handoff-evidence"; then
+            echo "The unfixed graph unexpectedly passed; inspect the negative control."
+            exit 1
+          fi
+          python3 - "$RUNNER_TEMP/runtime-handoff-evidence/summary.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          summary = json.loads(Path(sys.argv[1]).read_text())
+          expected = {
+              "current-thread-normal": "timed_out",
+              "current-thread-panic": "timed_out",
+              "two-worker-normal": "passed",
+              "two-worker-panic": "passed",
+          }
+          assert summary["sqlmodel_source"] == "registry", summary
+          assert summary["sqlmodel_version"] == "0.5.1", summary
+          assert summary["asupersync_version"] == "0.5.0", summary
+          assert summary["asupersync_source"] == "published registry", summary
+          assert len(summary["cases"]) == len(expected), summary
+          actual = {case["case"]: case["status"] for case in summary["cases"]}
+          assert actual == expected, actual
+          for case in ("current-thread-normal", "current-thread-panic"):
+              log = Path(sys.argv[1]).with_name(f"{case}.log").read_text()
+              assert "holder joined and runtime dropped:" in log, case
+              assert "consumer: before acquire (default checkout ping)" in log, case
+              assert "consumer: acquired; before query" not in log, case
+          print("Observed the two original current-thread timeouts; both two-worker controls passed.")
+          PY
+
+      - name: Preserve qualification manifests, features, and case logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-handoff-${{ matrix.graph }}
+          path: ${{ runner.temp }}/runtime-handoff-evidence/
+          if-no-files-found: error
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
