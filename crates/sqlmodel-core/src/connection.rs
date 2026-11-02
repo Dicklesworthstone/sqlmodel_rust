@@ -510,11 +510,18 @@ pub trait Connection: Send + Sync {
 
     /// Close the connection as part of pool retirement.
     ///
-    /// The pool routes every teardown (shutdown, idle eviction, max-lifetime
-    /// expiry, and failed checkout validation) through this method exactly
-    /// once after removing the connection from pool state. It is never awaited
-    /// while the pool's internal mutex is held. Returning a healthy connection
-    /// to the idle queue does not call this method.
+    /// The pool uses this method for graceful teardown (shutdown, idle
+    /// eviction, max-lifetime expiry, and failed checkout validation) after
+    /// removing the connection from admission. It is never awaited while the
+    /// pool's internal mutex is held. Returning a healthy connection to the
+    /// idle queue does not call this method.
+    ///
+    /// Cancellation, acquisition deadline expiry, or dropping an in-flight
+    /// checkout may instead drop the connection or its owning close future.
+    /// Implementations must release their resources on drop even when this
+    /// hook never starts or completes. The pool keeps the connection accounted
+    /// as active until that resource drop finishes; it never reuses a connection
+    /// whose validation or retirement was interrupted.
     ///
     /// The default simply delegates to [`Connection::close`], so callers that
     /// close a connection they own directly see no behavioral change. Drivers

@@ -718,6 +718,8 @@ impl<C: Connection> Pool<C> {
     /// On timeout or cancellation, in-flight futures are dropped. A connection
     /// interrupted during validation is discarded before its slot is released;
     /// it is never returned to idle inventory.
+    /// As with other cooperative async deadlines, a driver must yield from its
+    /// `poll` implementation; synchronous blocking work cannot be preempted.
     ///
     /// # Errors
     ///
@@ -771,7 +773,13 @@ impl<C: Connection> Pool<C> {
                     .unwrap_or_else(|| CancelReason::user("pool acquire interrupted"));
                 return std::task::Poll::Ready(Outcome::Cancelled(reason));
             }
-            acquisition.as_mut().poll(task_cx)
+            let outcome = acquisition.as_mut().poll(task_cx);
+            if outcome.is_pending()
+                && let Some(interruption) = self.acquire_interruption(cx, deadline)
+            {
+                return std::task::Poll::Ready(interruption);
+            }
+            outcome
         })
         .await
         // The owned acquisition future drops before this outcome reaches the
@@ -880,6 +888,9 @@ impl<C: Connection> Pool<C> {
             // validation and creation. Dropping the acquisition drops every
             // remaining guard, including a close hook that never completes.
             for guard in retired {
+                if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                    return outcome;
+                }
                 match guard
                     .close(cx, "expired pooled connection retirement")
                     .await
@@ -937,6 +948,9 @@ impl<C: Connection> Pool<C> {
                                 AcquirePublish::Published(pooled) => Outcome::Ok(pooled),
                                 AcquirePublish::Interrupted(outcome) => outcome,
                                 AcquirePublish::Retire { guard, error } => {
+                                    if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                                        return outcome;
+                                    }
                                     match guard.close(cx, "acquire publication rejected").await {
                                         RetirementOutcome::Closed => Outcome::Err(error),
                                         RetirementOutcome::Cancelled(reason) => {
@@ -1033,6 +1047,11 @@ impl<C: Connection> Pool<C> {
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(info) => return Outcome::Panicked(info),
                 Outcome::Err(_) => {
+                    // A driver may consume the remaining budget within one
+                    // poll. Do not begin another I/O operation after expiry.
+                    if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                        return outcome;
+                    }
                     match guard
                         .close(cx, "pooled connection checkout validation failure")
                         .await
@@ -1051,6 +1070,9 @@ impl<C: Connection> Pool<C> {
             AcquirePublish::Published(pooled) => Outcome::Ok(Some(pooled)),
             AcquirePublish::Interrupted(outcome) => outcome.map(Some),
             AcquirePublish::Retire { guard, error } => {
+                if let Some(outcome) = self.acquire_interruption(cx, deadline) {
+                    return outcome;
+                }
                 match guard.close(cx, "checkout publication rejected").await {
                     RetirementOutcome::Closed => Outcome::Err(error),
                     RetirementOutcome::Cancelled(reason) => Outcome::Cancelled(reason),
@@ -1889,16 +1911,16 @@ mod tests {
             calls.fetch_add(1, Ordering::Relaxed);
             Outcome::Ok(MockConnection::new(2))
         }));
-        let wakes = Arc::new(WakeCounter::default());
-        let waker = Waker::from(Arc::clone(&wakes));
+        let notifications = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&notifications));
         let mut task_cx = Context::from_waker(&waker);
         assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
         assert_eq!(pool.stats().active_connections, 1);
         assert!(dropped.get().is_none());
 
-        let before = wakes.wakes.load(Ordering::Relaxed);
+        let before = notifications.wakes.load(Ordering::Relaxed);
         cx.set_cancel_requested(true);
-        assert!(wakes.wakes.load(Ordering::Relaxed) > before);
+        assert!(notifications.wakes.load(Ordering::Relaxed) > before);
         assert!(matches!(
             acquire.as_mut().poll(&mut task_cx),
             Poll::Ready(Outcome::Cancelled(_))
@@ -1936,18 +1958,18 @@ mod tests {
         let mut waiter = Box::pin(pool.acquire(&waiting_cx, || async {
             Outcome::Ok(MockConnection::new(2))
         }));
-        let wakes = Arc::new(WakeCounter::default());
-        let waker = Waker::from(Arc::clone(&wakes));
+        let notifications = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&notifications));
         let mut task_cx = Context::from_waker(&waker);
         assert!(validation.as_mut().poll(&mut task_cx).is_pending());
         assert!(waiter.as_mut().poll(&mut task_cx).is_pending());
         assert_eq!(pool.stats().pending_requests, 1);
-        let before = wakes.wakes.load(Ordering::Relaxed);
+        let before = notifications.wakes.load(Ordering::Relaxed);
 
         drop(validation);
 
         assert_drop_precedes_slot_release(&dropped);
-        assert!(wakes.wakes.load(Ordering::Relaxed) > before);
+        assert!(notifications.wakes.load(Ordering::Relaxed) > before);
         assert_eq!(pool.stats().total_connections, 0);
         assert_eq!(pool.stats().pending_requests, 1);
         let lease = match waiter.as_mut().poll(&mut task_cx) {
@@ -2145,6 +2167,56 @@ mod tests {
         ));
         assert_no_occupied_slots(&pool);
         assert_eq!(pool.stats().timeouts, 0);
+    }
+
+    #[test]
+    fn production_context_stalled_validation_is_bounded_on_supported_runtimes() {
+        const ACQUIRE_TIMEOUT_MS: u64 = 50;
+        for current_thread in [true, false] {
+            let builder = if current_thread {
+                RuntimeBuilder::current_thread()
+            } else {
+                RuntimeBuilder::new().worker_threads(2)
+            };
+            let runtime = builder.build().expect("production runtime");
+            let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            let pool = Pool::new(PoolConfig::new(1).acquire_timeout(ACQUIRE_TIMEOUT_MS));
+            let dropped = Arc::new(OnceCell::new());
+            seed_idle(
+                &pool,
+                MockConnection::with_ping(1, MockPing::Pending)
+                    .observe_drop(&pool, Arc::clone(&dropped)),
+            );
+            let factories = AtomicUsize::new(0);
+            let started = std::time::Instant::now();
+            let guarded = runtime.block_on(asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(2),
+                pool.acquire(&cx, || async {
+                    factories.fetch_add(1, Ordering::Relaxed);
+                    Outcome::Ok(MockConnection::new(2))
+                }),
+            ));
+            // A watchdog timeout is a failure. The pool's own finite deadline
+            // must produce the inner Timeout and release its resource first.
+            let outcome = guarded.expect("outer watchdog won: pool validation was not bounded");
+            assert!(matches!(
+                outcome,
+                Outcome::Err(Error::Pool(PoolError {
+                    kind: PoolErrorKind::Timeout,
+                    ..
+                }))
+            ));
+            assert!(started.elapsed() >= Duration::from_millis(ACQUIRE_TIMEOUT_MS));
+            assert_eq!(factories.load(Ordering::Relaxed), 0);
+            assert_drop_precedes_slot_release(&dropped);
+            assert_no_occupied_slots(&pool);
+            let stats = pool.stats();
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.connections_closed, 1);
+            assert_eq!(stats.acquires, 1);
+            assert_eq!(stats.timeouts, 1);
+        }
     }
 
     #[test]
@@ -3206,8 +3278,14 @@ mod tests {
         let create: AcquireAction<MockConnection> = AcquireAction::CreateNew;
         assert!(matches!(create, AcquireAction::CreateNew));
 
-        let wait: AcquireAction<MockConnection> = AcquireAction::Wait;
-        assert!(matches!(wait, AcquireAction::Wait));
+        let pool = Pool::<MockConnection>::new(PoolConfig::new(1));
+        pool.shared.lock_or_recover().waiter_count = 1;
+        let wait = AcquireAction::Wait(WaiterGuard {
+            pool: Arc::clone(&pool.shared),
+        });
+        assert!(matches!(&wait, AcquireAction::Wait(_)));
+        drop(wait);
+        assert_eq!(pool.stats().pending_requests, 0);
 
         let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
         let validate: AcquireAction<MockConnection> = AcquireAction::ValidateExisting(meta);
@@ -3961,6 +4039,115 @@ mod tests {
     }
 
     #[test]
+    fn lab_expired_idle_retirement_cannot_extend_the_acquisition_deadline() {
+        run_acquire_lab(
+            PoolConfig::new(1).max_lifetime(1).acquire_timeout(200),
+            Budget::INFINITE,
+            |pool, cx| async move {
+                let dropped = Arc::new(OnceCell::new());
+                let closes = Arc::new(AtomicUsize::new(0));
+                let first = pool
+                    .acquire(&cx, || async {
+                        Outcome::Ok(
+                            MockConnection::with_pending_pool_close(1, Arc::clone(&closes))
+                                .observe_drop(&pool, Arc::clone(&dropped)),
+                        )
+                    })
+                    .await
+                    .expect("create connection before its lifetime expires");
+                drop(first);
+                asupersync::time::sleep(cx.now(), Duration::from_millis(2)).await;
+                let factories = AtomicUsize::new(0);
+                let mut acquire = Box::pin(pool.acquire(&cx, || async {
+                    factories.fetch_add(1, Ordering::Relaxed);
+                    Outcome::Ok(MockConnection::new(99))
+                }));
+                assert!(matches!(
+                    acquire.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(cx.now(), Time::from_millis(202));
+                assert_eq!(closes.load(Ordering::Relaxed), 1);
+                assert_eq!(factories.load(Ordering::Relaxed), 0);
+                assert_drop_precedes_slot_release(&dropped);
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().connections_created, 1);
+                assert_eq!(pool.stats().connections_closed, 1);
+                assert_eq!(pool.stats().acquires, 1);
+                assert_eq!(pool.stats().timeouts, 1);
+
+                let replacement = pool
+                    .acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) })
+                    .await
+                    .expect("timed-out idle retirement releases its capacity");
+                assert_eq!(replacement.id, 2);
+                drop(replacement);
+                pool.close_and_drain(&cx)
+                    .await
+                    .expect("replacement drains successfully");
+                assert_no_occupied_slots(&pool);
+            },
+        );
+    }
+
+    #[test]
+    fn lab_successful_checkout_reuses_connection_and_unregisters_timeout() {
+        let (mut runtime, pool, region) = lab_pool(PoolConfig::new(1).acquire_timeout(200));
+        let completed = Arc::new(OnceCell::new());
+        let record = Arc::clone(&completed);
+        let task_pool = Arc::clone(&pool);
+        let (task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task context");
+                let first = task_pool
+                    .acquire(&cx, || async {
+                        Outcome::Ok(MockConnection::with_ping(
+                            1,
+                            MockPing::Delay(Duration::from_millis(50)),
+                        ))
+                    })
+                    .await
+                    .expect("create first connection");
+                drop(first);
+                let factories = AtomicUsize::new(0);
+                let lease = task_pool
+                    .acquire(&cx, || async {
+                        factories.fetch_add(1, Ordering::Relaxed);
+                        Outcome::Ok(MockConnection::new(2))
+                    })
+                    .await
+                    .expect("validation completes before the deadline");
+                assert_eq!(lease.id, 1, "checkout reuses the original connection");
+                assert_eq!(factories.load(Ordering::Relaxed), 0);
+                assert_eq!(cx.now(), Time::from_millis(50));
+                drop(lease);
+                let _ = record.set(());
+            })
+            .expect("spawn successful validation");
+        runtime.scheduler.lock().schedule(task, 0);
+        runtime.run_with_auto_advance();
+        assert!(completed.get().is_some(), "successful reuse must complete");
+        let stats = pool.stats();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_closed, 0);
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.idle_connections, 1);
+        assert_eq!(stats.total_connections, 1);
+        assert_eq!(stats.pending_requests, 0);
+        assert_eq!(stats.acquires, 2);
+        assert_eq!(stats.timeouts, 0);
+        assert_eq!(
+            runtime.now(),
+            Time::from_millis(50),
+            "successful checkout removes its 200ms timeout from the timer driver"
+        );
+    }
+
+    #[test]
     fn lab_validation_retries_and_close_hooks_share_the_original_deadline() {
         run_acquire_lab(
             PoolConfig::new(2).acquire_timeout(200),
@@ -4078,6 +4265,68 @@ mod tests {
                 "both publication sites must recheck time"
             );
         }
+    }
+
+    #[test]
+    fn lab_failed_ping_at_deadline_does_not_start_retirement() {
+        let (clock, driver) = virtual_clock();
+        let mut runtime = LabRuntime::new(LabConfig::new(0x43_0002));
+        runtime.state.set_timer_driver(driver.clone());
+        let pool = Arc::new(Pool::with_timer_driver(
+            PoolConfig::new(1).acquire_timeout(200),
+            driver,
+        ));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        let completed = Arc::new(OnceCell::new());
+        let record = Arc::clone(&completed);
+        let (task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task context");
+                let dropped = Arc::new(OnceCell::new());
+                let closes = Arc::new(AtomicUsize::new(0));
+                let first = pool
+                    .acquire(&cx, || async {
+                        let mut conn =
+                            MockConnection::with_pool_close_counter(1, Arc::clone(&closes))
+                                .observe_drop(&pool, Arc::clone(&dropped));
+                        conn.ping = MockPing::AdvanceClock(Arc::clone(&clock), 200_000_000);
+                        conn.ping_should_fail.store(true, Ordering::Relaxed);
+                        Outcome::Ok(conn)
+                    })
+                    .await
+                    .expect("create connection before deadline");
+                drop(first);
+                let mut acquire =
+                    Box::pin(pool.acquire(&cx, || async { Outcome::Ok(MockConnection::new(2)) }));
+                assert!(matches!(
+                    acquire.as_mut().await,
+                    Outcome::Err(Error::Pool(PoolError {
+                        kind: PoolErrorKind::Timeout,
+                        ..
+                    }))
+                ));
+                assert_eq!(cx.now(), Time::from_millis(200));
+                assert_eq!(
+                    closes.load(Ordering::Relaxed),
+                    0,
+                    "failed ping must not start more driver work after the deadline"
+                );
+                assert_drop_precedes_slot_release(&dropped);
+                assert_no_occupied_slots(&pool);
+                assert_eq!(pool.stats().connections_created, 1);
+                assert_eq!(pool.stats().connections_closed, 1);
+                assert_eq!(pool.stats().acquires, 1);
+                assert_eq!(pool.stats().timeouts, 1);
+                let _ = record.set(());
+            })
+            .expect("spawn expired-ping retirement regression");
+        runtime.scheduler.lock().schedule(task, 0);
+        runtime.run_with_auto_advance();
+        assert!(
+            completed.get().is_some(),
+            "expired ping must finish cleanup"
+        );
     }
 
     #[test]
