@@ -71,6 +71,28 @@ than assuming the transaction rolled back.
 
 ---
 
+## Dropping an ORM Flush
+
+On repository `main`, a `Session` keeps ownership of its pending INSERT,
+UPDATE, and DELETE queues while `flush` awaits database operations. Dropping
+the flush future therefore preserves unfinished work. Acknowledged inserts
+and updates retain their recorded state, and acknowledged parent deletions
+are detached immediately, so a later flush does not repeat those completed
+row operations. `AfterFlush` fires only when the flush reaches completion.
+
+Cascade cleanup also remains recorded: dropping a flush after deleting child
+rows preserves the pending parent deletion without restoring detached child
+work. A cascade for an unfinished parent may be planned again on retry; this
+is not an exactly-once guarantee for cascade statements or their triggers.
+
+Retaining queued work does not establish the outcome of a statement whose
+response was interrupted. If cancellation invalidated the connection, the
+application still needs to resolve the transaction and replace the connection
+before deciding whether to retry. These queue protections are unreleased and
+are not part of published SQLModel 0.5.1.
+
+---
+
 ## Enforcing Budgets & Deadlines
 
 Using `asupersync`'s budget primitives, you can place strict time limits on database calls:

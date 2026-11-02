@@ -38,6 +38,12 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- ORM flush queues now remain owned by the `Session` across suspension. Dropping
+  a pending flush preserves unfinished INSERT, UPDATE, and DELETE work while
+  retaining acknowledged row progress. Completed parent deletions are detached
+  immediately, and cascade cleanup is not undone by restoring an older queue
+  snapshot. Regression tests cover interruption before and after partial
+  progress, including a completed child cascade with its parent still pending.
 - Pool checkout now runs driver reuse safeguards even when its optional ping
   is disabled. PostgreSQL rejects and physically retires open or failed raw
   transactions left by an abandoned ORM `Session`, so the next borrower

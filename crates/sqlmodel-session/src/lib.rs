@@ -1467,7 +1467,9 @@ impl<C: Connection> Session<C> {
         let dialect = self.connection.dialect();
 
         // 1. Execute DELETEs first (to respect FK constraints), including explicit cascades.
-        let deletes: Vec<ObjectKey> = std::mem::take(&mut self.pending_delete);
+        // Keep the queue owned by the session across every await. Dropping this
+        // future must not discard work that has not completed.
+        let deletes = self.pending_delete.clone();
 
         // Cascade planning: use relationship metadata on each deleted parent to proactively
         // delete dependent rows (and clean up link tables) when `passive_deletes` is not set.
@@ -1583,23 +1585,13 @@ impl<C: Connection> Session<C> {
             );
 
             if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
-                self.pending_delete = deletes;
                 return outcome;
             }
             match self.connection.execute(cx, &sql, &pks).await {
                 Outcome::Ok(_) => {}
-                Outcome::Err(e) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Err(e);
-                }
-                Outcome::Cancelled(r) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Cancelled(r);
-                }
-                Outcome::Panicked(p) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Panicked(p);
-                }
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
 
             // Remove now-deleted children from the identity map to prevent stale reads.
@@ -1676,23 +1668,13 @@ impl<C: Connection> Session<C> {
             );
 
             if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
-                self.pending_delete = deletes;
                 return outcome;
             }
             match self.connection.execute(cx, &sql, &params).await {
                 Outcome::Ok(_) => {}
-                Outcome::Err(e) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Err(e);
-                }
-                Outcome::Cancelled(r) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Cancelled(r);
-                }
-                Outcome::Panicked(p) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Panicked(p);
-                }
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
 
             // Remove now-deleted children from the identity map to prevent stale reads.
@@ -1745,24 +1727,14 @@ impl<C: Connection> Session<C> {
             );
 
             if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
-                self.pending_delete = deletes;
                 return outcome;
             }
 
             match self.connection.execute(cx, &sql, &pks).await {
                 Outcome::Ok(_) => {}
-                Outcome::Err(e) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Err(e);
-                }
-                Outcome::Cancelled(r) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Cancelled(r);
-                }
-                Outcome::Panicked(p) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Panicked(p);
-                }
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         }
 
@@ -1814,27 +1786,16 @@ impl<C: Connection> Session<C> {
             );
 
             if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
-                self.pending_delete = deletes;
                 return outcome;
             }
             match self.connection.execute(cx, &sql, &params).await {
                 Outcome::Ok(_) => {}
-                Outcome::Err(e) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Err(e);
-                }
-                Outcome::Cancelled(r) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Cancelled(r);
-                }
-                Outcome::Panicked(p) => {
-                    self.pending_delete = deletes;
-                    return Outcome::Panicked(p);
-                }
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         }
 
-        let mut actually_deleted: Vec<ObjectKey> = Vec::new();
         for key in &deletes {
             if let Some(tracked) = self.identity_map.get(key) {
                 // Skip if object was un-deleted (state changed from Deleted)
@@ -1877,12 +1838,15 @@ impl<C: Connection> Session<C> {
                 );
 
                 if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
-                    self.pending_delete = deletes;
                     return outcome;
                 }
                 match self.connection.execute(cx, &sql, &pk_values).await {
                     Outcome::Ok(_) => {
-                        actually_deleted.push(*key);
+                        // Record acknowledged progress before any later work
+                        // can suspend or unwind. A resumed flush must not issue
+                        // this parent DELETE again.
+                        self.pending_delete.retain(|pending| pending != key);
+                        self.identity_map.remove(key);
 
                         // PassiveDeletes::Passive orphan tracking: the DB will delete children,
                         // so eagerly detach them from the identity map after the parent delete succeeds.
@@ -1941,52 +1905,16 @@ impl<C: Connection> Session<C> {
                             self.pending_delete.retain(|k| !to_remove.contains(k));
                         }
                     }
-                    Outcome::Err(e) => {
-                        // Only restore deletes that weren't already executed
-                        // (exclude actually_deleted items from restoration)
-                        self.pending_delete = deletes
-                            .into_iter()
-                            .filter(|k| !actually_deleted.contains(k))
-                            .collect();
-                        // Remove successfully deleted objects before returning error
-                        for key in &actually_deleted {
-                            self.identity_map.remove(key);
-                        }
-                        return Outcome::Err(e);
-                    }
-                    Outcome::Cancelled(r) => {
-                        // Same handling for cancellation
-                        self.pending_delete = deletes
-                            .into_iter()
-                            .filter(|k| !actually_deleted.contains(k))
-                            .collect();
-                        for key in &actually_deleted {
-                            self.identity_map.remove(key);
-                        }
-                        return Outcome::Cancelled(r);
-                    }
-                    Outcome::Panicked(p) => {
-                        // Same handling for panic
-                        self.pending_delete = deletes
-                            .into_iter()
-                            .filter(|k| !actually_deleted.contains(k))
-                            .collect();
-                        for key in &actually_deleted {
-                            self.identity_map.remove(key);
-                        }
-                        return Outcome::Panicked(p);
-                    }
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
                 }
             }
         }
-
-        // Remove only actually deleted objects from identity map
-        for key in &actually_deleted {
-            self.identity_map.remove(key);
-        }
+        self.pending_delete.clear();
 
         // 2. Execute INSERTs
-        let inserts: Vec<ObjectKey> = std::mem::take(&mut self.pending_new);
+        let inserts = self.pending_new.clone();
         for key in &inserts {
             if let Some(tracked) = self.identity_map.get_mut(key) {
                 // Skip if already persistent (was inserted in a previous attempt before error)
@@ -2025,7 +1953,6 @@ impl<C: Connection> Session<C> {
                 );
 
                 if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
-                    self.pending_new = inserts;
                     return outcome;
                 }
                 match self.connection.execute(cx, &sql, &insert_values).await {
@@ -2036,27 +1963,16 @@ impl<C: Connection> Session<C> {
                         tracked.original_state =
                             Some(serde_json::to_vec(&tracked.values).unwrap_or_default());
                     }
-                    Outcome::Err(e) => {
-                        // Restore pending_new for retry
-                        self.pending_new = inserts;
-                        return Outcome::Err(e);
-                    }
-                    Outcome::Cancelled(r) => {
-                        // Restore pending_new for retry (same as Err handling)
-                        self.pending_new = inserts;
-                        return Outcome::Cancelled(r);
-                    }
-                    Outcome::Panicked(p) => {
-                        // Restore pending_new for retry (same as Err handling)
-                        self.pending_new = inserts;
-                        return Outcome::Panicked(p);
-                    }
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
                 }
             }
         }
+        self.pending_new.clear();
 
         // 3. Execute UPDATEs for dirty objects
-        let dirty: Vec<ObjectKey> = std::mem::take(&mut self.pending_dirty);
+        let dirty = self.pending_dirty.clone();
         for key in &dirty {
             if let Some(tracked) = self.identity_map.get_mut(key) {
                 // Only UPDATE persistent objects
@@ -2145,7 +2061,6 @@ impl<C: Connection> Session<C> {
                 );
 
                 if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
-                    self.pending_dirty = dirty;
                     return outcome;
                 }
 
@@ -2154,24 +2069,13 @@ impl<C: Connection> Session<C> {
                         // Update original_state to current state
                         tracked.original_state = Some(current_state);
                     }
-                    Outcome::Err(e) => {
-                        // Restore pending_dirty for retry
-                        self.pending_dirty = dirty;
-                        return Outcome::Err(e);
-                    }
-                    Outcome::Cancelled(r) => {
-                        // Restore pending_dirty for retry (same as Err handling)
-                        self.pending_dirty = dirty;
-                        return Outcome::Cancelled(r);
-                    }
-                    Outcome::Panicked(p) => {
-                        // Restore pending_dirty for retry (same as Err handling)
-                        self.pending_dirty = dirty;
-                        return Outcome::Panicked(p);
-                    }
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
                 }
             }
         }
+        self.pending_dirty.clear();
 
         // Fire after_flush event
         if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterFlush) {
@@ -3913,6 +3817,8 @@ mod tests {
         last_sql: Option<String>,
         execute_calls: usize,
         executed: Vec<(String, Vec<Value>)>,
+        /// Suspend this call before recording any database effect.
+        stall_execute_at: Option<usize>,
     }
 
     #[derive(Debug, Clone)]
@@ -4018,9 +3924,19 @@ mod tests {
             let sql = sql.to_string();
             let params = params.to_vec();
             async move {
-                let mut guard = state.lock().expect("lock poisoned");
-                guard.execute_calls += 1;
-                guard.executed.push((sql, params));
+                let stall = {
+                    let mut guard = state.lock().expect("lock poisoned");
+                    guard.execute_calls += 1;
+                    guard.stall_execute_at == Some(guard.execute_calls)
+                };
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                state
+                    .lock()
+                    .expect("lock poisoned")
+                    .executed
+                    .push((sql, params));
                 Outcome::Ok(0)
             }
         }
@@ -4157,6 +4073,301 @@ mod tests {
         fn rollback(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
             async { Outcome::Ok(()) }
         }
+    }
+
+    fn suspend_execute_after(state: &Mutex<MockState>, completed: usize) {
+        let mut guard = state.lock().expect("lock poisoned");
+        guard.executed.clear();
+        guard.execute_calls = 0;
+        guard.stall_execute_at = Some(completed + 1);
+    }
+
+    fn drop_pending_flush(session: &mut Session<MockConnection>, cx: &Cx) {
+        let mut flush = Box::pin(session.flush(cx));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(flush.as_mut().poll(&mut context).is_pending());
+        // This drops the actual future, not just a Pin reference to it.
+        drop(flush);
+    }
+
+    #[allow(clippy::result_large_err)] // Event callbacks use the public unboxed Error type.
+    fn count_completed_flushes(session: &mut Session<MockConnection>) -> Arc<Mutex<usize>> {
+        let count = Arc::new(Mutex::new(0));
+        let observed = Arc::clone(&count);
+        session.on_after_flush(move || {
+            *observed.lock().expect("lock poisoned") += 1;
+            Ok(())
+        });
+        count
+    }
+
+    #[test]
+    fn dropped_flush_keeps_unfinished_inserts_and_completed_prefix() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+
+        for completed in [1, 0, 2] {
+            let state = Arc::new(Mutex::new(MockState::default()));
+            let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+            let teams: Vec<_> = (1..=3)
+                .map(|id| Team {
+                    id: Some(id),
+                    name: format!("Team {id}"),
+                })
+                .collect();
+            session.add_all(&teams);
+            rt.block_on(async { unwrap_outcome(session.begin(&cx).await) });
+            let flushes = count_completed_flushes(&mut session);
+            suspend_execute_after(&state, completed);
+
+            drop_pending_flush(&mut session, &cx);
+
+            assert_eq!(*flushes.lock().unwrap(), 0);
+            assert_eq!(state.lock().unwrap().executed.len(), completed);
+            for team in &teams[completed..] {
+                assert_eq!(session.object_state(team), Some(ObjectState::New));
+                assert!(
+                    session.pending_new.contains(&ObjectKey::from_model(team)),
+                    "dropping a flush lost an unfinished INSERT after {completed} acknowledgements"
+                );
+            }
+            for team in &teams[..completed] {
+                assert_eq!(session.object_state(team), Some(ObjectState::Persistent));
+            }
+
+            state.lock().unwrap().stall_execute_at = None;
+            rt.block_on(async { unwrap_outcome(session.flush(&cx).await) });
+            assert_eq!(session.pending_new_count(), 0);
+            assert_eq!(*flushes.lock().unwrap(), 1);
+            let recorded = state.lock().unwrap().executed.clone();
+            assert_eq!(
+                recorded.len(),
+                teams.len(),
+                "acknowledged INSERTs must not repeat"
+            );
+            for (index, (sql, params)) in recorded.iter().enumerate() {
+                assert!(sql.starts_with("INSERT INTO"));
+                assert_eq!(
+                    params,
+                    &teams[index]
+                        .to_row()
+                        .into_iter()
+                        .map(|(_, v)| v)
+                        .collect::<Vec<_>>()
+                );
+            }
+
+            // The completed prefix remains part of this transaction: a later
+            // rollback must forget every inserted object, including that prefix.
+            rt.block_on(async { unwrap_outcome(session.rollback(&cx).await) });
+            assert_eq!(session.tracked_count(), 0);
+        }
+    }
+
+    #[test]
+    fn dropped_flush_keeps_unfinished_updates_and_completed_snapshots() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+
+        for completed in [1, 0, 2] {
+            let state = Arc::new(Mutex::new(MockState::default()));
+            let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+            let mut teams: Vec<_> = (1..=3)
+                .map(|id| Team {
+                    id: Some(id),
+                    name: format!("Team {id}"),
+                })
+                .collect();
+            session.add_all(&teams);
+            rt.block_on(async { unwrap_outcome(session.commit(&cx).await) });
+            for team in &mut teams {
+                team.name.push_str(" renamed");
+                session.mark_dirty(team);
+            }
+            rt.block_on(async { unwrap_outcome(session.begin(&cx).await) });
+            let flushes = count_completed_flushes(&mut session);
+            suspend_execute_after(&state, completed);
+
+            drop_pending_flush(&mut session, &cx);
+
+            assert_eq!(*flushes.lock().unwrap(), 0);
+            assert_eq!(state.lock().unwrap().executed.len(), completed);
+            for team in &teams[completed..] {
+                assert!(session.is_modified(team));
+                assert!(
+                    session.pending_dirty.contains(&ObjectKey::from_model(team)),
+                    "dropping a flush lost an unfinished UPDATE after {completed} acknowledgements"
+                );
+            }
+            for team in &teams[..completed] {
+                assert!(session.modified_attributes(team).is_empty());
+            }
+
+            state.lock().unwrap().stall_execute_at = None;
+            rt.block_on(async { unwrap_outcome(session.flush(&cx).await) });
+            assert_eq!(session.pending_dirty_count(), 0);
+            assert_eq!(*flushes.lock().unwrap(), 1);
+            let recorded = state.lock().unwrap().executed.clone();
+            assert_eq!(
+                recorded.len(),
+                teams.len(),
+                "acknowledged UPDATEs must not repeat"
+            );
+            for (index, (sql, params)) in recorded.iter().enumerate() {
+                assert!(sql.starts_with("UPDATE"));
+                assert_eq!(
+                    params,
+                    &vec![
+                        Value::Text(teams[index].name.clone()),
+                        Value::BigInt(teams[index].id.unwrap())
+                    ]
+                );
+                assert!(!session.is_modified(&teams[index]));
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_flush_keeps_unfinished_deletes_without_replaying_completed_rows() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+
+        for completed in [1, 0, 2] {
+            let state = Arc::new(Mutex::new(MockState::default()));
+            let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+            let teams: Vec<_> = (1..=3)
+                .map(|id| Team {
+                    id: Some(id),
+                    name: format!("Team {id}"),
+                })
+                .collect();
+            session.add_all(&teams);
+            rt.block_on(async { unwrap_outcome(session.commit(&cx).await) });
+            for team in &teams {
+                session.delete(team);
+            }
+            rt.block_on(async { unwrap_outcome(session.begin(&cx).await) });
+            let flushes = count_completed_flushes(&mut session);
+            suspend_execute_after(&state, completed);
+
+            drop_pending_flush(&mut session, &cx);
+
+            assert_eq!(*flushes.lock().unwrap(), 0);
+            assert_eq!(state.lock().unwrap().executed.len(), completed);
+            for team in &teams[completed..] {
+                assert_eq!(session.object_state(team), Some(ObjectState::Deleted));
+                assert!(
+                    session
+                        .pending_delete
+                        .contains(&ObjectKey::from_model(team)),
+                    "dropping a flush lost an unfinished DELETE after {completed} acknowledgements"
+                );
+            }
+
+            state.lock().unwrap().stall_execute_at = None;
+            rt.block_on(async { unwrap_outcome(session.flush(&cx).await) });
+            assert_eq!(session.pending_delete_count(), 0);
+            assert_eq!(session.tracked_count(), 0);
+            assert_eq!(*flushes.lock().unwrap(), 1);
+            let recorded = state.lock().unwrap().executed.clone();
+            assert_eq!(
+                recorded.len(),
+                teams.len(),
+                "acknowledged DELETEs must not repeat"
+            );
+            for (index, (sql, params)) in recorded.iter().enumerate() {
+                assert!(sql.starts_with("DELETE FROM"));
+                assert_eq!(params, &teams[index].primary_key_value());
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_flush_keeps_parent_after_acknowledged_cascade() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+        let parent = rt.block_on(async {
+            let parent = unwrap_outcome(session.get::<TeamWithHeroes>(&cx, 1_i64).await)
+                .expect("tracked parent");
+            let mut parents = vec![parent.clone()];
+            let loaded = unwrap_outcome(
+                session
+                    .load_one_to_many::<TeamWithHeroes, HeroChild, _, _>(
+                        &cx,
+                        &mut parents,
+                        |team| &mut team.heroes,
+                        |team| team.id.map_or(Value::Null, Value::BigInt),
+                    )
+                    .await,
+            );
+            assert_eq!(loaded, 2);
+            unwrap_outcome(session.begin(&cx).await);
+            parent
+        });
+        let children = [101, 102, 103].map(|id| HeroChild {
+            id: Some(id),
+            team_id: 1,
+        });
+        session.mark_dirty(&children[0]);
+        session.delete(&children[1]);
+        session.add(&children[2]);
+        session.delete(&parent);
+        assert_eq!(session.pending_dirty_count(), 1);
+        assert_eq!(session.pending_new_count(), 1);
+        assert_eq!(session.pending_delete_count(), 2);
+        let flushes = count_completed_flushes(&mut session);
+        // The child DELETE completes; the parent DELETE suspends before any
+        // effect. No clock or scheduler race chooses this boundary.
+        suspend_execute_after(&state, 1);
+
+        drop_pending_flush(&mut session, &cx);
+
+        assert_eq!(*flushes.lock().unwrap(), 0);
+        assert_eq!(session.object_state(&parent), Some(ObjectState::Deleted));
+        assert!(
+            session
+                .pending_delete
+                .contains(&ObjectKey::from_model(&parent)),
+            "an acknowledged child cascade must not lose the unfinished parent DELETE"
+        );
+        for child in &children {
+            assert_eq!(session.object_state(child), None);
+        }
+        assert_eq!(session.pending_new_count(), 0);
+        assert_eq!(session.pending_dirty_count(), 0);
+
+        state.lock().unwrap().stall_execute_at = None;
+        rt.block_on(async { unwrap_outcome(session.flush(&cx).await) });
+        assert_eq!(session.pending_delete_count(), 0);
+        assert_eq!(session.tracked_count(), 0);
+        assert_eq!(*flushes.lock().unwrap(), 1);
+        let recorded = state.lock().unwrap().executed.clone();
+        // An unfinished parent's cascade may be replanned on retry. Detached
+        // children must not be reinserted or updated, and the parent must
+        // finally be deleted; this does not promise once-only cascade SQL.
+        assert!(recorded[0].0.starts_with("DELETE FROM \"heroes\""));
+        assert!(
+            recorded
+                .last()
+                .unwrap()
+                .0
+                .starts_with("DELETE FROM \"teams\"")
+        );
+        assert!(
+            recorded[..recorded.len() - 1]
+                .iter()
+                .all(|(sql, _)| sql.starts_with("DELETE FROM \"heroes\""))
+        );
     }
 
     #[test]
