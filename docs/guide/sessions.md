@@ -158,15 +158,57 @@ async fn increment_counter(
 ```
 
 Between retry attempts:
-- The open transaction is safely rolled back.
-- The identity map is cleared to eliminate stale state.
-- Exponential backoff jitter is applied, strictly bounded by the `Cx` budget.
+
+- The database must acknowledge rollback of the failed attempt.
+- The identity map and pending queues are cleared after that acknowledgement.
+- Backoff respects the `Cx` budget, and every new attempt checks the deadline
+  before issuing `BEGIN` or entering the work closure. Immediate retry policies
+  obey the same attempt boundary.
+
+### Interrupted cleanup requires explicit recovery
+
+If rollback returns an error, cancellation, or panic outcome, `with_retry`
+stops without running another attempt. It retains the transaction flag,
+tracked objects, pending operations, and inserted-object ownership. Dropping
+the retry future during work or rollback also preserves that ownership and
+marks the Session as requiring rollback.
+
+Subsequent `begin`, `flush`, `commit`, `with_retry`, bulk writes, and relationship
+flushes return `TransactionErrorKind::RollbackRequired` before issuing SQL.
+Rejected relationship flushes leave the caller's pending links and unlinks
+intact. Call `session.rollback` with a live context to recover. Only an
+acknowledged rollback clears this state; PostgreSQL may instead have closed
+an interrupted wire exchange, in which case the connection needs replacement.
+
+When failed work returned an ordinary error, a failed cleanup's outcome is
+returned immediately. If the original work was cancelled or panicked, that
+original terminal outcome is preserved and the cleanup failure is logged.
+Neither case permits another attempt before recovery.
+
+### A committed attempt is never replayed automatically
+
+An `AfterCommit` callback runs after the database has committed. Its error
+does not undo those writes. `with_retry` returns the callback error directly,
+preserves committed tracking, and never invokes the retry policy for that
+attempt, even if the callback error is normally retryable.
+
+The same rule applies if the work closure calls `Session::commit` itself and
+then fails. If it starts another transaction after that commit, cleanup rolls
+back the later transaction while retaining the earlier durable objects in the
+identity map. Work is still not replayed. A failed cleanup retains the recovery
+state described above.
+
+These guarantees track Session-managed commits. Do not issue raw transaction
+control through `session.connection()` or commit through an independent alias
+inside retry work: those operations bypass the Session's commit tracking.
+External effects such as sending a message also remain the application's
+responsibility when designing retryable work.
 
 ---
 
 ## Differences from Python SQLModel
 
 - **Explicit Concurrency & Bounds**: In Python SQLAlchemy/SQLModel, sessions rely on thread-local contexts or asyncio task contexts with hidden event loops. In Rust, `Session` takes explicit `&Cx` contexts and executes within structured concurrency regions.
-- **Cancel-Safety**: Python sessions can leave dangling transactions if a coroutine is cancelled mid-execution. SQLModel Rust guarantees that a dropped or cancelled session safely rolls back and releases pooled connections.
+- **Cancellation and ownership**: Interrupted retry work retains its transaction state for explicit rollback with a live context. PostgreSQL closes incomplete wire exchanges, and pool checkout rejects unfinished Session transactions before lending a connection to another borrower.
 - **Typed Reference Identity**: Identity mapping uses `Arc<RwLock<M>>` internally for safe interior mutability and dirty checking without requiring Python's dynamic `__dict__` instrumentation.
 - **Built-in Resilient Retries**: `Session::with_retry` handles clean identity map clearing, transaction rollbacks, and budget-aware backoff natively.

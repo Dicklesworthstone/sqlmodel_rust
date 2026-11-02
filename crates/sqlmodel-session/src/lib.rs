@@ -536,6 +536,10 @@ pub struct Session<C: Connection> {
     connection: C,
     /// Whether we're in a transaction.
     in_transaction: bool,
+    /// An interrupted attempt or rollback must finish before more writes run.
+    rollback_required: bool,
+    /// Acknowledged commits, used to detect durable effects within a retry attempt.
+    commit_generation: u64,
     /// Identity map: ObjectKey -> TrackedObject.
     identity_map: HashMap<ObjectKey, TrackedObject>,
     /// Objects marked as new (need INSERT).
@@ -555,6 +559,26 @@ pub struct Session<C: Connection> {
     event_callbacks: SessionEventCallbacks,
 }
 
+/// Retain the need for recovery when a retry future is dropped or unwinds.
+/// The Session keeps its objects and queues; this guard performs no async work.
+struct RetryAttemptGuard<'session, C: Connection> {
+    session: &'session mut Session<C>,
+}
+
+impl<C: Connection> RetryAttemptGuard<'_, C> {
+    fn session(&mut self) -> &mut Session<C> {
+        self.session
+    }
+}
+
+impl<C: Connection> Drop for RetryAttemptGuard<'_, C> {
+    fn drop(&mut self) {
+        if self.session.in_transaction {
+            self.session.rollback_required = true;
+        }
+    }
+}
+
 impl<C: Connection> Session<C> {
     /// Create a new session from an existing connection.
     pub fn new(connection: C) -> Self {
@@ -566,6 +590,8 @@ impl<C: Connection> Session<C> {
         Self {
             connection,
             in_transaction: false,
+            rollback_required: false,
+            commit_generation: 0,
             identity_map: HashMap::new(),
             pending_new: Vec::new(),
             pending_delete: Vec::new(),
@@ -1394,6 +1420,16 @@ impl<C: Connection> Session<C> {
     // Transaction Management
     // ========================================================================
 
+    fn rollback_required_error(&self) -> Option<Error> {
+        self.rollback_required.then(|| {
+            Error::Transaction(sqlmodel_core::error::TransactionError {
+                kind: TransactionErrorKind::RollbackRequired,
+                message: "Session transaction recovery is incomplete; rollback must succeed before more writes or retries"
+                    .to_string(),
+            })
+        })
+    }
+
     /// Begin a transaction in the session's configured [`TransactionMode`].
     ///
     /// The statement is chosen per dialect (`BEGIN`, `BEGIN CONCURRENT`,
@@ -1401,14 +1437,17 @@ impl<C: Connection> Session<C> {
     /// [`Connection::supports_transaction_mode`] is refused with
     /// [`sqlmodel_core::TransactionErrorKind::UnsupportedMode`].
     pub async fn begin(&mut self, cx: &Cx) -> Outcome<(), Error> {
-        if self.in_transaction {
-            return Outcome::Ok(());
-        }
         if cx.is_cancel_requested() {
             return Outcome::Cancelled(
                 cx.cancel_reason()
                     .unwrap_or_else(|| CancelReason::user("Session::begin cancelled")),
             );
+        }
+        if let Some(error) = self.rollback_required_error() {
+            return Outcome::Err(error);
+        }
+        if self.in_transaction {
+            return Outcome::Ok(());
         }
 
         let mode = self.config.transaction_mode;
@@ -1450,6 +1489,9 @@ impl<C: Connection> Session<C> {
         // statement boundary below.
         if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
             return outcome;
+        }
+        if let Some(error) = self.rollback_required_error() {
+            return Outcome::Err(error);
         }
         if let Err(e) = self.event_callbacks.fire(SessionEvent::BeforeFlush) {
             return Outcome::Err(e);
@@ -2094,6 +2136,12 @@ impl<C: Connection> Session<C> {
     /// rollback notification fails, that failure is logged while the original
     /// transaction error remains the result.
     pub async fn commit(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Outcome::Cancelled(reason);
+        }
+        if let Some(error) = self.rollback_required_error() {
+            return Outcome::Err(error);
+        }
         // Flush any pending changes first
         match self.flush(cx).await {
             Outcome::Ok(()) => {}
@@ -2114,6 +2162,8 @@ impl<C: Connection> Session<C> {
             match self.connection.commit_transaction(cx).await {
                 Outcome::Ok(()) => {
                     self.in_transaction = false;
+                    // Record durability before user callbacks can fail or panic.
+                    self.commit_generation = self.commit_generation.wrapping_add(1);
                 }
                 Outcome::Err(error) => {
                     if matches!(
@@ -2122,6 +2172,7 @@ impl<C: Connection> Session<C> {
                             if transaction.kind == TransactionErrorKind::AlreadyRolledBack
                     ) {
                         self.in_transaction = false;
+                        self.rollback_required = false;
                         self.reconcile_after_rollback();
                         if let Err(callback_error) =
                             self.event_callbacks.fire(SessionEvent::AfterRollback)
@@ -2159,17 +2210,32 @@ impl<C: Connection> Session<C> {
         Outcome::Ok(())
     }
 
-    /// Rollback the current transaction.
     /// Run `work` against this session and commit, retrying the whole unit of
     /// work when a flush or the commit fails with a retryable error (a
     /// serialization failure, deadlock, or busy-snapshot conflict under
     /// [`TransactionMode::Concurrent`], for example).
     ///
-    /// Between attempts the open transaction is rolled back and the identity
-    /// map is cleared, so `work` must re-`add` / re-`get` everything it needs;
-    /// nothing from a failed attempt survives into the next one. The policy's
-    /// backoff respects the `Cx` budget deadline, and a cancelled `Cx` is never
-    /// retried. On give-up the returned error is the last failure, or
+    /// Between attempts rollback must be acknowledged before the identity map
+    /// is cleared, so `work` must re-`add` / re-`get` everything it needs. A
+    /// failed or interrupted cleanup retains the transaction and tracked work;
+    /// call [`Self::rollback`] with a live context before writing or retrying.
+    /// Dropping this future while an attempt owns an active transaction also
+    /// requires explicit rollback. Recovery failures stop before retry policy
+    /// evaluation. Original cancellation and panic outcomes remain authoritative
+    /// when their cleanup fails.
+    ///
+    /// An acknowledged commit during the attempt prevents replay, including
+    /// when an `AfterCommit` callback fails or `work` commits and then begins a
+    /// later transaction. Any active remainder is rolled back without forgetting
+    /// earlier committed objects. Transaction-control SQL issued directly through
+    /// [`Self::connection`] bypasses this Session bookkeeping; leave transaction
+    /// ownership to the Session when using this retry helper.
+    ///
+    /// An existing clean transaction is used for the first attempt. Put all
+    /// replayable work inside the closure: statements issued before it cannot
+    /// be recreated by replaying it. Every attempt checks the `Cx` budget before
+    /// BEGIN or work, and cancellation is never retried. On give-up the returned
+    /// error is the last failure, or
     /// [`sqlmodel_core::TransactionErrorKind::RetriesExhausted`] when the
     /// attempts ran out.
     ///
@@ -2195,8 +2261,14 @@ impl<C: Connection> Session<C> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            if cx.is_cancel_requested() {
-                return Outcome::Cancelled(CancelReason::user("Session::with_retry cancelled"));
+            match enforce_budget(cx) {
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+            if let Some(error) = self.rollback_required_error() {
+                return Outcome::Err(error);
             }
 
             // Open the transaction before `work` runs, so raw statements issued
@@ -2214,31 +2286,93 @@ impl<C: Connection> Session<C> {
                 }
             }
 
-            let failure = match work(cx, self).await {
-                Outcome::Ok(value) => match self.commit(cx).await {
-                    Outcome::Ok(()) => return Outcome::Ok(value),
-                    Outcome::Err(e) => e,
-                    Outcome::Cancelled(r) => {
-                        self.reset_after_failed_attempt(cx).await;
-                        return Outcome::Cancelled(r);
-                    }
-                    Outcome::Panicked(p) => {
-                        self.reset_after_failed_attempt(cx).await;
-                        return Outcome::Panicked(p);
-                    }
-                },
-                Outcome::Err(e) => e,
-                Outcome::Cancelled(r) => {
-                    self.reset_after_failed_attempt(cx).await;
-                    return Outcome::Cancelled(r);
+            let failure = {
+                // Install only after the boundary checks and successful BEGIN:
+                // rejecting an untouched preexisting transaction must not mark
+                // it for recovery. This owner survives every attempt await.
+                let mut guard = RetryAttemptGuard { session: self };
+                let session = guard.session();
+                let generation = session.commit_generation;
+                // BEGIN may consume the remaining budget. Its acknowledged
+                // transaction is now owned by the guard, but work must not run
+                // after the deadline or cancellation observed during BEGIN.
+                let work_outcome = match enforce_budget(cx) {
+                    Outcome::Ok(()) => work(cx, session).await,
+                    Outcome::Err(error) => Outcome::Err(error),
+                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => Outcome::Panicked(payload),
+                };
+                let outcome = match work_outcome {
+                    Outcome::Ok(value) => session.commit(cx).await.map(|()| value),
+                    Outcome::Err(error) => Outcome::Err(error),
+                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => Outcome::Panicked(payload),
+                };
+                let committed = session.commit_generation != generation;
+                if committed && !session.in_transaction {
+                    // Preserve committed tracking even when a notification or
+                    // the body returns a cancellation/panic after committing.
+                    return outcome;
                 }
-                Outcome::Panicked(p) => {
-                    self.reset_after_failed_attempt(cx).await;
-                    return Outcome::Panicked(p);
+
+                match outcome {
+                    Outcome::Ok(value) => return Outcome::Ok(value),
+                    Outcome::Err(error) => {
+                        match session.reset_after_failed_attempt(cx, committed).await {
+                            Outcome::Ok(()) => {}
+                            Outcome::Err(cleanup_error) => {
+                                tracing::warn!(
+                                    original_error = %error,
+                                    error = %cleanup_error,
+                                    "retry rollback failed; preserving unfinished transaction state"
+                                );
+                                return Outcome::Err(cleanup_error);
+                            }
+                            Outcome::Cancelled(reason) => {
+                                tracing::warn!(
+                                    original_error = %error,
+                                    ?reason,
+                                    "retry rollback cancelled; preserving unfinished transaction state"
+                                );
+                                return Outcome::Cancelled(reason);
+                            }
+                            Outcome::Panicked(payload) => {
+                                tracing::warn!(
+                                    original_error = %error,
+                                    ?payload,
+                                    "retry rollback panicked; preserving unfinished transaction state"
+                                );
+                                return Outcome::Panicked(payload);
+                            }
+                        }
+                        if committed {
+                            return Outcome::Err(error);
+                        }
+                        error
+                    }
+                    Outcome::Cancelled(reason) => {
+                        let cleanup = session.reset_after_failed_attempt(cx, committed).await;
+                        if !cleanup.is_ok() {
+                            tracing::warn!(
+                                ?cleanup,
+                                "retry rollback did not complete; preserving the original cancellation"
+                            );
+                        }
+                        return Outcome::Cancelled(reason);
+                    }
+                    Outcome::Panicked(payload) => {
+                        let cleanup = session.reset_after_failed_attempt(cx, committed).await;
+                        if !cleanup.is_ok() {
+                            tracing::warn!(
+                                ?cleanup,
+                                "retry rollback did not complete; preserving the original panic"
+                            );
+                        }
+                        return Outcome::Panicked(payload);
+                    }
                 }
             };
 
-            self.reset_after_failed_attempt(cx).await;
             match policy.after_failure(cx, attempt, failure).await {
                 RetryDecision::Retry => {}
                 RetryDecision::GiveUp(e) => return Outcome::Err(e),
@@ -2246,32 +2380,54 @@ impl<C: Connection> Session<C> {
         }
     }
 
-    /// Roll back whatever a failed attempt left open and forget every tracked
-    /// object, so the next attempt (or the caller) starts from a clean session.
-    async fn reset_after_failed_attempt(&mut self, cx: &Cx) {
-        if self.in_transaction {
-            // The connection may already have discarded the transaction; either
-            // way the session must not believe it is still inside one.
-            let _ = self.connection.execute(cx, "ROLLBACK", &[]).await;
-            self.in_transaction = false;
+    /// Reset only after acknowledged cleanup. A partially committed attempt
+    /// cannot replay, so preserve its durable objects using normal rollback
+    /// reconciliation instead of clearing the entire identity map.
+    async fn reset_after_failed_attempt(&mut self, cx: &Cx, committed: bool) -> Outcome<(), Error> {
+        if committed && !self.in_transaction {
+            return Outcome::Ok(());
         }
-        self.identity_map.clear();
-        self.inserted_in_transaction.clear();
-        self.pending_new.clear();
-        self.pending_delete.clear();
-        self.pending_dirty.clear();
+        match self.rollback_transaction_state(cx).await {
+            Outcome::Ok(()) => {}
+            failure => return failure,
+        }
+        if committed {
+            self.reconcile_after_rollback();
+        } else {
+            self.identity_map.clear();
+            self.inserted_in_transaction.clear();
+            self.pending_new.clear();
+            self.pending_delete.clear();
+            self.pending_dirty.clear();
+        }
+        Outcome::Ok(())
     }
 
-    pub async fn rollback(&mut self, cx: &Cx) -> Outcome<(), Error> {
-        if self.in_transaction {
+    /// Acknowledge rollback before releasing transaction ownership. Arming the
+    /// recovery marker before await also protects a dropped rollback future.
+    async fn rollback_transaction_state(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        if self.in_transaction || self.rollback_required {
+            self.rollback_required = true;
             match self.connection.rollback_transaction(cx).await {
                 Outcome::Ok(()) => {
                     self.in_transaction = false;
+                    self.rollback_required = false;
                 }
                 Outcome::Err(e) => return Outcome::Err(e),
                 Outcome::Cancelled(r) => return Outcome::Cancelled(r),
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
+        }
+        Outcome::Ok(())
+    }
+
+    /// Roll back the current transaction, including unfinished retry recovery.
+    /// Tracking changes only after the database acknowledges rollback. A failed
+    /// or dropped rollback keeps writes blocked until a later rollback succeeds.
+    pub async fn rollback(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        match self.rollback_transaction_state(cx).await {
+            Outcome::Ok(()) => {}
+            failure => return failure,
         }
 
         self.reconcile_after_rollback();
@@ -3004,6 +3160,12 @@ impl<C: Connection> Session<C> {
         FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
         FP: Fn(&P) -> Vec<Value>,
     {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Outcome::Cancelled(reason);
+        }
+        if let Some(error) = self.rollback_required_error() {
+            return Outcome::Err(error);
+        }
         let mut ops = Vec::new();
         let local_cols = link_table.local_cols();
         let remote_cols = link_table.remote_cols();
@@ -3572,6 +3734,12 @@ impl<C: Connection> Session<C> {
         models: &[M],
         batch_size: usize,
     ) -> Outcome<u64, Error> {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Outcome::Cancelled(reason);
+        }
+        if let Some(error) = self.rollback_required_error() {
+            return Outcome::Err(error);
+        }
         if models.is_empty() {
             return Outcome::Ok(0);
         }
@@ -3604,6 +3772,12 @@ impl<C: Connection> Session<C> {
         cx: &Cx,
         models: &[M],
     ) -> Outcome<u64, Error> {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Outcome::Cancelled(reason);
+        }
+        if let Some(error) = self.rollback_required_error() {
+            return Outcome::Err(error);
+        }
         if models.is_empty() {
             return Outcome::Ok(0);
         }
@@ -3669,6 +3843,7 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use sqlmodel_core::Row;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -3852,6 +4027,10 @@ mod tests {
         stall_execute_at: Option<usize>,
         /// Return this error once, after recording the next COMMIT attempt.
         commit_error: Option<Error>,
+        /// Return this outcome once, after recording the next ROLLBACK attempt.
+        rollback_outcome: Option<Outcome<u64, Error>>,
+        /// Advance the shared clock once when BEGIN is acknowledged.
+        advance_on_begin: Option<(Arc<asupersync::time::VirtualClock>, asupersync::Time)>,
     }
 
     #[derive(Debug, Clone)]
@@ -3965,20 +4144,25 @@ mod tests {
                 if stall {
                     std::future::pending::<()>().await;
                 }
-                let commit_error = {
+                let (scripted_outcome, advance_on_begin) = {
                     let mut guard = state.lock().expect("lock poisoned");
-                    let error = if sql == "COMMIT" {
-                        guard.commit_error.take()
+                    let outcome = match sql.as_str() {
+                        "COMMIT" => guard.commit_error.take().map(Outcome::Err),
+                        "ROLLBACK" => guard.rollback_outcome.take(),
+                        _ => None,
+                    };
+                    let advance_on_begin = if sql == "BEGIN" {
+                        guard.advance_on_begin.take()
                     } else {
                         None
                     };
                     guard.executed.push((sql, params));
-                    error
+                    (outcome, advance_on_begin)
                 };
-                match commit_error {
-                    Some(error) => Outcome::Err(error),
-                    None => Outcome::Ok(0),
+                if let Some((clock, deadline)) = advance_on_begin {
+                    clock.advance_to(deadline);
                 }
+                scripted_outcome.unwrap_or(Outcome::Ok(0))
             }
         }
 
@@ -5872,6 +6056,664 @@ mod tests {
     #[test]
     fn commit_rollback_acknowledgement_preserves_error_when_notification_fails() {
         exercise_commit_rollback_acknowledgement(true);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RetryTerminal {
+        Error,
+        Cancelled,
+        Panicked,
+    }
+
+    fn retry_terminal<T>(terminal: RetryTerminal, message: &'static str) -> Outcome<T, Error> {
+        match terminal {
+            RetryTerminal::Error => Outcome::Err(Error::Custom(message.to_string())),
+            RetryTerminal::Cancelled => Outcome::Cancelled(CancelReason::user(message)),
+            RetryTerminal::Panicked => {
+                Outcome::Panicked(asupersync::types::PanicPayload::new(message))
+            }
+        }
+    }
+
+    fn assert_retry_terminal<T: std::fmt::Debug>(
+        outcome: Outcome<T, Error>,
+        terminal: RetryTerminal,
+        message: &'static str,
+    ) {
+        match (outcome, terminal) {
+            (Outcome::Err(Error::Custom(actual)), RetryTerminal::Error) => {
+                assert_eq!(actual, message);
+            }
+            (Outcome::Cancelled(actual), RetryTerminal::Cancelled) => {
+                assert_eq!(actual, CancelReason::user(message));
+            }
+            (Outcome::Panicked(actual), RetryTerminal::Panicked) => {
+                assert_eq!(actual.message(), message);
+            }
+            (actual, expected) => panic!("expected {expected:?} ({message}), got {actual:?}"),
+        }
+    }
+
+    fn retry_team(id: i64) -> Team {
+        Team {
+            id: Some(id),
+            name: format!("retry team {id}"),
+        }
+    }
+
+    async fn prepare_unfinished_retry_work(cx: &Cx, session: &mut Session<MockConnection>) {
+        let mut changed =
+            unwrap_outcome(session.get::<Team>(cx, 1_i64).await).expect("existing row to update");
+        let deleted =
+            unwrap_outcome(session.get::<Team>(cx, 2_i64).await).expect("existing row to delete");
+        session.add(&retry_team(3));
+        unwrap_outcome(session.flush(cx).await);
+        session.add(&retry_team(4));
+        changed.name = "uncommitted retry update".to_string();
+        session.mark_dirty(&changed);
+        session.delete(&deleted);
+    }
+
+    fn assert_unfinished_retry_work_retained(session: &Session<MockConnection>) {
+        assert!(session.in_transaction());
+        assert_eq!(session.tracked_count(), 4);
+        assert_eq!(session.pending_new_count(), 1);
+        assert_eq!(session.pending_dirty_count(), 1);
+        assert_eq!(session.pending_delete_count(), 1);
+        assert_eq!(session.inserted_in_transaction.len(), 1);
+        assert!(
+            session
+                .inserted_in_transaction
+                .contains(&ObjectKey::from_model(&retry_team(3)))
+        );
+        for (id, expected) in [
+            (1, ObjectState::Persistent),
+            (2, ObjectState::Deleted),
+            (3, ObjectState::Persistent),
+            (4, ObjectState::New),
+        ] {
+            assert_eq!(session.object_state(&retry_team(id)), Some(expected));
+        }
+    }
+
+    fn assert_retry_recovery_error<T: std::fmt::Debug>(outcome: Outcome<T, Error>) {
+        assert!(
+            matches!(
+                &outcome,
+                Outcome::Err(Error::Transaction(error))
+                    if error.kind == TransactionErrorKind::RollbackRequired
+            ),
+            "unfinished retry work requires explicit rollback: {outcome:?}"
+        );
+    }
+
+    async fn assert_retry_recovery_and_resume(
+        session: &mut Session<MockConnection>,
+        state: &Mutex<MockState>,
+    ) {
+        let fresh_cx = Cx::for_testing();
+        let before = {
+            let guard = state.lock().unwrap();
+            (guard.execute_calls, guard.query_calls, guard.executed.len())
+        };
+        assert_retry_recovery_error(session.begin(&fresh_cx).await);
+        assert_retry_recovery_error(session.flush(&fresh_cx).await);
+        assert_retry_recovery_error(session.commit(&fresh_cx).await);
+        let bodies = AtomicUsize::new(0);
+        assert_retry_recovery_error(
+            session
+                .with_retry(
+                    &fresh_cx,
+                    &RetryPolicy::immediate().max_attempts(2),
+                    async |_, _| {
+                        bodies.fetch_add(1, Ordering::Relaxed);
+                        Outcome::Ok(())
+                    },
+                )
+                .await,
+        );
+        assert_eq!(bodies.load(Ordering::Relaxed), 0);
+
+        // Bulk writes must honor the same recovery gate, including their
+        // empty-work fast paths and the default-batch wrapper.
+        for models in [Vec::new(), vec![retry_team(8)]] {
+            assert_retry_recovery_error(session.bulk_insert(&fresh_cx, &models).await);
+            assert_retry_recovery_error(
+                session
+                    .bulk_insert_with_batch_size(&fresh_cx, &models, 1)
+                    .await,
+            );
+            assert_retry_recovery_error(session.bulk_update(&fresh_cx, &models).await);
+        }
+
+        let link = sqlmodel_core::LinkTableInfo::composite(
+            "mm_link",
+            &["parent_id1", "parent_id2"],
+            &["child_id1", "child_id2"],
+        );
+        let mut parents = [MmParentComposite {
+            id1: 1,
+            id2: 2,
+            children: sqlmodel_core::RelatedMany::with_link_table(link),
+        }];
+        parents[0]
+            .children
+            .link(&MmChildComposite { id1: 7, id2: 9 });
+        parents[0]
+            .children
+            .unlink(&MmChildComposite { id1: 8, id2: 10 });
+        assert_retry_recovery_error(
+            session
+                .flush_related_many_pk(
+                    &fresh_cx,
+                    &mut parents,
+                    |parent| &mut parent.children,
+                    |parent| vec![Value::BigInt(parent.id1), Value::BigInt(parent.id2)],
+                    &link,
+                )
+                .await,
+        );
+        assert_eq!(
+            parents[0].children.take_pending_links(),
+            vec![vec![Value::BigInt(7), Value::BigInt(9)]],
+            "rejected writes must not take the caller's pending links"
+        );
+        assert_eq!(
+            parents[0].children.take_pending_unlinks(),
+            vec![vec![Value::BigInt(8), Value::BigInt(10)]],
+            "rejected writes must not take the caller's pending unlinks"
+        );
+        assert_retry_recovery_error(
+            session
+                .flush_related_many_pk::<MmParentComposite, MmChildComposite, _, _>(
+                    &fresh_cx,
+                    &mut [],
+                    |parent| &mut parent.children,
+                    |parent| vec![Value::BigInt(parent.id1), Value::BigInt(parent.id2)],
+                    &link,
+                )
+                .await,
+        );
+        {
+            let guard = state.lock().unwrap();
+            assert_eq!(
+                (guard.execute_calls, guard.query_calls, guard.executed.len()),
+                before,
+                "recovery gates must run before database calls"
+            );
+        }
+        assert_unfinished_retry_work_retained(session);
+
+        unwrap_outcome(session.rollback(&fresh_cx).await);
+        assert!(!session.in_transaction());
+        assert!(session.inserted_in_transaction.is_empty());
+        assert_eq!(session.pending_new_count(), 0);
+        assert_eq!(session.pending_dirty_count(), 0);
+        assert_eq!(session.pending_delete_count(), 0);
+        assert_eq!(session.object_state(&retry_team(3)), None);
+        assert_eq!(session.object_state(&retry_team(4)), None);
+        for id in [1, 2] {
+            assert_eq!(
+                session.object_state(&retry_team(id)),
+                Some(ObjectState::Expired)
+            );
+        }
+        unwrap_outcome(
+            session
+                .with_retry(
+                    &fresh_cx,
+                    &RetryPolicy::immediate().max_attempts(2),
+                    async |_, session| {
+                        bodies.fetch_add(1, Ordering::Relaxed);
+                        session.add(&retry_team(5));
+                        Outcome::Ok(())
+                    },
+                )
+                .await,
+        );
+        assert_eq!(bodies.load(Ordering::Relaxed), 1);
+        assert!(!session.in_transaction());
+        assert!(session.inserted_in_transaction.is_empty());
+        assert_eq!(session.pending_new_count(), 0);
+        assert_eq!(
+            session.object_state(&retry_team(5)),
+            Some(ObjectState::Expired)
+        );
+    }
+
+    fn exercise_retry_cleanup_failure(
+        cleanup: RetryTerminal,
+        original_terminal: Option<RetryTerminal>,
+    ) {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let state = Arc::new(Mutex::new(MockState {
+            rollback_outcome: Some(retry_terminal(cleanup, "rollback failed")),
+            ..MockState::default()
+        }));
+        let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+        let bodies = AtomicUsize::new(0);
+        let outcome: Outcome<(), Error> = rt.block_on(session.with_retry(
+            &cx,
+            &RetryPolicy::immediate().max_attempts(2),
+            async |cx, session| {
+                bodies.fetch_add(1, Ordering::Relaxed);
+                prepare_unfinished_retry_work(cx, session).await;
+                match original_terminal {
+                    Some(terminal) => retry_terminal(terminal, "work stopped"),
+                    None => Outcome::Err(Error::Timeout),
+                }
+            },
+        ));
+        if let Some(original) = original_terminal {
+            assert_retry_terminal(outcome, original, "work stopped");
+        } else {
+            assert_retry_terminal(outcome, cleanup, "rollback failed");
+        }
+        assert_eq!(bodies.load(Ordering::Relaxed), 1);
+        assert!(
+            !cx.is_cancel_requested(),
+            "driver outcomes leave the Cx live"
+        );
+        assert_unfinished_retry_work_retained(&session);
+        let sql: Vec<_> = state
+            .lock()
+            .unwrap()
+            .executed
+            .iter()
+            .map(|(sql, _)| sql.clone())
+            .collect();
+        assert_eq!(sql.iter().filter(|sql| sql.as_str() == "BEGIN").count(), 1);
+        assert_eq!(
+            sql.iter().filter(|sql| sql.as_str() == "ROLLBACK").count(),
+            1
+        );
+        assert!(sql.iter().all(|sql| sql != "COMMIT"));
+        rt.block_on(assert_retry_recovery_and_resume(&mut session, &state));
+    }
+
+    #[test]
+    fn with_retry_stops_when_rollback_returns_error() {
+        exercise_retry_cleanup_failure(RetryTerminal::Error, None);
+    }
+
+    #[test]
+    fn with_retry_stops_when_rollback_returns_cancelled() {
+        exercise_retry_cleanup_failure(RetryTerminal::Cancelled, None);
+    }
+
+    #[test]
+    fn with_retry_stops_when_rollback_returns_panicked() {
+        exercise_retry_cleanup_failure(RetryTerminal::Panicked, None);
+    }
+
+    #[test]
+    fn with_retry_preserves_work_cancellation_when_cleanup_fails() {
+        exercise_retry_cleanup_failure(RetryTerminal::Error, Some(RetryTerminal::Cancelled));
+    }
+
+    #[test]
+    fn with_retry_preserves_work_panic_when_cleanup_fails() {
+        exercise_retry_cleanup_failure(RetryTerminal::Error, Some(RetryTerminal::Panicked));
+    }
+
+    fn exercise_dropped_retry(during_rollback: bool) {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+        let bodies = AtomicUsize::new(0);
+        let policy = RetryPolicy::immediate().max_attempts(2);
+
+        rt.block_on(async {
+            let mut retry = Box::pin(session.with_retry(&cx, &policy, async |cx, session| {
+                bodies.fetch_add(1, Ordering::Relaxed);
+                prepare_unfinished_retry_work(cx, session).await;
+                if during_rollback {
+                    let mut guard = state.lock().unwrap();
+                    guard.stall_execute_at = Some(guard.execute_calls + 1);
+                    Outcome::Err(Error::Timeout)
+                } else {
+                    std::future::pending::<Outcome<(), Error>>().await
+                }
+            }));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(retry.as_mut().poll(&mut context).is_pending());
+            // Destroy the actual retry future. Its surviving Session must not
+            // allow this incomplete attempt to be committed or adopted anew.
+            drop(retry);
+        });
+        assert_eq!(bodies.load(Ordering::Relaxed), 1);
+        assert_unfinished_retry_work_retained(&session);
+        {
+            let mut guard = state.lock().unwrap();
+            assert_eq!(guard.execute_calls, if during_rollback { 3 } else { 2 });
+            assert_eq!(guard.executed.len(), 2);
+            guard.stall_execute_at = None;
+        }
+        rt.block_on(assert_retry_recovery_and_resume(&mut session, &state));
+    }
+
+    #[test]
+    fn with_retry_dropped_rollback_requires_explicit_recovery() {
+        exercise_dropped_retry(true);
+    }
+
+    #[test]
+    fn with_retry_dropped_work_requires_explicit_recovery() {
+        exercise_dropped_retry(false);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // Event callbacks use the public unboxed Error type.
+    fn with_retry_does_not_replay_after_commit_notification_failure() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut session = Session::with_config(
+            MockConnection::new(Arc::clone(&state)),
+            SessionConfig {
+                expire_on_commit: false,
+                ..SessionConfig::default()
+            },
+        );
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed_callbacks = Arc::clone(&callbacks);
+        session.on_after_commit(move || {
+            if observed_callbacks.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(Error::Timeout)
+            } else {
+                Ok(())
+            }
+        });
+        let bodies = AtomicUsize::new(0);
+        let outcome = rt.block_on(session.with_retry(
+            &cx,
+            &RetryPolicy::immediate().max_attempts(2),
+            async |_, session| {
+                bodies.fetch_add(1, Ordering::Relaxed);
+                session.add(&retry_team(3));
+                Outcome::Ok(7_u64)
+            },
+        ));
+
+        assert!(
+            matches!(outcome, Outcome::Err(Error::Timeout)),
+            "a notification error cannot replay durable writes: {outcome:?}"
+        );
+        assert_eq!(bodies.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert!(!session.in_transaction());
+        assert_eq!(
+            session.object_state(&retry_team(3)),
+            Some(ObjectState::Persistent)
+        );
+        assert!(session.inserted_in_transaction.is_empty());
+        assert_eq!(session.pending_new_count(), 0);
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard
+                .executed
+                .iter()
+                .filter(|(sql, _)| sql == "COMMIT")
+                .count(),
+            1
+        );
+        assert_eq!(
+            guard
+                .executed
+                .iter()
+                .filter(|(sql, _)| sql.starts_with("INSERT"))
+                .count(),
+            1
+        );
+        assert!(guard.executed.iter().all(|(sql, _)| sql != "ROLLBACK"));
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // Event callbacks use the public unboxed Error type.
+    fn with_retry_does_not_replay_manual_commit_followed_by_another_transaction() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+        let rollback_callbacks = Arc::new(AtomicUsize::new(0));
+        let observed_rollbacks = Arc::clone(&rollback_callbacks);
+        session.on_after_rollback(move || {
+            observed_rollbacks.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let bodies = AtomicUsize::new(0);
+        let outcome: Outcome<(), Error> = rt.block_on(session.with_retry(
+            &cx,
+            &RetryPolicy::immediate().max_attempts(2),
+            async |cx, session| {
+                bodies.fetch_add(1, Ordering::Relaxed);
+                session.add(&retry_team(3));
+                unwrap_outcome(session.commit(cx).await);
+                unwrap_outcome(session.begin(cx).await);
+                session.add(&retry_team(4));
+                unwrap_outcome(session.flush(cx).await);
+                Outcome::Err(Error::Timeout)
+            },
+        ));
+
+        assert!(
+            matches!(outcome, Outcome::Err(Error::Timeout)),
+            "an active later transaction cannot hide an earlier durable commit: {outcome:?}"
+        );
+        assert_eq!(bodies.load(Ordering::Relaxed), 1);
+        assert_eq!(rollback_callbacks.load(Ordering::Relaxed), 0);
+        assert!(!session.in_transaction());
+        assert!(session.inserted_in_transaction.is_empty());
+        assert_eq!(session.pending_new_count(), 0);
+        assert_eq!(
+            session.object_state(&retry_team(3)),
+            Some(ObjectState::Expired),
+            "the earlier committed insertion remains durable and tracked"
+        );
+        assert_eq!(
+            session.object_state(&retry_team(4)),
+            None,
+            "the later insertion was rolled back"
+        );
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard
+                .executed
+                .iter()
+                .filter(|(sql, _)| sql == "BEGIN")
+                .count(),
+            2
+        );
+        assert_eq!(
+            guard
+                .executed
+                .iter()
+                .filter(|(sql, _)| sql == "COMMIT")
+                .count(),
+            1
+        );
+        assert_eq!(
+            guard
+                .executed
+                .iter()
+                .filter(|(sql, _)| sql == "ROLLBACK")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn with_retry_replays_after_acknowledged_rollback_without_old_attempt_state() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut session = Session::with_config(
+            MockConnection::new(Arc::clone(&state)),
+            SessionConfig {
+                expire_on_commit: false,
+                ..SessionConfig::default()
+            },
+        );
+        // Earlier successful transactions do not forbid a later safe retry.
+        session.add(&retry_team(9));
+        rt.block_on(async { unwrap_outcome(session.commit(&cx).await) });
+        let before = state.lock().unwrap().executed.len();
+        let bodies = AtomicUsize::new(0);
+        let value = unwrap_outcome(rt.block_on(session.with_retry(
+            &cx,
+            &RetryPolicy::immediate().max_attempts(2),
+            async |cx, session| {
+                let attempt = bodies.fetch_add(1, Ordering::Relaxed);
+                if attempt > 0 {
+                    assert_eq!(session.tracked_count(), 0);
+                    assert_eq!(session.pending_new_count(), 0);
+                    assert_eq!(session.pending_dirty_count(), 0);
+                    assert_eq!(session.pending_delete_count(), 0);
+                    assert!(session.inserted_in_transaction.is_empty());
+                }
+                assert!(session.in_transaction());
+                session.add(&retry_team(3));
+                unwrap_outcome(session.flush(cx).await);
+                if attempt == 0 {
+                    Outcome::Err(Error::Timeout)
+                } else {
+                    Outcome::Ok(7_u64)
+                }
+            },
+        )));
+        assert_eq!(value, 7);
+        assert_eq!(bodies.load(Ordering::Relaxed), 2);
+        assert!(!session.in_transaction());
+        assert!(session.inserted_in_transaction.is_empty());
+        assert_eq!(
+            session.object_state(&retry_team(3)),
+            Some(ObjectState::Persistent)
+        );
+        let guard = state.lock().unwrap();
+        let executed = &guard.executed[before..];
+        assert_eq!(executed.iter().filter(|(sql, _)| sql == "BEGIN").count(), 2);
+        assert_eq!(
+            executed.iter().filter(|(sql, _)| sql == "ROLLBACK").count(),
+            1
+        );
+        assert_eq!(
+            executed.iter().filter(|(sql, _)| sql == "COMMIT").count(),
+            1
+        );
+        assert_eq!(
+            executed
+                .iter()
+                .filter(|(sql, _)| sql.starts_with("INSERT"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn with_retry_checks_exact_deadline_after_begin_before_work() {
+        use asupersync::lab::{LabConfig, LabRuntime};
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+        use std::task::{Context, Poll, Waker};
+
+        let clock = Arc::new(VirtualClock::new());
+        let mut runtime = LabRuntime::new(LabConfig::new(0x43_0052));
+        runtime
+            .state
+            .set_timer_driver(TimerDriverHandle::with_virtual_clock(Arc::clone(&clock)));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        let deadline = Time::from_millis(50);
+        let state = Arc::new(Mutex::new(MockState {
+            advance_on_begin: Some((Arc::clone(&clock), deadline)),
+            ..MockState::default()
+        }));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completion = Arc::clone(&completed);
+        let (task, _) = runtime
+            .state
+            .create_task(
+                region,
+                Budget::INFINITE.with_deadline(deadline),
+                async move {
+                    let cx = Cx::current().expect("lab task context");
+                    let mut session = Session::new(MockConnection::new(Arc::clone(&state)));
+                    session.add(&retry_team(3));
+                    let bodies = AtomicUsize::new(0);
+                    let policy = RetryPolicy::immediate().max_attempts(2);
+                    let outcome = {
+                        let mut retry = Box::pin(session.with_retry(&cx, &policy, async |_, _| {
+                            bodies.fetch_add(1, Ordering::Relaxed);
+                            Outcome::Ok(())
+                        }));
+                        let mut context = Context::from_waker(Waker::noop());
+                        let Poll::Ready(outcome) = retry.as_mut().poll(&mut context) else {
+                            panic!("synchronous BEGIN and rollback must finish in one poll");
+                        };
+                        outcome
+                    };
+
+                    assert!(
+                        matches!(outcome, Outcome::Err(Error::Timeout)),
+                        "a BEGIN that consumes the budget must stop before work: {outcome:?}"
+                    );
+                    assert_eq!(cx.now(), deadline);
+                    assert!(!cx.is_cancel_requested());
+                    assert_eq!(bodies.load(Ordering::Relaxed), 0);
+                    assert!(!session.in_transaction());
+                    assert_eq!(session.tracked_count(), 0);
+                    assert_eq!(session.pending_new_count(), 0);
+                    assert!(session.inserted_in_transaction.is_empty());
+                    let sql: Vec<_> = state
+                        .lock()
+                        .unwrap()
+                        .executed
+                        .iter()
+                        .map(|(sql, _)| sql.clone())
+                        .collect();
+                    assert_eq!(sql, vec!["BEGIN", "ROLLBACK"]);
+
+                    // The late BEGIN is still owned and its rollback was
+                    // acknowledged, so a fresh context can safely do work.
+                    let fresh_cx = Cx::for_testing();
+                    let recovered = {
+                        let mut retry =
+                            Box::pin(session.with_retry(&fresh_cx, &policy, async |_, session| {
+                                session.add(&retry_team(5));
+                                Outcome::Ok(())
+                            }));
+                        let mut context = Context::from_waker(Waker::noop());
+                        let Poll::Ready(outcome) = retry.as_mut().poll(&mut context) else {
+                            panic!(
+                                "healthy retry with synchronous mock I/O must finish in one poll"
+                            );
+                        };
+                        outcome
+                    };
+                    unwrap_outcome(recovered);
+                    assert!(!session.in_transaction());
+                    assert_eq!(
+                        session.object_state(&retry_team(5)),
+                        Some(ObjectState::Expired)
+                    );
+                    completion.store(1, Ordering::Release);
+                },
+            )
+            .expect("spawn retry BEGIN deadline regression");
+        runtime.scheduler.lock().schedule(task, 0);
+        runtime.run_with_auto_advance();
+        assert_eq!(completed.load(Ordering::Acquire), 1);
     }
 
     /// `mark_dirty` on an object expired by `commit` must still produce the

@@ -120,6 +120,9 @@ pub enum TransactionErrorKind {
     SavepointNotFound,
     /// Nested transaction not supported
     NestedNotSupported,
+    /// An interrupted or failed Session attempt still owns transaction state.
+    /// Explicit rollback must succeed before the Session can write again.
+    RollbackRequired,
     /// The connection cannot start a transaction in the requested
     /// [`crate::TransactionMode`] (for example `BEGIN CONCURRENT` on C SQLite).
     UnsupportedMode,

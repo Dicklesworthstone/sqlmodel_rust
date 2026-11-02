@@ -38,6 +38,20 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- Session retries now require acknowledged rollback before another attempt.
+  Failed, cancelled, panicked, or dropped cleanup preserves transaction and
+  tracking ownership. Dropping work also marks the Session as requiring
+  rollback; subsequent Session writes return `RollbackRequired` until explicit
+  rollback succeeds. The guard includes bulk and relationship writes without
+  consuming their pending operations. Cancellation and panic from the original
+  work remain authoritative when cleanup also fails.
+- Acknowledged Session commits now prevent retrying the same work after an
+  `AfterCommit` notification error or a later failure inside the work closure.
+  Earlier durable objects remain tracked when a later transaction is rolled
+  back. Retry entry also checks the caller's deadline before `BEGIN` or work,
+  including immediate retry policies. Regressions cover real PostgreSQL
+  duplicate-write prevention, explicit recovery, hard-dropped futures,
+  cancellation at rollback, and exact virtual-time deadline expiry.
 - ORM Session finalization now preserves PostgreSQL's command acknowledgement.
   If a statement has aborted the transaction, a `COMMIT` acknowledged as
   `ROLLBACK` returns `AlreadyRolledBack`, reconciles tracked objects, and fires

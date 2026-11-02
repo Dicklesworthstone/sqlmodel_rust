@@ -21,6 +21,7 @@ use sqlmodel_e2e::{
     parse_postgres_url, run_owned_on_every_driver,
 };
 use sqlmodel_postgres::{PgConfig, SharedPgConnection};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -1001,6 +1002,128 @@ fn postgres_session_commit_and_rollback_preserve_backend_and_persistence() {
             .close(&cx)
             .await
             .expect("close healthy Session observer");
+    });
+}
+
+#[test]
+fn postgres_session_retry_does_not_replay_after_commit_callback_failure() {
+    let Some(cfg) = postgres_session_config() else {
+        return;
+    };
+    let _watchdog = SessionWatchdog::start("PostgreSQL Session committed callback failure");
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production Session runtime");
+    let cx = rt.request_cx_with_budget(
+        Budget::new().with_deadline(asupersync::time::wall_now() + Duration::from_secs(5)),
+    );
+    rt.block_on(async {
+        let writer = expect_outcome(
+            SharedPgConnection::connect(&cx, cfg.clone()).await,
+            "connect retry Session writer",
+        );
+        let observer = expect_outcome(
+            SharedPgConnection::connect(&cx, cfg).await,
+            "connect independent retry observer",
+        );
+        let original_backend = postgres_session_backend(&cx, &writer).await;
+        let observer_backend = postgres_session_backend(&cx, &observer).await;
+        let table = sqlmodel_e2e::unique_table("session_commit_callback");
+        // Duplicates are allowed: a replay must remain visible as a second
+        // durable row, rather than being hidden by a constraint violation.
+        expect_outcome(
+            writer
+                .execute(&cx, &format!("CREATE TABLE {table} (marker INTEGER)"), &[])
+                .await,
+            "create retry callback marker table",
+        );
+        let mut session = Session::new(writer);
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let callback_counter = Arc::clone(&callback_calls);
+        session.on_after_commit(move || {
+            if callback_counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(Error::Timeout)
+            } else {
+                Ok(())
+            }
+        });
+        let body_calls = AtomicUsize::new(0);
+        let insert_sql = format!("INSERT INTO {table} VALUES (1)");
+        let policy = RetryPolicy::immediate().max_attempts(2);
+        let retried = session
+            .with_retry(&cx, &policy, async |cx, session| {
+                body_calls.fetch_add(1, Ordering::Relaxed);
+                session
+                    .connection()
+                    .execute(cx, &insert_sql, &[])
+                    .await
+                    .map(|_| 7)
+            })
+            .await;
+        let attempts = body_calls.load(Ordering::Relaxed);
+        let notifications = callback_calls.load(Ordering::Relaxed);
+        let still_in_transaction = session.in_transaction();
+        let persisted = count(
+            &cx,
+            &observer,
+            &table,
+            "durable rows after callback failure",
+        )
+        .await;
+        let backend_after = postgres_session_backend(&cx, session.connection()).await;
+        let healthy_query = session.connection().query(&cx, "SELECT 7", &[]).await;
+
+        // Even the unfixed replay path cleans its fixture before the RED
+        // assertion, after the observer has independently counted both rows.
+        expect_outcome(
+            observer
+                .execute(&cx, &format!("DROP TABLE {table}"), &[])
+                .await,
+            "remove retry callback marker table",
+        );
+        session
+            .into_connection()
+            .close(&cx)
+            .await
+            .expect("close retry Session writer");
+        observer.close(&cx).await.expect("close retry observer");
+
+        eprintln!(
+            "PostgreSQL Session callback failure: outcome={retried:?}, attempts={attempts}, \
+             notifications={notifications}, persisted={persisted}, \
+             original_backend={original_backend}, backend_after={backend_after}"
+        );
+        assert!(
+            Error::Timeout.is_retryable(),
+            "the callback must return a retryable error"
+        );
+        assert!(
+            matches!(retried, Outcome::Err(Error::Timeout)),
+            "return the original callback timeout without replaying committed work, got {retried:?}"
+        );
+        assert_eq!(attempts, 1, "the acknowledged commit must fence replay");
+        assert_eq!(notifications, 1, "notify the completed commit only once");
+        assert_eq!(
+            persisted, 1,
+            "the observer must see exactly one durable write"
+        );
+        assert!(!still_in_transaction);
+        assert_ne!(
+            observer_backend, original_backend,
+            "observer must be independent"
+        );
+        assert_eq!(
+            backend_after, original_backend,
+            "callback failure must preserve the healthy backend"
+        );
+        let healthy_rows = expect_outcome(
+            healthy_query,
+            "connection remains usable after callback failure",
+        );
+        assert_eq!(
+            healthy_rows[0].get_as::<i64>(0).expect("healthy SELECT 7"),
+            7
+        );
     });
 }
 

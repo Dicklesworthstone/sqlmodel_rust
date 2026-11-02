@@ -27,10 +27,13 @@
 
 #![allow(clippy::result_large_err)]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use asupersync::lab::{LabConfig, LabRuntime};
 use asupersync::runtime::RuntimeBuilder;
-use asupersync::{Cx, Outcome};
+use asupersync::time::{TimerDriverHandle, VirtualClock};
+use asupersync::{Budget, Cx, Outcome, Time};
 use serde::{Deserialize, Serialize};
 use sqlmodel::Session;
 use sqlmodel::prelude::*;
@@ -735,6 +738,102 @@ fn parent(id: i64, name: &str) -> Parent {
 }
 
 #[test]
+fn session_with_retry_rejects_exactly_expired_budget_before_attempt_work() {
+    for already_active in [false, true] {
+        let clock = Arc::new(VirtualClock::new());
+        let mut runtime = LabRuntime::new(LabConfig::new(0x43_0051));
+        runtime
+            .state
+            .set_timer_driver(TimerDriverHandle::with_virtual_clock(Arc::clone(&clock)));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        let deadline = Time::from_millis(50);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completion = Arc::clone(&completed);
+        let (task, _) = runtime
+            .state
+            .create_task(
+                region,
+                Budget::INFINITE.with_deadline(deadline),
+                async move {
+                    let cx = Cx::current().expect("lab task context");
+                    let recovery_cx = Cx::for_testing();
+                    let conn = seeded_db(&recovery_cx, &family_fixture()).await;
+                    let original = family_state(&recovery_cx, &conn).await;
+                    let mut session = Session::new(CancelAt::new(conn, 0));
+                    if already_active {
+                        expect_outcome(session.begin(&recovery_cx).await, "preexisting BEGIN");
+                        session.add(&parent(8, "uncommitted before retry"));
+                        expect_outcome(session.flush(&recovery_cx).await, "preexisting write");
+                    }
+                    session.add(&parent(9, "pending before retry"));
+                    let prior_state = session.debug_state();
+                    let prior_calls = session.connection().calls_made();
+
+                    // Expire within this poll, before the runtime can request
+                    // cancellation. The retry loop must enforce the deadline
+                    // itself, even when immediate backoff has no timer await.
+                    clock.advance_to(deadline);
+                    assert_eq!(cx.now(), deadline);
+                    assert_eq!(cx.budget().deadline, Some(deadline));
+                    assert!(!cx.is_cancel_requested());
+                    let mut body_calls = 0;
+                    let outcome = {
+                        let policy = RetryPolicy::immediate().max_attempts(2);
+                        let mut retry = Box::pin(session.with_retry(&cx, &policy, async |_, _| {
+                            body_calls += 1;
+                            Outcome::Ok(())
+                        }));
+                        // Expiry must complete in one poll. Keep this lending
+                        // future out of the Lab task's suspension points; the
+                        // public retry API does not require its body to be Send.
+                        let mut poll_context =
+                            std::task::Context::from_waker(std::task::Waker::noop());
+                        match std::future::Future::poll(retry.as_mut(), &mut poll_context) {
+                            std::task::Poll::Ready(outcome) => outcome,
+                            std::task::Poll::Pending => {
+                                panic!("already-expired retry must complete in its first poll")
+                            }
+                        }
+                    };
+                    let after_state = session.debug_state();
+                    let after_calls = session.connection().calls_made();
+                    let log = session.connection().log();
+
+                    // Recover any preexisting transaction before asserting;
+                    // refusing a new attempt must not forget its ownership.
+                    expect_outcome(session.rollback(&recovery_cx).await, "explicit recovery");
+                    let recovered = family_state(&recovery_cx, session.connection().inner()).await;
+
+                    assert!(
+                        matches!(&outcome, Outcome::Err(Error::Timeout)),
+                        "expired retry must report Timeout before work, got {outcome:?}"
+                    );
+                    assert_eq!(body_calls, 0, "expired retry must not enter its body");
+                    assert_eq!(
+                        after_calls, prior_calls,
+                        "expired retry must not BEGIN, finish, or query a transaction: {log:?}"
+                    );
+                    assert_eq!(after_state.in_transaction, already_active);
+                    assert_eq!(after_state.tracked, prior_state.tracked);
+                    assert_eq!(after_state.pending_new, prior_state.pending_new);
+                    assert_eq!(after_state.pending_dirty, prior_state.pending_dirty);
+                    assert_eq!(after_state.pending_delete, prior_state.pending_delete);
+                    assert_eq!(recovered, original);
+                    completion.store(1, Ordering::Release);
+                },
+            )
+            .expect("spawn retry deadline regression");
+        runtime.scheduler.lock().schedule(task, 0);
+        runtime.run_with_auto_advance();
+        assert_eq!(
+            completed.load(Ordering::Acquire),
+            1,
+            "retry deadline assertions must finish (already_active={already_active})"
+        );
+    }
+}
+
+#[test]
 fn cancellation_sweep_session_ops_on_c_sqlite_memory() {
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -767,6 +866,61 @@ fn cancellation_sweep_session_ops_on_c_sqlite_memory() {
                 other => return other,
             }
             s.rollback(cx).await
+        })
+        .await;
+
+        sweep_session("session with_retry cleanup", &family, family_state, async |s, cx| {
+            let policy = RetryPolicy::immediate().max_attempts(2);
+            let mut attempts = 0;
+            // The first attempt writes, then fails before COMMIT. The healthy
+            // path crosses ROLLBACK before beginning a second transaction, so
+            // the sweep includes cancellation of cleanup itself.
+            let outcome = s
+                .with_retry(cx, &policy, async |cx, session| {
+                    assert!(
+                        !cx.is_cancel_requested(),
+                        "retry work must not restart after cancellation"
+                    );
+                    attempts += 1;
+                    session.add(&parent(9, "retried parent"));
+                    match session.flush(cx).await {
+                        Outcome::Ok(()) => {}
+                        other => return other,
+                    }
+                    if attempts == 1 {
+                        Outcome::Err(Error::Timeout)
+                    } else {
+                        Outcome::Ok(())
+                    }
+                })
+                .await;
+            let log = s.connection().log();
+            if let Some(cancelled_at) = log.iter().position(|record| record.cancelled_before) {
+                assert!(
+                    !log[cancelled_at + 1..]
+                        .iter()
+                        .any(|record| record.sql.as_deref() == Some("BEGIN")),
+                    "retry must not begin another attempt after cancellation: {log:?}"
+                );
+                if log[cancelled_at].sql.as_deref() == Some("ROLLBACK") {
+                    assert_eq!(attempts, 1, "cancelled cleanup stops before the next body");
+                    assert!(
+                        s.in_transaction(),
+                        "cancelled rollback must retain ownership for fresh-context recovery: {log:?}"
+                    );
+                }
+            } else {
+                assert!(matches!(&outcome, Outcome::Ok(())));
+                assert_eq!(attempts, 2, "the baseline must exercise an actual retry");
+                assert!(
+                    log.iter().any(|record| record.sql.as_deref() == Some("ROLLBACK")),
+                    "the baseline must include acknowledged retry cleanup"
+                );
+            }
+            // sweep_session checks every cancellation outcome and the commit
+            // log, then uses a fresh Cx to roll back retained ownership before
+            // requiring the original database snapshot.
+            outcome
         })
         .await;
 
