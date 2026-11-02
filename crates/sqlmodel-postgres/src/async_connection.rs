@@ -20,16 +20,18 @@ use std::future::{Future, poll_fn};
 #[cfg(feature = "tls")]
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::net::TcpStream;
-use asupersync::sync::{Mutex, OnceCell, OwnedMutexGuard};
+use asupersync::sync::{LockError, Mutex, OnceCell, OwnedMutexGuard};
 use asupersync::{CancelReason, Cx, Outcome};
 
 use sqlmodel_core::connection::{Connection, IsolationLevel, PreparedStatement, TransactionOps};
 use sqlmodel_core::error::{
     ConnectionError, ConnectionErrorKind, ProtocolError, QueryError, QueryErrorKind,
+    TransactionError, TransactionErrorKind,
 };
 use sqlmodel_core::row::ColumnInfo;
 use sqlmodel_core::{Error, Row, Value};
@@ -302,6 +304,7 @@ struct StatementCacheKey {
 /// supports the extended query protocol for parameter binding.
 pub struct PgAsyncConnection {
     stream: PgAsyncStream,
+    physically_closed: Arc<AtomicBool>,
     state: ConnectionState,
     process_id: i32,
     secret_key: i32,
@@ -423,6 +426,25 @@ async fn await_cancellable<T>(
     .await
 }
 
+/// Both shared handles and transaction-local operations can wait for a lock.
+/// A production request Cx needs an independent timer for that wait too.
+async fn lock_owned<T>(mutex: Arc<Mutex<T>>, cx: &Cx) -> Outcome<OwnedMutexGuard<T>, Error> {
+    await_cancellable(cx, async {
+        match OwnedMutexGuard::lock(mutex, cx).await {
+            Ok(guard) => Outcome::Ok(guard),
+            Err(LockError::Cancelled) => Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("PostgreSQL connection lock cancelled")),
+            ),
+            Err(LockError::TimedOut(_)) => Outcome::Cancelled(CancelReason::deadline()),
+            Err(error) => Outcome::Err(disconnected_error(format!(
+                "Failed to acquire PostgreSQL connection lock: {error}"
+            ))),
+        }
+    })
+    .await
+}
+
 impl PgAsyncConnection {
     /// Establish a new async connection to the PostgreSQL server.
     pub async fn connect(_cx: &Cx, config: PgConfig) -> Outcome<Self, Error> {
@@ -476,6 +498,7 @@ impl PgAsyncConnection {
 
         let mut conn = Self {
             stream: PgAsyncStream::Plain(stream),
+            physically_closed: Arc::new(AtomicBool::new(false)),
             state: ConnectionState::Connecting,
             process_id: 0,
             secret_key: 0,
@@ -619,7 +642,11 @@ impl PgAsyncConnection {
             Ok(guard) => guard,
             Err(error) => return Outcome::Err(error),
         };
-        await_cancellable(cx, guard.connection.close_statement_exchange(cx, name)).await
+        await_cancellable(
+            cx,
+            Box::pin(guard.connection.close_statement_exchange(cx, name)),
+        )
+        .await
     }
 
     async fn close_statement_exchange(&mut self, cx: &Cx, name: &str) -> Outcome<(), Error> {
@@ -694,6 +721,9 @@ impl PgAsyncConnection {
         self.reader = MessageReader::new();
         self.prepared.clear();
         self.clear_statement_cache();
+        // Publish only after the socket and buffered state are gone. Shared
+        // close must remain idempotent if a later guard drop poisons its mutex.
+        self.physically_closed.store(true, Ordering::Release);
     }
 
     // ==================== Prepared statements ====================
@@ -704,7 +734,7 @@ impl PgAsyncConnection {
             Ok(guard) => guard,
             Err(error) => return Outcome::Err(error),
         };
-        await_cancellable(cx, guard.connection.prepare_exchange(cx, sql)).await
+        await_cancellable(cx, Box::pin(guard.connection.prepare_exchange(cx, sql))).await
     }
 
     async fn prepare_exchange(&mut self, cx: &Cx, sql: &str) -> Outcome<PreparedStatement, Error> {
@@ -1001,7 +1031,11 @@ impl PgAsyncConnection {
             Ok(guard) => guard,
             Err(error) => return Outcome::Err(error),
         };
-        await_cancellable(cx, guard.connection.run_extended_exchange(cx, sql, params)).await
+        await_cancellable(
+            cx,
+            Box::pin(guard.connection.run_extended_exchange(cx, sql, params)),
+        )
+        .await
     }
 
     async fn run_extended_exchange(
@@ -1305,7 +1339,11 @@ impl PgAsyncConnection {
             Ok(guard) => guard,
             Err(error) => return Outcome::Err(error),
         };
-        await_cancellable(cx, guard.connection.run_prepared_exchange(cx, meta, params)).await
+        await_cancellable(
+            cx,
+            Box::pin(guard.connection.run_prepared_exchange(cx, meta, params)),
+        )
+        .await
     }
 
     async fn run_prepared_exchange(
@@ -1809,11 +1847,13 @@ impl PgAsyncConnection {
 /// Shared, cloneable PostgreSQL connection with interior mutability.
 pub struct SharedPgConnection {
     inner: Arc<Mutex<PgAsyncConnection>>,
+    physically_closed: Arc<AtomicBool>,
 }
 
 impl SharedPgConnection {
     pub fn new(conn: PgAsyncConnection) -> Self {
         Self {
+            physically_closed: Arc::clone(&conn.physically_closed),
             inner: Arc::new(Mutex::new(conn)),
         }
     }
@@ -1839,39 +1879,53 @@ impl SharedPgConnection {
         if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
             return Outcome::Cancelled(reason);
         }
-        let inner = Arc::clone(&self.inner);
-        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-            return Outcome::Err(connection_error("Failed to acquire connection lock"));
+        let guard = match lock_owned(Arc::clone(&self.inner), cx).await {
+            Outcome::Ok(guard) => guard,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         };
-
-        if let Some(level) = isolation {
-            let sql = format!("SET TRANSACTION ISOLATION LEVEL {}", level.as_sql());
-            match guard.execute_async(cx, &sql, &[]).await {
-                Outcome::Ok(_) => {}
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
+        match guard.state {
+            ConnectionState::Ready(TransactionStatusState::Idle) => {}
+            ConnectionState::Ready(_) => {
+                return Outcome::Err(Error::Transaction(TransactionError {
+                    kind: TransactionErrorKind::NestedNotSupported,
+                    message: "PostgreSQL connection already has an open transaction".to_string(),
+                }));
             }
+            _ => return Outcome::Err(disconnected_error("PostgreSQL connection is not ready")),
         }
 
-        match guard.execute_async(cx, "BEGIN", &[]).await {
+        // The owner is installed before BEGIN so dropping this future cannot
+        // strand a transaction after the server has accepted it.
+        let mut state = PgTransactionState {
+            connection: Some(guard),
+        };
+        let sql = isolation.map_or_else(
+            || "BEGIN".to_string(),
+            |level| format!("BEGIN ISOLATION LEVEL {}", level.as_sql()),
+        );
+        match state.connection_mut().execute_async(cx, &sql, &[]).await {
             Outcome::Ok(_) => {}
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         }
-
-        drop(guard);
+        if !matches!(
+            state.connection_mut().state,
+            ConnectionState::Ready(TransactionStatusState::InTransaction)
+        ) {
+            return Outcome::Err(protocol_error("BEGIN did not establish a transaction"));
+        }
         Outcome::Ok(SharedPgTransaction {
-            inner,
-            committed: false,
+            state: Arc::new(Mutex::new(state)),
             _marker: std::marker::PhantomData,
         })
     }
 
     /// Return the number of statements currently held in the prepared statement cache.
     pub async fn statement_cache_len(&self, cx: &Cx) -> usize {
-        let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await else {
+        let Outcome::Ok(guard) = lock_owned(Arc::clone(&self.inner), cx).await else {
             return 0;
         };
         guard.statement_cache_len()
@@ -1879,7 +1933,7 @@ impl SharedPgConnection {
 
     /// Clear the local statement cache.
     pub async fn clear_statement_cache(&self, cx: &Cx) {
-        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await {
+        if let Outcome::Ok(mut guard) = lock_owned(Arc::clone(&self.inner), cx).await {
             guard.clear_statement_cache();
         }
     }
@@ -1889,6 +1943,7 @@ impl Clone for SharedPgConnection {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            physically_closed: Arc::clone(&self.physically_closed),
         }
     }
 }
@@ -1901,25 +1956,90 @@ impl std::fmt::Debug for SharedPgConnection {
     }
 }
 
+/// An exclusive owner of a PostgreSQL transaction and its connection.
+///
+/// Other connection handles wait until finalization. Dropping an unfinished
+/// transaction closes the socket synchronously, allowing PostgreSQL to roll
+/// back without asynchronous work in Drop.
 pub struct SharedPgTransaction<'conn> {
-    inner: Arc<Mutex<PgAsyncConnection>>,
-    committed: bool,
+    state: Arc<Mutex<PgTransactionState>>,
     _marker: std::marker::PhantomData<&'conn ()>,
 }
 
-impl<'conn> Drop for SharedPgTransaction<'conn> {
-    fn drop(&mut self) {
-        if !self.committed {
-            // WARNING: Transaction was dropped without commit() or rollback()!
-            // We cannot do async work in Drop, so the PostgreSQL transaction will
-            // remain open until the connection is closed or a new transaction
-            // is started.
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "WARNING: SharedPgTransaction dropped without commit/rollback. \
-                 The PostgreSQL transaction may still be open."
-            );
+/// This payload owns cleanup even if the transaction-local mutex poisons.
+/// Its connection guard is released only after unfinished work is closed.
+struct PgTransactionState {
+    connection: Option<OwnedMutexGuard<PgAsyncConnection>>,
+}
+
+impl PgTransactionState {
+    fn connection_mut(&mut self) -> &mut PgAsyncConnection {
+        self.connection
+            .as_mut()
+            .expect("transaction connection is owned until finalization")
+    }
+
+    fn release_connection(&mut self) {
+        if let Some(mut connection) = self.connection.take() {
+            if std::thread::panicking()
+                || !matches!(
+                    connection.state,
+                    ConnectionState::Ready(TransactionStatusState::Idle)
+                )
+            {
+                // Even an idle connection must close during unwind: dropping
+                // its owned guard will poison the original shared mutex.
+                connection.close_stream();
+            }
+            drop(connection);
         }
+    }
+}
+
+impl Drop for PgTransactionState {
+    fn drop(&mut self) {
+        self.release_connection();
+    }
+}
+
+impl SharedPgTransaction<'_> {
+    async fn finish(self, cx: &Cx, sql: &str) -> Outcome<(), Error> {
+        let outcome = match lock_owned(Arc::clone(&self.state), cx).await {
+            Outcome::Ok(mut state) => {
+                let outcome = state.connection_mut().run_extended(cx, sql, &[]).await;
+                // Ready(Idle) is safe after COMMIT/ROLLBACK, including a server
+                // error that ends the transaction. Any unfinished state closes.
+                state.release_connection();
+                match outcome {
+                    Outcome::Ok(result) if result.command_tag.as_deref() == Some(sql) => {
+                        Outcome::Ok(())
+                    }
+                    Outcome::Ok(result)
+                        if sql == "COMMIT" && result.command_tag.as_deref() == Some("ROLLBACK") =>
+                    {
+                        Outcome::Err(Error::Transaction(TransactionError {
+                            kind: TransactionErrorKind::AlreadyRolledBack,
+                            message: "PostgreSQL rolled back the failed transaction instead of committing"
+                                .to_string(),
+                        }))
+                    }
+                    Outcome::Ok(result) => Outcome::Err(protocol_error(format!(
+                        "Unexpected acknowledgement for {sql}: {:?}",
+                        result.command_tag
+                    ))),
+                    Outcome::Err(error) => Outcome::Err(error),
+                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                    Outcome::Panicked(info) => Outcome::Panicked(info),
+                }
+            }
+            Outcome::Err(error) => Outcome::Err(error),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => Outcome::Panicked(info),
+        };
+        // In particular, preflight cancellation must destroy its owner before
+        // returning, even if the completed finalization future is retained.
+        drop(self);
+        outcome
     }
 }
 
@@ -1946,8 +2066,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             guard.query_async(cx, &sql, &params).await
         }
@@ -1966,8 +2089,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             let rows = match guard.query_async(cx, &sql, &params).await {
                 Outcome::Ok(r) => r,
@@ -1992,8 +2118,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             guard.execute_async(cx, &sql, &params).await
         }
@@ -2012,8 +2141,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             guard.insert_async(cx, &sql, &params).await
         }
@@ -2030,8 +2162,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             let mut results = Vec::with_capacity(statements.len());
             for (sql, params) in &statements {
@@ -2077,8 +2212,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             guard.prepare_async(cx, &sql).await
         }
@@ -2097,8 +2235,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             guard.query_prepared_async(cx, &stmt, &params).await
         }
@@ -2117,8 +2258,11 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             guard.execute_prepared_async(cx, &stmt, &params).await
         }
@@ -2130,18 +2274,37 @@ impl Connection for SharedPgConnection {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(inner, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
             guard.ping_async(cx).await
         }
     }
 
     async fn close(self, cx: &Cx) -> sqlmodel_core::Result<()> {
-        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&self.inner), cx).await else {
-            return Err(connection_error("Failed to acquire connection lock"));
+        if self.physically_closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let outcome = match lock_owned(Arc::clone(&self.inner), cx).await {
+            Outcome::Ok(mut guard) => guard.close_async(cx).await,
+            other => {
+                // A transaction may have closed and poisoned the mutex while
+                // this handle waited. Physical closure already fulfills close.
+                if self.physically_closed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match other {
+                    Outcome::Ok(_) => unreachable!("successful lock handled above"),
+                    Outcome::Err(error) => Outcome::Err(error),
+                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                    Outcome::Panicked(info) => Outcome::Panicked(info),
+                }
+            }
         };
-        match guard.close_async(cx).await {
+        match outcome {
             Outcome::Ok(()) => Ok(()),
             Outcome::Err(e) => Err(e),
             Outcome::Cancelled(r) => Err(Error::Query(QueryError {
@@ -2170,17 +2333,20 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
-        let inner = Arc::clone(&self.inner);
+        let state = Arc::clone(&self.state);
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(state, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
-            guard.query_async(cx, &sql, &params).await
+            guard.connection_mut().query_async(cx, &sql, &params).await
         }
     }
 
@@ -2190,17 +2356,20 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
-        let inner = Arc::clone(&self.inner);
+        let state = Arc::clone(&self.state);
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(state, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
-            let rows = match guard.query_async(cx, &sql, &params).await {
+            let rows = match guard.connection_mut().query_async(cx, &sql, &params).await {
                 Outcome::Ok(r) => r,
                 Outcome::Err(e) => return Outcome::Err(e),
                 Outcome::Cancelled(r) => return Outcome::Cancelled(r),
@@ -2216,22 +2385,28 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<u64, Error>> + Send {
-        let inner = Arc::clone(&self.inner);
+        let state = Arc::clone(&self.state);
         let sql = sql.to_string();
         let params = params.to_vec();
         async move {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(state, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
-            guard.execute_async(cx, &sql, &params).await
+            guard
+                .connection_mut()
+                .execute_async(cx, &sql, &params)
+                .await
         }
     }
 
     fn savepoint(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let inner = Arc::clone(&self.inner);
+        let state = Arc::clone(&self.state);
         let name = name.to_string();
         async move {
             if let Err(e) = validate_savepoint_name(&name) {
@@ -2241,15 +2416,22 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(state, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
-            guard.execute_async(cx, &sql, &[]).await.map(|_| ())
+            guard
+                .connection_mut()
+                .execute_async(cx, &sql, &[])
+                .await
+                .map(|_| ())
         }
     }
 
     fn rollback_to(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let inner = Arc::clone(&self.inner);
+        let state = Arc::clone(&self.state);
         let name = name.to_string();
         async move {
             if let Err(e) = validate_savepoint_name(&name) {
@@ -2259,15 +2441,22 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(state, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
-            guard.execute_async(cx, &sql, &[]).await.map(|_| ())
+            guard
+                .connection_mut()
+                .execute_async(cx, &sql, &[])
+                .await
+                .map(|_| ())
         }
     }
 
     fn release(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let inner = Arc::clone(&self.inner);
+        let state = Arc::clone(&self.state);
         let name = name.to_string();
         async move {
             if let Err(e) = validate_savepoint_name(&name) {
@@ -2277,48 +2466,26 @@ impl<'conn> TransactionOps for SharedPgTransaction<'conn> {
             if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
                 return Outcome::Cancelled(reason);
             }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
+            let mut guard = match lock_owned(state, cx).await {
+                Outcome::Ok(guard) => guard,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             };
-            guard.execute_async(cx, &sql, &[]).await.map(|_| ())
+            guard
+                .connection_mut()
+                .execute_async(cx, &sql, &[])
+                .await
+                .map(|_| ())
         }
     }
 
-    // Note: clippy sometimes flags `self.committed = true` as unused, but Drop reads it.
-    #[allow(unused_assignments)]
-    fn commit(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let inner = Arc::clone(&self.inner);
-        async move {
-            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
-                return Outcome::Cancelled(reason);
-            }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
-            };
-            let result = guard.execute_async(cx, "COMMIT", &[]).await;
-            if matches!(result, Outcome::Ok(_)) {
-                self.committed = true;
-            }
-            result.map(|_| ())
-        }
+    fn commit(self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        self.finish(cx, "COMMIT")
     }
 
-    #[allow(unused_assignments)]
-    fn rollback(mut self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
-        let inner = Arc::clone(&self.inner);
-        async move {
-            if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
-                return Outcome::Cancelled(reason);
-            }
-            let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&inner), cx).await else {
-                return Outcome::Err(connection_error("Failed to acquire connection lock"));
-            };
-            let result = guard.execute_async(cx, "ROLLBACK", &[]).await;
-            if matches!(result, Outcome::Ok(_)) {
-                self.committed = true;
-            }
-            result.map(|_| ())
-        }
+    fn rollback(self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        self.finish(cx, "ROLLBACK")
     }
 }
 

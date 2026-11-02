@@ -87,3 +87,17 @@ Asupersync; and qualification of a published SQLModel release. Adding these
 witnesses or observing upstream's own tests does not establish the latter two.
 The runtime-handoff and PostgreSQL cases must actually execute and their
 retained results must be inspected before claiming a successful integration.
+
+### Latest staged evaluation (2026-11-02 UTC)
+
+The latest evaluation used clean SQLModel revision
+[`bef4100dff319d9387163c009461a15e87295a05`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/bef4100dff319d9387163c009461a15e87295a05)
+and the published Asupersync 0.6.1 package above. The staged production graph
+resolved one registry runtime without `test-internals` or Tokio, and all 1,276
+extracted package files matched the published archive. Native LLVM compilation
+with dependency-only `-Zhint-mostly-unused` ended with `SIGKILL` in the
+eight-GiB build environment. No strict case executed, so this evaluation does
+not qualify SQLModel API compatibility or successful runtime handoff. Those
+claims still require a completed build and all six cases to pass. There is
+still no published compatible 0.5 patch, and the full single-runtime release
+continues to require an aligned FrankenSQLite port.

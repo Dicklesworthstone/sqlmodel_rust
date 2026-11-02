@@ -193,28 +193,38 @@ native x86_64 Linux, using the published Asupersync 0.5.0 dependency:
 | Two-worker runtime handoff, normal holder exit and holder panic | Checkout reused the original backend PID, completed a query, and drained cleanly |
 | Reuse within one current-thread runtime | Successful reuse of the original backend PID |
 | Expired or server-terminated connections | Retirement and replacement succeeded with the existing accounting and drain checks |
+| Dropped PostgreSQL query future | The interrupted socket was closed; checkout replaced it and returned the new query's own result |
+| Abandoned transaction or transaction holder panic, with a surviving shared handle | First checkout replaced the backend; the old server session disappeared, abandoned writes were absent, and draining succeeded |
+| Raw transaction `COMMIT` followed by holder panic | The committed write remained, while the poisoned connection was physically retired and replaced |
 
-The 99 native pool tests also passed, including stalled validation and
-cancellation coverage. The separate strict current-thread handoff success
+The 101 native pool tests also passed, including stalled validation,
+cancellation, and future drain deadlines on both runtime configurations.
+The separate strict current-thread handoff success
 contract still fails on 0.5.0 with a pool timeout: bounding that failure does
 not establish successful migration of the old connection.
 
-The existing PostgreSQL suite passed 61 driver unit tests and eight live
-integration tests, including prepared-statement caching, transaction rollback,
-error mapping, and introspection. All four cancellation sweep tests passed.
+The PostgreSQL suite passed 61 driver unit tests and 16 live integration tests,
+including prepared-statement caching, transaction ownership and isolation,
+pending-I/O and lock-wait cancellation, commit error preservation, and
+introspection. All six production PostgreSQL pool tests and all four
+cancellation sweep tests passed.
 Workspace checking, formatting, and Clippy with warnings denied also passed.
 The native builds used the pinned nightly LLVM toolchain, one Cargo job,
 disabled debug information, and 256 codegen units for the large runtime and
 engine dependencies to fit the build environment; dependency sources were
 unchanged.
 
-The staged 0.6.1 candidate resolved exactly one registry Asupersync version,
-with `test-internals` disabled and no Tokio in the native dependency tree.
-Native compilation did not complete in the available eight-GiB build environment.
-Two attempts were killed during runtime compilation and a final attempt was
-interrupted when execution access was lost. No staged handoff case executed,
-so this remains an unverified integration until the strict matrix completes
-on a suitable build host.
+The latest staged 0.6.1 evaluation used clean SQLModel revision
+[`bef4100dff319d9387163c009461a15e87295a05`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/bef4100dff319d9387163c009461a15e87295a05).
+It resolved exactly one registry Asupersync version, with `test-internals`
+disabled and no Tokio in the native dependency tree. The runtime source files
+matched the published archive. Native LLVM compilation, including the
+dependency-only `-Zhint-mostly-unused` build option, ended with `SIGKILL` in
+the eight-GiB build environment. None of the six strict cases executed.
+Dependency resolution and source integrity are verified; SQLModel API
+compatibility and successful runtime handoff remain unqualified until the
+native build and complete matrix pass. The compatible 0.5 patch and full
+single-runtime FrankenSQLite port requirements above remain unresolved.
 
 ---
 

@@ -832,6 +832,33 @@ fn postgres_handoff_config() -> Option<PgConfig> {
     }
 }
 
+async fn assert_postgres_backend_retired(cx: &Cx, observer: &SharedPgConnection, backend: i64) {
+    // Take a fresh server snapshot on each query. This timeout is a test
+    // watchdog, independent of the pool's acquisition or drain deadlines.
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        Duration::from_secs(5),
+        async {
+            loop {
+                let live = scalar_i64(
+                    cx,
+                    observer,
+                    "SELECT count(*) FROM pg_stat_activity WHERE pid = $1::bigint",
+                    &[Value::BigInt(backend)],
+                    "retired backend count",
+                )
+                .await;
+                if live == 0 {
+                    break;
+                }
+                asupersync::runtime::yield_now::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("retired connection must disappear from pg_stat_activity");
+}
+
 /// A timeout proves bounded acquisition and retirement, never successful
 /// handoff. On Asupersync 0.5.0 the current-thread cases take that branch;
 /// a runtime carrying the upstream fix must reuse the original backend.
@@ -956,28 +983,7 @@ fn exercise_postgres_production_handoff(
                 assert_eq!(rows[0].get_as::<i64>(0).expect("SELECT 1"), 1);
                 assert_eq!(pool.stats().connections_created, 2, "{label}");
 
-                // The server must observe the retired socket closing too. A
-                // fresh query snapshot is taken on every iteration; the outer
-                // timeout is only a test watchdog, not the acquisition bound.
-                asupersync::time::timeout(
-                    asupersync::time::wall_now(),
-                    Duration::from_secs(5),
-                    async {
-                        loop {
-                            let live = scalar_i64(
-                                &cx,
-                                &*fresh,
-                                "SELECT count(*) FROM pg_stat_activity WHERE pid = $1::bigint",
-                                &[Value::BigInt(original_backend)],
-                                "retired backend count",
-                            ).await;
-                            if live == 0 {
-                                break;
-                            }
-                            asupersync::runtime::yield_now::yield_now().await;
-                        }
-                    },
-                ).await.expect("retired connection must disappear from pg_stat_activity");
+                assert_postgres_backend_retired(&cx, &fresh, original_backend).await;
                 drop(fresh);
             }
             other => panic!("{label}: successful handoff required, got {other:?}"),
@@ -1156,6 +1162,157 @@ fn postgres_pool_retires_connection_after_dropped_query_future() {
         );
         assert_eq!(pool.stats().total_connections, 0);
     });
+}
+
+#[test]
+fn postgres_pool_retires_abandoned_transactions_after_return_and_panic() {
+    const HOLDER_PANIC: &str = "pooled PostgreSQL transaction holder panics intentionally";
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    for (panic_holder, raw_commit) in [(false, false), (true, false), (true, true)] {
+        let label = format!(
+            "postgres abandoned transaction: panic_holder={panic_holder}, raw_commit={raw_commit}"
+        );
+        let _watchdog = HandoffWatchdog::start(label.clone());
+        let rt = HandoffRuntime::CurrentThread.build();
+        let cx = rt.request_cx_with_budget(Budget::INFINITE);
+        let pool = Pool::new(PoolConfig::new(1).min_connections(0).acquire_timeout(2_000));
+        let factory = || SharedPgConnection::connect(&cx, cfg.clone());
+        let table = sqlmodel_e2e::unique_table("pool_abandoned_tx");
+        let mut original_backend = None;
+        let mut escaped = None;
+
+        // Keep the runtime alive across the holder's exit. These assertions
+        // exercise transaction cleanup independently of runtime handoff.
+        let holder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let lease = expect_outcome(
+                    pool.acquire(&cx, &factory).await,
+                    "lease before abandoned transaction",
+                );
+                original_backend = Some(
+                    session_id(
+                        &cx,
+                        &*lease,
+                        "SELECT pg_backend_pid()",
+                        "original transaction backend",
+                    )
+                    .await,
+                );
+                escaped = Some((*lease).clone());
+                expect_outcome(
+                    lease
+                        .execute(&cx, &format!("CREATE TABLE {table} (marker INTEGER)"), &[])
+                        .await,
+                    "create transaction marker table",
+                );
+                let tx = expect_outcome(lease.begin(&cx).await, "begin abandoned transaction");
+                expect_outcome(
+                    tx.execute(&cx, &format!("INSERT INTO {table} VALUES (1)"), &[])
+                        .await,
+                    "insert transaction marker",
+                );
+                if raw_commit {
+                    expect_outcome(
+                        tx.execute(&cx, "COMMIT", &[]).await,
+                        "raw commit before holder panic",
+                    );
+                }
+                assert!(!panic_holder, "{HOLDER_PANIC}");
+                drop(tx);
+                drop(lease);
+            });
+        }));
+        match holder {
+            Ok(()) => assert!(!panic_holder, "{label}: holder must panic"),
+            Err(payload) => {
+                assert!(panic_holder, "{label}: unexpected holder panic");
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+                assert_eq!(message, Some(HOLDER_PANIC), "{label}");
+            }
+        }
+        let original_backend = original_backend.expect("holder recorded its backend");
+        let escaped = escaped.expect("shared clone survives transaction abandonment");
+        let returned = pool.stats();
+        assert_eq!(returned.active_connections, 0, "{label}");
+        assert_eq!(returned.total_connections, 1, "{label}");
+        assert_eq!(returned.idle_connections, 1, "{label}");
+        assert_eq!(returned.pending_requests, 0, "{label}");
+
+        rt.block_on(async {
+            // The first checkout must retire and replace in one acquisition.
+            // Merely releasing capacity after a retirement error is insufficient.
+            let replacement = expect_outcome(
+                pool.acquire(&cx, &factory).await,
+                "first replacement after abandoned transaction",
+            );
+            let backend = session_id(
+                &cx,
+                &*replacement,
+                "SELECT pg_backend_pid()",
+                "replacement transaction backend",
+            )
+            .await;
+            assert_ne!(
+                backend, original_backend,
+                "{label}: abandoned session was reused"
+            );
+            assert_postgres_backend_retired(&cx, &replacement, original_backend).await;
+            let markers = scalar_i64(
+                &cx,
+                &*replacement,
+                &format!("SELECT count(*) FROM {table}"),
+                &[],
+                "transaction marker persistence",
+            )
+            .await;
+            assert_eq!(markers, i64::from(raw_commit), "{label}");
+
+            // The retained clone must not keep a poisoned session alive.
+            // Perform this idempotent close only after proving server-side
+            // retirement, so it cannot be what actually cleans up the socket.
+            escaped
+                .clone()
+                .close(&cx)
+                .await
+                .expect("closing an already retired shared clone succeeds despite poison");
+            expect_outcome(
+                replacement
+                    .execute(&cx, &format!("DROP TABLE {table}"), &[])
+                    .await,
+                "drop transaction marker table",
+            );
+            drop(replacement);
+            let reused = pool.stats();
+            assert_eq!(reused.connections_created, 2, "{label}");
+            assert_eq!(reused.connections_closed, 1, "{label}");
+            assert_eq!(reused.acquires, 2, "{label}");
+            assert_eq!(reused.timeouts, 0, "{label}");
+            assert_eq!(reused.total_connections, 1, "{label}");
+            assert_eq!(reused.idle_connections, 1, "{label}");
+            assert_eq!(reused.active_connections, 0, "{label}");
+            assert_eq!(reused.pending_requests, 0, "{label}");
+
+            expect_outcome(
+                pool.close_and_drain(&cx).await,
+                "abandoned transaction pool drains without sticky retirement failure",
+            );
+            let drained = pool.stats();
+            assert_eq!(drained.connections_created, 2, "{label}");
+            assert_eq!(drained.connections_closed, 2, "{label}");
+            assert_eq!(drained.acquires, 2, "{label}");
+            assert_eq!(drained.timeouts, 0, "{label}");
+            assert_eq!(drained.total_connections, 0, "{label}");
+            assert_eq!(drained.active_connections, 0, "{label}");
+            assert_eq!(drained.idle_connections, 0, "{label}");
+            assert_eq!(drained.pending_requests, 0, "{label}");
+        });
+        drop(escaped);
+    }
 }
 
 /// A cancelled `close_and_drain` reports `Cancelled` but leaves the pool

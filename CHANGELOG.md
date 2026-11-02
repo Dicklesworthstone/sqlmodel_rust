@@ -38,6 +38,14 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- PostgreSQL transactions now retain exclusive connection ownership through
+  finalization. Dropped transactions and abandoned commit/rollback futures
+  close their socket before releasing ownership, including holder panic and
+  surviving shared handles. Closing a physically retired, poisoned connection
+  is idempotent, so the first pool checkout can replace it and drain cleanly.
+  Waiting handles honor their own cancellation/deadline without interrupting
+  the transaction owner. `BEGIN` applies the requested isolation level, and
+  a server `ROLLBACK` acknowledgement cannot be reported as a successful commit.
 - PostgreSQL now owns each wire exchange until its matching `ReadyForQuery`
   is consumed. Dropping or cancelling an unfinished query closes the socket
   before releasing the shared connection lock, so a later query or checkout

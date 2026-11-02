@@ -32,7 +32,7 @@ SQLModel Rust **never** creates its own runtime; the `Cx` flows down from the co
 Database operations in SQLModel check `cx` at critical execution boundaries:
 - **Before sending queries**: If cancellation was already requested, the driver skips writing to the socket and returns `Outcome::Cancelled` immediately.
 - **Between wire packets**: During large result streaming, long read loops yield and check for cancellation.
-- **Before committing transactions**: If a cancellation signal arrives while preparing to commit, the commit is aborted and the transaction is rolled back instead.
+- **Before committing transactions**: A cancellation already observed before the commit is sent prevents that write. A commit sent before cancellation can have an unknown outcome.
 
 On repository `main`, PostgreSQL also registers cancellation and deadline
 wakers while wire I/O is pending. An interrupted exchange closes its socket
@@ -48,10 +48,26 @@ does a server error whose complete response has been consumed.
 
 One of the most dangerous bugs in traditional database libraries is transaction leakage: when an async future is dropped or cancelled, the server-side transaction may remain open, holding locks indefinitely.
 
-In SQLModel Rust:
-1. A transaction object implements cancel-safe cleanup on `Drop`.
-2. If cancellation occurs, an explicit `ROLLBACK` is dispatched or the connection is severed and reset before being returned to the pool.
-3. Your database tables are guaranteed never to remain locked by forgotten transactions.
+On repository `main`, `SharedPgTransaction` exclusively owns its PostgreSQL
+connection until finalization. Other shared handles wait for that ownership
+to end. A waiting handle's cancellation or deadline removes that waiter
+without cancelling the transaction owner.
+
+Dropping an unfinished transaction closes its socket before releasing the
+connection lock. This also covers holder panic and dropped or cancelled
+commit/rollback futures. A pool with checkout validation retires the closed
+connection on its next acquisition, even if another shared handle survives.
+The server aborts an open transaction when it observes the disconnect.
+
+Successful explicit commit and rollback release a healthy idle connection for
+reuse before reporting completion. A server `ROLLBACK` acknowledgement in
+response to `COMMIT` is reported as `AlreadyRolledBack`, not as a successful
+commit. These ownership protections are unreleased and are not part of
+published SQLModel 0.5.1.
+
+If a `COMMIT` was sent and its response was lost, closing the socket does not
+establish whether the commit succeeded. Treat that result as unknown rather
+than assuming the transaction rolled back.
 
 ---
 
@@ -61,10 +77,8 @@ Using `asupersync`'s budget primitives, you can place strict time limits on data
 
 ```rust,no_run
 use sqlmodel::prelude::*;
-use std::time::Duration;
-
 async fn bounded_query(cx: &Cx, conn: &impl Connection) -> Outcome<Vec<Row>, Error> {
-    // If the query takes longer than 2 seconds, cx cancels it cooperatively
+    // The caller must have created cx with a two-second deadline.
     conn.query(cx, "SELECT pg_sleep(10)", &[]).await
 }
 ```
@@ -86,4 +100,4 @@ non-idempotent write is safe.
 
 - **Structured Concurrency vs Fire-and-Forget**: Python's `asyncio` allows unbounded background tasks via `asyncio.create_task()` which can outlive request handlers. SQLModel Rust requires all async work to be bounded by structured concurrency scopes.
 - **Explicit `Cx` Context**: Python relies on implicit global event loops and thread-local contexts. Rust passes `&Cx` explicitly, making cancellation pathways clear and statically verifiable.
-- **Leak-Proof Transactions**: Python coroutines dropped mid-transaction can leave database connections in indeterminate states; SQLModel Rust enforces cancel-correct rollbacks on every path.
+- **Explicit PostgreSQL transaction ownership**: Transaction operations retain exclusive access until finalization. Abandoned transactions retire their connection, while acknowledged commit and rollback preserve healthy reuse.

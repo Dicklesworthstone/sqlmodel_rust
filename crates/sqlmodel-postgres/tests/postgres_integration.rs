@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Budget, CancelKind, Cx, Outcome};
 
-use sqlmodel_core::error::{ConnectionErrorKind, QueryErrorKind};
-use sqlmodel_core::{Connection, Error, TransactionOps, Value};
+use sqlmodel_core::error::{ConnectionErrorKind, QueryErrorKind, TransactionErrorKind};
+use sqlmodel_core::{Connection, Error, IsolationLevel, TransactionOps, Value};
 
 use sqlmodel_postgres::{PgConfig, SharedPgConnection, SslMode};
 use sqlmodel_schema::introspect::{Dialect, Introspector};
@@ -450,6 +450,326 @@ fn postgres_transaction_rollback_discards_changes() {
         assert_eq!(count, 0);
 
         let _ = conn.execute(&cx, &drop_sql, &[]).await;
+    });
+}
+
+#[test]
+fn postgres_transaction_isolation_is_applied_by_begin() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
+        for isolation in [
+            IsolationLevel::Serializable,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::ReadCommitted,
+        ] {
+            let tx = unwrap_outcome(conn.begin_with(&cx, isolation).await);
+            let rows = unwrap_outcome(tx.query(&cx, "SHOW transaction_isolation", &[]).await);
+            let observed = rows[0].get_as::<String>(0).expect("transaction isolation");
+            unwrap_outcome(tx.rollback(&cx).await);
+            assert_eq!(observed, isolation.as_sql().to_ascii_lowercase());
+        }
+    });
+}
+
+#[test]
+fn postgres_transaction_excludes_connection_clones_until_finalized() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
+        let clone = conn.clone();
+        let before = unwrap_outcome(conn.query(&cx, "SELECT pg_backend_pid()", &[]).await)[0]
+            .get_as::<i64>(0)
+            .expect("original backend PID");
+        unwrap_outcome(
+            conn.execute(
+                &cx,
+                "CREATE TEMP TABLE sqlmodel_tx_exclusion (id INTEGER)",
+                &[],
+            )
+            .await,
+        );
+        let tx = unwrap_outcome(conn.begin(&cx).await);
+        unwrap_outcome(
+            tx.execute(
+                &cx,
+                "INSERT INTO sqlmodel_tx_exclusion VALUES (424242)",
+                &[],
+            )
+            .await,
+        );
+        let started = std::time::Instant::now();
+        let waiter_cx = rt.request_cx_with_budget(
+            Budget::new().with_deadline(asupersync::time::wall_now() + Duration::from_millis(30)),
+        );
+        let mut waiting = Box::pin(clone.query(
+            &waiter_cx,
+            "SELECT count(*) FROM sqlmodel_tx_exclusion",
+            &[],
+        ));
+        let outcome = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_millis(500),
+            waiting.as_mut(),
+        )
+        .await
+        .expect("a waiting connection clone must honor its request deadline");
+        match outcome {
+            Outcome::Cancelled(reason) => assert_eq!(reason.kind, CancelKind::Deadline),
+            other => panic!("connection clone entered another owner's transaction: {other:?}"),
+        }
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_millis(400));
+
+        // The cancelled waiter must leave its owner and the connection alone,
+        // even while the caller retains the completed waiting future.
+        let rows = unwrap_outcome(
+            tx.query(&cx, "SELECT count(*) FROM sqlmodel_tx_exclusion", &[])
+                .await,
+        );
+        assert_eq!(
+            rows[0].get_as::<i64>(0).expect("owner's uncommitted row"),
+            1
+        );
+
+        let cancelled_cx = rt.request_cx_with_budget(Budget::INFINITE);
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let cancel_cx = cancelled_cx.clone();
+        let canceller = std::thread::spawn(move || {
+            pending_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("clone waits for transaction owner");
+            std::thread::sleep(Duration::from_millis(20));
+            cancel_cx.cancel_with(CancelKind::User, Some("cancel waiting connection clone"));
+        });
+        let mut cancel_waiter = Box::pin(clone.query(&cancelled_cx, "SELECT 7", &[]));
+        let mut pending = Some(pending_tx);
+        let started = std::time::Instant::now();
+        let outcome = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_millis(500),
+            poll_fn(|task_cx| {
+                let outcome = cancel_waiter.as_mut().poll(task_cx);
+                if outcome.is_pending()
+                    && let Some(pending) = pending.take()
+                {
+                    pending.send(()).expect("notify cancellation thread");
+                }
+                outcome
+            }),
+        )
+        .await;
+        canceller.join().expect("cancel waiting clone");
+        match outcome.expect("explicit cancellation must wake the connection-lock waiter") {
+            Outcome::Cancelled(reason) => assert_eq!(
+                reason,
+                cancelled_cx
+                    .cancel_reason()
+                    .expect("explicit cancellation reason")
+            ),
+            other => panic!("connection-lock waiter lost cancellation: {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_millis(400));
+        unwrap_outcome(tx.rollback(&cx).await);
+        let rows = unwrap_outcome(
+            clone
+                .query(
+                    &cx,
+                    "SELECT pg_backend_pid(), (SELECT count(*) FROM sqlmodel_tx_exclusion)",
+                    &[],
+                )
+                .await,
+        );
+        assert_eq!(
+            rows[0].get_as::<i64>(0).expect("reused backend PID"),
+            before
+        );
+        assert_eq!(rows[0].get_as::<i64>(1).expect("rolled-back row count"), 0);
+        drop(cancel_waiter);
+        drop(waiting);
+    });
+}
+
+#[test]
+fn postgres_transaction_commit_and_rollback_preserve_backend() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
+        let before = unwrap_outcome(conn.query(&cx, "SELECT pg_backend_pid()", &[]).await)[0]
+            .get_as::<i64>(0)
+            .expect("original backend PID");
+        unwrap_outcome(
+            conn.execute(
+                &cx,
+                "CREATE TEMP TABLE sqlmodel_tx_finalization (id INTEGER PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE)",
+                &[],
+            )
+            .await,
+        );
+        for rollback in [false, true] {
+            let tx = unwrap_outcome(conn.begin(&cx).await);
+            let id = if rollback { 2 } else { 1 };
+            unwrap_outcome(
+                tx.execute(
+                    &cx,
+                    "INSERT INTO sqlmodel_tx_finalization VALUES ($1)",
+                    &[Value::Int(id)],
+                )
+                .await,
+            );
+            unwrap_outcome(tx.savepoint(&cx, "recovery_point").await);
+            unwrap_outcome(
+                tx.execute(&cx, "INSERT INTO sqlmodel_tx_finalization VALUES (99)", &[])
+                    .await,
+            );
+            unwrap_outcome(tx.rollback_to(&cx, "recovery_point").await);
+            unwrap_outcome(tx.release(&cx, "recovery_point").await);
+
+            let mut finish: std::pin::Pin<
+                Box<dyn Future<Output = Outcome<(), Error>> + Send + '_>,
+            > = if rollback {
+                Box::pin(tx.rollback(&cx))
+            } else {
+                Box::pin(tx.commit(&cx))
+            };
+            unwrap_outcome(finish.as_mut().await);
+            // Keep the completed finalization future allocated. It must no
+            // longer retain the transaction's exclusive connection guard.
+            let rows = unwrap_outcome(
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(500),
+                    conn.query(
+                        &cx,
+                        "SELECT pg_backend_pid(), (SELECT count(*) FROM sqlmodel_tx_finalization)",
+                        &[],
+                    ),
+                )
+                .await
+                .expect("completed finalization must release connection ownership"),
+            );
+            assert_eq!(rows[0].get_as::<i64>(0).expect("same backend PID"), before);
+            assert_eq!(
+                rows[0]
+                    .get_as::<i64>(1)
+                    .expect("only committed row remains"),
+                1
+            );
+            drop(finish);
+        }
+
+        for deferred in [false, true] {
+            let tx = unwrap_outcome(conn.begin(&cx).await);
+            if deferred {
+                unwrap_outcome(tx.execute(&cx, "SET CONSTRAINTS ALL DEFERRED", &[]).await);
+            }
+            let duplicate = tx.execute(&cx, "INSERT INTO sqlmodel_tx_finalization VALUES (1)", &[]).await;
+            if deferred {
+                unwrap_outcome(duplicate);
+            } else {
+                assert!(matches!(duplicate, Outcome::Err(Error::Query(error)) if error.sqlstate.as_deref() == Some("23505")));
+            }
+            let mut commit = Box::pin(tx.commit(&cx));
+            match commit.as_mut().await {
+                Outcome::Err(Error::Query(error)) if deferred => assert_eq!(error.sqlstate.as_deref(), Some("23505")),
+                Outcome::Err(Error::Transaction(error)) if !deferred => assert_eq!(error.kind, TransactionErrorKind::AlreadyRolledBack),
+                other => panic!("commit must report its real server outcome, deferred={deferred}: {other:?}"),
+            }
+            let rows = unwrap_outcome(
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(500),
+                    conn.query(&cx, "SELECT pg_backend_pid(), (SELECT count(*) FROM sqlmodel_tx_finalization)", &[]),
+                )
+                .await
+                .expect("fully drained failed commit must release ownership"),
+            );
+            assert_eq!(rows[0].get_as::<i64>(0).expect("same backend after failed commit"), before);
+            assert_eq!(rows[0].get_as::<i64>(1).expect("failed commit preserves prior rows"), 1);
+            drop(commit);
+        }
+    });
+}
+
+#[test]
+fn postgres_transaction_cancelled_or_unpolled_finish_closes_connection() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        let admin = unwrap_outcome(SharedPgConnection::connect(&cx, cfg.clone()).await);
+        let table = test_table_name("sqlmodel_pg_abandoned_finish");
+        unwrap_outcome(admin.execute(&cx, &format!("CREATE TABLE \"{table}\" (id INTEGER)"), &[]).await);
+        for rollback in [false, true] {
+            for cancelled in [false, true] {
+                let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg.clone()).await);
+                let tx = unwrap_outcome(conn.begin(&cx).await);
+                unwrap_outcome(tx.execute(&cx, &format!("INSERT INTO \"{table}\" VALUES (424242)"), &[]).await);
+                let finish_cx = rt.request_cx_with_budget(Budget::INFINITE);
+                if cancelled {
+                    finish_cx.cancel_with(CancelKind::User, Some("abandon transaction finalization"));
+                }
+                let finish: std::pin::Pin<Box<dyn Future<Output = Outcome<(), Error>> + Send + '_>> =
+                    if rollback {
+                        Box::pin(tx.rollback(&finish_cx))
+                    } else {
+                        Box::pin(tx.commit(&finish_cx))
+                    };
+                let mut finish = Some(finish);
+                if cancelled {
+                    match finish.as_mut().expect("finalization future").as_mut().await {
+                        Outcome::Cancelled(reason) => assert_eq!(reason, finish_cx.cancel_reason().expect("explicit cancellation")),
+                        other => panic!("cancelled finalization lost cancellation: {other:?}"),
+                    }
+                } else {
+                    drop(finish.take());
+                }
+                let next = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(500),
+                    conn.query(&cx, "SELECT 7", &[]),
+                )
+                .await
+                .expect("abandoned finalization must release its ownership promptly");
+                assert!(matches!(next, Outcome::Err(Error::Connection(_))), "rollback={rollback}, cancelled={cancelled}: abandoned transaction remained usable: {next:?}");
+                // For cancellation, the completed finalization future is
+                // still allocated until after the connection is invalidated.
+                drop(finish);
+                let rows = unwrap_outcome(admin.query(&cx, &format!("SELECT count(*) FROM \"{table}\""), &[]).await);
+                assert_eq!(rows[0].get_as::<i64>(0).expect("uncommitted rows"), 0);
+            }
+        }
+        unwrap_outcome(admin.execute(&cx, &format!("DROP TABLE \"{table}\""), &[]).await);
     });
 }
 
