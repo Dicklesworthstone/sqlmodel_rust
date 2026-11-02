@@ -34,6 +34,14 @@ Database operations in SQLModel check `cx` at critical execution boundaries:
 - **Between wire packets**: During large result streaming, long read loops yield and check for cancellation.
 - **Before committing transactions**: If a cancellation signal arrives while preparing to commit, the commit is aborted and the transaction is rolled back instead.
 
+On repository `main`, PostgreSQL also registers cancellation and deadline
+wakers while wire I/O is pending. An interrupted exchange closes its socket
+before releasing the shared connection lock. Other clones then reject new
+queries, and a pool with checkout validation retires the connection. This
+prevents a later query from receiving rows belonging to an abandoned query.
+Cancellation before the first write leaves a clean connection reusable, as
+does a server error whose complete response has been consumed.
+
 ---
 
 ## Transaction Cancellation Guards
@@ -61,7 +69,16 @@ async fn bounded_query(cx: &Cx, conn: &impl Connection) -> Outcome<Vec<Row>, Err
 }
 ```
 
-When the budget expires, the query aborts cleanly with `Outcome::Cancelled` and the connection returns to a ready state.
+The incoming `Cx` must carry a deadline; the SQL statement alone does not set
+one. On repository `main`, PostgreSQL returns `Outcome::Cancelled` when that
+deadline expires, even while a socket read is pending. If a wire exchange has
+started, the connection is closed and must be replaced. These changes are not
+part of the published SQLModel 0.5.1 release.
+
+Closing the client socket is not a PostgreSQL `CancelRequest` and does not
+prove that the server stopped a statement before applying its effects. A
+timeout or cancellation must not be treated as evidence that retrying a
+non-idempotent write is safe.
 
 ---
 

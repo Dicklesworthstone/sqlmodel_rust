@@ -1077,6 +1077,87 @@ fn postgres_production_checkout_retires_expired_and_server_terminated_connection
     );
 }
 
+#[test]
+fn postgres_pool_retires_connection_after_dropped_query_future() {
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    let _watchdog = HandoffWatchdog::start("postgres interrupted query replacement".into());
+    let rt = HandoffRuntime::CurrentThread.build();
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+    let pool = Pool::new(PoolConfig::new(1).min_connections(0).acquire_timeout(2_000));
+    let factory = || SharedPgConnection::connect(&cx, cfg.clone());
+
+    rt.block_on(async {
+        let lease = expect_outcome(
+            pool.acquire(&cx, &factory).await,
+            "lease before interrupted query",
+        );
+        let original = session_id(
+            &cx,
+            &*lease,
+            "SELECT pg_backend_pid()",
+            "interrupted backend",
+        )
+        .await;
+        let incomplete = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_millis(20),
+            lease.query(
+                &cx,
+                "SELECT 424242 AS abandoned_marker FROM pg_sleep(0.2)",
+                &[],
+            ),
+        )
+        .await;
+        assert!(incomplete.is_err(), "query must still await its response");
+        drop(lease);
+
+        let replacement = expect_outcome(
+            pool.acquire(&cx, &factory).await,
+            "replacement after interrupted query",
+        );
+        let rows = expect_outcome(
+            replacement
+                .query(&cx, "SELECT 7 AS fresh_marker", &[])
+                .await,
+            "fresh query response",
+        );
+        assert_eq!(
+            rows[0].get_as::<i64>(0).expect("fresh marker"),
+            7,
+            "must not receive abandoned query or checkout-ping rows"
+        );
+        let backend = session_id(
+            &cx,
+            &*replacement,
+            "SELECT pg_backend_pid()",
+            "replacement backend",
+        )
+        .await;
+        assert_ne!(
+            backend, original,
+            "unfinished protocol connection must be retired"
+        );
+        drop(replacement);
+        let stats = pool.stats();
+        assert_eq!(stats.connections_created, 2);
+        assert_eq!(stats.connections_closed, 1);
+        assert_eq!(stats.acquires, 2);
+        assert_eq!(
+            stats.timeouts, 0,
+            "query timeout is separate from pool acquisition"
+        );
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.pending_requests, 0);
+        expect_outcome(
+            pool.close_and_drain(&cx).await,
+            "interrupted-query pool drain",
+        );
+        assert_eq!(pool.stats().total_connections, 0);
+    });
+}
+
 /// A cancelled `close_and_drain` reports `Cancelled` but leaves the pool
 /// closed: acquires are refused, the active lease still returns, and a
 /// later drain completes.

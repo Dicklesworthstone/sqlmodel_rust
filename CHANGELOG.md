@@ -38,6 +38,12 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- PostgreSQL now owns each wire exchange until its matching `ReadyForQuery`
+  is consumed. Dropping or cancelling an unfinished query closes the socket
+  before releasing the shared connection lock, so a later query or checkout
+  ping cannot consume the abandoned response. Pending wire I/O observes both
+  explicit cancellation and the caller's absolute deadline. Fully drained
+  SQL errors and cancellation before the first write preserve healthy reuse.
 - Pool shutdown now registers the caller's future deadline across idle
   retirement and waiting for borrowed leases. A production request context
   can time out a drain even when no driver or borrower wakes it. Expiry
@@ -58,7 +64,7 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
   of the budget cannot start another close operation. The connection contract
   documents hard-drop cleanup when graceful retirement is interrupted.
 
-These are unreleased pool protections. They do not change the known limitation
+These are unreleased protections. They do not change the known limitation
 of the published SQLModel 0.5.1 release or establish successful PostgreSQL
 handoff against a fixed runtime dependency.
 

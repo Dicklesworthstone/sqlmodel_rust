@@ -16,15 +16,16 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
+use std::future::{Future, poll_fn};
 #[cfg(feature = "tls")]
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::task::Poll;
 
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::net::TcpStream;
-use asupersync::sync::{Mutex, OwnedMutexGuard};
-use asupersync::{Cx, Outcome};
+use asupersync::sync::{Mutex, OnceCell, OwnedMutexGuard};
+use asupersync::{CancelReason, Cx, Outcome};
 
 use sqlmodel_core::connection::{Connection, IsolationLevel, PreparedStatement, TransactionOps};
 use sqlmodel_core::error::{
@@ -52,7 +53,6 @@ enum PgAsyncStream {
     Plain(TcpStream),
     #[cfg(feature = "tls")]
     Tls(AsyncTlsStream),
-    #[cfg(feature = "tls")]
     Closed,
 }
 
@@ -63,7 +63,6 @@ impl PgAsyncStream {
             PgAsyncStream::Plain(s) => read_exact_plain_async(s, buf).await,
             #[cfg(feature = "tls")]
             PgAsyncStream::Tls(s) => s.read_exact(buf).await,
-            #[cfg(feature = "tls")]
             PgAsyncStream::Closed => Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "connection closed",
@@ -76,7 +75,6 @@ impl PgAsyncStream {
             PgAsyncStream::Plain(s) => read_some_plain_async(s, buf).await,
             #[cfg(feature = "tls")]
             PgAsyncStream::Tls(s) => s.read_plain(buf).await,
-            #[cfg(feature = "tls")]
             PgAsyncStream::Closed => Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "connection closed",
@@ -89,7 +87,6 @@ impl PgAsyncStream {
             PgAsyncStream::Plain(s) => write_all_plain_async(s, buf).await,
             #[cfg(feature = "tls")]
             PgAsyncStream::Tls(s) => s.write_all(buf).await,
-            #[cfg(feature = "tls")]
             PgAsyncStream::Closed => Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "connection closed",
@@ -102,7 +99,6 @@ impl PgAsyncStream {
             PgAsyncStream::Plain(s) => flush_plain_async(s).await,
             #[cfg(feature = "tls")]
             PgAsyncStream::Tls(s) => s.flush().await,
-            #[cfg(feature = "tls")]
             PgAsyncStream::Closed => Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "connection closed",
@@ -339,6 +335,94 @@ impl std::fmt::Debug for PgAsyncConnection {
     }
 }
 
+/// Owns a serialized protocol exchange until its ReadyForQuery is consumed.
+/// The first write marks the connection InQuery. A completed server error is
+/// safe to reuse once drained; dropping an incomplete exchange is not.
+struct PgExchangeGuard<'a> {
+    connection: &'a mut PgAsyncConnection,
+}
+
+impl<'a> PgExchangeGuard<'a> {
+    fn new(connection: &'a mut PgAsyncConnection) -> Result<Self, Error> {
+        if !matches!(connection.state, ConnectionState::Ready(_)) {
+            return Err(disconnected_error(
+                "PostgreSQL connection is closed or has an unfinished protocol exchange",
+            ));
+        }
+        Ok(Self { connection })
+    }
+}
+
+impl Drop for PgExchangeGuard<'_> {
+    fn drop(&mut self) {
+        if !matches!(self.connection.state, ConnectionState::Ready(_)) {
+            // Do not attempt async resynchronization in Drop. Closing the
+            // socket also protects other SharedPgConnection clones from
+            // consuming this exchange's buffered response as their own.
+            self.connection.close_stream();
+        }
+    }
+}
+
+/// Register a cancellation waker while wire I/O is pending. Checking the Cx
+/// only between messages cannot interrupt a socket read that never wakes.
+/// The losing operation is dropped before its exchange guard releases the
+/// connection lock, so cancellation and hard future drops have the same
+/// protocol ownership boundary.
+async fn await_cancellable<T>(
+    cx: &Cx,
+    future: impl Future<Output = Outcome<T, Error>>,
+) -> Outcome<T, Error> {
+    let cancellation = OnceCell::<()>::new();
+    let mut cancelled = std::pin::pin!(cancellation.wait(cx));
+    let deadline = cx.budget().deadline;
+    let mut elapsed = std::pin::pin!(async {
+        if let Some(deadline) = deadline {
+            asupersync::time::sleep_until(deadline).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    });
+    let mut operation = std::pin::pin!(future);
+    poll_fn(|task_cx| {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Poll::Ready(Outcome::Cancelled(reason));
+        }
+        if deadline.is_some_and(|deadline| cx.now() >= deadline) {
+            return Poll::Ready(Outcome::Cancelled(CancelReason::deadline()));
+        }
+        // An independently constructed request Cx has no scheduler task to
+        // wake it at its budget deadline. Keep one timer for the whole
+        // exchange, rather than restarting the budget for each message.
+        if elapsed.as_mut().poll(task_cx).is_ready() {
+            let reason = cx
+                .cancel_reason()
+                .or_else(|| Cx::current().and_then(|ambient| ambient.cancel_reason()))
+                .unwrap_or_else(|| {
+                    if deadline.is_some_and(|deadline| cx.now() >= deadline) {
+                        CancelReason::deadline()
+                    } else {
+                        // Sleep can complete early on ambient cancellation;
+                        // that is not evidence the request deadline expired.
+                        CancelReason::user("PostgreSQL operation interrupted")
+                    }
+                });
+            return Poll::Ready(Outcome::Cancelled(reason));
+        }
+        if let Poll::Ready(outcome) = operation.as_mut().poll(task_cx) {
+            return Poll::Ready(outcome);
+        }
+        if cancelled.as_mut().poll(task_cx).is_ready() {
+            return Poll::Ready(Outcome::Cancelled(
+                cx.cancel_reason()
+                    .unwrap_or_else(|| CancelReason::user("PostgreSQL operation cancelled")),
+            ));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 impl PgAsyncConnection {
     /// Establish a new async connection to the PostgreSQL server.
     pub async fn connect(_cx: &Cx, config: PgConfig) -> Outcome<Self, Error> {
@@ -531,7 +615,15 @@ impl PgAsyncConnection {
 
     /// Close a named prepared statement on the server.
     pub async fn close_statement_async(&mut self, cx: &Cx, name: &str) -> Outcome<(), Error> {
-        if let Outcome::Err(e) = self
+        let guard = match PgExchangeGuard::new(self) {
+            Ok(guard) => guard,
+            Err(error) => return Outcome::Err(error),
+        };
+        await_cancellable(cx, guard.connection.close_statement_exchange(cx, name)).await
+    }
+
+    async fn close_statement_exchange(&mut self, cx: &Cx, name: &str) -> Outcome<(), Error> {
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Close {
@@ -541,10 +633,16 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
-        if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
-            return Outcome::Err(e);
+        match self.send_message(cx, &FrontendMessage::Sync).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
         loop {
@@ -569,25 +667,52 @@ impl PgAsyncConnection {
 
     /// Close the connection.
     pub async fn close_async(&mut self, cx: &Cx) -> Outcome<(), Error> {
-        self.clear_statement_cache();
-        // Best-effort terminate. If this fails, the drop will close the socket.
+        if !matches!(self.state, ConnectionState::Ready(_)) {
+            self.close_stream();
+            return Outcome::Ok(());
+        }
+        // Best-effort terminate. The guard also closes the socket if the
+        // future is dropped during the write or cancellation interrupts it.
         //
         // Note: server-side prepared statements are released when the connection terminates;
         // explicit Close/DEALLOCATE is not required for correctness here.
-        let _ = self.send_message(cx, &FrontendMessage::Terminate).await;
-        self.state = ConnectionState::Closed;
+        let guard = PgExchangeGuard { connection: self };
+        let _ = await_cancellable(
+            cx,
+            guard
+                .connection
+                .send_message(cx, &FrontendMessage::Terminate),
+        )
+        .await;
+        guard.connection.close_stream();
         Outcome::Ok(())
+    }
+
+    fn close_stream(&mut self) {
+        self.stream = PgAsyncStream::Closed;
+        self.state = ConnectionState::Closed;
+        self.reader = MessageReader::new();
+        self.prepared.clear();
+        self.clear_statement_cache();
     }
 
     // ==================== Prepared statements ====================
 
     /// Prepare a server-side statement and return a reusable handle.
     pub async fn prepare_async(&mut self, cx: &Cx, sql: &str) -> Outcome<PreparedStatement, Error> {
+        let guard = match PgExchangeGuard::new(self) {
+            Ok(guard) => guard,
+            Err(error) => return Outcome::Err(error),
+        };
+        await_cancellable(cx, guard.connection.prepare_exchange(cx, sql)).await
+    }
+
+    async fn prepare_exchange(&mut self, cx: &Cx, sql: &str) -> Outcome<PreparedStatement, Error> {
         let stmt_id = self.next_prepared_id;
         self.next_prepared_id = self.next_prepared_id.saturating_add(1);
         let stmt_name = format!("sqlmodel_stmt_{stmt_id}");
 
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Parse {
@@ -600,10 +725,13 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Describe {
@@ -613,11 +741,17 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
-            return Outcome::Err(e);
+        match self.send_message(cx, &FrontendMessage::Sync).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
         let mut param_type_oids: Option<Vec<u32>> = None;
@@ -863,6 +997,19 @@ impl PgAsyncConnection {
         sql: &str,
         params: &[Value],
     ) -> Outcome<PgQueryResult, Error> {
+        let guard = match PgExchangeGuard::new(self) {
+            Ok(guard) => guard,
+            Err(error) => return Outcome::Err(error),
+        };
+        await_cancellable(cx, guard.connection.run_extended_exchange(cx, sql, params)).await
+    }
+
+    async fn run_extended_exchange(
+        &mut self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> Outcome<PgQueryResult, Error> {
         let trimmed = sql.trim();
         if trimmed.eq_ignore_ascii_case("DISCARD ALL")
             || trimmed.eq_ignore_ascii_case("DISCARD PLANS")
@@ -873,7 +1020,7 @@ impl PgAsyncConnection {
 
         // When parameters are empty, run through the unnamed statement without caching.
         if params.is_empty() {
-            if let Outcome::Err(e) = self
+            match self
                 .send_message(
                     cx,
                     &FrontendMessage::Parse {
@@ -884,10 +1031,13 @@ impl PgAsyncConnection {
                 )
                 .await
             {
-                return Outcome::Err(e);
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
 
-            if let Outcome::Err(e) = self
+            match self
                 .send_message(
                     cx,
                     &FrontendMessage::Bind {
@@ -900,10 +1050,13 @@ impl PgAsyncConnection {
                 )
                 .await
             {
-                return Outcome::Err(e);
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
 
-            if let Outcome::Err(e) = self
+            match self
                 .send_message(
                     cx,
                     &FrontendMessage::Describe {
@@ -913,10 +1066,13 @@ impl PgAsyncConnection {
                 )
                 .await
             {
-                return Outcome::Err(e);
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
 
-            if let Outcome::Err(e) = self
+            match self
                 .send_message(
                     cx,
                     &FrontendMessage::Execute {
@@ -926,11 +1082,17 @@ impl PgAsyncConnection {
                 )
                 .await
             {
-                return Outcome::Err(e);
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
 
-            if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
-                return Outcome::Err(e);
+            match self.send_message(cx, &FrontendMessage::Sync).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
             return self.read_extended_result(cx).await;
         }
@@ -969,7 +1131,7 @@ impl PgAsyncConnection {
             self.statement_order.push_back(cache_key);
 
             // Bind against cached named statement
-            if let Outcome::Err(e) = self
+            match self
                 .send_message(
                     cx,
                     &FrontendMessage::Bind {
@@ -982,10 +1144,13 @@ impl PgAsyncConnection {
                 )
                 .await
             {
-                return Outcome::Err(e);
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
 
-            if let Outcome::Err(e) = self
+            match self
                 .send_message(
                     cx,
                     &FrontendMessage::Describe {
@@ -995,10 +1160,13 @@ impl PgAsyncConnection {
                 )
                 .await
             {
-                return Outcome::Err(e);
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
 
-            if let Outcome::Err(e) = self
+            match self
                 .send_message(
                     cx,
                     &FrontendMessage::Execute {
@@ -1008,11 +1176,17 @@ impl PgAsyncConnection {
                 )
                 .await
             {
-                return Outcome::Err(e);
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
 
-            if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
-                return Outcome::Err(e);
+            match self.send_message(cx, &FrontendMessage::Sync).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(info) => return Outcome::Panicked(info),
             }
             return self.read_extended_result(cx).await;
         }
@@ -1023,7 +1197,12 @@ impl PgAsyncConnection {
                 break;
             };
             if let Some(evicted_name) = self.statement_cache.remove(&oldest_key) {
-                let _ = self.close_statement_async(cx, &evicted_name).await;
+                match self.close_statement_async(cx, &evicted_name).await {
+                    Outcome::Ok(()) => {}
+                    Outcome::Err(error) => return Outcome::Err(error),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(info) => return Outcome::Panicked(info),
+                }
             }
         }
 
@@ -1032,7 +1211,7 @@ impl PgAsyncConnection {
         let stmt_name = format!("sqlmodel_s{stmt_id}");
 
         // Parse with generated name
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Parse {
@@ -1043,11 +1222,14 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
         // Bind + Describe + Execute + Sync
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Bind {
@@ -1060,10 +1242,13 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Describe {
@@ -1073,10 +1258,13 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Execute {
@@ -1086,11 +1274,17 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
-            return Outcome::Err(e);
+        match self.send_message(cx, &FrontendMessage::Sync).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
         let outcome = self.read_extended_result(cx).await;
@@ -1102,6 +1296,19 @@ impl PgAsyncConnection {
     }
 
     async fn run_prepared(
+        &mut self,
+        cx: &Cx,
+        meta: &PgPreparedMeta,
+        params: &[Value],
+    ) -> Outcome<PgQueryResult, Error> {
+        let guard = match PgExchangeGuard::new(self) {
+            Ok(guard) => guard,
+            Err(error) => return Outcome::Err(error),
+        };
+        await_cancellable(cx, guard.connection.run_prepared_exchange(cx, meta, params)).await
+    }
+
+    async fn run_prepared_exchange(
         &mut self,
         cx: &Cx,
         meta: &PgPreparedMeta,
@@ -1140,7 +1347,7 @@ impl PgAsyncConnection {
             vec![Format::Text.code()]
         };
 
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Bind {
@@ -1153,10 +1360,13 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Describe {
@@ -1166,10 +1376,13 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self
+        match self
             .send_message(
                 cx,
                 &FrontendMessage::Execute {
@@ -1179,11 +1392,17 @@ impl PgAsyncConnection {
             )
             .await
         {
-            return Outcome::Err(e);
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
-        if let Outcome::Err(e) = self.send_message(cx, &FrontendMessage::Sync).await {
-            return Outcome::Err(e);
+        match self.send_message(cx, &FrontendMessage::Sync).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
         }
 
         self.read_extended_result(cx).await
@@ -1492,15 +1711,23 @@ impl PgAsyncConnection {
     // ==================== I/O ====================
 
     async fn send_message(&mut self, cx: &Cx, msg: &FrontendMessage) -> Outcome<(), Error> {
-        // If cancelled, propagate early.
-        if let Some(reason) = cx.cancel_reason() {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
             return Outcome::Cancelled(reason);
         }
+        if !matches!(
+            self.state,
+            ConnectionState::Ready(_) | ConnectionState::InQuery
+        ) {
+            return Outcome::Err(disconnected_error("PostgreSQL connection is not usable"));
+        }
+        // Arm the exchange before the first write can yield or partially
+        // transfer a message. Only its ReadyForQuery restores readiness.
+        self.state = ConnectionState::InQuery;
         self.send_message_no_cx(msg).await
     }
 
     async fn receive_message(&mut self, cx: &Cx) -> Outcome<BackendMessage, Error> {
-        if let Some(reason) = cx.cancel_reason() {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
             return Outcome::Cancelled(reason);
         }
         self.receive_message_no_cx().await
@@ -2105,6 +2332,14 @@ struct PgQueryResult {
 fn connection_error(msg: impl Into<String>) -> Error {
     Error::Connection(ConnectionError {
         kind: ConnectionErrorKind::Connect,
+        message: msg.into(),
+        source: None,
+    })
+}
+
+fn disconnected_error(msg: impl Into<String>) -> Error {
+    Error::Connection(ConnectionError {
+        kind: ConnectionErrorKind::Disconnected,
         message: msg.into(),
         source: None,
     })

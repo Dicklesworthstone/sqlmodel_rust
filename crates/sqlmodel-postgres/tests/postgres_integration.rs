@@ -1,9 +1,10 @@
+use std::future::{Future, poll_fn};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::runtime::RuntimeBuilder;
-use asupersync::{Cx, Outcome};
+use asupersync::{Budget, CancelKind, Cx, Outcome};
 
-use sqlmodel_core::error::QueryErrorKind;
+use sqlmodel_core::error::{ConnectionErrorKind, QueryErrorKind};
 use sqlmodel_core::{Connection, Error, TransactionOps, Value};
 
 use sqlmodel_postgres::{PgConfig, SharedPgConnection, SslMode};
@@ -131,6 +132,232 @@ fn postgres_connect_select_1() {
         assert_eq!(rows.len(), 1);
         let one: i64 = rows[0].get_as(0).expect("row[0] as i64");
         assert_eq!(one, 1);
+    });
+}
+
+#[test]
+fn postgres_dropped_query_future_invalidates_unfinished_exchange() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        for prepared in [false, true] {
+            let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg.clone()).await);
+            let sql = "SELECT 424242 AS abandoned_marker FROM pg_sleep(0.2)";
+            let incomplete = if prepared {
+                let statement = unwrap_outcome(conn.prepare(&cx, sql).await);
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(20),
+                    conn.query_prepared(&cx, &statement, &[]),
+                )
+                .await
+            } else {
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(20),
+                    conn.query(&cx, sql, &[]),
+                )
+                .await
+            };
+            assert!(incomplete.is_err(), "the response must still be pending");
+
+            // A future drop cannot leave the old response available for a
+            // different request, even when the caller retains the connection.
+            let next = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(2),
+                conn.query(&cx, "SELECT 7 AS fresh_marker", &[]),
+            )
+            .await
+            .expect("an interrupted connection must reject new work promptly");
+            match next {
+                Outcome::Err(Error::Connection(error)) => {
+                    assert_eq!(error.kind, ConnectionErrorKind::Disconnected);
+                }
+                other => panic!(
+                    "prepared={prepared}: unfinished exchange was reused; SELECT 7 must not consume the abandoned response: {other:?}"
+                ),
+            }
+        }
+    });
+}
+
+#[test]
+fn postgres_pending_wire_read_observes_cancellation_and_request_deadline() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        for deadline in [false, true] {
+            let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg.clone()).await);
+            let budget = if deadline {
+                Budget::new().with_deadline(
+                    asupersync::time::wall_now() + Duration::from_millis(20),
+                )
+            } else {
+                Budget::INFINITE
+            };
+            let query_cx = rt.request_cx_with_budget(budget);
+            let mut query = Box::pin(conn.query(
+                &query_cx,
+                "SELECT 424242 AS abandoned_marker FROM pg_sleep(1)",
+                &[],
+            ));
+            let (mut pending, canceller) = if deadline {
+                (None, None)
+            } else {
+                let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+                let cancel_cx = query_cx.clone();
+                let canceller = std::thread::spawn(move || {
+                    pending_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("query entered a pending wire exchange");
+                    std::thread::sleep(Duration::from_millis(20));
+                    cancel_cx.cancel_with(CancelKind::User, Some("cancel pending PostgreSQL read"));
+                });
+                (Some(pending_tx), Some(canceller))
+            };
+            let started = std::time::Instant::now();
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_millis(500),
+                poll_fn(|task_cx| {
+                    let outcome = query.as_mut().poll(task_cx);
+                    if outcome.is_pending()
+                        && let Some(pending) = pending.take()
+                    {
+                        pending.send(()).expect("notify cancellation thread");
+                    }
+                    outcome
+                }),
+            )
+            .await;
+            if let Some(canceller) = canceller {
+                canceller.join().expect("cancellation thread completed");
+            }
+            let result = result.expect("cancellation must finish before the one-second server query");
+            assert!(
+                started.elapsed() < Duration::from_millis(400),
+                "the query must be woken by its Cx, before the outer watchdog"
+            );
+            match result {
+                Outcome::Cancelled(reason) if deadline => assert_eq!(reason.kind, CancelKind::Deadline),
+                Outcome::Cancelled(reason) => assert_eq!(reason, query_cx.cancel_reason().expect("explicit cancellation reason")),
+                other => panic!("pending wire read did not propagate cancellation: {other:?}"),
+            }
+            // Keep the completed future allocated: ownership must already be
+            // released when it reports Cancelled, not deferred to its Drop.
+            assert!(matches!(
+                conn.query(&cx, "SELECT 7", &[]).await,
+                Outcome::Err(Error::Connection(error)) if error.kind == ConnectionErrorKind::Disconnected
+            ));
+            drop(query);
+        }
+    });
+}
+
+#[test]
+fn postgres_completed_or_unstarted_exchange_remains_reusable() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
+        let before = unwrap_outcome(conn.query(&cx, "SELECT pg_backend_pid()", &[]).await)[0]
+            .get_as::<i64>(0)
+            .expect("original backend PID");
+        let timely = rt.request_cx_with_budget(
+            Budget::new().with_deadline(asupersync::time::wall_now() + Duration::from_secs(2)),
+        );
+        let rows = unwrap_outcome(conn.query(&timely, "SELECT 7", &[]).await);
+        assert_eq!(rows[0].get_as::<i64>(0).expect("completed query"), 7);
+        let cancelled = rt.request_cx_with_budget(Budget::INFINITE);
+        cancelled.cancel_with(CancelKind::User, Some("cancel before any wire write"));
+        match conn.query(&cancelled, "SELECT 999", &[]).await {
+            Outcome::Cancelled(reason) => assert_eq!(
+                reason,
+                cancelled
+                    .cancel_reason()
+                    .expect("preflight cancellation reason")
+            ),
+            other => panic!("preflight cancellation was not observed: {other:?}"),
+        }
+        let rows = unwrap_outcome(conn.query(&cx, "SELECT 7, pg_backend_pid()", &[]).await);
+        assert_eq!(rows[0].get_as::<i64>(0).expect("fresh result"), 7);
+        assert_eq!(rows[0].get_as::<i64>(1).expect("same backend PID"), before);
+    });
+}
+
+#[test]
+fn postgres_fully_drained_server_errors_preserve_connection_reuse() {
+    let Some(cfg) = postgres_test_config() else {
+        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
+        return;
+    };
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production runtime");
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+
+    rt.block_on(async {
+        let conn = unwrap_outcome(SharedPgConnection::connect(&cx, cfg).await);
+        let before = unwrap_outcome(conn.query(&cx, "SELECT pg_backend_pid()", &[]).await)[0]
+            .get_as::<i64>(0)
+            .expect("original backend PID");
+        assert!(matches!(
+            conn.query(&cx, "SELECT FROM", &[]).await,
+            Outcome::Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            conn.prepare(&cx, "SELECT FROM").await,
+            Outcome::Err(Error::Query(_))
+        ));
+        unwrap_outcome(
+            conn.execute(
+                &cx,
+                "CREATE TEMP TABLE sqlmodel_error_recovery (id INTEGER PRIMARY KEY)",
+                &[],
+            )
+            .await,
+        );
+        unwrap_outcome(
+            conn.execute(&cx, "INSERT INTO sqlmodel_error_recovery VALUES (1)", &[])
+                .await,
+        );
+        match conn
+            .execute(&cx, "INSERT INTO sqlmodel_error_recovery VALUES (1)", &[])
+            .await
+        {
+            Outcome::Err(Error::Query(error)) => {
+                assert_eq!(error.sqlstate.as_deref(), Some("23505"));
+            }
+            other => panic!("expected a fully drained unique violation: {other:?}"),
+        }
+        let rows = unwrap_outcome(conn.query(&cx, "SELECT 7, pg_backend_pid()", &[]).await);
+        assert_eq!(rows[0].get_as::<i64>(0).expect("fresh result"), 7);
+        assert_eq!(
+            rows[0].get_as::<i64>(1).expect("reused backend PID"),
+            before
+        );
     });
 }
 
