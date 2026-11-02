@@ -935,17 +935,36 @@ fn exercise_postgres_production_handoff(
             .acquire(&cx, || SharedPgConnection::connect(&cx, cfg.clone()))
             .await;
         let waited = started.elapsed();
+        let checkout_state = match &acquired {
+            Outcome::Ok(_) => "lease",
+            Outcome::Err(_) => "error",
+            Outcome::Cancelled(_) => "cancelled",
+            Outcome::Panicked(_) => "panicked",
+        };
+        eprintln!(
+            "{label}: checkout returned {checkout_state} after {waited:?}; {:?}",
+            pool.stats()
+        );
         assert!(
             waited < Duration::from_secs(5),
             "{label}: acquire exceeded its {TIMEOUT_MS} ms deadline: {waited:?}"
         );
         match acquired {
             Outcome::Ok(lease) => {
-                let backend = session_id(&cx, &*lease, "SELECT pg_backend_pid()", "reused backend")
+                // An already-readable ping does not prove that another socket
+                // wait can progress after handoff. Bound the separate reuse
+                // proof too, and never label a failed proof as successful reuse.
+                let proof_cx = rt.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(
+                        cx.now() + Duration::from_millis(TIMEOUT_MS),
+                    ),
+                );
+                eprintln!("{label}: querying the reused backend after checkout");
+                let backend = session_id(&proof_cx, &*lease, "SELECT pg_backend_pid()", "reused backend")
                     .await;
                 assert_eq!(backend, original_backend, "{label}: same physical connection");
                 let rows = expect_outcome(
-                    lease.query(&cx, "SELECT 1", &[]).await,
+                    lease.query(&proof_cx, "SELECT 1", &[]).await,
                     "production consumer SELECT 1",
                 );
                 assert_eq!(rows[0].get_as::<i64>(0).expect("SELECT 1"), 1);
@@ -1524,6 +1543,133 @@ fn postgres_pool_session_checkout_preserves_clean_transaction_reuse() {
             exercise_postgres_session_return(&cfg, test_on_checkout, returned);
         }
     }
+}
+
+#[test]
+fn postgres_pool_return_bounds_retirement_while_escaped_transaction_holds_connection() {
+    const RETIREMENT_MS: u64 = 50;
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    let _watchdog = HandoffWatchdog::start("postgres bounded synchronous retirement".to_owned());
+    let rt = HandoffRuntime::CurrentThread.build();
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+    let pool = Pool::new(
+        PoolConfig::new(1)
+            .min_connections(0)
+            .acquire_timeout(RETIREMENT_MS),
+    );
+    let lease = rt.block_on(async {
+        expect_outcome(
+            pool.acquire(&cx, || SharedPgConnection::connect(&cx, cfg.clone()))
+                .await,
+            "lease before synchronous retirement",
+        )
+    });
+    let original_backend = rt.block_on(session_id(
+        &cx,
+        &*lease,
+        "SELECT pg_backend_pid()",
+        "backend before synchronous retirement",
+    ));
+    let escaped = (*lease).clone();
+    let transaction = rt.block_on(async {
+        expect_outcome(
+            escaped.begin(&cx).await,
+            "escaped transaction holds the connection lock",
+        )
+    });
+    pool.close();
+    assert!(pool.is_closed());
+    assert_eq!(pool.stats().active_connections, 1);
+
+    let (completed, completion) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(lease);
+        let elapsed = started.elapsed();
+        let _ = completed.send(elapsed);
+        elapsed
+    });
+    // The original runtime stays alive. This isolates a close hook waiting
+    // for a transaction-owned mutex from the runtime-handoff regression.
+    let before_transaction_release = completion.recv_timeout(Duration::from_millis(500));
+    let retained_owner = before_transaction_release.is_ok().then(|| {
+        let owner_cx = rt.request_cx_with_budget(
+            Budget::new().with_deadline(asupersync::time::wall_now() + Duration::from_millis(250)),
+        );
+        // Cancelling a separate close waiter must preserve the transaction's
+        // ownership and live backend. Record the result before cleanup, but
+        // defer every assertion until the worker has been joined.
+        rt.block_on(transaction.query(&owner_cx, "SELECT pg_backend_pid()", &[]))
+    });
+
+    // Always release the blocking owner and join the worker before asserting.
+    // The unfixed implementation then fails this test without leaving a
+    // deadlocked worker or an idle-in-transaction backend behind.
+    drop(transaction);
+    let elapsed = holder.join().expect("lease-return worker must join");
+    let stats = pool.stats();
+    let (first_drain, repeated_drain) = rt.block_on(async {
+        let first = pool.close_and_drain(&cx).await;
+        let repeated = pool.close_and_drain(&cx).await;
+        let observer = expect_outcome(
+            SharedPgConnection::connect(&cx, cfg).await,
+            "observer after transaction release",
+        );
+        // The escaped clone remains alive, so disappearance proves that the
+        // transaction release physically closed the socket. The pool's grace
+        // expiry alone cannot close a socket still owned by that transaction.
+        assert_postgres_backend_retired(&cx, &observer, original_backend).await;
+        observer
+            .close(&cx)
+            .await
+            .expect("close retirement observer");
+        (first, repeated)
+    });
+    drop(escaped);
+
+    eprintln!(
+        "postgres synchronous retirement: before_release={before_transaction_release:?}, \
+         elapsed={elapsed:?}, stats={stats:?}, first_drain={first_drain:?}, \
+         repeated_drain={repeated_drain:?}"
+    );
+    assert!(
+        before_transaction_release.is_ok(),
+        "returning a lease must finish within its retirement grace while the escaped transaction still holds the connection"
+    );
+    assert!(elapsed >= Duration::from_millis(RETIREMENT_MS));
+    assert!(elapsed < Duration::from_millis(400));
+    let owner_rows = expect_outcome(
+        retained_owner.expect("bounded retirement allows the retained-owner query"),
+        "retirement cancellation preserves the external transaction owner",
+    );
+    assert_eq!(owner_rows.len(), 1);
+    assert_eq!(
+        owner_rows[0]
+            .get_as::<i64>(0)
+            .expect("retained backend PID"),
+        original_backend,
+        "the escaped transaction must still own its original backend"
+    );
+    assert_eq!(stats.connections_created, 1);
+    assert_eq!(stats.connections_closed, 1);
+    assert_eq!(stats.acquires, 1);
+    assert_eq!(
+        stats.timeouts, 0,
+        "retirement is not an acquisition timeout"
+    );
+    assert_eq!(stats.total_connections, 0);
+    assert_eq!(stats.active_connections, 0);
+    assert_eq!(stats.idle_connections, 0);
+    assert_eq!(stats.pending_requests, 0);
+    let Outcome::Err(first_error) = first_drain else {
+        panic!("exhausted retirement grace must remain a reported drain failure");
+    };
+    let Outcome::Err(repeated_error) = repeated_drain else {
+        panic!("repeated drain must retain the incomplete-retirement failure");
+    };
+    assert_eq!(first_error.to_string(), repeated_error.to_string());
 }
 
 /// A cancelled `close_and_drain` reports `Cancelled` but leaves the pool

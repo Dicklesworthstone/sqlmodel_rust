@@ -547,8 +547,10 @@ pub trait Connection: Send + Sync {
     /// pool's internal mutex is held. Returning a healthy connection to the
     /// idle queue does not call this method.
     ///
-    /// Cancellation, acquisition deadline expiry, or dropping an in-flight
-    /// checkout may instead drop the connection or its owning close future.
+    /// Cancellation, acquisition deadline expiry, synchronous retirement grace
+    /// expiry, or dropping an in-flight checkout may instead drop the connection
+    /// or its owning close future. Synchronous pool cleanup uses the configured
+    /// acquisition timeout as one grace for the entire retirement batch.
     /// Implementations must release their resources on drop even when this
     /// hook never starts or completes. The pool keeps the connection accounted
     /// as active until that resource drop finishes; it never reuses a connection

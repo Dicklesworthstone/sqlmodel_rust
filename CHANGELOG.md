@@ -38,6 +38,14 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- Synchronous pool retirement now uses `acquire_timeout` as a finite grace,
+  with one deadline for an entire idle batch. Returning a lease to a closed
+  pool, retiring an expired lease, and dropping a lease after its pool is gone
+  cannot wait indefinitely on a yielding close hook. Retirement ownership
+  survives close-hook panic, and incomplete graceful cleanup is recorded
+  before the final slot is released, so later drains cannot report success.
+  Native PostgreSQL coverage holds an escaped transaction open while returning
+  its lease; cleanup releases pool capacity without waiting for that owner.
 - ORM flush queues now remain owned by the `Session` across suspension. Dropping
   a pending flush preserves unfinished INSERT, UPDATE, and DELETE work while
   retaining acknowledged row progress. Completed parent deletions are detached
@@ -92,6 +100,10 @@ handoff against a fixed runtime dependency.
 
 ### Qualification
 
+- PostgreSQL handoff tests now log checkout completion before verifying reuse
+  and apply a finite production budget to the verification queries. An
+  already-readable ping cannot turn a later stalled query into an unbounded
+  test step or be counted as successful runtime handoff.
 - Fixed the standalone qualification runner's staged workspace inheritance:
   the outer fixture excludes the copied workspace, so Cargo resolves the
   copied crates' package fields and dependencies from their own manifest.

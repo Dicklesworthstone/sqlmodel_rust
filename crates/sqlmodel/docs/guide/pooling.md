@@ -126,6 +126,41 @@ async fn shutdown_pool(cx: &Cx, pool: Pool<impl Connection>) -> Outcome<(), Erro
 }
 ```
 
+### Bounded Synchronous Retirement
+
+On repository `main`, `close()`, `clear_idle()`, and lease destruction use
+`acquire_timeout` as the maximum grace for synchronous retirement. An entire
+idle batch shares one deadline; the grace does not restart for each connection.
+A lease retains this setting even if its pool has already been dropped. A
+normal return to an open pool still puts the connection back into the idle
+queue without running a close hook.
+
+Synchronous retirement drives the driver's close hook on a temporary
+current-thread runtime with a finite request budget and an independent timer.
+This cleanup runtime uses wall time even when the pool has a virtual clock.
+At expiry, the pool destroys its in-flight close future and any unstarted
+retirement resources before releasing their slots. It creates no detached
+cleanup task. As with checkout deadlines, this requires the close hook and
+resource destructors to yield or return; it cannot preempt synchronous blocking.
+
+A timeout, close error, or close-hook panic leaves a persistent retirement
+failure before the final slot is released. `close_and_drain` then returns an
+error once pool accounting reaches zero, including for concurrent or later
+drainers. The acquisition `timeouts` counter is unchanged by cleanup timeouts.
+Graceful close within the deadline continues to allow a successful drain.
+During an existing panic, synchronous retirement drops its owned work and
+records interrupted cleanup without invoking another close hook that could
+panic during unwinding.
+
+This bounds cleanup of pool-owned resources. An escaped shared handle or
+transaction can retain ownership outside the pool. In PostgreSQL, a transaction
+holding the shared connection lock no longer makes lease return wait forever;
+the retained transaction remains usable, and dropping it subsequently closes
+its abandoned socket. A bounded
+return with a retirement error is not proof that all external owners or server
+sessions have finished. Prefer `close_and_drain(cx)` when shutdown can await an
+explicit caller budget and inspect its result.
+
 ---
 
 ## PostgreSQL Runtime Handoff and the Asupersync Compatibility Port
@@ -211,9 +246,13 @@ native x86_64 Linux, using the published Asupersync 0.5.0 dependency:
 | Abandoned transaction or transaction holder panic, with a surviving shared handle | First checkout replaced the backend; the old server session disappeared, abandoned writes were absent, and draining succeeded |
 | Raw transaction `COMMIT` followed by holder panic | The committed write remained, while the poisoned connection was physically retired and replaced |
 | Abandoned, panicked, or failed ORM `Session`, with checkout ping enabled or disabled | First checkout retired the dirty backend, including surviving shared handles, and returned no abandoned writes; explicit commit and rollback controls reused the original backend |
+| Lease returned to a closed pool while an escaped transaction owns the connection | Return completed in 50.94 ms with a 50 ms grace, released pool capacity, and retained a drain error; the transaction remained usable until its owner dropped it |
 
-The 104 native pool tests also passed, including stalled validation,
-cancellation, and future drain deadlines on both runtime configurations.
+The 113 native pool tests also passed, including stalled validation,
+cancellation, future drain deadlines, and bounded synchronous retirement.
+The new checks cover zero and exact 50 ms virtual deadlines, one grace across
+an idle batch, resource destruction before accounting release, panic recovery,
+and failure visibility at the final drain notification.
 The separate strict current-thread handoff success
 contract still fails on 0.5.0 with a pool timeout: bounding that failure does
 not establish successful migration of the old connection.
@@ -221,13 +260,21 @@ not establish successful migration of the old connection.
 The PostgreSQL suite passed 61 driver unit tests and 16 live integration tests,
 including prepared-statement caching, transaction ownership and isolation,
 pending-I/O and lock-wait cancellation, commit error preservation, and
-introspection. All eight production PostgreSQL pool tests and all four
+introspection. All nine production PostgreSQL pool tests and all four
 cancellation sweep tests passed.
 Workspace checking, formatting, and Clippy with warnings denied also passed.
 The native builds used the pinned nightly LLVM toolchain, one Cargo job,
 disabled debug information, and 256 codegen units for the large runtime and
 engine dependencies to fit the build environment; dependency sources were
 unchanged.
+
+An earlier current-thread handoff run exceeded its 30-second watchdog before
+the test recorded the checkout outcome. A focused rerun and the final full
+matrix passed. The test now logs acquisition completion separately and gives
+the subsequent backend/query proof a finite production budget; a failed proof
+still fails the test. The earlier stall's exact phase was not captured, so it
+is retained as an unexplained observation rather than attributed to a proven
+cause or counted as successful runtime qualification.
 
 The latest staged 0.6.1 evaluation used clean SQLModel revision
 [`bef4100dff319d9387163c009461a15e87295a05`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/bef4100dff319d9387163c009461a15e87295a05).

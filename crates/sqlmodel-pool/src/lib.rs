@@ -100,7 +100,8 @@ pub struct PoolConfig {
     /// Connection idle timeout in milliseconds
     pub idle_timeout_ms: u64,
     /// Maximum acquisition time in milliseconds, including connection creation,
-    /// checkout validation, and retirement of unusable connections.
+    /// checkout validation, and retirement of unusable connections. Also bounds
+    /// the graceful retirement work of each synchronous close or lease return.
     pub acquire_timeout_ms: u64,
     /// Maximum lifetime of a connection in milliseconds
     pub max_lifetime_ms: u64,
@@ -146,7 +147,7 @@ impl PoolConfig {
         self
     }
 
-    /// Set acquire timeout in milliseconds.
+    /// Set the acquisition timeout and synchronous retirement grace in milliseconds.
     #[must_use]
     pub fn acquire_timeout(mut self, ms: u64) -> Self {
         self.acquire_timeout_ms = ms;
@@ -354,7 +355,9 @@ impl<C: Connection> PoolShared<C> {
     /// Release one active slot that is leaving the pool permanently.
     ///
     /// The caller must not invoke this until any required driver close has
-    /// completed. Keeping the slot active through close is what makes
+    /// completed or its owned close future and resource have been destroyed.
+    /// Any retirement failure must be recorded before releasing the slot.
+    /// Keeping the slot active through disposal is what makes
     /// `Pool::close_and_drain` a resource-quiescence boundary instead of only
     /// a bookkeeping boundary.
     fn release_active_slot(&self, operation: &'static str) {
@@ -441,32 +444,134 @@ impl<C: Connection> PoolShared<C> {
     }
 }
 
+fn retirement_timeout() -> Error {
+    Error::Custom("synchronous pool retirement grace period expired".to_string())
+}
+
+/// Enforce one absolute grace independently of driver cooperation. Failure is
+/// published while the owned operation still exists: dropping it may release
+/// the final accounting slot and synchronously wake a concurrent drainer.
+#[allow(clippy::result_large_err)] // Preserve the driver's existing rich Error type.
+async fn supervise_retirement<F>(
+    cx: &Cx,
+    deadline: Time,
+    operation: F,
+    record_failure: impl Fn(&Error),
+) -> Result<(), Error>
+where
+    F: Future<Output = Result<(), Error>>,
+{
+    let mut operation = Box::pin(operation);
+    let mut timer = std::pin::pin!(asupersync::time::sleep_until(deadline));
+    let result = std::future::poll_fn(|task_cx| {
+        let outcome = if cx.now() >= deadline {
+            std::task::Poll::Ready(Err(retirement_timeout()))
+        } else if timer.as_mut().poll(task_cx).is_ready() {
+            let error = if cx.now() >= deadline {
+                retirement_timeout()
+            } else {
+                // Sleep can also finish because a distinct ambient context
+                // was cancelled. Never repoll its completed future.
+                Error::Custom("synchronous pool retirement interrupted".to_string())
+            };
+            std::task::Poll::Ready(Err(error))
+        } else {
+            let outcome = operation.as_mut().poll(task_cx);
+            if outcome.is_pending() && cx.now() >= deadline {
+                std::task::Poll::Ready(Err(retirement_timeout()))
+            } else {
+                // A completed guarded close already classified its deadline
+                // before releasing the slot. Do not invent a later failure
+                // after a successful final release has woken drainers.
+                outcome
+            }
+        };
+        if let std::task::Poll::Ready(Err(error)) = &outcome {
+            record_failure(error);
+        }
+        outcome
+    })
+    .await;
+    drop(operation);
+    result
+}
+
 #[allow(clippy::result_large_err)] // Error is the crate's rich public error type.
-fn close_connection_blocking<C: Connection>(conn: C, context: &'static str) -> Result<(), Error> {
+fn run_retirement_blocking<F, Fut>(
+    deadline: Time,
+    context: &'static str,
+    operation: F,
+    record_failure: impl Fn(&Error),
+) -> Result<(), Error>
+where
+    F: FnOnce(Cx) -> Fut,
+    Fut: Future<Output = Result<(), Error>>,
+{
+    let unavailable = if std::thread::panicking() {
+        // A user is already unwinding. Invoking another driver hook here could
+        // panic a second time and abort instead of releasing owned resources.
+        Some(Error::Custom(
+            "synchronous pool retirement interrupted by unwinding".to_string(),
+        ))
+    } else if asupersync::time::wall_now() >= deadline {
+        Some(retirement_timeout())
+    } else {
+        None
+    };
+    if let Some(error) = unavailable {
+        record_failure(&error);
+        drop(operation);
+        return Err(error);
+    }
     let runtime = match RuntimeBuilder::current_thread().build() {
         Ok(runtime) => runtime,
         Err(error) => {
-            tracing::warn!(
-                context,
-                error = %error,
-                "failed to build runtime while closing pooled connection"
-            );
-            drop(conn);
-            return Err(Error::Custom(format!(
-                "failed to build runtime while closing pooled connection: {error}"
-            )));
+            let error = Error::Custom(format!(
+                "failed to build runtime while retiring pooled connection: {error}"
+            ));
+            record_failure(&error);
+            drop(operation);
+            return Err(error);
         }
     };
-    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
-    let result = runtime.block_on(async { conn.close_for_pool(&cx).await });
+    // The finite context lets cooperative drivers stop themselves. A request
+    // context's budget alone cannot wake a permanently pending driver, so the
+    // supervisor also registers this runtime's independent deadline timer.
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE.with_deadline(deadline));
+    let result = runtime.block_on(supervise_retirement(
+        &cx,
+        deadline,
+        operation(cx.clone()),
+        record_failure,
+    ));
     if let Err(error) = &result {
-        tracing::warn!(
-            context,
-            error = %error,
-            "failed to close pooled connection explicitly"
-        );
+        tracing::warn!(context, error = %error, "synchronous pool retirement failed");
     }
     result
+}
+
+#[allow(clippy::result_large_err)] // Error is the crate's rich public error type.
+fn close_connection_blocking<C: Connection>(
+    conn: C,
+    grace: Duration,
+    context: &'static str,
+) -> Result<(), Error> {
+    let deadline = asupersync::time::wall_now() + grace;
+    run_retirement_blocking(
+        deadline,
+        context,
+        move |cx| async move {
+            let result = conn.close_for_pool(&cx).await;
+            if cx.now() >= deadline {
+                Err(retirement_timeout())
+            } else {
+                result
+            }
+        },
+        |error| {
+            tracing::warn!(context, error = %error, "unowned-pool connection retirement failed");
+        },
+    )
 }
 
 /// Owns an active/total pool slot while an asynchronous connection factory is
@@ -529,6 +634,10 @@ struct ActiveConnectionGuard<C: Connection> {
     pool: Arc<PoolShared<C>>,
     meta: Option<ConnectionMeta<C>>,
     armed: bool,
+    /// Synchronous retirement cannot return cancellation to its caller. Any
+    /// unfinished close, including an unwind, must become a sticky failure
+    /// before this guard can publish the final drain notification.
+    synchronous_context: Option<&'static str>,
 }
 
 enum RetirementOutcome {
@@ -543,6 +652,7 @@ impl<C: Connection> ActiveConnectionGuard<C> {
             pool,
             meta: Some(meta),
             armed: true,
+            synchronous_context: None,
         }
     }
 
@@ -567,6 +677,37 @@ impl<C: Connection> ActiveConnectionGuard<C> {
             self.pool.connections_closed.fetch_add(1, Ordering::Relaxed);
             self.pool.release_active_slot(operation);
         }
+    }
+
+    #[allow(clippy::result_large_err)] // Preserve the driver's existing rich Error type.
+    async fn close_synchronously(
+        mut self,
+        cx: &Cx,
+        deadline: Time,
+        context: &'static str,
+    ) -> Result<(), Error> {
+        self.synchronous_context = Some(context);
+        let meta = self
+            .meta
+            .take()
+            .expect("active connection guard already consumed");
+        // Keep the consuming future younger than the accounting owner. Its
+        // resource must be destroyed first on completion, timeout, or panic.
+        let mut close = Box::pin(meta.conn.close_for_pool(cx));
+        let result = close.as_mut().await;
+        drop(close);
+        let result = if cx.now() >= deadline {
+            Err(retirement_timeout())
+        } else {
+            result
+        };
+        if let Err(error) = &result {
+            self.pool.record_retirement_failure(context, error);
+        }
+        // Unlike the async close path, do not let a cancellation latch release
+        // this owner before the synchronous supervisor classifies its failure.
+        self.release(context);
+        result
     }
 
     async fn close(mut self, cx: &Cx, context: &'static str) -> RetirementOutcome {
@@ -631,11 +772,20 @@ impl<C: Connection> Drop for ActiveConnectionGuard<C> {
         if !self.armed {
             return;
         }
+        if let Some(context) = self.synchronous_context {
+            let error = Error::Custom(
+                "synchronous pool retirement interrupted before close completed".to_string(),
+            );
+            self.pool.record_retirement_failure(context, &error);
+        }
         // Async Drop is impossible. Dropping the resource itself is the
         // hard-cancellation fallback; do that before releasing its pool slot so
         // a concurrent drainer cannot observe quiescence too early.
         drop(self.meta.take());
-        self.release("checkout validation future drop");
+        self.release(
+            self.synchronous_context
+                .unwrap_or("checkout validation future drop"),
+        );
     }
 }
 
@@ -1035,6 +1185,7 @@ impl<C: Connection> Pool<C> {
         AcquirePublish::Published(PooledConnection::new(
             guard.into_meta(),
             Arc::downgrade(&self.shared),
+            Duration::from_millis(inner.config.acquire_timeout_ms),
         ))
     }
 
@@ -1156,51 +1307,67 @@ impl<C: Connection> Pool<C> {
     }
 
     fn close_retirements_blocking(
-        &self,
-        retired: Vec<ActiveConnectionGuard<C>>,
+        mut retired: Vec<ActiveConnectionGuard<C>>,
+        deadline: Time,
         context: &'static str,
     ) {
-        for guard in retired {
-            let runtime = match RuntimeBuilder::current_thread().build() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    tracing::warn!(
-                        context,
-                        error = %error,
-                        "failed to build runtime while retiring pooled connection"
-                    );
-                    let error = Error::Custom(format!(
-                        "failed to build runtime while retiring pooled connection: {error}"
-                    ));
-                    self.shared.record_retirement_failure(context, &error);
-                    drop(guard);
-                    continue;
-                }
-            };
-            // Runtime-owned request context with no deadline: retirement must not be
-            // cut short, and `Cx::for_testing` only exists behind asupersync's
-            // `test-internals` feature (it compiled here purely through dev-dependency
-            // feature unification, and broke `cargo doc`).
-            let cx = runtime.request_cx_with_budget(Budget::INFINITE);
-            let _ = runtime.block_on(guard.close(&cx, context));
+        let Some(first) = retired.first() else {
+            return;
+        };
+        let shared = Arc::clone(&first.pool);
+        for guard in &mut retired {
+            guard.synchronous_context = Some(context);
         }
+        let work_shared = Arc::clone(&shared);
+        let _ = run_retirement_blocking(
+            deadline,
+            context,
+            move |cx| async move {
+                let mut first_failure = None;
+                for guard in retired {
+                    if cx.now() >= deadline {
+                        let error = retirement_timeout();
+                        work_shared.record_retirement_failure(context, &error);
+                        return Err(error);
+                    }
+                    if let Err(error) = guard.close_synchronously(&cx, deadline, context).await {
+                        first_failure.get_or_insert(error);
+                    }
+                }
+                first_failure.map_or(Ok(()), Err)
+            },
+            |error| shared.record_retirement_failure(context, error),
+        );
     }
 
     /// Close all currently idle connections.
     ///
+    /// The entire idle batch shares one `acquire_timeout_ms` grace period.
+    /// Unfinished owned resources are dropped on expiry and later drainers
+    /// observe a sticky retirement failure. No background cleanup is detached.
+    ///
     /// If the pool mutex is poisoned, this logs an error and leaves the idle
     /// inventory untouched because its accounting cannot be mutated safely.
     pub fn clear_idle(&self) {
+        let deadline =
+            asupersync::time::wall_now() + Duration::from_millis(self.config().acquire_timeout_ms);
         let retired = self.begin_idle_retirement();
-        self.close_retirements_blocking(retired, "pool clear_idle");
+        Self::close_retirements_blocking(retired, deadline, "pool clear_idle");
     }
 
     /// Close the pool, preventing new connections and closing all idle connections.
     ///
+    /// Graceful idle retirement shares one `acquire_timeout_ms` wall-clock
+    /// grace period. Expiry or unwinding drops the remaining pool-owned work
+    /// and records a failure before waking drainers. Independently held shared
+    /// connection aliases remain outside the pool's ownership.
+    ///
     /// If the pool mutex is poisoned, this logs an error but still wakes waiters.
     pub fn close(&self) {
+        let deadline =
+            asupersync::time::wall_now() + Duration::from_millis(self.config().acquire_timeout_ms);
         let retired = self.begin_close();
-        self.close_retirements_blocking(retired, "pool close");
+        Self::close_retirements_blocking(retired, deadline, "pool close");
 
         // Closing an already-empty pool is itself the one and only drain
         // transition. Accounted retirements set the latch when their final
@@ -1215,8 +1382,10 @@ impl<C: Connection> Pool<C> {
     /// Closing admission and removing idle inventory happen synchronously
     /// before this method first yields. Blocked acquirers are woken and observe
     /// [`PoolErrorKind::Closed`]. Connections already checked out are closed
-    /// when returned; this future completes only after their explicit
-    /// `close_for_pool` hooks finish and the active count reaches zero.
+    /// when returned. Each slot remains active until its `close_for_pool` hook
+    /// finishes or its owned close future and resource have been destroyed.
+    /// Incomplete synchronous retirement leaves a sticky failure, reported
+    /// after the active count reaches zero.
     ///
     /// The wait is cancellation- and deadline-aware through `cx`. Cancellation
     /// returns [`Outcome::Cancelled`] without reopening the pool: `closed`
@@ -1396,19 +1565,30 @@ enum AcquirePublish<C: Connection> {
 /// When dropped, the connection is automatically returned to the pool, also
 /// while a panic unwinds the holder. The connection can be used via `Deref`
 /// and `DerefMut`.
+/// Retirement after closure or maximum age uses the pool's configured
+/// acquisition timeout as its graceful-close bound, even if the pool is gone.
 pub struct PooledConnection<C: Connection> {
     /// The connection metadata (Some while held, None after return)
     meta: Option<ConnectionMeta<C>>,
     /// Weak reference to pool for returning
     pool: Weak<PoolShared<C>>,
+    /// Retained independently of the weak pool reference for late returns.
+    retirement_grace: Duration,
 }
 
 impl<C: Connection> PooledConnection<C> {
-    fn new(meta: ConnectionMeta<C>, pool: Weak<PoolShared<C>>) -> Self {
+    fn new(meta: ConnectionMeta<C>, pool: Weak<PoolShared<C>>, retirement_grace: Duration) -> Self {
         Self {
             meta: Some(meta),
             pool,
+            retirement_grace,
         }
+    }
+
+    fn retire(&self, pool: &Arc<PoolShared<C>>, meta: ConnectionMeta<C>, context: &'static str) {
+        let deadline = asupersync::time::wall_now() + self.retirement_grace;
+        let guard = ActiveConnectionGuard::new(Arc::clone(pool), meta);
+        Pool::close_retirements_blocking(vec![guard], deadline, context);
     }
 
     /// Detach this connection from the pool.
@@ -1478,11 +1658,7 @@ impl<C: Connection> Drop for PooledConnection<C> {
                              connection will be closed instead of returned. A thread panicked while holding the lock."
                         );
                         let context = "pooled connection drop poisoned";
-                        if let Err(error) = close_connection_blocking(meta.conn, context) {
-                            pool.record_retirement_failure(context, &error);
-                        }
-                        pool.connections_closed.fetch_add(1, Ordering::Relaxed);
-                        pool.release_active_slot(context);
+                        self.retire(&pool, meta, context);
                         return;
                     }
                 };
@@ -1490,11 +1666,7 @@ impl<C: Connection> Drop for PooledConnection<C> {
                 if inner.closed {
                     drop(inner);
                     let context = "pooled connection drop closed pool";
-                    if let Err(error) = close_connection_blocking(meta.conn, context) {
-                        pool.record_retirement_failure(context, &error);
-                    }
-                    pool.connections_closed.fetch_add(1, Ordering::Relaxed);
-                    pool.release_active_slot("pooled connection drop closed pool");
+                    self.retire(&pool, meta, context);
                     return;
                 }
 
@@ -1503,11 +1675,7 @@ impl<C: Connection> Drop for PooledConnection<C> {
                 if meta.age() > max_lifetime {
                     drop(inner);
                     let context = "pooled connection drop max lifetime";
-                    if let Err(error) = close_connection_blocking(meta.conn, context) {
-                        pool.record_retirement_failure(context, &error);
-                    }
-                    pool.connections_closed.fetch_add(1, Ordering::Relaxed);
-                    pool.release_active_slot("pooled connection drop max lifetime");
+                    self.retire(&pool, meta, context);
                     return;
                 }
 
@@ -1517,7 +1685,11 @@ impl<C: Connection> Drop for PooledConnection<C> {
                 drop(inner);
                 pool.conn_available.notify_one();
             } else {
-                let _ = close_connection_blocking(meta.conn, "pooled connection drop missing pool");
+                let _ = close_connection_blocking(
+                    meta.conn,
+                    self.retirement_grace,
+                    "pooled connection drop missing pool",
+                );
             }
         }
     }
@@ -1597,6 +1769,85 @@ mod tests {
         Cancelled,
     }
 
+    /// An externally releasable close hook. Its independent context deliberately
+    /// ignores the retirement deadline, requiring the pool to enforce the bound.
+    /// Tests release it before joining their worker even when the old pool code
+    /// waits forever, so a failed regression cannot strand a thread.
+    #[derive(Debug)]
+    struct PoolCloseGate {
+        released: OnceCell<()>,
+        started: std::sync::mpsc::Sender<()>,
+        completions: AtomicUsize,
+    }
+
+    impl PoolCloseGate {
+        fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+            let (started, receiver) = std::sync::mpsc::channel();
+            (
+                Arc::new(Self {
+                    released: OnceCell::new(),
+                    started,
+                    completions: AtomicUsize::new(0),
+                }),
+                receiver,
+            )
+        }
+
+        async fn wait(&self) {
+            let independent = Cx::for_testing();
+            let mut wait = std::pin::pin!(self.released.wait(&independent));
+            let mut announced = false;
+            std::future::poll_fn(|task_cx| {
+                let outcome = wait.as_mut().poll(task_cx);
+                if outcome.is_pending() && !announced {
+                    announced = true;
+                    let _ = self.started.send(());
+                }
+                outcome
+            })
+            .await
+            .expect("the test gate is released, never cancelled");
+            self.completions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn release(&self) {
+            let _ = self.released.set(());
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum GateRelease {
+        AfterStart,
+        AfterWatchdog,
+    }
+
+    /// Observe synchronous teardown without letting a RED leave it blocked.
+    /// Both the gate release and worker join happen before any assertion.
+    fn run_gated_retirement(
+        gate: &PoolCloseGate,
+        started: &std::sync::mpsc::Receiver<()>,
+        release: GateRelease,
+        retire: impl FnOnce() + Send + 'static,
+    ) -> (bool, Duration) {
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let started_at = std::time::Instant::now();
+            retire();
+            let elapsed = started_at.elapsed();
+            let _ = completed_tx.send(());
+            elapsed
+        });
+        let hook_started = started.recv_timeout(Duration::from_secs(2));
+        let completed_before_release = match release {
+            GateRelease::AfterStart => completed_rx.try_recv().is_ok(),
+            GateRelease::AfterWatchdog => completed_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+        };
+        gate.release();
+        let elapsed = worker.join().expect("retirement worker must not panic");
+        assert!(hook_started.is_ok(), "the close hook must be attempted");
+        (completed_before_release, elapsed)
+    }
+
     /// Observes resource destruction itself, before the pool may release its
     /// active slot. A missing inner snapshot also detects a held pool mutex.
     #[derive(Debug)]
@@ -1632,6 +1883,9 @@ mod tests {
         pool_close_pending: bool,
         /// When true, pool retirement returns a deterministic driver error.
         pool_close_should_fail: bool,
+        /// When true, the close hook unwinds after taking ownership.
+        pool_close_panics: bool,
+        pool_close_gate: Option<Arc<PoolCloseGate>>,
         pool_close_delay: Option<Duration>,
         /// Optional probe used to prove the pool mutex is not held while the
         /// retirement hook runs.
@@ -1651,6 +1905,8 @@ mod tests {
                 pool_close_calls: Arc::new(AtomicUsize::new(0)),
                 pool_close_pending: false,
                 pool_close_should_fail: false,
+                pool_close_panics: false,
+                pool_close_gate: None,
                 pool_close_delay: None,
                 pool_shared: None,
                 pool_lock_was_free: None,
@@ -1749,6 +2005,46 @@ mod tests {
 
         fn wake_by_ref(self: &Arc<Self>) {
             self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Observe the publication boundary itself, not a later poll after the
+    /// retiring thread has had another opportunity to record its failure.
+    struct DrainFailureWake {
+        pool: Weak<PoolShared<MockConnection>>,
+        observed: OnceCell<bool>,
+        advance_after_wake: Option<(Arc<VirtualClock>, u64)>,
+    }
+
+    impl DrainFailureWake {
+        fn new(pool: &Pool<MockConnection>) -> Arc<Self> {
+            Arc::new(Self {
+                pool: Arc::downgrade(&pool.shared),
+                observed: OnceCell::new(),
+                advance_after_wake: None,
+            })
+        }
+
+        fn record(&self) {
+            let failed = self
+                .pool
+                .upgrade()
+                .is_some_and(|pool| pool.retirement_failure_error().is_some());
+            if self.observed.set(failed).is_ok()
+                && let Some((clock, nanos)) = &self.advance_after_wake
+            {
+                clock.advance(*nanos);
+            }
+        }
+    }
+
+    impl Wake for DrainFailureWake {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.record();
         }
     }
 
@@ -1953,6 +2249,10 @@ mod tests {
                 pool_lock_was_free.store(mutex_is_available, Ordering::Relaxed);
             }
             self.pool_close_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(gate) = &self.pool_close_gate {
+                gate.wait().await;
+            }
+            assert!(!self.pool_close_panics, "mock pool close panicked");
             if let Some(delay) = self.pool_close_delay {
                 asupersync::time::sleep(cx.now(), delay).await;
             }
@@ -1966,7 +2266,10 @@ mod tests {
         }
     }
 
-    fn seed_idle(pool: &Pool<MockConnection>, conn: MockConnection) {
+    fn acquire_mock(
+        pool: &Pool<MockConnection>,
+        conn: MockConnection,
+    ) -> PooledConnection<MockConnection> {
         let cx = Cx::for_testing();
         let conn = Mutex::new(Some(conn));
         let mut acquire = Box::pin(pool.acquire(&cx, || {
@@ -1974,10 +2277,30 @@ mod tests {
         }));
         let mut task_cx = Context::from_waker(Waker::noop());
         match acquire.as_mut().poll(&mut task_cx) {
-            Poll::Ready(Outcome::Ok(lease)) => drop(lease),
+            Poll::Ready(Outcome::Ok(lease)) => lease,
             other => panic!("immediate factory did not create the fixture: {other:?}"),
         }
+    }
+
+    fn seed_idle(pool: &Pool<MockConnection>, conn: MockConnection) {
+        drop(acquire_mock(pool, conn));
         assert_eq!(pool.stats().idle_connections, 1);
+    }
+
+    fn assert_sticky_retirement_failure(pool: &Pool<MockConnection>) {
+        let cx = Cx::for_testing();
+        let mut task_cx = Context::from_waker(Waker::noop());
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            let mut drain = Box::pin(pool.close_and_drain(&cx));
+            match drain.as_mut().poll(&mut task_cx) {
+                Poll::Ready(Outcome::Err(error)) => messages.push(error.to_string()),
+                other => panic!("incomplete synchronous retirement must fail drain: {other:?}"),
+            }
+        }
+        assert_eq!(messages[0], messages[1]);
+        assert_no_occupied_slots(pool);
+        assert_eq!(pool.stats().timeouts, 0, "retirement is not acquisition");
     }
 
     fn assert_no_occupied_slots(pool: &Pool<MockConnection>) {
@@ -2644,6 +2967,7 @@ mod tests {
         let pooled = PooledConnection::new(
             ConnectionMeta::new(MockConnection::with_failing_pool_close(1), test_clock()),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
         let first_cx = Cx::for_testing();
         let second_cx = Cx::for_testing();
@@ -2696,6 +3020,7 @@ mod tests {
                 test_clock(),
             ),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
         let cx = Cx::for_testing();
         let mut drain = Box::pin(pool.close_and_drain(&cx));
@@ -2728,10 +3053,12 @@ mod tests {
         let first = PooledConnection::new(
             ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
         let second = PooledConnection::new(
             ConnectionMeta::new(MockConnection::new(2), test_clock()),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
         let first_cx = Cx::for_testing();
         let second_cx = Cx::for_testing();
@@ -2782,6 +3109,7 @@ mod tests {
         let pooled = PooledConnection::new(
             ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
         let cx = Cx::for_testing();
         let mut drain = Box::pin(pool.close_and_drain(&cx));
@@ -2832,6 +3160,7 @@ mod tests {
         let pooled = PooledConnection::new(
             ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
         let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(Time::ZERO));
         let mut drain = Box::pin(pool.close_and_drain(&cx));
@@ -3193,6 +3522,7 @@ mod tests {
         let pooled = PooledConnection::new(
             ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
         let waiting_pool = Arc::clone(&pool);
         let (started_tx, started_rx) = mpsc::sync_channel(0);
@@ -3269,6 +3599,310 @@ mod tests {
         assert!(pool.is_closed());
         assert_eq!(pool_close_calls.load(Ordering::Relaxed), 1);
         assert!(pool_lock_was_free.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn synchronous_retirement_bounds_closed_lease_return() {
+        const GRACE_MS: u64 = 50;
+        let pool = Pool::new(PoolConfig::new(1).acquire_timeout(GRACE_MS));
+        let (gate, started) = PoolCloseGate::new();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(OnceCell::new());
+        let mut conn = MockConnection::with_pool_close_counter(1, Arc::clone(&closes));
+        conn.pool_close_gate = Some(Arc::clone(&gate));
+        let lease = acquire_mock(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        pool.close();
+        let drain_cx = Cx::for_testing();
+        let wake = DrainFailureWake::new(&pool);
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut task_cx = Context::from_waker(&waker);
+        let mut drain = Box::pin(pool.close_and_drain(&drain_cx));
+        let waited = drain.as_mut().poll(&mut task_cx).is_pending();
+
+        let (bounded, elapsed) =
+            run_gated_retirement(&gate, &started, GateRelease::AfterWatchdog, move || {
+                drop(lease);
+            });
+
+        assert!(
+            bounded,
+            "lease return ignored its configured grace and needed gate release: {elapsed:?}"
+        );
+        assert!(elapsed >= Duration::from_millis(GRACE_MS));
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.completions.load(Ordering::Relaxed), 0);
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        let stats = pool.stats();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_closed, 1);
+        assert_eq!(stats.acquires, 1);
+        assert_eq!(stats.timeouts, 0);
+        assert!(waited);
+        assert_eq!(
+            wake.observed.get(),
+            Some(&true),
+            "the final-slot wake must already expose retirement failure"
+        );
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Err(_))
+        ));
+        assert_sticky_retirement_failure(&pool);
+    }
+
+    #[test]
+    fn synchronous_retirement_shares_one_grace_across_idle_batch() {
+        const GRACE_MS: u64 = 50;
+        let pool = Arc::new(Pool::new(PoolConfig::new(3).acquire_timeout(GRACE_MS)));
+        let (gate, started) = PoolCloseGate::new();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut dropped = Vec::new();
+        let mut leases = Vec::new();
+        for id in 1..=3 {
+            let observed = Arc::new(OnceCell::new());
+            let mut conn = MockConnection::with_pool_close_counter(id, Arc::clone(&closes));
+            conn.pool_close_gate = Some(Arc::clone(&gate));
+            leases.push(acquire_mock(
+                &pool,
+                conn.observe_drop(&pool, Arc::clone(&observed)),
+            ));
+            dropped.push(observed);
+        }
+        drop(leases);
+        let retiring_pool = Arc::clone(&pool);
+        let (bounded, elapsed) =
+            run_gated_retirement(&gate, &started, GateRelease::AfterWatchdog, move || {
+                retiring_pool.clear_idle();
+            });
+
+        assert!(
+            bounded,
+            "idle retirement needed the watchdog's gate release: {elapsed:?}"
+        );
+        assert!(elapsed >= Duration::from_millis(GRACE_MS));
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            1,
+            "expiry must stop the batch before another close hook starts"
+        );
+        assert_eq!(gate.completions.load(Ordering::Relaxed), 0);
+        let mut active_at_drop = Vec::new();
+        for observed in dropped {
+            let stats = observed
+                .get()
+                .expect("every retired resource must be destroyed before return")
+                .as_ref()
+                .expect("resource destruction must not hold the pool mutex");
+            assert_eq!(stats.total_connections, stats.active_connections);
+            assert_eq!(stats.idle_connections, 0);
+            active_at_drop.push(stats.active_connections);
+        }
+        active_at_drop.sort_unstable();
+        assert_eq!(active_at_drop, vec![1, 2, 3]);
+        assert_no_occupied_slots(&pool);
+        assert!(!pool.is_closed(), "clear_idle preserves admission");
+        let stats = pool.stats();
+        assert_eq!(stats.connections_created, 3);
+        assert_eq!(stats.connections_closed, 3);
+        assert_eq!(stats.acquires, 3);
+        assert_eq!(stats.timeouts, 0);
+
+        let replacement = acquire_mock(&pool, MockConnection::new(4));
+        assert_eq!(replacement.id, 4, "retirement must restore usable capacity");
+        drop(replacement);
+        assert_sticky_retirement_failure(&pool);
+        assert_eq!(pool.stats().connections_created, 4);
+        assert_eq!(pool.stats().connections_closed, 4);
+    }
+
+    #[test]
+    fn synchronous_retirement_bounds_expired_lease_on_a_virtual_pool_clock() {
+        const GRACE_MS: u64 = 50;
+        let (mut runtime, pool, region) =
+            lab_pool(PoolConfig::new(1).max_lifetime(1).acquire_timeout(GRACE_MS));
+        let (gate, started) = PoolCloseGate::new();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(OnceCell::new());
+        let held = Arc::new(Mutex::new(None));
+        let record = Arc::clone(&held);
+        let task_pool = Arc::clone(&pool);
+        let task_gate = Arc::clone(&gate);
+        let task_closes = Arc::clone(&closes);
+        let task_dropped = Arc::clone(&dropped);
+        let (task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task has a context");
+                let lease = task_pool
+                    .acquire(&cx, || async {
+                        let mut conn =
+                            MockConnection::with_pool_close_counter(1, Arc::clone(&task_closes));
+                        conn.pool_close_gate = Some(Arc::clone(&task_gate));
+                        Outcome::Ok(conn.observe_drop(&task_pool, Arc::clone(&task_dropped)))
+                    })
+                    .await
+                    .expect("create lease on the lab clock");
+                *record.lock().unwrap() = Some(lease);
+            })
+            .expect("spawn lease creation");
+        runtime.scheduler.lock().schedule(task, 0);
+        runtime.run_with_auto_advance();
+        runtime.advance_time(2_000_000);
+        let lease = held.lock().unwrap().take().expect("lab task created lease");
+        let age = lease.age();
+        let (bounded, elapsed) =
+            run_gated_retirement(&gate, &started, GateRelease::AfterWatchdog, move || {
+                drop(lease);
+            });
+
+        assert!(
+            bounded,
+            "expired return must use a live wall-clock grace: {elapsed:?}"
+        );
+        assert_eq!(age, Duration::from_millis(2));
+        assert!(elapsed >= Duration::from_millis(GRACE_MS));
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.completions.load(Ordering::Relaxed), 0);
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert!(!pool.is_closed());
+        assert_eq!(pool.stats().connections_closed, 1);
+        assert_sticky_retirement_failure(&pool);
+    }
+
+    #[test]
+    fn synchronous_retirement_remembers_grace_after_pool_is_gone() {
+        const GRACE_MS: u64 = 50;
+        let pool = Pool::new(PoolConfig::new(1).acquire_timeout(GRACE_MS));
+        let (gate, started) = PoolCloseGate::new();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(OnceCell::new());
+        let mut conn = MockConnection::with_pool_close_counter(1, Arc::clone(&closes));
+        conn.pool_close_gate = Some(Arc::clone(&gate));
+        let lease = acquire_mock(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        let weak_pool = Arc::downgrade(&pool.shared);
+        drop(pool);
+        let pool_was_gone = weak_pool.upgrade().is_none();
+        let (bounded, elapsed) =
+            run_gated_retirement(&gate, &started, GateRelease::AfterWatchdog, move || {
+                drop(lease);
+            });
+
+        assert!(
+            bounded,
+            "a surviving lease lost its configured retirement grace: {elapsed:?}"
+        );
+        assert!(pool_was_gone, "fixture must outlive the entire shared pool");
+        assert!(elapsed >= Duration::from_millis(GRACE_MS));
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.completions.load(Ordering::Relaxed), 0);
+        assert!(
+            matches!(dropped.get(), Some(None)),
+            "the connection must be destroyed even without accounting state"
+        );
+    }
+
+    #[test]
+    fn synchronous_retirement_preserves_graceful_close_after_pending() {
+        let pool = Arc::new(Pool::new(PoolConfig::new(1).acquire_timeout(2_000)));
+        let (gate, started) = PoolCloseGate::new();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(OnceCell::new());
+        let mut conn = MockConnection::with_pool_close_counter(1, Arc::clone(&closes));
+        conn.pool_close_gate = Some(Arc::clone(&gate));
+        seed_idle(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        let retiring_pool = Arc::clone(&pool);
+        let (completed_before_release, _) =
+            run_gated_retirement(&gate, &started, GateRelease::AfterStart, move || {
+                retiring_pool.close();
+            });
+
+        assert!(!completed_before_release);
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.completions.load(Ordering::Relaxed), 1);
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert!(pool.shared.retirement_failure_error().is_none());
+        let cx = Cx::for_testing();
+        let mut drain = Box::pin(pool.close_and_drain(&cx));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Ok(()))
+        ));
+        assert_eq!(pool.stats().connections_closed, 1);
+        assert_eq!(pool.stats().timeouts, 0);
+    }
+
+    #[test]
+    fn synchronous_retirement_panic_does_not_strand_lease_accounting() {
+        let pool = Pool::new(PoolConfig::new(1).acquire_timeout(50));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(OnceCell::new());
+        let mut conn = MockConnection::with_pool_close_counter(1, Arc::clone(&closes));
+        conn.pool_close_panics = true;
+        let lease = acquire_mock(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        pool.close();
+        let drain_cx = Cx::for_testing();
+        let wake = DrainFailureWake::new(&pool);
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut task_cx = Context::from_waker(&waker);
+        let mut drain = Box::pin(pool.close_and_drain(&drain_cx));
+        let waited = drain.as_mut().poll(&mut task_cx).is_pending();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(lease)));
+
+        assert!(
+            unwound.is_err(),
+            "fixture must actually unwind the close hook"
+        );
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert_eq!(pool.stats().connections_closed, 1);
+        assert_eq!(pool.stats().timeouts, 0);
+        assert!(pool.shared.active_drained.get().is_some());
+        assert!(!pool.shared.inner.is_poisoned());
+        assert!(waited);
+        assert_eq!(
+            wake.observed.get(),
+            Some(&true),
+            "unwind must record failure before waking the blocked drainer"
+        );
+        assert!(matches!(
+            drain.as_mut().poll(&mut task_cx),
+            Poll::Ready(Outcome::Err(_))
+        ));
+        assert_sticky_retirement_failure(&pool);
+    }
+
+    #[test]
+    fn synchronous_retirement_during_holder_unwind_skips_driver_hook() {
+        let pool = Pool::new(PoolConfig::new(1).acquire_timeout(50));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(OnceCell::new());
+        let conn = MockConnection::with_pool_close_counter(1, Arc::clone(&closes));
+        let lease = acquire_mock(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        pool.close();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = lease;
+            panic!("holder panic before retirement");
+        }));
+
+        let payload = unwound.expect_err("the original holder panic must propagate");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"holder panic before retirement")
+        );
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            0,
+            "do not invoke a potentially panicking driver hook during unwind"
+        );
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert_eq!(pool.stats().connections_closed, 1);
+        assert_sticky_retirement_failure(&pool);
     }
 
     #[test]
@@ -3450,7 +4084,11 @@ mod tests {
         }
 
         let meta = ConnectionMeta::new(MockConnection::new(1), pool.shared.clock.clone());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // Age starts at exactly zero on the virtual clock
         assert_eq!(pooled.age(), Duration::ZERO);
@@ -3473,7 +4111,11 @@ mod tests {
         }
 
         let meta = ConnectionMeta::new(MockConnection::new(42), test_clock());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // Verify counts before detach
         assert_eq!(pool.total_count(), 1);
@@ -3504,7 +4146,11 @@ mod tests {
         }
 
         let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // While held, active=1, idle=0
         assert_eq!(pool.active_count(), 1);
@@ -3531,7 +4177,11 @@ mod tests {
         }
 
         let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // Close the pool while connection is out
         pool.close();
@@ -3560,7 +4210,11 @@ mod tests {
         }
 
         let meta = ConnectionMeta::new(MockConnection::new(99), test_clock());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // Deref should give access to the connection's id
         assert_eq!(pooled.id, 99);
@@ -3578,7 +4232,11 @@ mod tests {
         }
 
         let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
-        let mut pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let mut pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // DerefMut should allow mutation
         pooled.id = 50;
@@ -3597,7 +4255,11 @@ mod tests {
         }
 
         let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         let debug_str = format!("{:?}", pooled);
         assert!(debug_str.contains("PooledConnection"));
@@ -3905,6 +4567,7 @@ mod tests {
         let pooled = PooledConnection::new(
             ConnectionMeta::new(MockConnection::new(1), test_clock()),
             Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
         );
 
         let shared = Arc::clone(&pool.shared);
@@ -3957,7 +4620,11 @@ mod tests {
 
         // Create a pooled connection
         let meta = ConnectionMeta::new(MockConnection::new(1), test_clock());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // Poison the mutex by panicking in another thread
         let shared_clone = Arc::clone(&pool.shared);
@@ -3999,7 +4666,11 @@ mod tests {
 
         // Create a pooled connection
         let meta = ConnectionMeta::new(MockConnection::new(42), test_clock());
-        let pooled = PooledConnection::new(meta, Arc::downgrade(&pool.shared));
+        let pooled = PooledConnection::new(
+            meta,
+            Arc::downgrade(&pool.shared),
+            Duration::from_millis(pool.config().acquire_timeout_ms),
+        );
 
         // Poison the mutex
         let shared_clone = Arc::clone(&pool.shared);
@@ -4187,6 +4858,123 @@ mod tests {
             completed.get().is_some(),
             "acquisition regression must finish every assertion"
         );
+    }
+
+    #[test]
+    fn lab_synchronous_retirement_supervisor_expires_at_exact_deadline() {
+        for grace_ms in [0, 50] {
+            run_acquire_lab(
+                PoolConfig::new(1).acquire_timeout(50),
+                Budget::INFINITE,
+                move |pool, cx| async move {
+                    let dropped = Arc::new(OnceCell::new());
+                    let closes = Arc::new(AtomicUsize::new(0));
+                    let mut lease = pool
+                        .acquire(&cx, || async {
+                            Outcome::Ok(
+                                MockConnection::with_pending_pool_close(1, Arc::clone(&closes))
+                                    .observe_drop(&pool, Arc::clone(&dropped)),
+                            )
+                        })
+                        .await
+                        .expect("create a lease before retirement");
+                    let guard = ActiveConnectionGuard::new(
+                        Arc::clone(&pool.shared),
+                        lease.meta.take().expect("transfer lease ownership"),
+                    );
+                    drop(lease);
+                    pool.close();
+                    let deadline = cx.now() + Duration::from_millis(grace_ms);
+                    let context = "lab synchronous retirement";
+                    let mut retiring = Box::pin(supervise_retirement(
+                        &cx,
+                        deadline,
+                        guard.close_synchronously(&cx, deadline, context),
+                        |error| pool.shared.record_retirement_failure(context, error),
+                    ));
+
+                    assert!(retiring.as_mut().await.is_err());
+                    assert_eq!(cx.now(), Time::from_millis(grace_ms));
+                    // Retain the completed supervisor: its Ready result, not its
+                    // later destruction, must release the owned close future.
+                    assert_eq!(closes.load(Ordering::Relaxed), usize::from(grace_ms > 0));
+                    assert_drop_precedes_slot_release(&dropped);
+                    assert_no_occupied_slots(&pool);
+                    assert_eq!(pool.stats().connections_closed, 1);
+                    assert_eq!(pool.stats().timeouts, 0);
+                    assert_sticky_retirement_failure(&pool);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn lab_synchronous_retirement_does_not_fail_after_successful_final_release() {
+        let (clock, driver) = virtual_clock();
+        let mut runtime = LabRuntime::new(LabConfig::new(0x43_0003));
+        runtime.state.set_timer_driver(driver.clone());
+        let pool = Arc::new(Pool::with_timer_driver(
+            PoolConfig::new(1).acquire_timeout(50),
+            driver,
+        ));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        let completed = Arc::new(OnceCell::new());
+        let record = Arc::clone(&completed);
+        let (task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("lab task context");
+                let dropped = Arc::new(OnceCell::new());
+                let mut lease = pool
+                    .acquire(&cx, || async {
+                        Outcome::Ok(
+                            MockConnection::new(1).observe_drop(&pool, Arc::clone(&dropped)),
+                        )
+                    })
+                    .await
+                    .expect("create lease before retirement");
+                let guard = ActiveConnectionGuard::new(
+                    Arc::clone(&pool.shared),
+                    lease.meta.take().expect("transfer lease ownership"),
+                );
+                drop(lease);
+                pool.close();
+                let wake = Arc::new(DrainFailureWake {
+                    pool: Arc::downgrade(&pool.shared),
+                    observed: OnceCell::new(),
+                    advance_after_wake: Some((clock, 50_000_000)),
+                });
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut drain = Box::pin(pool.close_and_drain(&cx));
+                {
+                    let mut task_cx = Context::from_waker(&waker);
+                    assert!(drain.as_mut().poll(&mut task_cx).is_pending());
+                }
+                let deadline = Time::from_millis(50);
+                let context = "lab ready retirement boundary";
+                supervise_retirement(
+                    &cx,
+                    deadline,
+                    guard.close_synchronously(&cx, deadline, context),
+                    |error| pool.shared.record_retirement_failure(context, error),
+                )
+                .await
+                .expect("the close completed before the final-slot wake advanced time");
+
+                assert_eq!(cx.now(), deadline);
+                assert_eq!(wake.observed.get(), Some(&false));
+                assert!(pool.shared.retirement_failure_error().is_none());
+                assert_drop_precedes_slot_release(&dropped);
+                assert_no_occupied_slots(&pool);
+                drain
+                    .await
+                    .expect("successful retirement remains successful");
+                let _ = record.set(());
+            })
+            .expect("spawn final-release boundary regression");
+        runtime.scheduler.lock().schedule(task, 0);
+        runtime.run_with_auto_advance();
+        assert!(completed.get().is_some());
     }
 
     #[test]
