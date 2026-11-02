@@ -56,7 +56,8 @@ pub use unit_of_work::{PendingCounts, UnitOfWork, UowError};
 use asupersync::{CancelReason, Cx, Outcome};
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{
-    Connection, Error, Lazy, LazyLoader, Model, RetryDecision, RetryPolicy, TransactionMode, Value,
+    Connection, Error, Lazy, LazyLoader, Model, RetryDecision, RetryPolicy, TransactionErrorKind,
+    TransactionMode, Value,
 };
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -2086,6 +2087,12 @@ impl<C: Connection> Session<C> {
     }
 
     /// Commit the current transaction.
+    ///
+    /// A driver-confirmed rollback returns
+    /// [`TransactionErrorKind::AlreadyRolledBack`] after reconciling the tracked
+    /// objects and firing `AfterRollback`. It never fires `AfterCommit`. If the
+    /// rollback notification fails, that failure is logged while the original
+    /// transaction error remains the result.
     pub async fn commit(&mut self, cx: &Cx) -> Outcome<(), Error> {
         // Flush any pending changes first
         match self.flush(cx).await {
@@ -2104,11 +2111,29 @@ impl<C: Connection> Session<C> {
             if let outcome @ (Outcome::Err(_) | Outcome::Cancelled(_)) = enforce_budget(cx) {
                 return outcome;
             }
-            match self.connection.execute(cx, "COMMIT", &[]).await {
-                Outcome::Ok(_) => {
+            match self.connection.commit_transaction(cx).await {
+                Outcome::Ok(()) => {
                     self.in_transaction = false;
                 }
-                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Err(error) => {
+                    if matches!(
+                        &error,
+                        Error::Transaction(transaction)
+                            if transaction.kind == TransactionErrorKind::AlreadyRolledBack
+                    ) {
+                        self.in_transaction = false;
+                        self.reconcile_after_rollback();
+                        if let Err(callback_error) =
+                            self.event_callbacks.fire(SessionEvent::AfterRollback)
+                        {
+                            tracing::warn!(
+                                error = %callback_error,
+                                "after_rollback callback failed after confirmed transaction rollback"
+                            );
+                        }
+                    }
+                    return Outcome::Err(error);
+                }
                 Outcome::Cancelled(r) => return Outcome::Cancelled(r),
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
@@ -2239,8 +2264,8 @@ impl<C: Connection> Session<C> {
 
     pub async fn rollback(&mut self, cx: &Cx) -> Outcome<(), Error> {
         if self.in_transaction {
-            match self.connection.execute(cx, "ROLLBACK", &[]).await {
-                Outcome::Ok(_) => {
+            match self.connection.rollback_transaction(cx).await {
+                Outcome::Ok(()) => {
                     self.in_transaction = false;
                 }
                 Outcome::Err(e) => return Outcome::Err(e),
@@ -2249,6 +2274,19 @@ impl<C: Connection> Session<C> {
             }
         }
 
+        self.reconcile_after_rollback();
+
+        // Fire after_rollback event after state reflects the database outcome.
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterRollback) {
+            return Outcome::Err(e);
+        }
+
+        Outcome::Ok(())
+    }
+
+    /// Reconcile tracked objects after the database has acknowledged rollback.
+    /// Kept synchronous so the entire transition finishes before callbacks run.
+    fn reconcile_after_rollback(&mut self) {
         // Clear pending operations
         self.pending_new.clear();
         self.pending_delete.clear();
@@ -2279,13 +2317,6 @@ impl<C: Connection> Session<C> {
         for key in to_remove {
             self.identity_map.remove(&key);
         }
-
-        // Fire after_rollback event
-        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterRollback) {
-            return Outcome::Err(e);
-        }
-
-        Outcome::Ok(())
     }
 
     // ========================================================================
@@ -3819,6 +3850,8 @@ mod tests {
         executed: Vec<(String, Vec<Value>)>,
         /// Suspend this call before recording any database effect.
         stall_execute_at: Option<usize>,
+        /// Return this error once, after recording the next COMMIT attempt.
+        commit_error: Option<Error>,
     }
 
     #[derive(Debug, Clone)]
@@ -3932,12 +3965,20 @@ mod tests {
                 if stall {
                     std::future::pending::<()>().await;
                 }
-                state
-                    .lock()
-                    .expect("lock poisoned")
-                    .executed
-                    .push((sql, params));
-                Outcome::Ok(0)
+                let commit_error = {
+                    let mut guard = state.lock().expect("lock poisoned");
+                    let error = if sql == "COMMIT" {
+                        guard.commit_error.take()
+                    } else {
+                        None
+                    };
+                    guard.executed.push((sql, params));
+                    error
+                };
+                match commit_error {
+                    Some(error) => Outcome::Err(error),
+                    None => Outcome::Ok(0),
+                }
             }
         }
 
@@ -5703,6 +5744,134 @@ mod tests {
             "old + fresh + fresh again: {:?}",
             guard.executed
         );
+    }
+
+    fn exercise_commit_rollback_acknowledgement(notification_fails: bool) {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut session = Session::with_config(
+            MockConnection::new(Arc::clone(&state)),
+            SessionConfig {
+                // Rollback must expire existing state even when a successful
+                // commit would retain it.
+                expire_on_commit: false,
+                ..SessionConfig::default()
+            },
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let committed_events = Arc::clone(&events);
+        session.on_after_commit(move || {
+            committed_events
+                .lock()
+                .unwrap()
+                .push(SessionEvent::AfterCommit);
+            Ok(())
+        });
+        let rolled_back_events = Arc::clone(&events);
+        session.on_after_rollback(move || {
+            rolled_back_events
+                .lock()
+                .unwrap()
+                .push(SessionEvent::AfterRollback);
+            if notification_fails {
+                // A retryable notification failure must not replace the
+                // server's definitive rollback acknowledgement.
+                Err(Error::Timeout)
+            } else {
+                Ok(())
+            }
+        });
+
+        rt.block_on(async {
+            let mut existing = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await)
+                .expect("existing database row");
+            let flushed = Team {
+                id: Some(3),
+                name: "flushed before commit".to_string(),
+            };
+            session.add(&flushed);
+            unwrap_outcome(session.flush(&cx).await);
+            assert_eq!(
+                session.object_state(&flushed),
+                Some(ObjectState::Persistent)
+            );
+            assert_eq!(session.inserted_in_transaction.len(), 1);
+
+            existing.name = "rolled-back update".to_string();
+            session.mark_dirty(&existing);
+            let pending = Team {
+                id: Some(4),
+                name: "flushed during commit".to_string(),
+            };
+            session.add(&pending);
+            assert_eq!(session.debug_state().pending_new, 1);
+            assert_eq!(session.debug_state().pending_dirty, 1);
+            state.lock().unwrap().commit_error =
+                Some(Error::Transaction(sqlmodel_core::error::TransactionError {
+                    kind: sqlmodel_core::TransactionErrorKind::AlreadyRolledBack,
+                    message: "server acknowledged ROLLBACK instead of COMMIT".to_string(),
+                }));
+
+            let outcome = session.commit(&cx).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Outcome::Err(Error::Transaction(ref error))
+                        if error.kind == sqlmodel_core::TransactionErrorKind::AlreadyRolledBack
+                ),
+                "definitive rollback must remain the returned outcome: {outcome:?}"
+            );
+            assert!(
+                !session.in_transaction(),
+                "the server has acknowledged the end of the transaction"
+            );
+            assert!(session.inserted_in_transaction.is_empty());
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 0);
+            assert_eq!(info.pending_dirty, 0);
+            assert_eq!(info.pending_delete, 0);
+            assert_eq!(session.object_state(&flushed), None);
+            assert_eq!(session.object_state(&pending), None);
+            assert_eq!(
+                session.object_state(&existing),
+                Some(ObjectState::Expired),
+                "the tracked update was rolled back"
+            );
+            assert!(matches!(session.expired_attributes(&existing), Some(None)));
+            assert_eq!(*events.lock().unwrap(), vec![SessionEvent::AfterRollback]);
+
+            let guard = state.lock().unwrap();
+            assert_eq!(
+                guard
+                    .executed
+                    .iter()
+                    .filter(|(sql, _)| sql == "COMMIT")
+                    .count(),
+                1
+            );
+            assert!(
+                guard.executed.iter().all(|(sql, _)| sql != "ROLLBACK"),
+                "a definitive rollback acknowledgement needs no second ROLLBACK"
+            );
+            drop(guard);
+
+            session.add(&flushed);
+            assert_eq!(session.object_state(&flushed), Some(ObjectState::New));
+            assert_eq!(session.debug_state().pending_new, 1);
+        });
+    }
+
+    #[test]
+    fn commit_rollback_acknowledgement_reconciles_session_tracking() {
+        exercise_commit_rollback_acknowledgement(false);
+    }
+
+    #[test]
+    fn commit_rollback_acknowledgement_preserves_error_when_notification_fails() {
+        exercise_commit_rollback_acknowledgement(true);
     }
 
     /// `mark_dirty` on an object expired by `commit` must still produce the

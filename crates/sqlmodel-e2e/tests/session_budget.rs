@@ -92,6 +92,16 @@ impl Connection for SleepingConnection {
         self.inner.supports_transaction_mode(mode)
     }
 
+    async fn commit_transaction(&self, cx: &Cx) -> Outcome<(), Error> {
+        std::thread::sleep(Duration::from_millis(STMT_MS));
+        self.inner.commit_transaction(cx).await
+    }
+
+    async fn rollback_transaction(&self, cx: &Cx) -> Outcome<(), Error> {
+        std::thread::sleep(Duration::from_millis(STMT_MS));
+        self.inner.rollback_transaction(cx).await
+    }
+
     async fn prepare(&self, cx: &Cx, sql: &str) -> Outcome<PreparedStatement, Error> {
         self.inner.prepare(cx, sql).await
     }

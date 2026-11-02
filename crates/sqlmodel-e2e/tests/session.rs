@@ -1,22 +1,28 @@
 //! `Session` (unit of work) against real databases. Until this file existed the
 //! session layer had only ever talked to an in-crate mock connection.
 //!
-//! Every assertion about database state goes through a raw query on the
-//! session's own connection, so the session cannot vouch for itself.
+//! Database-state assertions use raw queries. Transaction-finalization
+//! witnesses also use an independent observer to distinguish uncommitted rows
+//! from durable writes.
 
 // The session's event callbacks are `FnMut() -> Result<(), Error>`; the size of
 // `Error` is the library's contract, not something this test can change.
 #![allow(clippy::result_large_err)]
 
-use asupersync::{CancelKind, Cx, Outcome};
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::{Budget, CancelKind, Cx, Outcome};
 use serde::{Deserialize, Serialize};
 use sqlmodel::prelude::*;
 use sqlmodel::{SchemaBuilder, Session};
-use sqlmodel_core::{Lazy, LinkTableInfo, RelatedMany};
+use sqlmodel_core::test_support::CancelAt;
+use sqlmodel_core::{Lazy, LinkTableInfo, RelatedMany, TransactionErrorKind};
 use sqlmodel_e2e::{
-    CapturingConnection, DriverUnderTest, OwnedScenario, expect_outcome, run_owned_on_every_driver,
+    CapturingConnection, DriverUnderTest, OwnedScenario, POSTGRES_URL_ENV, expect_outcome,
+    parse_postgres_url, run_owned_on_every_driver,
 };
-use std::sync::{Arc, Mutex};
+use sqlmodel_postgres::{PgConfig, SharedPgConnection};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 /// Author <-> Tag link table, seen from the author side.
 const AUTHOR_TAGS: LinkTableInfo =
@@ -695,6 +701,307 @@ fn session_unit_of_work_and_relationships_work_on_every_available_driver() {
     let ran = run_owned_on_every_driver(&cx, &StatementReuse);
     assert!(ran.contains(&"frankensqlite"), "{ran:?}");
     assert!(ran.contains(&"c-sqlite(memory)"), "{ran:?}");
+}
+
+/// Independent of the async runtime's deadline machinery. Completing a case
+/// cancels and joins this watchdog rather than leaving a detached sleeper.
+struct SessionWatchdog {
+    done: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SessionWatchdog {
+    fn start(label: &'static str) -> Self {
+        let (done, completion) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            if completion.recv_timeout(Duration::from_secs(30))
+                == Err(mpsc::RecvTimeoutError::Timeout)
+            {
+                eprintln!("{label}: production Session regression exceeded the 30-second watchdog");
+                std::process::abort();
+            }
+        });
+        Self {
+            done,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for SessionWatchdog {
+    fn drop(&mut self) {
+        let _ = self.done.send(());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("Session watchdog must join");
+        }
+    }
+}
+
+fn postgres_session_config() -> Option<PgConfig> {
+    match std::env::var(POSTGRES_URL_ENV) {
+        Ok(url) => Some(parse_postgres_url(&url).expect("valid SQLMODEL_TEST_POSTGRES_URL")),
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("skipping PostgreSQL Session finalization tests: set {POSTGRES_URL_ENV}");
+            assert_ne!(
+                std::env::var("SQLMODEL_TEST_REQUIRE_SERVICES").as_deref(),
+                Ok("1"),
+                "PostgreSQL Session witnesses require SQLMODEL_TEST_POSTGRES_URL"
+            );
+            None
+        }
+        Err(error) => panic!("invalid {POSTGRES_URL_ENV}: {error}"),
+    }
+}
+
+async fn postgres_session_backend<C: Connection>(cx: &Cx, connection: &C) -> i64 {
+    expect_outcome(
+        connection.query(cx, "SELECT pg_backend_pid()", &[]).await,
+        "Session backend PID",
+    )[0]
+    .get_as::<i64>(0)
+    .expect("PostgreSQL backend PID")
+}
+
+fn record_session_finalization<C: Connection>(
+    session: &mut Session<C>,
+) -> Arc<Mutex<Vec<&'static str>>> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hook = |name| {
+        let events = Arc::clone(&events);
+        move || {
+            events.lock().expect("finalization events").push(name);
+            Ok(())
+        }
+    };
+    session.on_before_commit(hook("before_commit"));
+    session.on_after_commit(hook("after_commit"));
+    session.on_after_rollback(hook("after_rollback"));
+    events
+}
+
+#[test]
+fn postgres_session_commit_rejects_server_rollback_after_statement_error() {
+    let Some(cfg) = postgres_session_config() else {
+        return;
+    };
+    let _watchdog = SessionWatchdog::start("PostgreSQL Session server rollback");
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production Session runtime");
+    let cx = rt.request_cx_with_budget(
+        Budget::new().with_deadline(asupersync::time::wall_now() + Duration::from_secs(5)),
+    );
+    rt.block_on(async {
+        let writer = expect_outcome(
+            SharedPgConnection::connect(&cx, cfg.clone()).await,
+            "connect Session writer",
+        );
+        // Both generic wrappers must forward semantic finalization to the
+        // driver; falling back to execute("COMMIT") loses the rollback tag.
+        let writer = CancelAt::new(CapturingConnection::new(writer), 0);
+        let observer = expect_outcome(
+            SharedPgConnection::connect(&cx, cfg).await,
+            "connect independent Session observer",
+        );
+        let original_backend = postgres_session_backend(&cx, &writer).await;
+        let observer_backend = postgres_session_backend(&cx, &observer).await;
+        let table = sqlmodel_e2e::unique_table("session_commit_outcome");
+        expect_outcome(
+            writer
+                .execute(&cx, &format!("CREATE TABLE {table} (marker INTEGER)"), &[])
+                .await,
+            "create Session commit marker table",
+        );
+        let mut session = Session::new(writer);
+        let events = record_session_finalization(&mut session);
+        expect_outcome(session.begin(&cx).await, "begin Session before server error");
+        expect_outcome(
+            session
+                .connection()
+                .execute(&cx, &format!("INSERT INTO {table} VALUES (1)"), &[])
+                .await,
+            "insert uncommitted Session marker",
+        );
+        let visible_before = count(&cx, &observer, &table, "visibility before server error").await;
+        let statement_error = session.connection().execute(&cx, "SELECT 1 / 0", &[]).await;
+        // No pending ORM writes remain: commit must reach PostgreSQL's COMMIT
+        // acknowledgment rather than fail earlier while flushing an aborted tx.
+        let committed = session.commit(&cx).await;
+        let still_in_transaction = session.in_transaction();
+        let commit_events = events.lock().expect("finalization events").clone();
+        let commit_checkpoints = session
+            .connection()
+            .log()
+            .iter()
+            .filter(|call| call.sql.as_deref() == Some("COMMIT"))
+            .count();
+        let captured_commits = session
+            .connection()
+            .inner()
+            .statements()
+            .iter()
+            .filter(|(sql, _)| sql == "COMMIT")
+            .count();
+        let cancellation_injected = session.connection().cancellation_injected();
+        let persisted = count(&cx, &observer, &table, "durability after failed transaction").await;
+        let backend_after = postgres_session_backend(&cx, session.connection()).await;
+        let healthy_query = session.connection().query(&cx, "SELECT 7", &[]).await;
+
+        // A definitive rollback must also reset Session's transaction flag.
+        // Otherwise begin() can become a no-op and this INSERT autocommits.
+        expect_outcome(session.begin(&cx).await, "begin Session recovery transaction");
+        expect_outcome(
+            session
+                .connection()
+                .execute(&cx, &format!("INSERT INTO {table} VALUES (2)"), &[])
+                .await,
+            "insert Session recovery marker",
+        );
+        let visible_during_recovery =
+            count(&cx, &observer, &table, "recovery transaction isolation").await;
+        expect_outcome(session.rollback(&cx).await, "rollback Session recovery");
+        let persisted_after_recovery =
+            count(&cx, &observer, &table, "durability after recovery rollback").await;
+        let recovery_backend = postgres_session_backend(&cx, session.connection()).await;
+
+        // Cleanup precedes the expected RED assertion: a false Ok must not
+        // leave its table or either physical connection behind.
+        expect_outcome(
+            observer.execute(&cx, &format!("DROP TABLE {table}"), &[]).await,
+            "remove Session commit marker table",
+        );
+        session
+            .into_connection()
+            .close(&cx)
+            .await
+            .expect("close Session writer");
+        observer.close(&cx).await.expect("close Session observer");
+
+        eprintln!(
+            "PostgreSQL Session finalization: commit={committed:?}, persisted={persisted}, \
+             in_transaction={still_in_transaction}, events={commit_events:?}, \
+             original_backend={original_backend}, backend_after={backend_after}, \
+             commit_checkpoints={commit_checkpoints}, captured_commits={captured_commits}"
+        );
+        assert!(
+            matches!(statement_error, Outcome::Err(Error::Query(error)) if error.sqlstate.as_deref() == Some("22012")),
+            "the fixture must abort its transaction with division by zero"
+        );
+        assert!(
+            matches!(&committed, Outcome::Err(Error::Transaction(error)) if error.kind == TransactionErrorKind::AlreadyRolledBack),
+            "Session must reject a COMMIT acknowledged as ROLLBACK, got {committed:?} with {persisted} durable rows"
+        );
+        assert!(!still_in_transaction, "the server acknowledged a terminal rollback");
+        assert!(!commit_events.contains(&"after_commit"));
+        assert_eq!(commit_events.iter().filter(|event| **event == "before_commit").count(), 1);
+        assert_eq!(commit_events.iter().filter(|event| **event == "after_rollback").count(), 1);
+        assert_eq!(commit_checkpoints, 1, "one recorded COMMIT checkpoint");
+        assert_eq!(captured_commits, 1, "one captured COMMIT statement");
+        assert!(!cancellation_injected, "checkpoint zero records without cancellation");
+        assert_ne!(observer_backend, original_backend, "observer must be independent");
+        assert_eq!(visible_before, 0);
+        assert_eq!(persisted, 0);
+        assert_eq!(backend_after, original_backend);
+        assert_eq!(recovery_backend, original_backend);
+        let healthy_rows = expect_outcome(healthy_query, "writer remains usable after server rollback");
+        assert_eq!(healthy_rows[0].get_as::<i64>(0).expect("healthy SELECT 7"), 7);
+        assert_eq!(visible_during_recovery, 0, "recovery BEGIN must preserve isolation");
+        assert_eq!(persisted_after_recovery, 0, "recovery rollback must discard its marker");
+    });
+}
+
+#[test]
+fn postgres_session_commit_and_rollback_preserve_backend_and_persistence() {
+    let Some(cfg) = postgres_session_config() else {
+        return;
+    };
+    let _watchdog = SessionWatchdog::start("PostgreSQL Session healthy finalization");
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .expect("production Session runtime");
+    let cx = rt.request_cx_with_budget(
+        Budget::new().with_deadline(asupersync::time::wall_now() + Duration::from_secs(5)),
+    );
+    rt.block_on(async {
+        let writer = expect_outcome(
+            SharedPgConnection::connect(&cx, cfg.clone()).await,
+            "connect healthy Session writer",
+        );
+        let observer = expect_outcome(
+            SharedPgConnection::connect(&cx, cfg).await,
+            "connect healthy Session observer",
+        );
+        let original_backend = postgres_session_backend(&cx, &writer).await;
+        let observer_backend = postgres_session_backend(&cx, &observer).await;
+        let mut session = Session::new(writer);
+        let events = record_session_finalization(&mut session);
+        for commit in [true, false] {
+            let table = sqlmodel_e2e::unique_table("session_healthy_finish");
+            expect_outcome(
+                session
+                    .connection()
+                    .execute(&cx, &format!("CREATE TABLE {table} (marker INTEGER)"), &[])
+                    .await,
+                "create healthy Session marker table",
+            );
+            expect_outcome(
+                session.begin(&cx).await,
+                "begin healthy Session transaction",
+            );
+            expect_outcome(
+                session
+                    .connection()
+                    .execute(&cx, &format!("INSERT INTO {table} VALUES (1)"), &[])
+                    .await,
+                "insert healthy Session marker",
+            );
+            let visible_before = count(&cx, &observer, &table, "uncommitted visibility").await;
+            let finalized = if commit {
+                session.commit(&cx).await
+            } else {
+                session.rollback(&cx).await
+            };
+            let still_in_transaction = session.in_transaction();
+            let finish_events = std::mem::take(&mut *events.lock().expect("finalization events"));
+            let persisted = count(&cx, &observer, &table, "healthy finalization durability").await;
+            let backend_after = postgres_session_backend(&cx, session.connection()).await;
+            expect_outcome(
+                observer
+                    .execute(&cx, &format!("DROP TABLE {table}"), &[])
+                    .await,
+                "remove healthy Session marker table",
+            );
+
+            eprintln!(
+                "PostgreSQL Session healthy finalization: commit={commit}, outcome={finalized:?}, \
+                 persisted={persisted}, backend={backend_after}, events={finish_events:?}"
+            );
+            expect_outcome(finalized, "healthy Session finalization");
+            assert_ne!(
+                observer_backend, original_backend,
+                "observer must be independent"
+            );
+            assert_eq!(visible_before, 0);
+            assert_eq!(persisted, i64::from(commit));
+            assert!(!still_in_transaction);
+            assert_eq!(backend_after, original_backend);
+            let expected_events = if commit {
+                vec!["before_commit", "after_commit"]
+            } else {
+                vec!["after_rollback"]
+            };
+            assert_eq!(finish_events, expected_events);
+        }
+        session
+            .into_connection()
+            .close(&cx)
+            .await
+            .expect("close healthy Session writer");
+        observer
+            .close(&cx)
+            .await
+            .expect("close healthy Session observer");
+    });
 }
 
 /// A server-side statement counter, where the server keeps one.

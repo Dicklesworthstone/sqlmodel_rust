@@ -466,6 +466,41 @@ pub trait Connection: Send + Sync {
         }
     }
 
+    /// Commit a transaction managed directly on this connection.
+    ///
+    /// Higher-level owners such as a Session use this after issuing `BEGIN`
+    /// through [`Connection::execute`]. Transactions returned by
+    /// [`Connection::begin`] must use [`TransactionOps::commit`] instead.
+    ///
+    /// Success means the database acknowledged a commit. Drivers whose
+    /// protocol can acknowledge a rollback in response to `COMMIT` must
+    /// override this method instead of discarding that acknowledgement in a
+    /// rows-affected count. [`crate::TransactionErrorKind::AlreadyRolledBack`]
+    /// means the database definitively rolled back and has no active
+    /// transaction, so the owner can reconcile its local state.
+    ///
+    /// The default executes `COMMIT`. Connection wrappers must forward this
+    /// hook to preserve their inner driver's finalization semantics.
+    fn commit_transaction(
+        &self,
+        cx: &Cx,
+    ) -> impl Future<Output = Outcome<(), crate::Error>> + Send {
+        async move { self.execute(cx, "COMMIT", &[]).await.map(|_| ()) }
+    }
+
+    /// Roll back a transaction managed directly on this connection.
+    ///
+    /// Success means the database acknowledged the rollback. The default
+    /// executes `ROLLBACK`; connection wrappers must forward this hook to
+    /// preserve their inner driver's finalization semantics. Transactions
+    /// returned by [`Connection::begin`] use [`TransactionOps::rollback`].
+    fn rollback_transaction(
+        &self,
+        cx: &Cx,
+    ) -> impl Future<Output = Outcome<(), crate::Error>> + Send {
+        async move { self.execute(cx, "ROLLBACK", &[]).await.map(|_| ()) }
+    }
+
     /// Prepare a statement for repeated execution.
     ///
     /// Prepared statements are cached by the driver and can be executed

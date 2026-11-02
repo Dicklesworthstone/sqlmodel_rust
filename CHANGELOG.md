@@ -38,6 +38,15 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- ORM Session finalization now preserves PostgreSQL's command acknowledgement.
+  If a statement has aborted the transaction, a `COMMIT` acknowledged as
+  `ROLLBACK` returns `AlreadyRolledBack`, reconciles tracked objects, and fires
+  `AfterRollback` instead of reporting success or firing `AfterCommit`.
+  Notification failures cannot replace that database outcome. Additive
+  connection hooks carry these semantics through connection wrappers, while
+  the typed PostgreSQL transaction retains its exclusive cleanup ownership.
+  Native regressions check durability from an independent backend and verify
+  healthy commit, rollback, and subsequent reuse on the original backend.
 - Synchronous pool retirement now uses `acquire_timeout` as a finite grace,
   with one deadline for an entire idle batch. Returning a lease to a closed
   pool, retiring an expired lease, and dropping a lease after its pool is gone

@@ -585,6 +585,45 @@ impl PgAsyncConnection {
         }
     }
 
+    /// Preserve the terminal command tag for owners that need to distinguish
+    /// a committed transaction from PostgreSQL rolling back an aborted one.
+    async fn finish_transaction(&mut self, cx: &Cx, sql: &str) -> Outcome<(), Error> {
+        let result = match self.run_extended(cx, sql, &[]).await {
+            Outcome::Ok(result) => result,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
+        };
+        if !matches!(
+            self.state,
+            ConnectionState::Ready(TransactionStatusState::Idle)
+        ) {
+            let error = protocol_error(format!(
+                "PostgreSQL did not end the transaction after {sql}: {:?}",
+                self.state
+            ));
+            self.close_stream();
+            return Outcome::Err(error);
+        }
+        match result.command_tag.as_deref() {
+            Some(tag) if tag == sql => Outcome::Ok(()),
+            Some("ROLLBACK") if sql == "COMMIT" => {
+                Outcome::Err(Error::Transaction(TransactionError {
+                    kind: TransactionErrorKind::AlreadyRolledBack,
+                    message: "PostgreSQL rolled back the failed transaction instead of committing"
+                        .to_string(),
+                }))
+            }
+            _ => {
+                self.close_stream();
+                Outcome::Err(protocol_error(format!(
+                    "Unexpected acknowledgement for {sql}: {:?}",
+                    result.command_tag
+                )))
+            }
+        }
+    }
+
     /// Execute an INSERT and return the inserted id.
     ///
     /// PostgreSQL requires `RETURNING` to retrieve generated IDs. This method
@@ -1871,6 +1910,19 @@ impl SharedPgConnection {
         &self.inner
     }
 
+    async fn finish_transaction_impl(&self, cx: &Cx, sql: &str) -> Outcome<(), Error> {
+        if let Some(reason) = sqlmodel_core::cancel_requested(cx) {
+            return Outcome::Cancelled(reason);
+        }
+        let mut guard = match lock_owned(Arc::clone(&self.inner), cx).await {
+            Outcome::Ok(guard) => guard,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(info) => return Outcome::Panicked(info),
+        };
+        guard.finish_transaction(cx, sql).await
+    }
+
     async fn begin_transaction_impl(
         &self,
         cx: &Cx,
@@ -2006,31 +2058,11 @@ impl SharedPgTransaction<'_> {
     async fn finish(self, cx: &Cx, sql: &str) -> Outcome<(), Error> {
         let outcome = match lock_owned(Arc::clone(&self.state), cx).await {
             Outcome::Ok(mut state) => {
-                let outcome = state.connection_mut().run_extended(cx, sql, &[]).await;
+                let outcome = state.connection_mut().finish_transaction(cx, sql).await;
                 // Ready(Idle) is safe after COMMIT/ROLLBACK, including a server
                 // error that ends the transaction. Any unfinished state closes.
                 state.release_connection();
-                match outcome {
-                    Outcome::Ok(result) if result.command_tag.as_deref() == Some(sql) => {
-                        Outcome::Ok(())
-                    }
-                    Outcome::Ok(result)
-                        if sql == "COMMIT" && result.command_tag.as_deref() == Some("ROLLBACK") =>
-                    {
-                        Outcome::Err(Error::Transaction(TransactionError {
-                            kind: TransactionErrorKind::AlreadyRolledBack,
-                            message: "PostgreSQL rolled back the failed transaction instead of committing"
-                                .to_string(),
-                        }))
-                    }
-                    Outcome::Ok(result) => Outcome::Err(protocol_error(format!(
-                        "Unexpected acknowledgement for {sql}: {:?}",
-                        result.command_tag
-                    ))),
-                    Outcome::Err(error) => Outcome::Err(error),
-                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-                    Outcome::Panicked(info) => Outcome::Panicked(info),
-                }
+                outcome
             }
             Outcome::Err(error) => Outcome::Err(error),
             Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
@@ -2191,6 +2223,14 @@ impl Connection for SharedPgConnection {
         isolation: IsolationLevel,
     ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
         self.begin_transaction_impl(cx, Some(isolation))
+    }
+
+    fn commit_transaction(&self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        self.finish_transaction_impl(cx, "COMMIT")
+    }
+
+    fn rollback_transaction(&self, cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+        self.finish_transaction_impl(cx, "ROLLBACK")
     }
 
     /// PostgreSQL transactions are MVCC-concurrent by nature, so

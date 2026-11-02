@@ -92,6 +92,31 @@ When models are added to a session or loaded via `session.get`, they are tracked
 | `session.refresh(cx, &mut model)` | Re-reads current column values from the database into the model. |
 | `session.merge(cx, model)` | Incorporates the state of a detached model into the session. |
 
+### Transaction acknowledgements and lifecycle events
+
+PostgreSQL can respond to `COMMIT` with a `ROLLBACK` acknowledgement when a
+previous statement aborted the transaction. `Session::commit` returns
+`Error::Transaction` with `TransactionErrorKind::AlreadyRolledBack` in that
+case. It marks the transaction inactive, removes tracked inserts whose rows
+were rolled back, expires other affected persistent objects, and fires
+`AfterRollback` exactly once. It does not fire `AfterCommit`. A failing
+`AfterRollback` callback is logged without replacing the database's rollback
+result.
+
+A normal acknowledged commit still fires `AfterCommit`; explicit rollback
+fires `AfterRollback`. PostgreSQL connections remain usable after these
+completed exchanges. Other errors or cancellation do not establish a
+definitive transaction outcome: the Session retains its conservative state
+until rollback succeeds, and an interrupted PostgreSQL wire exchange closes
+the socket to prevent unsafe reuse.
+
+Connection adapters must forward `Connection::commit_transaction` and
+`Connection::rollback_transaction` to their inner driver. Using the default
+raw SQL implementation in a wrapper would discard a PostgreSQL driver's
+command-tag checks. These hooks are for owners such as Session that issue
+`BEGIN` directly; typed transactions returned by `Connection::begin` continue
+to use their own `TransactionOps::commit` and `TransactionOps::rollback`.
+
 ---
 
 ## Resilient Transactions with `with_retry`

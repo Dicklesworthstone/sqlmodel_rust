@@ -203,6 +203,26 @@ where
             .map(|tx| self.tx_wrapper(tx))
     }
 
+    async fn commit_transaction(&self, cx: &Cx) -> Outcome<(), Error> {
+        self.state.arm(
+            cx,
+            "commit_transaction",
+            Some("COMMIT"),
+            self.cancel_from_call,
+        );
+        self.inner.commit_transaction(cx).await
+    }
+
+    async fn rollback_transaction(&self, cx: &Cx) -> Outcome<(), Error> {
+        self.state.arm(
+            cx,
+            "rollback_transaction",
+            Some("ROLLBACK"),
+            self.cancel_from_call,
+        );
+        self.inner.rollback_transaction(cx).await
+    }
+
     async fn prepare(&self, cx: &Cx, sql: &str) -> Outcome<PreparedStatement, Error> {
         self.state
             .arm(cx, "prepare", Some(sql), self.cancel_from_call);

@@ -34,7 +34,7 @@ use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
 use sqlmodel::Session;
 use sqlmodel::prelude::*;
-use sqlmodel_core::test_support::CancelAt;
+use sqlmodel_core::test_support::{CallRecord, CancelAt};
 use sqlmodel_core::{
     Lazy, LinkTableInfo, RelatedMany, RetryPolicy, TransactionOptions, retry_transaction,
 };
@@ -298,6 +298,16 @@ enum Oracle {
     },
 }
 
+fn is_commit_call(record: &CallRecord) -> bool {
+    matches!(record.call, "tx.commit" | "commit_transaction")
+        || record.sql.as_deref().is_some_and(|sql| {
+            sql.trim_start()
+                .split(|ch: char| ch.is_whitespace() || ch == ';')
+                .next()
+                .is_some_and(|keyword| keyword.eq_ignore_ascii_case("COMMIT"))
+        })
+}
+
 async fn sweep(
     name: &str,
     fixture: &Fixture,
@@ -349,8 +359,7 @@ async fn sweep(
             "{name}: checkpoint {k} is not marked cancelled-before; log {log:?}"
         );
         assert!(
-            !log.iter()
-                .any(|r| r.call == "tx.commit" && !r.cancelled_before),
+            !log.iter().any(|r| is_commit_call(r) && !r.cancelled_before),
             "{name}: a commit ran at or after the cancellation point; log {log:?}"
         );
         // The run Cx is cancelled by the sweep; state reads need a clean one.
@@ -678,8 +687,11 @@ where
             }
         }
         assert!(
-            !log.iter()
-                .any(|r| r.call == "tx.commit" && !r.cancelled_before),
+            log.get(k - 1).is_some_and(|r| r.cancelled_before),
+            "{name}: checkpoint {k} is not marked cancelled-before; log {log:?}"
+        );
+        assert!(
+            !log.iter().any(|r| is_commit_call(r) && !r.cancelled_before),
             "{name}: a commit ran at or after the cancellation point; log {log:?}"
         );
         // A cancelled op leaves the session's transaction open (the caller

@@ -429,6 +429,16 @@ impl<C: Connection> Connection for CapturingConnection<C> {
         self.inner.begin_with_options(cx, options).await
     }
 
+    async fn commit_transaction(&self, cx: &Cx) -> Outcome<(), Error> {
+        self.record("COMMIT", &[]);
+        self.inner.commit_transaction(cx).await
+    }
+
+    async fn rollback_transaction(&self, cx: &Cx) -> Outcome<(), Error> {
+        self.record("ROLLBACK", &[]);
+        self.inner.rollback_transaction(cx).await
+    }
+
     async fn prepare(
         &self,
         cx: &Cx,
