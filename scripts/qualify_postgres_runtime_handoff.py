@@ -149,6 +149,9 @@ def fixture_manifest(args: argparse.Namespace, root: Path, runtime_version: str,
         "publish = false",
         "",
         "[workspace]",
+        # Keep the copied crates in their own workspace so inherited package
+        # fields and dependencies come from the staged workspace manifest.
+        'exclude = ["staged-workspace"]',
         "",
         "[[bin]]",
         'name = "postgres-runtime-handoff"',

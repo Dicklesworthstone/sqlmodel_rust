@@ -114,6 +114,15 @@ fn postgres_handoff(flavor: RuntimeFlavor, exit: HolderExit) {
             let rows = expect_ok(lease.query(&cx, "SELECT 1", &[]).await, "holder query");
             assert_eq!(rows.len(), 1);
             let pid = backend_pid(&cx, &lease).await;
+            // A delayed server response makes the holder await socket
+            // readiness before its reactor exits. Immediate loopback replies
+            // can otherwise leave this PostgreSQL witness without a stale
+            // registration to migrate. The separate TCP cases below force
+            // both Pending reads without relying on scheduling delays.
+            expect_ok(
+                lease.query(&cx, "SELECT 1 FROM pg_sleep(0.02)", &[]).await,
+                "holder readiness witness",
+            );
             assert_eq!(holder_pool.stats().active_connections, 1);
             pid_tx.send(pid).expect("record original backend");
             match exit {

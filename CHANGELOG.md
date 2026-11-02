@@ -47,6 +47,10 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 - Checkout validation preserves cancellation and panic outcomes and rechecks
   pool closure and the acquisition deadline before publishing a lease. A ping
   finishing after closure or expiry cannot hand out a connection.
+- Acquisition also checks its remaining deadline before each retirement hook
+  and after a driver returns `Pending`. A failed ping that consumes the last
+  of the budget cannot start another close operation. The connection contract
+  documents hard-drop cleanup when graceful retirement is interrupted.
 
 These are unreleased pool protections. They do not change the known limitation
 of the published SQLModel 0.5.1 release or establish successful PostgreSQL
@@ -54,6 +58,18 @@ handoff against a fixed runtime dependency.
 
 ### Qualification
 
+- Fixed the standalone qualification runner's staged workspace inheritance:
+  the outer fixture excludes the copied workspace, so Cargo resolves the
+  copied crates' package fields and dependencies from their own manifest.
+  Actual metadata resolution verifies one production registry runtime. The
+  PostgreSQL holder also awaits a delayed server response before runtime exit.
+- Native pool regressions cover permanently pending validation on both
+  current-thread and explicit two-worker runtimes, stalled expired-connection
+  retirement, and successful validation without a leftover timeout timer.
+  PostgreSQL tests separately check bounded handoff failure and retirement,
+  successful reuse, normal runtime exit, holder panic, expired sessions, and
+  server-terminated sessions. A checkout cancellation sweep verifies that
+  interrupted validation retires ownership without retrying or leaking slots.
 - Added production-context PostgreSQL runtime-handoff witnesses for normal
   holder exit and intentional holder panic, retaining the explicit
   `worker_threads(2)` controls. The witness asserts the original backend PID,

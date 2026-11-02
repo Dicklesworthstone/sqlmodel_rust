@@ -11,19 +11,24 @@
 //! return (never by creating an extra connection), and `close_and_drain`
 //! refusing queued waiters promptly while still waiting for active leases.
 
+// The all-driver fan-out witness nests the cancellation-aware acquisition
+// future inside spawned tasks. Allow the compiler to prove its Send bounds
+// without suppressing the recursion-depth warning or changing the witness.
+#![recursion_limit = "256"]
+
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
-use asupersync::{Cx, Outcome};
+use asupersync::{Budget, Cx, Outcome};
 use sqlmodel::prelude::*;
 use sqlmodel::{Pool, PoolConfig};
 use sqlmodel_core::error::PoolErrorKind;
-use sqlmodel_e2e::{DriverUnderTest, expect_outcome};
+use sqlmodel_e2e::{DriverUnderTest, expect_outcome, parse_postgres_url};
 use sqlmodel_frankensqlite::FrankenConnection;
 use sqlmodel_mysql::SharedMySqlConnection;
-use sqlmodel_postgres::SharedPgConnection;
+use sqlmodel_postgres::{PgConfig, SharedPgConnection};
 use sqlmodel_sqlite::SqliteConnection;
 
 const MAX: usize = 3;
@@ -751,6 +756,325 @@ where
         );
     });
     assert_eq!(pool.stats().total_connections, 0, "{name}: drained");
+}
+
+/// Production-context witnesses for GH#43. These deliberately do not use
+/// `Cx::for_testing`: each connect, checkout and query belongs to the runtime
+/// that actually polls it. The original all-driver success contract below is
+/// retained, including its current-thread handoff after a holder panic.
+#[derive(Clone, Copy, Debug)]
+enum HandoffRuntime {
+    CurrentThread,
+    TwoWorkers,
+}
+
+impl HandoffRuntime {
+    fn build(self) -> Runtime {
+        match self {
+            Self::CurrentThread => RuntimeBuilder::current_thread(),
+            Self::TwoWorkers => RuntimeBuilder::new().worker_threads(2),
+        }
+        .build()
+        .expect("production handoff runtime")
+    }
+}
+
+/// An independent wall-clock watchdog catches a regression even if the
+/// runtime's own timer stops progressing. Completion cancels and joins it;
+/// no detached sleeping watchdog survives a successful case.
+struct HandoffWatchdog {
+    done: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HandoffWatchdog {
+    fn start(label: String) -> Self {
+        let (done, completion) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            if completion.recv_timeout(Duration::from_secs(30))
+                == Err(mpsc::RecvTimeoutError::Timeout)
+            {
+                eprintln!("{label}: production pool regression exceeded the 30-second watchdog");
+                std::process::abort();
+            }
+        });
+        Self {
+            done,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for HandoffWatchdog {
+    fn drop(&mut self) {
+        let _ = self.done.send(());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("handoff watchdog");
+        }
+    }
+}
+
+fn postgres_handoff_config() -> Option<PgConfig> {
+    match std::env::var("SQLMODEL_TEST_POSTGRES_URL") {
+        Ok(url) => Some(parse_postgres_url(&url).expect("valid SQLMODEL_TEST_POSTGRES_URL")),
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!(
+                "skipping Postgres integration tests (production pool handoff): set SQLMODEL_TEST_POSTGRES_URL"
+            );
+            assert_ne!(
+                std::env::var("SQLMODEL_TEST_REQUIRE_SERVICES").as_deref(),
+                Ok("1"),
+                "PostgreSQL production pool witnesses require SQLMODEL_TEST_POSTGRES_URL"
+            );
+            None
+        }
+        Err(error) => panic!("invalid SQLMODEL_TEST_POSTGRES_URL: {error}"),
+    }
+}
+
+/// A timeout proves bounded acquisition and retirement, never successful
+/// handoff. On Asupersync 0.5.0 the current-thread cases take that branch;
+/// a runtime carrying the upstream fix must reuse the original backend.
+fn exercise_postgres_production_handoff(
+    cfg: &PgConfig,
+    flavor: HandoffRuntime,
+    panic_holder: bool,
+) {
+    const TIMEOUT_MS: u64 = 2_000;
+    const HOLDER_PANIC: &str = "production pool holder panics intentionally";
+
+    let label = format!("postgres production {flavor:?}, panic_holder={panic_holder}");
+    let _watchdog = HandoffWatchdog::start(label.clone());
+    let pool: Arc<Pool<SharedPgConnection>> = Arc::new(Pool::new(
+        PoolConfig::new(MAX)
+            .min_connections(0)
+            .acquire_timeout(TIMEOUT_MS),
+    ));
+    let (backend_tx, backend_rx) = mpsc::channel();
+    let holder_pool = Arc::clone(&pool);
+    let holder_cfg = cfg.clone();
+    let holder = std::thread::spawn(move || {
+        let rt = flavor.build();
+        let cx = rt.request_cx_with_budget(Budget::INFINITE);
+        rt.block_on(async {
+            let lease = expect_outcome(
+                holder_pool
+                    .acquire(&cx, || SharedPgConnection::connect(&cx, holder_cfg.clone()))
+                    .await,
+                "production holder: acquire",
+            );
+            let backend =
+                session_id(&cx, &*lease, "SELECT pg_backend_pid()", "holder backend").await;
+            // Force the read to park under the holder's reactor before it
+            // exits; an already-readable socket must not hide a handoff bug.
+            let rows = expect_outcome(
+                lease.query(&cx, "SELECT 1 FROM pg_sleep(0.02)", &[]).await,
+                "holder SELECT 1 with a readiness-registration witness",
+            );
+            assert_eq!(rows[0].get_as::<i64>(0).expect("SELECT 1"), 1);
+            backend_tx.send(backend).expect("report holder backend");
+            assert_eq!(holder_pool.stats().active_connections, 1);
+            if panic_holder {
+                std::panic::panic_any(HOLDER_PANIC);
+            }
+        });
+    });
+    let joined = holder.join();
+    if panic_holder {
+        let payload = joined.expect_err("holder must panic intentionally");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some(HOLDER_PANIC),
+            "{label}: an unrelated holder failure is not the expected panic"
+        );
+    } else {
+        joined.expect("holder must return normally");
+    }
+    let original_backend = backend_rx.recv().expect("holder reached its query");
+    let returned = pool.stats();
+    eprintln!("{label}: holder joined, runtime dropped; {returned:?}");
+    assert_eq!(returned.total_connections, 1, "{label}");
+    assert_eq!(returned.idle_connections, 1, "{label}");
+    assert_eq!(returned.active_connections, 0, "{label}");
+    assert_eq!(returned.pending_requests, 0, "{label}");
+    assert_eq!(returned.connections_created, 1, "{label}");
+    assert_eq!(returned.connections_closed, 0, "{label}");
+
+    let rt = flavor.build();
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+    rt.block_on(async {
+        let started = Instant::now();
+        let acquired = pool
+            .acquire(&cx, || SharedPgConnection::connect(&cx, cfg.clone()))
+            .await;
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "{label}: acquire exceeded its {TIMEOUT_MS} ms deadline: {waited:?}"
+        );
+        match acquired {
+            Outcome::Ok(lease) => {
+                let backend = session_id(&cx, &*lease, "SELECT pg_backend_pid()", "reused backend")
+                    .await;
+                assert_eq!(backend, original_backend, "{label}: same physical connection");
+                let rows = expect_outcome(
+                    lease.query(&cx, "SELECT 1", &[]).await,
+                    "production consumer SELECT 1",
+                );
+                assert_eq!(rows[0].get_as::<i64>(0).expect("SELECT 1"), 1);
+                drop(lease);
+                let stats = pool.stats();
+                assert_eq!(stats.connections_created, 1, "{label}: actual reuse");
+                assert_eq!(stats.connections_closed, 0, "{label}");
+                assert_eq!(stats.acquires, 2, "{label}");
+                assert_eq!(stats.timeouts, 0, "{label}");
+                eprintln!("{label}: SUCCESSFUL REUSE of backend {backend} after {waited:?}");
+            }
+            Outcome::Err(error) if matches!(flavor, HandoffRuntime::CurrentThread) => {
+                assert_eq!(pool_error_kind(&error), Some(PoolErrorKind::Timeout), "{label}: {error}");
+                assert!(waited >= Duration::from_millis(TIMEOUT_MS), "{label}: early timeout");
+                let stats = pool.stats();
+                assert_eq!(stats.total_connections, 0, "{label}: failed validation retired");
+                assert_eq!(stats.idle_connections, 0, "{label}: no unusable idle connection");
+                assert_eq!(stats.active_connections, 0, "{label}: no leaked lease");
+                assert_eq!(stats.pending_requests, 0, "{label}: no leaked waiter");
+                assert_eq!(stats.connections_created, 1, "{label}");
+                assert_eq!(stats.connections_closed, 1, "{label}: retired exactly once");
+                assert_eq!(stats.acquires, 1, "{label}: failed checkout is not an acquire");
+                assert_eq!(stats.timeouts, 1, "{label}: timeout counted exactly once");
+                eprintln!(
+                    "{label}: BOUNDED FAILURE after {waited:?}; backend {original_backend} retired. This is not successful runtime handoff (GH#43 / asupersync#85)."
+                );
+
+                let fresh = expect_outcome(
+                    pool.acquire(&cx, || SharedPgConnection::connect(&cx, cfg.clone())).await,
+                    "acquire after timed-out validation",
+                );
+                let backend = session_id(&cx, &*fresh, "SELECT pg_backend_pid()", "replacement backend").await;
+                assert_ne!(backend, original_backend, "{label}: stale socket was not returned");
+                let rows = expect_outcome(fresh.query(&cx, "SELECT 1", &[]).await, "replacement SELECT 1");
+                assert_eq!(rows[0].get_as::<i64>(0).expect("SELECT 1"), 1);
+                assert_eq!(pool.stats().connections_created, 2, "{label}");
+
+                // The server must observe the retired socket closing too. A
+                // fresh query snapshot is taken on every iteration; the outer
+                // timeout is only a test watchdog, not the acquisition bound.
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    async {
+                        loop {
+                            let live = scalar_i64(
+                                &cx,
+                                &*fresh,
+                                "SELECT count(*) FROM pg_stat_activity WHERE pid = $1::bigint",
+                                &[Value::BigInt(original_backend)],
+                                "retired backend count",
+                            ).await;
+                            if live == 0 {
+                                break;
+                            }
+                            asupersync::runtime::yield_now::yield_now().await;
+                        }
+                    },
+                ).await.expect("retired connection must disappear from pg_stat_activity");
+                drop(fresh);
+            }
+            other => panic!("{label}: successful handoff required, got {other:?}"),
+        }
+        expect_outcome(pool.close_and_drain(&cx).await, "production handoff drain");
+        let drained = pool.stats();
+        assert_eq!(drained.total_connections, 0, "{label}");
+        assert_eq!(drained.active_connections, 0, "{label}");
+        assert_eq!(drained.idle_connections, 0, "{label}");
+        assert_eq!(drained.pending_requests, 0, "{label}");
+        assert_eq!(drained.connections_created, drained.connections_closed, "{label}");
+    });
+}
+
+#[test]
+fn postgres_current_thread_handoff_has_bounded_acquisition_and_retirement() {
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    for panic_holder in [false, true] {
+        exercise_postgres_production_handoff(&cfg, HandoffRuntime::CurrentThread, panic_holder);
+    }
+}
+
+#[test]
+fn postgres_two_worker_handoff_successfully_reuses_connection_after_return_and_panic() {
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    for panic_holder in [false, true] {
+        exercise_postgres_production_handoff(&cfg, HandoffRuntime::TwoWorkers, panic_holder);
+    }
+}
+
+#[test]
+fn postgres_current_thread_same_runtime_successfully_reuses_connection() {
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    let _watchdog = HandoffWatchdog::start("postgres same-runtime reuse".into());
+    let rt = HandoffRuntime::CurrentThread.build();
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+    let pool: Pool<SharedPgConnection> =
+        Pool::new(PoolConfig::new(1).min_connections(0).acquire_timeout(2_000));
+    rt.block_on(async {
+        let mut original_backend = None;
+        for _ in 0..3 {
+            let lease = expect_outcome(
+                pool.acquire(&cx, || SharedPgConnection::connect(&cx, cfg.clone()))
+                    .await,
+                "same-runtime acquire",
+            );
+            let backend = session_id(
+                &cx,
+                &*lease,
+                "SELECT pg_backend_pid()",
+                "same-runtime backend",
+            )
+            .await;
+            assert_eq!(*original_backend.get_or_insert(backend), backend);
+            let rows = expect_outcome(
+                lease.query(&cx, "SELECT 1", &[]).await,
+                "same-runtime SELECT 1",
+            );
+            assert_eq!(rows[0].get_as::<i64>(0).expect("SELECT 1"), 1);
+        }
+        let stats = pool.stats();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.acquires, 3);
+        assert_eq!(stats.timeouts, 0);
+        expect_outcome(pool.close_and_drain(&cx).await, "same-runtime drain");
+        assert_eq!(pool.stats().total_connections, 0);
+        assert_eq!(pool.stats().connections_closed, 1);
+    });
+}
+
+#[test]
+fn postgres_production_checkout_retires_expired_and_server_terminated_connections() {
+    let Some(cfg) = postgres_handoff_config() else {
+        return;
+    };
+    let _watchdog = HandoffWatchdog::start("postgres production retirement and replacement".into());
+    let rt = HandoffRuntime::CurrentThread.build();
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
+    let factory = || SharedPgConnection::connect(&cx, cfg.clone());
+
+    // Run independently of the all-driver handoff contract: Asupersync 0.5's
+    // known current-thread handoff failure must not prevent the existing
+    // server-side retirement and replacement assertions from being reached.
+    exercise_server_sessions(
+        &rt,
+        &cx,
+        "postgres production retirement",
+        &factory,
+        "SELECT pg_backend_pid()",
+        |id| format!("SELECT pg_terminate_backend({id})"),
+    );
 }
 
 /// A cancelled `close_and_drain` reports `Cancelled` but leaves the pool

@@ -27,6 +27,8 @@
 
 #![allow(clippy::result_large_err)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use serde::{Deserialize, Serialize};
@@ -823,11 +825,9 @@ fn cancellation_sweep_pool_ops_on_c_sqlite_memory() {
         .build()
         .expect("asupersync runtime");
     rt.block_on(async {
-        // The pool's cancellation contract is a pre-flight guard on its own
-        // entry (pool acquire/drain are not sequences of delegated connection
-        // calls), so this sweep asserts the already-cancelled-Cx contract and
-        // balanced counters directly; checkpoint-exhaustive pool timing lives
-        // in sqlmodel-pool's lab tests (bd-x6jl.1).
+        // Already-cancelled entry must not call the factory. Checkout ping
+        // delegates to the real driver and is swept separately below;
+        // checkpoint-exhaustive timing lives in the pool's lab tests.
         let cancelled = Cx::for_testing();
         cancelled.cancel_with(asupersync::CancelKind::User, Some("pool acquire sweep"));
         let pool: sqlmodel_pool::Pool<CancelAt<SqliteConnection>> =
@@ -849,5 +849,129 @@ fn cancellation_sweep_pool_ops_on_c_sqlite_memory() {
         }
         assert_eq!(pool.stats().acquires, 0, "no lease was handed out");
         assert_eq!(pool.stats().connections_created, 0, "factory never ran");
+
+        let checkpoints = sweep_pool_checkout_validation(0).await;
+        assert_eq!(checkpoints, 3, "three successive idle validations recorded");
+        for cancel_from in 1..=checkpoints {
+            sweep_pool_checkout_validation(cancel_from).await;
+        }
+        eprintln!(
+            "cancel-sweep pool checkout: k=1..={checkpoints} all Cancelled, retired exactly once, capacity recovered"
+        );
     });
+}
+
+/// Cancel each successive checkout ping of a real SQLite connection. The
+/// connection is owned by the pool, so a failed validation destroys its log;
+/// observe every successful prefix through the lease, then check cancellation
+/// and ownership through the Cx, factory calls and pool counters.
+async fn sweep_pool_checkout_validation(cancel_from: u64) -> u64 {
+    let cx = Cx::for_testing();
+    let factory_calls = AtomicUsize::new(0);
+    let pool = sqlmodel_pool::Pool::new(
+        sqlmodel_pool::PoolConfig::new(1)
+            .min_connections(0)
+            .test_on_checkout(true),
+    );
+    let factory = || async {
+        factory_calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Ok(CancelAt::new(
+            SqliteConnection::open_memory().expect("checkout sweep database"),
+            cancel_from,
+        ))
+    };
+    let first = expect_outcome(pool.acquire(&cx, &factory).await, "checkout sweep seed");
+    assert_eq!(first.calls_made(), 0, "new connections need no idle ping");
+    drop(first);
+
+    let mut checkpoints = 0;
+    for checkpoint in 1..=3 {
+        match pool.acquire(&cx, &factory).await {
+            Outcome::Ok(lease) => {
+                assert!(
+                    cancel_from == 0 || checkpoint < cancel_from,
+                    "checkout {checkpoint} handed out a cancelled connection"
+                );
+                checkpoints = lease.calls_made();
+                assert_eq!(checkpoints, checkpoint, "one ping per checkout");
+                let log = lease.log();
+                assert!(
+                    log.iter()
+                        .all(|entry| entry.call == "ping" && !entry.cancelled_before),
+                    "checkout sweep prefix: {log:?}"
+                );
+                assert!(!cx.is_cancel_requested());
+                drop(lease);
+            }
+            Outcome::Cancelled(_) => {
+                assert_eq!(checkpoint, cancel_from, "correct cancellation checkpoint");
+                assert!(
+                    cx.is_cancel_requested(),
+                    "driver wrapper injected cancellation"
+                );
+                let stats = pool.stats();
+                assert_eq!(stats.total_connections, 0, "cancelled validation retired");
+                assert_eq!(stats.active_connections, 0, "no leaked lease");
+                assert_eq!(stats.idle_connections, 0, "cancelled connection not reused");
+                assert_eq!(stats.pending_requests, 0, "no leaked waiter");
+                assert_eq!(stats.connections_closed, 1, "retired exactly once");
+                assert_eq!(stats.acquires, checkpoint, "no lease for cancelled ping");
+                assert_eq!(stats.timeouts, 0, "cancellation is not a timeout");
+                assert_eq!(
+                    factory_calls.load(Ordering::SeqCst),
+                    1,
+                    "no retry after cancellation"
+                );
+                break;
+            }
+            Outcome::Err(error) => {
+                panic!("checkout sweep returned Err instead of Cancelled: {error}")
+            }
+            Outcome::Panicked(info) => panic!("checkout sweep panicked: {info:?}"),
+        }
+    }
+    assert_eq!(
+        factory_calls.load(Ordering::SeqCst),
+        1,
+        "only the original factory ran"
+    );
+
+    let fresh_cx = Cx::for_testing();
+    if cancel_from != 0 {
+        assert!(
+            cx.is_cancel_requested(),
+            "cancellation checkpoint was reached"
+        );
+        let fresh = expect_outcome(
+            pool.acquire(&fresh_cx, || async {
+                Outcome::Ok(CancelAt::new(
+                    SqliteConnection::open_memory().expect("replacement sweep database"),
+                    0,
+                ))
+            })
+            .await,
+            "replacement after checkout cancellation",
+        );
+        let rows = expect_outcome(
+            fresh.query(&fresh_cx, "SELECT 1", &[]).await,
+            "replacement query",
+        );
+        assert_eq!(rows[0].get_as::<i64>(0).expect("SELECT 1"), 1);
+        assert_eq!(
+            pool.stats().connections_created,
+            2,
+            "retired slot was reusable"
+        );
+        drop(fresh);
+    }
+    expect_outcome(
+        pool.close_and_drain(&fresh_cx).await,
+        "checkout sweep drain",
+    );
+    let drained = pool.stats();
+    assert_eq!(drained.total_connections, 0);
+    assert_eq!(drained.active_connections, 0);
+    assert_eq!(drained.pending_requests, 0);
+    assert_eq!(drained.connections_created, drained.connections_closed);
+    checkpoints
 }
