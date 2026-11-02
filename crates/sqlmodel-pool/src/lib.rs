@@ -1211,6 +1211,10 @@ impl<C: Connection> Pool<C> {
     /// returns [`Outcome::Cancelled`] without reopening the pool: `closed`
     /// remains a one-way lifecycle transition, and a later caller may resume
     /// draining. Dropping this future has the same persistent-close property.
+    /// One timer covers both idle retirement and waiting for borrowed leases.
+    /// Deadline expiry drops this drain's in-flight retirement resources before
+    /// returning; leases still held by callers retain their ownership and remain
+    /// accounted until they return or detach.
     ///
     /// Multiple concurrent drainers are supported by the pool's one-shot drain
     /// latch. Since pool closure is irreversible, there is no reopen generation
@@ -1228,6 +1232,54 @@ impl<C: Connection> Pool<C> {
         // any cancellation point. Idle inventory remains accounted as active
         // retirement work until each close hook or hard drop releases it.
         let retired = self.begin_close();
+        let mut drain = std::pin::pin!(self.drain_retirements_and_leases(cx, retired));
+        let Some(deadline) = cx.budget().deadline else {
+            return drain.as_mut().await;
+        };
+        let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(deadline));
+
+        // A request Cx need not belong to a scheduled task. Its cancellation
+        // latch detects an elapsed budget when polled, but cannot itself wake
+        // a drain whose driver or borrower never produces another event.
+        // Keep one independently registered deadline across every await.
+        std::future::poll_fn(|task_cx| {
+            if cx.now() >= deadline {
+                return std::task::Poll::Ready(Outcome::Cancelled(
+                    cx.cancel_reason().unwrap_or_else(CancelReason::deadline),
+                ));
+            }
+            if elapsed.as_mut().poll(task_cx).is_ready() {
+                // Sleep may also finish when a distinct ambient context is
+                // cancelled. Preserve that cause and never repoll the timer.
+                if cx.now() >= deadline {
+                    return std::task::Poll::Ready(Outcome::Cancelled(
+                        cx.cancel_reason().unwrap_or_else(CancelReason::deadline),
+                    ));
+                }
+                let reason = cx
+                    .cancel_reason()
+                    .or_else(|| Cx::current().and_then(|ambient| ambient.cancel_reason()))
+                    .unwrap_or_else(|| CancelReason::user("pool drain interrupted"));
+                return std::task::Poll::Ready(Outcome::Cancelled(reason));
+            }
+            let outcome = drain.as_mut().poll(task_cx);
+            if outcome.is_pending() && cx.now() >= deadline {
+                return std::task::Poll::Ready(Outcome::Cancelled(
+                    cx.cancel_reason().unwrap_or_else(CancelReason::deadline),
+                ));
+            }
+            outcome
+        })
+        .await
+        // Drop the owned drain future (including unstarted retirement guards)
+        // before exposing the result, even if the caller retains this future.
+    }
+
+    async fn drain_retirements_and_leases(
+        &self,
+        cx: &Cx,
+        retired: Vec<ActiveConnectionGuard<C>>,
+    ) -> Outcome<(), Error> {
         let mut direct_failure = None;
         for guard in retired {
             match guard.close(cx, "pool close-and-drain").await {
@@ -2638,6 +2690,155 @@ mod tests {
         drop(drain);
         drop(pooled);
         assert_eq!(pool.active_count(), 0);
+    }
+
+    #[test]
+    fn production_drain_deadline_wakes_without_reclaiming_a_held_lease() {
+        const DRAIN_TIMEOUT_MS: u64 = 50;
+        for current_thread in [true, false] {
+            let builder = if current_thread {
+                RuntimeBuilder::current_thread()
+            } else {
+                RuntimeBuilder::new().worker_threads(2)
+            };
+            let runtime = builder.build().expect("production runtime");
+            let pool = Pool::new(PoolConfig::new(1));
+            let holder_cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            let dropped = Arc::new(OnceCell::new());
+            let lease = runtime
+                .block_on(pool.acquire(&holder_cx, || async {
+                    Outcome::Ok(MockConnection::new(1).observe_drop(&pool, Arc::clone(&dropped)))
+                }))
+                .expect("borrower acquires before shutdown");
+            let started = std::time::Instant::now();
+            let deadline = asupersync::time::wall_now() + Duration::from_millis(DRAIN_TIMEOUT_MS);
+            let drain_cx = runtime.request_cx_with_budget(Budget::new().with_deadline(deadline));
+            let mut drain = Box::pin(pool.close_and_drain(&drain_cx));
+            let guarded = runtime.block_on(asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(2),
+                drain.as_mut(),
+            ));
+            let outcome = guarded.expect("watchdog won: drain deadline did not wake the caller");
+            match outcome {
+                Outcome::Cancelled(reason) => {
+                    assert_eq!(reason.kind, asupersync::CancelKind::Deadline);
+                }
+                other => panic!("expected deadline cancellation, got {other:?}"),
+            }
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(DRAIN_TIMEOUT_MS));
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "drain only noticed the deadline after an unrelated wake: {elapsed:?}"
+            );
+            assert!(pool.is_closed());
+            assert!(dropped.get().is_none(), "borrower still owns the resource");
+            assert!(!holder_cx.is_cancel_requested());
+            let stats = pool.stats();
+            assert_eq!(stats.active_connections, 1);
+            assert_eq!(stats.total_connections, 1);
+            assert_eq!(stats.idle_connections, 0);
+            assert_eq!(stats.pending_requests, 0);
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.connections_closed, 0);
+            assert_eq!(stats.acquires, 1);
+            assert_eq!(stats.timeouts, 0, "drain is not an acquire timeout");
+
+            drop(lease);
+            assert_drop_precedes_slot_release(&dropped);
+            let later_cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            runtime
+                .block_on(pool.close_and_drain(&later_cx))
+                .expect("later caller resumes draining after borrower returns");
+            assert_no_occupied_slots(&pool);
+            assert_eq!(pool.stats().connections_closed, 1);
+            assert_eq!(pool.stats().timeouts, 0);
+        }
+    }
+
+    #[test]
+    fn production_drain_deadline_drops_stalled_close_and_all_remaining_idle_resources() {
+        const DRAIN_TIMEOUT_MS: u64 = 50;
+        for current_thread in [true, false] {
+            let builder = if current_thread {
+                RuntimeBuilder::current_thread()
+            } else {
+                RuntimeBuilder::new().worker_threads(2)
+            };
+            let runtime = builder.build().expect("production runtime");
+            let pool = Pool::new(PoolConfig::new(3));
+            let holder_cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            let closes = Arc::new(AtomicUsize::new(0));
+            let mut dropped = Vec::new();
+            let mut leases = Vec::new();
+            for id in 1..=3 {
+                let observed = Arc::new(OnceCell::new());
+                let lease = runtime
+                    .block_on(pool.acquire(&holder_cx, || async {
+                        Outcome::Ok(
+                            MockConnection::with_pending_pool_close(id, Arc::clone(&closes))
+                                .observe_drop(&pool, Arc::clone(&observed)),
+                        )
+                    }))
+                    .expect("create distinct connection before shutdown");
+                leases.push(lease);
+                dropped.push(observed);
+            }
+            drop(leases);
+            assert_eq!(pool.stats().idle_connections, 3);
+            let started = std::time::Instant::now();
+            let deadline = asupersync::time::wall_now() + Duration::from_millis(DRAIN_TIMEOUT_MS);
+            let drain_cx = runtime.request_cx_with_budget(Budget::new().with_deadline(deadline));
+            let mut drain = Box::pin(pool.close_and_drain(&drain_cx));
+            let guarded = runtime.block_on(asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(2),
+                drain.as_mut(),
+            ));
+            let outcome = guarded.expect("watchdog won: pending retirement ignored drain deadline");
+            match outcome {
+                Outcome::Cancelled(reason) => {
+                    assert_eq!(reason.kind, asupersync::CancelKind::Deadline);
+                }
+                other => panic!("expected deadline cancellation, got {other:?}"),
+            }
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(DRAIN_TIMEOUT_MS));
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "retirement only noticed the deadline after an unrelated wake: {elapsed:?}"
+            );
+            // Keep the completed future alive: Ready itself must release
+            // every owned resource, including guards not yet being closed.
+            let mut active_at_drop = Vec::new();
+            for observed in dropped {
+                let stats = observed
+                    .get()
+                    .expect("every idle resource was destroyed before drain returned")
+                    .as_ref()
+                    .expect("resource destruction must not hold the pool mutex");
+                assert_eq!(stats.total_connections, stats.active_connections);
+                assert_eq!(stats.idle_connections, 0);
+                active_at_drop.push(stats.active_connections);
+            }
+            active_at_drop.sort_unstable();
+            assert_eq!(active_at_drop, vec![1, 2, 3]);
+            assert_eq!(closes.load(Ordering::Relaxed), 1);
+            assert_no_occupied_slots(&pool);
+            assert!(pool.is_closed());
+            let stats = pool.stats();
+            assert_eq!(stats.connections_created, 3);
+            assert_eq!(stats.connections_closed, 3);
+            assert_eq!(stats.acquires, 3);
+            assert_eq!(stats.timeouts, 0, "drain is not an acquire timeout");
+            let later_cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            runtime
+                .block_on(pool.close_and_drain(&later_cx))
+                .expect("later caller observes complete resource cleanup");
+            assert_no_occupied_slots(&pool);
+            assert_eq!(pool.stats().timeouts, 0);
+        }
     }
 
     #[test]

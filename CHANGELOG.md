@@ -38,6 +38,12 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ### Fixed
 
+- Pool shutdown now registers the caller's future deadline across idle
+  retirement and waiting for borrowed leases. A production request context
+  can time out a drain even when no driver or borrower wakes it. Expiry
+  discards the drain's owned resources before returning `Cancelled(Deadline)`;
+  outstanding borrowers keep their ownership, admission stays closed, and a
+  later drain can finish. Native regressions cover both supported runtimes.
 - Pool acquisition now enforces one deadline across capacity waits, connection
   creation, checkout validation, and rejected-connection retirement. A stalled
   ping no longer bypasses `acquire_timeout` or a shorter caller budget
