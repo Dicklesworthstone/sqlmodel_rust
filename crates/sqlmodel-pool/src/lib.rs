@@ -3349,8 +3349,14 @@ mod tests {
     #[test]
     fn test_dropped_multi_expired_idle_close_releases_all_retirement_slots() {
         let pool_close_calls = Arc::new(AtomicUsize::new(0));
-        let pool: Pool<MockConnection> =
-            Pool::new(PoolConfig::new(3).max_lifetime(1).test_on_checkout(false));
+        let (clock, driver) = virtual_clock();
+        // A fresh process cannot backdate its wall clock before epoch zero.
+        // Make the original one-second age representable without a sleep.
+        clock.advance(1_000_000_000);
+        let pool: Pool<MockConnection> = Pool::with_timer_driver(
+            PoolConfig::new(3).max_lifetime(1).test_on_checkout(false),
+            driver,
+        );
         let mut first_expired = ConnectionMeta::new(
             MockConnection::with_pending_pool_close(1, Arc::clone(&pool_close_calls)),
             pool.shared.clock.clone(),
@@ -3361,6 +3367,8 @@ mod tests {
             pool.shared.clock.clone(),
         );
         backdate(&mut second_expired, Duration::from_secs(1));
+        assert!(first_expired.age() > Duration::from_millis(1));
+        assert!(second_expired.age() > Duration::from_millis(1));
         {
             let mut inner = pool.shared.inner.lock().unwrap();
             inner.total_count = 2;
@@ -3908,13 +3916,18 @@ mod tests {
     #[test]
     fn test_expired_idle_connection_routes_through_close_for_pool() {
         let pool_close_calls = Arc::new(AtomicUsize::new(0));
-        let pool: Pool<MockConnection> =
-            Pool::new(PoolConfig::new(2).max_lifetime(1).test_on_checkout(false));
+        let (clock, driver) = virtual_clock();
+        clock.advance(1_000_000_000);
+        let pool: Pool<MockConnection> = Pool::with_timer_driver(
+            PoolConfig::new(2).max_lifetime(1).test_on_checkout(false),
+            driver,
+        );
         let mut expired = ConnectionMeta::new(
             MockConnection::with_pool_close_counter(1, Arc::clone(&pool_close_calls)),
             pool.shared.clock.clone(),
         );
         backdate(&mut expired, Duration::from_secs(1));
+        assert!(expired.age() > Duration::from_millis(1));
         {
             let mut inner = pool
                 .shared
