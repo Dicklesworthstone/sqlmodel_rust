@@ -64,7 +64,7 @@ format_push_string = "allow"
 [workspace.dependencies]
 # Core async runtime - our custom cancel-correct runtime
 # Keep defaults off to avoid unsafe SIMD paths and test-only APIs in consumers.
-asupersync = { version = "0.5.0", default-features = false }
+asupersync = { version = "0.6.2", default-features = false }
 libsqlite3-sys = "0.39.1"
 
 # Serialization
