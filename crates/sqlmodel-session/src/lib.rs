@@ -5930,6 +5930,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::result_large_err)] // Event callbacks use the public unboxed Error type.
     fn exercise_commit_rollback_acknowledgement(notification_fails: bool) {
         let rt = RuntimeBuilder::current_thread()
             .build()
@@ -6136,10 +6137,10 @@ mod tests {
         }
     }
 
-    fn assert_retry_recovery_error<T: std::fmt::Debug>(outcome: Outcome<T, Error>) {
+    fn assert_retry_recovery_error<T: std::fmt::Debug>(outcome: &Outcome<T, Error>) {
         assert!(
             matches!(
-                &outcome,
+                outcome,
                 Outcome::Err(Error::Transaction(error))
                     if error.kind == TransactionErrorKind::RollbackRequired
             ),
@@ -6156,12 +6157,12 @@ mod tests {
             let guard = state.lock().unwrap();
             (guard.execute_calls, guard.query_calls, guard.executed.len())
         };
-        assert_retry_recovery_error(session.begin(&fresh_cx).await);
-        assert_retry_recovery_error(session.flush(&fresh_cx).await);
-        assert_retry_recovery_error(session.commit(&fresh_cx).await);
+        assert_retry_recovery_error(&session.begin(&fresh_cx).await);
+        assert_retry_recovery_error(&session.flush(&fresh_cx).await);
+        assert_retry_recovery_error(&session.commit(&fresh_cx).await);
         let bodies = AtomicUsize::new(0);
         assert_retry_recovery_error(
-            session
+            &session
                 .with_retry(
                     &fresh_cx,
                     &RetryPolicy::immediate().max_attempts(2),
@@ -6177,13 +6178,13 @@ mod tests {
         // Bulk writes must honor the same recovery gate, including their
         // empty-work fast paths and the default-batch wrapper.
         for models in [Vec::new(), vec![retry_team(8)]] {
-            assert_retry_recovery_error(session.bulk_insert(&fresh_cx, &models).await);
+            assert_retry_recovery_error(&session.bulk_insert(&fresh_cx, &models).await);
             assert_retry_recovery_error(
-                session
+                &session
                     .bulk_insert_with_batch_size(&fresh_cx, &models, 1)
                     .await,
             );
-            assert_retry_recovery_error(session.bulk_update(&fresh_cx, &models).await);
+            assert_retry_recovery_error(&session.bulk_update(&fresh_cx, &models).await);
         }
 
         let link = sqlmodel_core::LinkTableInfo::composite(
@@ -6203,7 +6204,7 @@ mod tests {
             .children
             .unlink(&MmChildComposite { id1: 8, id2: 10 });
         assert_retry_recovery_error(
-            session
+            &session
                 .flush_related_many_pk(
                     &fresh_cx,
                     &mut parents,
@@ -6224,7 +6225,7 @@ mod tests {
             "rejected writes must not take the caller's pending unlinks"
         );
         assert_retry_recovery_error(
-            session
+            &session
                 .flush_related_many_pk::<MmParentComposite, MmChildComposite, _, _>(
                     &fresh_cx,
                     &mut [],

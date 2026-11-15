@@ -603,6 +603,25 @@ pub trait Connection: Send + Sync {
     {
         self.close(cx)
     }
+
+    /// Try to finish pool retirement without an asynchronous runtime.
+    ///
+    /// Synchronous drivers may return `Break(result)` after consuming the
+    /// connection and releasing its resources. Otherwise return
+    /// `Continue(self)` without changing the connection; the pool will use
+    /// [`Connection::close_for_pool`] with its normal runtime and deadline.
+    /// The pool does not poll and discard a potentially pending close future.
+    ///
+    /// This hook has the same durability and drop obligations as
+    /// `close_for_pool`. It must not require a runtime or await network work.
+    /// A failed synchronous close is still a completed retirement, reported
+    /// as `Break(Err(error))`, never a request to retry closing the resource.
+    fn try_close_for_pool(self) -> std::ops::ControlFlow<Result<()>, Self>
+    where
+        Self: Sized,
+    {
+        std::ops::ControlFlow::Continue(self)
+    }
 }
 
 /// Trait for transaction operations.

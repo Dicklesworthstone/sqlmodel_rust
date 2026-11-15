@@ -1101,6 +1101,10 @@ impl Connection for FrankenConnection {
     fn close_for_pool(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
         std::future::ready(self.close_without_checkpoint_sync())
     }
+
+    fn try_close_for_pool(self) -> std::ops::ControlFlow<sqlmodel_core::Result<()>, Self> {
+        std::ops::ControlFlow::Break(self.close_without_checkpoint_sync())
+    }
 }
 
 // ── Transaction ───────────────────────────────────────────────────────────
@@ -2994,6 +2998,41 @@ mod tests {
         }
 
         remove_db_family(&path_str);
+    }
+
+    #[test]
+    fn synchronous_pool_close_preserves_committed_rows() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sqlmodel-sync-pool-close-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("storage.sqlite3");
+        let conn = FrankenConnection::open_file(path.to_str().unwrap()).unwrap();
+        conn.execute_raw("CREATE TABLE markers (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO markers VALUES (1, 'committed')")
+            .unwrap();
+        conn.execute_raw("BEGIN; INSERT INTO markers VALUES (2, 'uncommitted')")
+            .unwrap();
+        match conn.try_close_for_pool() {
+            std::ops::ControlFlow::Break(result) => result.expect("synchronous pool retirement"),
+            std::ops::ControlFlow::Continue(_) => {
+                panic!("FrankenSQLite must close without an async runtime")
+            }
+        }
+        let reopened = FrankenConnection::open_file(path.to_str().unwrap()).unwrap();
+        let rows = reopened
+            .query_sync("SELECT id, value FROM markers ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::BigInt(1)));
+        assert_eq!(rows[0].get(1), Some(&Value::Text("committed".into())));
+        reopened.close_sync().unwrap();
     }
 
     #[test]

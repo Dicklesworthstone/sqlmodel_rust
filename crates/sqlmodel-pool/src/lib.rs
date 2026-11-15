@@ -496,6 +496,11 @@ where
     result
 }
 
+#[cfg(test)]
+thread_local! {
+    static RETIREMENT_RUNTIME_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[allow(clippy::result_large_err)] // Error is the crate's rich public error type.
 fn run_retirement_blocking<F, Fut>(
     deadline: Time,
@@ -523,6 +528,8 @@ where
         drop(operation);
         return Err(error);
     }
+    #[cfg(test)]
+    RETIREMENT_RUNTIME_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let runtime = match RuntimeBuilder::current_thread().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -557,6 +564,24 @@ fn close_connection_blocking<C: Connection>(
     context: &'static str,
 ) -> Result<(), Error> {
     let deadline = asupersync::time::wall_now() + grace;
+    let conn = if std::thread::panicking() || asupersync::time::wall_now() >= deadline {
+        conn
+    } else {
+        match conn.try_close_for_pool() {
+            std::ops::ControlFlow::Continue(conn) => conn,
+            std::ops::ControlFlow::Break(result) => {
+                let result = if asupersync::time::wall_now() >= deadline {
+                    Err(retirement_timeout())
+                } else {
+                    result
+                };
+                if let Err(error) = &result {
+                    tracing::warn!(context, error = %error, "unowned-pool connection retirement failed");
+                }
+                return result;
+            }
+        }
+    };
     run_retirement_blocking(
         deadline,
         context,
@@ -676,6 +701,42 @@ impl<C: Connection> ActiveConnectionGuard<C> {
             self.armed = false;
             self.pool.connections_closed.fetch_add(1, Ordering::Relaxed);
             self.pool.release_active_slot(operation);
+        }
+    }
+
+    fn try_close_synchronously(
+        mut self,
+        deadline: Time,
+        context: &'static str,
+    ) -> std::ops::ControlFlow<Result<(), Error>, Self> {
+        self.synchronous_context = Some(context);
+        if std::thread::panicking() || asupersync::time::wall_now() >= deadline {
+            return std::ops::ControlFlow::Continue(self);
+        }
+        let mut meta = self
+            .meta
+            .take()
+            .expect("active connection guard already consumed");
+        match meta.conn.try_close_for_pool() {
+            std::ops::ControlFlow::Continue(conn) => {
+                meta.conn = conn;
+                self.meta = Some(meta);
+                std::ops::ControlFlow::Continue(self)
+            }
+            std::ops::ControlFlow::Break(result) => {
+                let result = if asupersync::time::wall_now() >= deadline {
+                    Err(retirement_timeout())
+                } else {
+                    result
+                };
+                if let Err(error) = &result {
+                    self.pool.record_retirement_failure(context, error);
+                }
+                // The consuming driver hook has destroyed the resource before
+                // an error or the final slot release becomes visible to drainers.
+                self.release(context);
+                std::ops::ControlFlow::Break(result)
+            }
         }
     }
 
@@ -1318,26 +1379,44 @@ impl<C: Connection> Pool<C> {
         for guard in &mut retired {
             guard.synchronous_context = Some(context);
         }
-        let work_shared = Arc::clone(&shared);
-        let _ = run_retirement_blocking(
-            deadline,
-            context,
-            move |cx| async move {
-                let mut first_failure = None;
-                for guard in retired {
-                    if cx.now() >= deadline {
-                        let error = retirement_timeout();
-                        work_shared.record_retirement_failure(context, &error);
-                        return Err(error);
-                    }
-                    if let Err(error) = guard.close_synchronously(&cx, deadline, context).await {
+        let mut retired = retired.into_iter();
+        let mut first_failure = None;
+        while let Some(guard) = retired.next() {
+            match guard.try_close_synchronously(deadline, context) {
+                std::ops::ControlFlow::Break(result) => {
+                    if let Err(error) = result {
                         first_failure.get_or_insert(error);
                     }
                 }
-                first_failure.map_or(Ok(()), Err)
-            },
-            |error| shared.record_retirement_failure(context, error),
-        );
+                std::ops::ControlFlow::Continue(guard) => {
+                    // Keep the original order and one shared grace: once a
+                    // driver defers, the remaining batch uses the same runtime.
+                    let retired = std::iter::once(guard).chain(retired);
+                    let work_shared = Arc::clone(&shared);
+                    let _ = run_retirement_blocking(
+                        deadline,
+                        context,
+                        move |cx| async move {
+                            for guard in retired {
+                                if cx.now() >= deadline {
+                                    let error = retirement_timeout();
+                                    work_shared.record_retirement_failure(context, &error);
+                                    return Err(error);
+                                }
+                                if let Err(error) =
+                                    guard.close_synchronously(&cx, deadline, context).await
+                                {
+                                    first_failure.get_or_insert(error);
+                                }
+                            }
+                            first_failure.map_or(Ok(()), Err)
+                        },
+                        |error| shared.record_retirement_failure(context, error),
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     /// Close all currently idle connections.
@@ -1883,6 +1962,9 @@ mod tests {
         pool_close_pending: bool,
         /// When true, pool retirement returns a deterministic driver error.
         pool_close_should_fail: bool,
+        /// Opt into the consuming synchronous close hook.
+        pool_close_synchronous: bool,
+        pool_sync_close_calls: Arc<AtomicUsize>,
         /// When true, the close hook unwinds after taking ownership.
         pool_close_panics: bool,
         pool_close_gate: Option<Arc<PoolCloseGate>>,
@@ -1905,6 +1987,8 @@ mod tests {
                 pool_close_calls: Arc::new(AtomicUsize::new(0)),
                 pool_close_pending: false,
                 pool_close_should_fail: false,
+                pool_close_synchronous: false,
+                pool_sync_close_calls: Arc::new(AtomicUsize::new(0)),
                 pool_close_panics: false,
                 pool_close_gate: None,
                 pool_close_delay: None,
@@ -2239,6 +2323,29 @@ mod tests {
             Ok(())
         }
 
+        fn try_close_for_pool(self) -> std::ops::ControlFlow<Result<(), Error>, Self> {
+            if !self.pool_close_synchronous {
+                return std::ops::ControlFlow::Continue(self);
+            }
+            self.pool_sync_close_calls.fetch_add(1, Ordering::Relaxed);
+            if let (Some(pool_shared), Some(pool_lock_was_free)) =
+                (self.pool_shared.as_ref(), self.pool_lock_was_free.as_ref())
+            {
+                let mutex_is_available = pool_shared
+                    .upgrade()
+                    .is_none_or(|shared| shared.inner.try_lock().is_ok());
+                pool_lock_was_free.store(mutex_is_available, Ordering::Relaxed);
+            }
+            self.pool_close_calls.fetch_add(1, Ordering::Relaxed);
+            assert!(!self.pool_close_panics, "mock pool close panicked");
+            let result = if self.pool_close_should_fail {
+                Err(Error::Custom("mock pool close failure".to_string()))
+            } else {
+                Ok(())
+            };
+            std::ops::ControlFlow::Break(result)
+        }
+
         async fn close_for_pool(self, cx: &Cx) -> Result<(), Error> {
             if let (Some(pool_shared), Some(pool_lock_was_free)) =
                 (self.pool_shared.as_ref(), self.pool_lock_was_free.as_ref())
@@ -2320,6 +2427,213 @@ mod tests {
         assert_eq!(at_drop.active_connections, 1);
         assert_eq!(at_drop.total_connections, 1);
         assert_eq!(at_drop.idle_connections, 0);
+    }
+
+    #[test]
+    fn synchronous_driver_retirement_avoids_runtime_and_preserves_accounting() {
+        for path in ["idle", "closed", "expired"] {
+            let (clock, driver) = virtual_clock();
+            clock.advance(1_000_000_000);
+            let pool = Pool::with_timer_driver(
+                PoolConfig::new(1).max_lifetime(1).test_on_checkout(false),
+                driver,
+            );
+            let closes = Arc::new(AtomicUsize::new(0));
+            let unlocked = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(OnceCell::new());
+            let mut conn = MockConnection::with_pool_close_probe(
+                1,
+                Arc::clone(&closes),
+                Arc::downgrade(&pool.shared),
+                Arc::clone(&unlocked),
+            );
+            conn.pool_close_synchronous = true;
+            let lease = acquire_mock(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+            let before = RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get);
+            match path {
+                "idle" => {
+                    drop(lease);
+                    pool.clear_idle();
+                }
+                "closed" => {
+                    pool.close();
+                    drop(lease);
+                }
+                "expired" => {
+                    clock.advance(2_000_000);
+                    drop(lease);
+                }
+                _ => unreachable!("fixed retirement paths"),
+            }
+            assert_eq!(
+                RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get) - before,
+                0,
+                "{path}: a synchronous driver must not construct a retirement runtime"
+            );
+            assert_eq!(closes.load(Ordering::Relaxed), 1, "{path}");
+            assert!(unlocked.load(Ordering::Relaxed), "{path}");
+            assert_drop_precedes_slot_release(&dropped);
+            assert_no_occupied_slots(&pool);
+            assert_eq!(pool.stats().connections_closed, 1);
+            assert!(pool.shared.retirement_failure_error().is_none());
+        }
+    }
+
+    #[test]
+    fn synchronous_driver_retirement_orphaned_lease_avoids_runtime() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let mut conn = MockConnection::new(1);
+        conn.pool_close_synchronous = true;
+        let closes = Arc::clone(&conn.pool_close_calls);
+        let lease = acquire_mock(&pool, conn);
+        drop(pool);
+        let before = RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get);
+        drop(lease);
+        assert_eq!(
+            RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get) - before,
+            0,
+            "an orphaned lease must retain the synchronous close path"
+        );
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn synchronous_driver_retirement_failure_is_sticky_without_runtime() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let dropped = Arc::new(OnceCell::new());
+        let mut conn = MockConnection::with_failing_pool_close(1);
+        conn.pool_close_synchronous = true;
+        let closes = Arc::clone(&conn.pool_close_calls);
+        seed_idle(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        let before = RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get);
+        pool.clear_idle();
+        assert_eq!(
+            RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get) - before,
+            0
+        );
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_drop_precedes_slot_release(&dropped);
+        assert!(
+            pool.shared
+                .retirement_failure_error()
+                .unwrap()
+                .to_string()
+                .contains("mock pool close failure")
+        );
+        assert_sticky_retirement_failure(&pool);
+    }
+
+    #[test]
+    fn asynchronous_driver_retirement_keeps_runtime_fallback() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let dropped = Arc::new(OnceCell::new());
+        let conn = MockConnection::new(1);
+        let closes = Arc::clone(&conn.pool_close_calls);
+        seed_idle(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        let before = RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get);
+        pool.clear_idle();
+        assert_eq!(
+            RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get) - before,
+            1,
+            "a driver that defers still needs the supervised runtime"
+        );
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_drop_precedes_slot_release(&dropped);
+        assert_no_occupied_slots(&pool);
+        assert!(pool.shared.retirement_failure_error().is_none());
+    }
+
+    #[test]
+    fn synchronous_driver_retirement_preserves_batch_order_and_async_failure_latch() {
+        for synchronous_middle in [false, true] {
+            let pool = Pool::new(PoolConfig::new(3));
+            let mut leases = Vec::new();
+            let mut dropped = Vec::new();
+            let mut closes = Vec::new();
+            let mut synchronous_closes = Vec::new();
+            for id in 1..=3 {
+                let observed = Arc::new(OnceCell::new());
+                let mut conn = MockConnection::new(id);
+                conn.pool_close_synchronous = id != 2 || synchronous_middle;
+                conn.pool_close_should_fail = id == 1;
+                closes.push(Arc::clone(&conn.pool_close_calls));
+                synchronous_closes.push(Arc::clone(&conn.pool_sync_close_calls));
+                leases.push(acquire_mock(
+                    &pool,
+                    conn.observe_drop(&pool, Arc::clone(&observed)),
+                ));
+                dropped.push(observed);
+            }
+            drop(leases);
+            assert_eq!(pool.stats().idle_connections, 3);
+            let before = RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get);
+            pool.clear_idle();
+            assert_eq!(
+                RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get) - before,
+                usize::from(!synchronous_middle)
+            );
+            assert_eq!(synchronous_closes[0].load(Ordering::Relaxed), 1);
+            assert_eq!(
+                synchronous_closes[2].load(Ordering::Relaxed),
+                usize::from(synchronous_middle),
+                "after the first async deferral the remaining batch keeps its original path"
+            );
+            for (index, observed) in dropped.iter().enumerate() {
+                assert_eq!(closes[index].load(Ordering::Relaxed), 1);
+                let at_drop = observed.get().unwrap().as_ref().unwrap();
+                assert_eq!(at_drop.active_connections, 3 - index);
+                assert_eq!(at_drop.total_connections, 3 - index);
+                assert_eq!(at_drop.idle_connections, 0);
+            }
+            assert_eq!(pool.stats().connections_closed, 3);
+            assert_sticky_retirement_failure(&pool);
+        }
+    }
+
+    #[test]
+    fn synchronous_driver_retirement_panic_keeps_failure_and_resource_accounting() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let dropped = Arc::new(OnceCell::new());
+        let mut conn = MockConnection::new(1);
+        conn.pool_close_synchronous = true;
+        conn.pool_close_panics = true;
+        seed_idle(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        let before = RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.clear_idle()))
+            .expect_err("the driver close panic must propagate");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"mock pool close panicked")
+        );
+        assert_eq!(RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get), before);
+        assert_drop_precedes_slot_release(&dropped);
+        assert_sticky_retirement_failure(&pool);
+    }
+
+    #[test]
+    fn synchronous_driver_retirement_skips_hook_during_holder_unwind() {
+        let pool = Pool::new(PoolConfig::new(1));
+        let mut conn = MockConnection::new(1);
+        conn.pool_close_synchronous = true;
+        conn.pool_close_panics = true;
+        let closes = Arc::clone(&conn.pool_close_calls);
+        let dropped = Arc::new(OnceCell::new());
+        let lease = acquire_mock(&pool, conn.observe_drop(&pool, Arc::clone(&dropped)));
+        pool.close();
+        let before = RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = lease;
+            panic!("original holder panic");
+        }));
+        let payload = unwound.expect_err("the holder panic must propagate");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"original holder panic")
+        );
+        assert_eq!(closes.load(Ordering::Relaxed), 0);
+        assert_eq!(RETIREMENT_RUNTIME_BUILDS.with(std::cell::Cell::get), before);
+        assert_drop_precedes_slot_release(&dropped);
+        assert_sticky_retirement_failure(&pool);
     }
 
     #[test]
