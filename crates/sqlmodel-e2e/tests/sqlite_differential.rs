@@ -45,16 +45,6 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "same stale counter as `upsert do update` (a DO NOTHING upsert changes it on neither side)",
     ),
     (
-        "rowid after insert returning",
-        "fsqlite does not set last_insert_rowid() to the rowid of an INSERT ... RETURNING row; \
-         C SQLite does",
-    ),
-    (
-        "rowid after delete returning",
-        "carries the `rowid after insert returning` value: neither side changes the counter \
-         on UPDATE/DELETE",
-    ),
-    (
         "syntax error",
         "fsqlite >= 0.4.4 reports an unexpected token as SyntaxError, which the frankensqlite \
          driver maps to QueryErrorKind::Syntax; C SQLite returns a plain SQLITE_ERROR \

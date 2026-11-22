@@ -40,6 +40,8 @@ pub struct ValidateDef {
     pub model_validators: Vec<ModelValidator>,
     /// Generics from the struct.
     pub generics: syn::Generics,
+    /// Optional explicit crate path override from `#[validate(crate = "...")]`.
+    pub crate_path: Option<syn::Path>,
 }
 
 /// Parsed validation rules for a single field.
@@ -80,8 +82,8 @@ pub fn parse_validate(input: &DeriveInput) -> Result<ValidateDef> {
     let name = input.ident.clone();
     let generics = input.generics.clone();
 
-    // Parse struct-level attributes for model validators
-    let model_validators = parse_model_validators(&input.attrs)?;
+    // Parse struct-level attributes for model validators and optional crate override
+    let (model_validators, crate_path) = parse_struct_validate_attrs(&input.attrs)?;
 
     let fields = match &input.data {
         Data::Struct(data) => parse_validate_fields(&data.fields)?,
@@ -104,12 +106,16 @@ pub fn parse_validate(input: &DeriveInput) -> Result<ValidateDef> {
         fields,
         model_validators,
         generics,
+        crate_path,
     })
 }
 
-/// Parse struct-level `#[validate(...)]` attributes for model validators.
-fn parse_model_validators(attrs: &[syn::Attribute]) -> Result<Vec<ModelValidator>> {
+/// Parse struct-level `#[validate(...)]` attributes for model validators and crate path.
+fn parse_struct_validate_attrs(
+    attrs: &[syn::Attribute],
+) -> Result<(Vec<ModelValidator>, Option<syn::Path>)> {
     let mut validators = Vec::new();
+    let mut crate_path: Option<syn::Path> = None;
 
     for attr in attrs {
         if !attr.path().is_ident("validate") {
@@ -117,7 +123,24 @@ fn parse_model_validators(attrs: &[syn::Attribute]) -> Result<Vec<ModelValidator
         }
 
         attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("model") {
+            if meta.path.is_ident("crate") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    if crate_path.is_some() {
+                        return Err(Error::new_spanned(
+                            meta.path,
+                            "duplicate validate attribute: crate",
+                        ));
+                    }
+                    crate_path = Some(lit_str.parse()?);
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal path for crate",
+                    ))
+                }
+            } else if meta.path.is_ident("model") {
                 // Parse: #[validate(model = "fn_name")] or
                 // #[validate(model(fn = "fn_name", mode = "after"))]
                 if meta.input.peek(syn::Token![=]) {
@@ -198,13 +221,13 @@ fn parse_model_validators(attrs: &[syn::Attribute]) -> Result<Vec<ModelValidator
             } else {
                 Err(Error::new_spanned(
                     meta.path,
-                    "unknown struct-level validate attribute, expected 'model'",
+                    "unknown struct-level validate attribute, expected 'model' or 'crate'",
                 ))
             }
         })?;
     }
 
-    Ok(validators)
+    Ok((validators, crate_path))
 }
 
 /// Parse all fields from a struct for validation.
@@ -453,6 +476,7 @@ fn extract_option_inner(ty: &Type) -> Option<&Type> {
 
 /// Generate the Validate trait implementation.
 pub fn generate_validate_impl(def: &ValidateDef) -> TokenStream {
+    let core = crate::resolve_core_crate(def.crate_path.as_ref());
     let name = &def.name;
     let (impl_generics, ty_generics, where_clause) = def.generics.split_for_impl();
 
@@ -461,7 +485,7 @@ pub fn generate_validate_impl(def: &ValidateDef) -> TokenStream {
         .fields
         .iter()
         .filter(|f| has_validation(f))
-        .map(generate_field_validation)
+        .map(|f| generate_field_validation(f, &core))
         .collect();
 
     // Generate model validator calls (before)
@@ -502,7 +526,7 @@ pub fn generate_validate_impl(def: &ValidateDef) -> TokenStream {
                 ///
                 /// Returns `Ok(())` if all validations pass, or `Err(ValidationError)`
                 /// with details about which fields failed.
-                pub fn validate(&self) -> std::result::Result<(), sqlmodel_core::ValidationError> {
+                pub fn validate(&self) -> std::result::Result<(), #core::ValidationError> {
                     Ok(())
                 }
             }
@@ -520,8 +544,8 @@ pub fn generate_validate_impl(def: &ValidateDef) -> TokenStream {
             /// 1. Model validators with mode="before"
             /// 2. Field-level validations
             /// 3. Model validators with mode="after" (default)
-            pub fn validate(&self) -> std::result::Result<(), sqlmodel_core::ValidationError> {
-                let mut errors = sqlmodel_core::ValidationError::new();
+            pub fn validate(&self) -> std::result::Result<(), #core::ValidationError> {
+                let mut errors = #core::ValidationError::new();
 
                 // 1. Before validators (run before field validation)
                 #(#before_validators)*
@@ -555,7 +579,7 @@ fn has_validation(field: &ValidateFieldDef) -> bool {
 }
 
 /// Generate validation code for a single field.
-fn generate_field_validation(field: &ValidateFieldDef) -> TokenStream {
+fn generate_field_validation(field: &ValidateFieldDef, core: &TokenStream) -> TokenStream {
     let field_name = &field.name;
     let field_name_str = field_name.to_string();
     let is_optional = is_option_type(&field.ty);
@@ -683,19 +707,19 @@ fn generate_field_validation(field: &ValidateFieldDef) -> TokenStream {
     }
 
     // Pattern check (regex)
-    // Uses sqlmodel_core::validate::matches_pattern for full regex support
+    // Uses #core::validate::matches_pattern for full regex support
     if let Some(ref pattern) = field.pattern {
         if is_optional {
             checks.push(quote! {
                 if let Some(ref value) = self.#field_name {
-                    if !sqlmodel_core::validate::matches_pattern(value.as_ref(), #pattern) {
+                    if !#core::validate::matches_pattern(value.as_ref(), #pattern) {
                         errors.add_pattern(#field_name_str, #pattern);
                     }
                 }
             });
         } else {
             checks.push(quote! {
-                if !sqlmodel_core::validate::matches_pattern(self.#field_name.as_ref(), #pattern) {
+                if !#core::validate::matches_pattern(self.#field_name.as_ref(), #pattern) {
                     errors.add_pattern(#field_name_str, #pattern);
                 }
             });
@@ -798,14 +822,14 @@ fn generate_field_validation(field: &ValidateFieldDef) -> TokenStream {
         if is_optional {
             checks.push(quote! {
                 if let Some(ref value) = self.#field_name {
-                    if !sqlmodel_core::validate::is_valid_credit_card(value.as_ref()) {
+                    if !#core::validate::is_valid_credit_card(value.as_ref()) {
                         errors.add_credit_card(#field_name_str);
                     }
                 }
             });
         } else {
             checks.push(quote! {
-                if !sqlmodel_core::validate::is_valid_credit_card(self.#field_name.as_ref()) {
+                if !#core::validate::is_valid_credit_card(self.#field_name.as_ref()) {
                     errors.add_credit_card(#field_name_str);
                 }
             });

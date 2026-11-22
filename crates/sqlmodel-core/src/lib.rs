@@ -109,3 +109,10 @@ pub use validate::{
     apply_serialization_aliases, apply_validation_aliases,
 };
 pub use value::Value;
+
+/// Private re-export used by `sqlmodel-macros` so explicit `#[sqlmodel(crate = "...")]`
+/// paths work identically whether pointed at `sqlmodel` or `sqlmodel_core`.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate as core;
+}

@@ -146,6 +146,16 @@ pub use sqlmodel_core::{RetryDecision, RetryPolicy, retry_transaction};
 
 pub use sqlmodel_macros::{Model, SqlEnum, Validate};
 
+/// Private re-exports used by `#[derive(Model)]`, `#[derive(Validate)]`, and
+/// `#[derive(SqlEnum)]` so applications that depend only on the `sqlmodel`
+/// facade do not need undeclared direct dependencies on `sqlmodel-core` or
+/// `sqlmodel-query`.
+#[doc(hidden)]
+pub mod __private {
+    pub use sqlmodel_core as core;
+    pub use sqlmodel_query as query;
+}
+
 /// Compiles every Rust code block in the repository README as a doctest, so
 /// the documented API cannot drift from the real one (blocks that are not
 /// runnable programs are marked `ignore` in the README itself). The README

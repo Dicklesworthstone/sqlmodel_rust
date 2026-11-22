@@ -823,7 +823,7 @@ fn diff_table(current: &TableInfo, expected: &TableInfo, dialect: Dialect, diff:
     diff_primary_key(current, &expected.primary_key, diff);
 
     // Diff foreign keys
-    diff_foreign_keys(current, &expected.foreign_keys, diff);
+    diff_foreign_keys(current, &expected.foreign_keys, dialect, diff);
 
     // Diff unique constraints
     diff_unique_constraints(current, &expected.unique_constraints, diff);
@@ -1014,6 +1014,7 @@ fn diff_primary_key(current_table: &TableInfo, expected_pk: &[String], diff: &mu
 fn diff_foreign_keys(
     current_table: &TableInfo,
     expected: &[ForeignKeyInfo],
+    dialect: Dialect,
     diff: &mut SchemaDiff,
 ) {
     let table = current_table.name.as_str();
@@ -1050,7 +1051,7 @@ fn diff_foreign_keys(
     // Changed foreign keys (compare references)
     for (col, expected_fk) in &expected_map {
         if let Some(current_fk) = current_map.get(col)
-            && !fk_matches(current_fk, expected_fk)
+            && !fk_matches(dialect, current_fk, expected_fk)
         {
             // Drop and recreate
             let name = fk_effective_name(table, current_fk);
@@ -1068,12 +1069,35 @@ fn diff_foreign_keys(
     }
 }
 
-/// Check if two foreign keys match.
-fn fk_matches(current: &ForeignKeyInfo, expected: &ForeignKeyInfo) -> bool {
+/// Normalize a foreign-key referential action according to dialect semantics.
+///
+/// An omitted clause (`None`) is equivalent to `NO ACTION` on every supported
+/// dialect. On MySQL and MariaDB, `RESTRICT` and `NO ACTION` are identical
+/// immediate checks, and MariaDB reports omitted `ON DELETE`/`ON UPDATE`
+/// clauses as `RESTRICT` in `information_schema.referential_constraints`;
+/// normalizing both to `None` prevents spurious drop/add churn while keeping
+/// `RESTRICT` distinct from `NO ACTION` on PostgreSQL and SQLite and keeping
+/// all non-default actions (`CASCADE`, `SET NULL`, `SET DEFAULT`) strictly
+/// compared across every dialect.
+fn normalize_fk_action(dialect: Dialect, action: Option<&str>) -> Option<String> {
+    let normalized = action?.trim().to_ascii_uppercase();
+    if normalized.is_empty() || normalized == "NO ACTION" {
+        return None;
+    }
+    if dialect == Dialect::Mysql && normalized == "RESTRICT" {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Check if two foreign keys match under `dialect`'s referential-action semantics.
+fn fk_matches(dialect: Dialect, current: &ForeignKeyInfo, expected: &ForeignKeyInfo) -> bool {
     current.foreign_table == expected.foreign_table
         && current.foreign_column == expected.foreign_column
-        && current.on_delete == expected.on_delete
-        && current.on_update == expected.on_update
+        && normalize_fk_action(dialect, current.on_delete.as_deref())
+            == normalize_fk_action(dialect, expected.on_delete.as_deref())
+        && normalize_fk_action(dialect, current.on_update.as_deref())
+            == normalize_fk_action(dialect, expected.on_update.as_deref())
 }
 
 /// Compare unique constraints.
@@ -2239,6 +2263,87 @@ mod tests {
         };
         assert!(
             matches!(op.inverse(), Some(SchemaOperation::AlterColumnType { from_type, to_type, .. }) if from_type == "INTEGER" && to_type == "TEXT")
+        );
+    }
+
+    #[test]
+    fn test_fk_default_action_normalization_mysql_mariadb() {
+        let make_fk = |on_delete: Option<&str>, on_update: Option<&str>| ForeignKeyInfo {
+            name: Some("fk_memberships_team_id".to_string()),
+            column: "team_id".to_string(),
+            foreign_table: "teams".to_string(),
+            foreign_column: "id".to_string(),
+            on_delete: on_delete.map(str::to_string),
+            on_update: on_update.map(str::to_string),
+        };
+
+        // MariaDB reports omitted ON UPDATE as RESTRICT while the model stores None.
+        let mariadb_introspected = make_fk(Some("CASCADE"), Some("RESTRICT"));
+        let model_expected = make_fk(Some("CASCADE"), None);
+        assert!(fk_matches(
+            Dialect::Mysql,
+            &mariadb_introspected,
+            &model_expected
+        ));
+
+        // Explicit NO ACTION and RESTRICT are also equivalent on MySQL/MariaDB.
+        assert!(fk_matches(
+            Dialect::Mysql,
+            &make_fk(Some("RESTRICT"), Some("NO ACTION")),
+            &make_fk(Some("NO ACTION"), Some("RESTRICT")),
+        ));
+
+        // Non-default actions remain strictly compared on MySQL/MariaDB.
+        assert!(!fk_matches(
+            Dialect::Mysql,
+            &make_fk(Some("CASCADE"), Some("RESTRICT")),
+            &make_fk(Some("SET NULL"), None),
+        ));
+        assert!(!fk_matches(
+            Dialect::Mysql,
+            &make_fk(Some("CASCADE"), Some("RESTRICT")),
+            &make_fk(Some("CASCADE"), Some("CASCADE")),
+        ));
+
+        // PostgreSQL and SQLite preserve the RESTRICT vs NO ACTION distinction.
+        assert!(!fk_matches(
+            Dialect::Postgres,
+            &mariadb_introspected,
+            &model_expected,
+        ));
+        assert!(!fk_matches(
+            Dialect::Sqlite,
+            &mariadb_introspected,
+            &model_expected,
+        ));
+        assert!(fk_matches(
+            Dialect::Postgres,
+            &make_fk(Some("CASCADE"), Some("NO ACTION")),
+            &model_expected,
+        ));
+        assert!(fk_matches(
+            Dialect::Sqlite,
+            &make_fk(Some("CASCADE"), Some("NO ACTION")),
+            &model_expected,
+        ));
+
+        // End-to-end schema_diff fixpoint check for MariaDB-shaped introspection.
+        let mut current = DatabaseSchema::new(Dialect::Mysql);
+        let mut expected = DatabaseSchema::new(Dialect::Mysql);
+        let mut cur_table =
+            make_table("memberships", vec![make_column("team_id", "BIGINT", false)]);
+        cur_table.foreign_keys.push(mariadb_introspected);
+        let mut exp_table =
+            make_table("memberships", vec![make_column("team_id", "BIGINT", false)]);
+        exp_table.foreign_keys.push(model_expected);
+        current.tables.insert("memberships".to_string(), cur_table);
+        expected.tables.insert("memberships".to_string(), exp_table);
+
+        let diff = schema_diff(&current, &expected);
+        assert!(
+            diff.operations.is_empty(),
+            "MariaDB default RESTRICT on omitted ON UPDATE must reach fixpoint, got {:?}",
+            diff.operations
         );
     }
 }

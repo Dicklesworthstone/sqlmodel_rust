@@ -1897,12 +1897,14 @@ fn franken_to_query_error(e: &fsqlite_error::FrankenError, sql: &str) -> Error {
     use fsqlite_error::FrankenError;
 
     let kind = match e {
-        FrankenError::UniqueViolation { .. } | FrankenError::NotNullViolation { .. } => {
-            QueryErrorKind::Constraint
-        }
-        FrankenError::ForeignKeyViolation | FrankenError::CheckViolation { .. } => {
-            QueryErrorKind::Constraint
-        }
+        FrankenError::UniqueViolation { .. }
+        | FrankenError::NotNullViolation { .. }
+        | FrankenError::ForeignKeyViolation
+        | FrankenError::CheckViolation { .. }
+        | FrankenError::PrimaryKeyViolation { .. }
+        | FrankenError::RowidViolation { .. }
+        | FrankenError::DatatypeViolation { .. }
+        | FrankenError::RtreeConstraint { .. } => QueryErrorKind::Constraint,
         FrankenError::WriteConflict { .. } | FrankenError::SerializationFailure { .. } => {
             QueryErrorKind::Deadlock
         }
@@ -3109,6 +3111,38 @@ mod tests {
         match mapped {
             Error::Query(qe) => assert_eq!(qe.kind, QueryErrorKind::Deadlock),
             other => panic!("expected Deadlock error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn error_type_mapping_fsqlite_0_5_constraint_variants() {
+        use fsqlite_error::FrankenError;
+        for err in [
+            FrankenError::PrimaryKeyViolation {
+                columns: "t.id".to_string(),
+            },
+            FrankenError::RowidViolation {
+                table: "t".to_string(),
+            },
+            FrankenError::DatatypeViolation {
+                column: "n".to_string(),
+                column_type: "INT".to_string(),
+                actual: "TEXT".to_string(),
+            },
+            FrankenError::RtreeConstraint {
+                constraint: "r.(x0<=x1)".to_string(),
+            },
+        ] {
+            let mapped = franken_to_query_error(&err, "INSERT INTO t VALUES (1)");
+            match mapped {
+                Error::Query(qe) => assert_eq!(
+                    qe.kind,
+                    QueryErrorKind::Constraint,
+                    "expected Constraint for {err:?}, got {:?}",
+                    qe.kind
+                ),
+                other => panic!("expected Query Constraint error for {err:?}, got {other}"),
+            }
         }
     }
 

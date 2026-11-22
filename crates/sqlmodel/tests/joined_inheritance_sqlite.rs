@@ -44,8 +44,16 @@ struct Student {
     grade: String,
 }
 
+// Serialize tests in this binary so the tracing callsite interest cache cannot
+// race between a thread running with no subscriber and the diagnostics test's
+// scoped `tracing::subscriber::with_default` subscriber.
+static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn sqlite_joined_inheritance_select_hydrates_parent_and_polymorphic_base() {
+    let _guard = TRACING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("create asupersync runtime");
@@ -184,6 +192,9 @@ impl Subscriber for TestSubscriber {
 
 #[test]
 fn sqlite_joined_inheritance_diagnostics_logging() {
+    let _guard = TRACING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("create asupersync runtime");

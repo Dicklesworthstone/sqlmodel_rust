@@ -23,6 +23,84 @@ mod validate_derive;
 
 use parse::{InheritanceStrategy, ModelDef, RelationshipKindAttr, parse_model};
 
+/// Resolve the path to `sqlmodel-core` (directly or through the `sqlmodel` facade).
+///
+/// Resolution order:
+/// 1. Explicit `#[sqlmodel(crate = "...")]` / `#[validate(crate = "...")]` path
+///    (works whether pointed at `sqlmodel`, a renamed facade, or `sqlmodel_core`,
+///    because both crates expose `#[doc(hidden)] pub mod __private { pub use ... as core; }`).
+/// 2. Direct `sqlmodel-core` dependency in the invoking crate's `Cargo.toml`
+///    (including renamed dependencies via `package = "sqlmodel-core"`).
+/// 3. `sqlmodel` facade dependency in the invoking crate's `Cargo.toml`
+///    (including renamed dependencies via `package = "sqlmodel"`).
+/// 4. Fallback to `::sqlmodel_core` when invoked outside Cargo.
+pub(crate) fn resolve_core_crate(explicit: Option<&syn::Path>) -> proc_macro2::TokenStream {
+    if let Some(path) = explicit {
+        return quote::quote! { #path::__private::core };
+    }
+    match proc_macro_crate::crate_name("sqlmodel-core") {
+        Ok(proc_macro_crate::FoundCrate::Itself) => {
+            if std::env::var("CARGO_CRATE_NAME").as_deref() == Ok("sqlmodel_core") {
+                return quote::quote! { crate };
+            }
+            return quote::quote! { ::sqlmodel_core };
+        }
+        Ok(proc_macro_crate::FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+            return quote::quote! { ::#ident };
+        }
+        Err(_) => {}
+    }
+    match proc_macro_crate::crate_name("sqlmodel") {
+        Ok(proc_macro_crate::FoundCrate::Itself) => {
+            if std::env::var("CARGO_CRATE_NAME").as_deref() == Ok("sqlmodel") {
+                return quote::quote! { crate::__private::core };
+            }
+            return quote::quote! { ::sqlmodel::__private::core };
+        }
+        Ok(proc_macro_crate::FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+            return quote::quote! { ::#ident::__private::core };
+        }
+        Err(_) => {}
+    }
+    quote::quote! { ::sqlmodel_core }
+}
+
+/// Resolve the path to `sqlmodel-query` (directly or through the `sqlmodel` facade).
+pub(crate) fn resolve_query_crate(explicit: Option<&syn::Path>) -> proc_macro2::TokenStream {
+    if let Some(path) = explicit {
+        return quote::quote! { #path::__private::query };
+    }
+    match proc_macro_crate::crate_name("sqlmodel-query") {
+        Ok(proc_macro_crate::FoundCrate::Itself) => {
+            if std::env::var("CARGO_CRATE_NAME").as_deref() == Ok("sqlmodel_query") {
+                return quote::quote! { crate };
+            }
+            return quote::quote! { ::sqlmodel_query };
+        }
+        Ok(proc_macro_crate::FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+            return quote::quote! { ::#ident };
+        }
+        Err(_) => {}
+    }
+    match proc_macro_crate::crate_name("sqlmodel") {
+        Ok(proc_macro_crate::FoundCrate::Itself) => {
+            if std::env::var("CARGO_CRATE_NAME").as_deref() == Ok("sqlmodel") {
+                return quote::quote! { crate::__private::query };
+            }
+            return quote::quote! { ::sqlmodel::__private::query };
+        }
+        Ok(proc_macro_crate::FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+            return quote::quote! { ::#ident::__private::query };
+        }
+        Err(_) => {}
+    }
+    quote::quote! { ::sqlmodel_query }
+}
+
 /// Derive macro for the `Model` trait.
 ///
 /// This macro generates implementations for:
@@ -88,6 +166,8 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 
 /// Generate the Model trait implementation from parsed model definition.
 fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
+    let core = resolve_core_crate(model.crate_path.as_ref());
+    let query = resolve_query_crate(model.crate_path.as_ref());
     let name = &model.name;
     let table_name_lit = &model.table_name;
     let (impl_generics, ty_generics, where_clause) = model.generics.split_for_impl();
@@ -108,7 +188,7 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
                     let ident = syn::Ident::new(parent, proc_macro2::Span::call_site());
                     quote::quote! { #ident }
                 };
-            quote::quote! { <#parent_ty_ts as sqlmodel_core::Model>::TABLE_NAME }
+            quote::quote! { <#parent_ty_ts as #core::Model>::TABLE_NAME }
         } else {
             quote::quote! { #table_name_lit }
         };
@@ -135,27 +215,27 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     };
 
     // Generate static FieldInfo array for fields()
-    let field_infos = generate_field_infos(model);
+    let field_infos = generate_field_infos(model, &core);
 
     // Generate RELATIONSHIPS constant
-    let relationships = generate_relationships(model);
+    let relationships = generate_relationships(model, &core);
 
     // Generate to_row implementation
-    let to_row_body = generate_to_row(model);
+    let to_row_body = generate_to_row(model, &core);
 
     // Generate from_row implementation
-    let from_row_body = generate_from_row(model);
+    let from_row_body = generate_from_row(model, &core);
     // Generate hydrate_relationship implementation (eager loading)
-    let hydrate_body = generate_hydrate_relationship(model);
+    let hydrate_body = generate_hydrate_relationship(model, &core);
 
     // Generate primary_key_value implementation
-    let pk_value_body = generate_primary_key_value(model);
+    let pk_value_body = generate_primary_key_value(model, &core);
 
     // Generate is_new implementation
     let is_new_body = generate_is_new(model);
 
     // Generate model_config implementation
-    let model_config_body = generate_model_config(model);
+    let model_config_body = generate_model_config(model, &core);
 
     // Helper: interpret `inherits = "..."` as a Rust type path in the current scope.
     let parent_ty_ts: Option<proc_macro2::TokenStream> =
@@ -180,7 +260,7 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
             .expect("parent_ty exists for joined child");
         quote::quote! {
             const _: () = {
-                if <#parent_ty as sqlmodel_core::Model>::INHERITANCE.has_parent() {
+                if <#parent_ty as #core::Model>::INHERITANCE.has_parent() {
                     panic!(concat!(
                         "multi-level joined inheritance is not supported; flatten <",
                         stringify!(#parent_ty),
@@ -196,52 +276,52 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
     };
 
     // Generate inheritance implementation
-    let inheritance_body = generate_inheritance(model, parent_ty_ts.as_ref());
+    let inheritance_body = generate_inheritance(model, parent_ty_ts.as_ref(), &core);
 
     // Generate shard_key implementation
-    let (shard_key_const, shard_key_value_body) = generate_shard_key(model);
+    let (shard_key_const, shard_key_value_body) = generate_shard_key(model, &core);
 
     // Generate joined-parent extraction for joined-table inheritance child models.
-    let joined_parent_row_body = generate_joined_parent_row(model);
+    let joined_parent_row_body = generate_joined_parent_row(model, &core);
 
     // Generate Debug impl only if any field has repr=false
     let debug_impl = generate_debug_impl(model);
 
     // Generate hybrid property expr methods
-    let hybrid_impl = generate_hybrid_methods(model);
+    let hybrid_impl = generate_hybrid_methods(model, &query);
 
     quote::quote! {
-        impl #impl_generics sqlmodel_core::Model for #name #ty_generics #where_clause {
+        impl #impl_generics #core::Model for #name #ty_generics #where_clause {
             const TABLE_NAME: &'static str = #table_name_ts;
             const PRIMARY_KEY: &'static [&'static str] = #pk_slice;
-            const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] = #relationships;
+            const RELATIONSHIPS: &'static [#core::RelationshipInfo] = #relationships;
             const SHARD_KEY: Option<&'static str> = #shard_key_const;
-            const INHERITANCE: sqlmodel_core::InheritanceInfo = #inheritance_body;
+            const INHERITANCE: #core::InheritanceInfo = #inheritance_body;
 
-            fn fields() -> &'static [sqlmodel_core::FieldInfo] {
-                static FIELDS: &[sqlmodel_core::FieldInfo] = &[
+            fn fields() -> &'static [#core::FieldInfo] {
+                static FIELDS: &[#core::FieldInfo] = &[
                     #field_infos
                 ];
                 FIELDS
             }
 
-            fn to_row(&self) -> Vec<(&'static str, sqlmodel_core::Value)> {
+            fn to_row(&self) -> Vec<(&'static str, #core::Value)> {
                 #to_row_body
             }
 
-            fn from_row(row: &sqlmodel_core::Row) -> sqlmodel_core::Result<Self> {
+            fn from_row(row: &#core::Row) -> #core::Result<Self> {
                 #from_row_body
             }
 
             fn hydrate_relationship(
                 &mut self,
                 relationship: &str,
-                rows: &[sqlmodel_core::Row],
-            ) -> sqlmodel_core::Result<()> {
+                rows: &[#core::Row],
+            ) -> #core::Result<()> {
                 #hydrate_body
             }
 
-            fn primary_key_value(&self) -> Vec<sqlmodel_core::Value> {
+            fn primary_key_value(&self) -> Vec<#core::Value> {
                 #pk_value_body
             }
 
@@ -249,15 +329,15 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
                 #is_new_body
             }
 
-            fn model_config() -> sqlmodel_core::ModelConfig {
+            fn model_config() -> #core::ModelConfig {
                 #model_config_body
             }
 
-            fn inheritance() -> sqlmodel_core::InheritanceInfo {
+            fn inheritance() -> #core::InheritanceInfo {
                 Self::INHERITANCE
             }
 
-            fn shard_key_value(&self) -> Option<sqlmodel_core::Value> {
+            fn shard_key_value(&self) -> Option<#core::Value> {
                 #shard_key_value_body
             }
 
@@ -277,7 +357,10 @@ fn generate_model_impl(model: &ModelDef) -> proc_macro2::TokenStream {
 /// For each field with `#[sqlmodel(hybrid, sql = "...")]`, generates
 /// a `pub fn {field}_expr() -> sqlmodel_query::Expr` method that returns
 /// `Expr::raw(sql)`.
-fn generate_hybrid_methods(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_hybrid_methods(
+    model: &ModelDef,
+    query: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let hybrid_fields: Vec<_> = model
         .fields
         .iter()
@@ -307,8 +390,8 @@ fn generate_hybrid_methods(model: &ModelDef) -> proc_macro2::TokenStream {
             );
             quote::quote! {
                 #[doc = #doc]
-                pub fn #method_name() -> sqlmodel_query::Expr {
-                    sqlmodel_query::Expr::raw(#sql)
+                pub fn #method_name() -> #query::Expr {
+                    #query::Expr::raw(#sql)
                 }
             }
         })
@@ -321,7 +404,10 @@ fn generate_hybrid_methods(model: &ModelDef) -> proc_macro2::TokenStream {
     }
 }
 
-fn generate_joined_parent_row(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_joined_parent_row(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let is_joined_child =
         model.config.inheritance == InheritanceStrategy::Joined && model.config.inherits.is_some();
     if !is_joined_child {
@@ -334,32 +420,38 @@ fn generate_joined_parent_row(model: &ModelDef) -> proc_macro2::TokenStream {
     let parent_ident = &parent_field.name;
 
     quote::quote! {
-        fn joined_parent_row(&self) -> Option<Vec<(&'static str, sqlmodel_core::Value)>> {
+        fn joined_parent_row(&self) -> Option<Vec<(&'static str, #core::Value)>> {
             Some(self.#parent_ident.to_row())
         }
     }
 }
 
 /// Convert a referential action string to the corresponding token.
-fn referential_action_ts(action: &str) -> proc_macro2::TokenStream {
+fn referential_action_ts(
+    action: &str,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     match action.to_uppercase().as_str() {
         "NO ACTION" | "NOACTION" | "NO_ACTION" => {
-            quote::quote! { sqlmodel_core::ReferentialAction::NoAction }
+            quote::quote! { #core::ReferentialAction::NoAction }
         }
-        "RESTRICT" => quote::quote! { sqlmodel_core::ReferentialAction::Restrict },
-        "CASCADE" => quote::quote! { sqlmodel_core::ReferentialAction::Cascade },
+        "RESTRICT" => quote::quote! { #core::ReferentialAction::Restrict },
+        "CASCADE" => quote::quote! { #core::ReferentialAction::Cascade },
         "SET NULL" | "SETNULL" | "SET_NULL" => {
-            quote::quote! { sqlmodel_core::ReferentialAction::SetNull }
+            quote::quote! { #core::ReferentialAction::SetNull }
         }
         "SET DEFAULT" | "SETDEFAULT" | "SET_DEFAULT" => {
-            quote::quote! { sqlmodel_core::ReferentialAction::SetDefault }
+            quote::quote! { #core::ReferentialAction::SetDefault }
         }
-        _ => quote::quote! { sqlmodel_core::ReferentialAction::NoAction },
+        _ => quote::quote! { #core::ReferentialAction::NoAction },
     }
 }
 
 /// Generate the static FieldInfo array contents.
-fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_field_infos(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let mut field_ts = Vec::new();
 
     // Use data_fields() to include computed fields in metadata (needed for serialization)
@@ -384,10 +476,10 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
             .or(field.sql_type.as_ref());
         let sql_type_ts = if let Some(sql_type_str) = effective_sql_type {
             // Parse the explicit SQL type attribute string
-            infer::parse_sql_type_attr(sql_type_str)
+            infer::parse_sql_type_attr(sql_type_str, core)
         } else {
             // Infer from Rust type (handles primitives, Option<T>, common library types)
-            infer::infer_sql_type(&field.ty)
+            infer::infer_sql_type(&field.ty, core)
         };
 
         // If sql_type attribute was provided, also store the raw string as an override for DDL.
@@ -426,7 +518,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
 
         // ON DELETE action
         let on_delete_ts = if let Some(ref action) = field.on_delete {
-            let action_ts = referential_action_ts(action);
+            let action_ts = referential_action_ts(action, core);
             quote::quote! { Some(#action_ts) }
         } else {
             quote::quote! { None }
@@ -434,7 +526,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
 
         // ON UPDATE action
         let on_update_ts = if let Some(ref action) = field.on_update {
-            let action_ts = referential_action_ts(action);
+            let action_ts = referential_action_ts(action, core);
             quote::quote! { Some(#action_ts) }
         } else {
             quote::quote! { None }
@@ -552,7 +644,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
         };
 
         field_ts.push(quote::quote! {
-            sqlmodel_core::FieldInfo::new(stringify!(#field_ident), #column_name, #sql_type_ts)
+            #core::FieldInfo::new(stringify!(#field_ident), #column_name, #sql_type_ts)
                 .sql_type_override_opt(#sql_type_override_ts)
                 .precision_opt(#precision_ts)
                 .scale_opt(#scale_ts)
@@ -589,7 +681,7 @@ fn generate_field_infos(model: &ModelDef) -> proc_macro2::TokenStream {
 }
 
 /// Generate the to_row method body.
-fn generate_to_row(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_to_row(model: &ModelDef, core: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
     let mut conversions = Vec::new();
 
     for field in model.select_fields() {
@@ -600,13 +692,13 @@ fn generate_to_row(model: &ModelDef) -> proc_macro2::TokenStream {
         if parse::is_option_type(&field.ty) {
             conversions.push(quote::quote! {
                 (#column_name, match &self.#field_name {
-                    Some(v) => sqlmodel_core::Value::from(v.clone()),
-                    None => sqlmodel_core::Value::Null,
+                    Some(v) => #core::Value::from(v.clone()),
+                    None => #core::Value::Null,
                 })
             });
         } else {
             conversions.push(quote::quote! {
-                (#column_name, sqlmodel_core::Value::from(self.#field_name.clone()))
+                (#column_name, #core::Value::from(self.#field_name.clone()))
             });
         }
     }
@@ -617,10 +709,10 @@ fn generate_to_row(model: &ModelDef) -> proc_macro2::TokenStream {
         // Single-table inheritance child models should always emit their discriminator
         // so inserts/updates can round-trip correctly even if the struct doesn't have a
         // dedicated discriminator field.
-        let inh = <Self as sqlmodel_core::Model>::inheritance();
+        let inh = <Self as #core::Model>::inheritance();
         if let (Some(col), Some(val)) = (inh.discriminator_column, inh.discriminator_value) {
             if !out.iter().any(|(c, _)| *c == col) {
-                out.push((col, sqlmodel_core::Value::from(val)));
+                out.push((col, #core::Value::from(val)));
             }
         }
 
@@ -629,7 +721,10 @@ fn generate_to_row(model: &ModelDef) -> proc_macro2::TokenStream {
 }
 
 /// Generate the from_row method body.
-fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_from_row(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let name = &model.name;
     let row_ident = quote::format_ident!("local_row");
 
@@ -673,8 +768,8 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
                 #field_name: match #slot {
                     Some(__sm_idx) => #row_ident.get_as(__sm_idx)?,
                     None => {
-                        return Err(sqlmodel_core::Error::Type(
-                            sqlmodel_core::error::TypeError {
+                        return Err(#core::Error::Type(
+                            #core::error::TypeError {
                                 expected: std::any::type_name::<#field_ty>(),
                                 actual: ::std::format!("column '{}' not found", #column_name),
                                 column: Some(#column_name.to_string()),
@@ -719,21 +814,21 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
             let ty = &f.ty;
             quote::quote! {
                 #field_name: {
-                    let inh = <Self as sqlmodel_core::Model>::inheritance();
+                    let inh = <Self as #core::Model>::inheritance();
                     let parent_table = inh.parent.ok_or_else(|| {
-                        sqlmodel_core::Error::Custom(
+                        #core::Error::Custom(
                             "joined inheritance parent_table missing in inheritance metadata".to_string(),
                         )
                     })?;
                     if !row.has_prefix(parent_table) {
-                        return Err(sqlmodel_core::Error::Custom(format!(
+                        return Err(#core::Error::Custom(format!(
                             "expected prefixed parent columns for joined inheritance: {}__*",
                             parent_table
                         )));
                     }
                     let prow = row.subset_by_prefix(parent_table);
-                    <#ty as sqlmodel_core::Model>::from_row(&prow).map_err(|e| {
-                        sqlmodel_core::Error::Type(sqlmodel_core::TypeError {
+                    <#ty as #core::Model>::from_row(&prow).map_err(|e| {
+                        #core::Error::Type(#core::TypeError {
                             expected: "valid parent model row",
                             actual: format!(
                                 "failed to hydrate joined inheritance parent table '{}' with prefix '{}__': {e}",
@@ -768,10 +863,10 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
 
     quote::quote! {
         let __sm_row_owned;
-        let #row_ident: &sqlmodel_core::Row = if row
-            .has_prefix(<Self as sqlmodel_core::Model>::TABLE_NAME)
+        let #row_ident: &#core::Row = if row
+            .has_prefix(<Self as #core::Model>::TABLE_NAME)
         {
-            __sm_row_owned = row.subset_by_prefix(<Self as sqlmodel_core::Model>::TABLE_NAME);
+            __sm_row_owned = row.subset_by_prefix(<Self as #core::Model>::TABLE_NAME);
             &__sm_row_owned
         } else {
             row
@@ -790,7 +885,10 @@ fn generate_from_row(model: &ModelDef) -> proc_macro2::TokenStream {
 }
 
 /// Generate the primary_key_value method body.
-fn generate_primary_key_value(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_primary_key_value(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let pk_fields = model.primary_key_fields();
 
     if pk_fields.is_empty() {
@@ -801,13 +899,13 @@ fn generate_primary_key_value(model: &ModelDef) -> proc_macro2::TokenStream {
             if parse::is_option_type(&field.ty) {
                 return quote::quote! {
                     match &self.#field_name {
-                        Some(v) => vec![sqlmodel_core::Value::from(v.clone())],
-                        None => vec![sqlmodel_core::Value::Null],
+                        Some(v) => vec![#core::Value::from(v.clone())],
+                        None => vec![#core::Value::Null],
                     }
                 };
             }
             return quote::quote! {
-                vec![sqlmodel_core::Value::from(self.#field_name.clone())]
+                vec![#core::Value::from(self.#field_name.clone())]
             };
         }
         return quote::quote! { vec![] };
@@ -819,13 +917,13 @@ fn generate_primary_key_value(model: &ModelDef) -> proc_macro2::TokenStream {
         if parse::is_option_type(&field.ty) {
             value_exprs.push(quote::quote! {
                 match &self.#field_name {
-                    Some(v) => sqlmodel_core::Value::from(v.clone()),
-                    None => sqlmodel_core::Value::Null,
+                    Some(v) => #core::Value::from(v.clone()),
+                    None => #core::Value::Null,
                 }
             });
         } else {
             value_exprs.push(quote::quote! {
-                sqlmodel_core::Value::from(self.#field_name.clone())
+                #core::Value::from(self.#field_name.clone())
             });
         }
     }
@@ -864,7 +962,10 @@ fn generate_is_new(model: &ModelDef) -> proc_macro2::TokenStream {
 }
 
 /// Generate the model_config method body.
-fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_model_config(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let config = &model.config;
 
     let table = config.table;
@@ -879,9 +980,9 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
 
     // Handle extra field behavior
     let extra_ts = match config.extra.as_str() {
-        "forbid" => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Forbid },
-        "allow" => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Allow },
-        _ => quote::quote! { sqlmodel_core::ExtraFieldsBehavior::Ignore },
+        "forbid" => quote::quote! { #core::ExtraFieldsBehavior::Forbid },
+        "allow" => quote::quote! { #core::ExtraFieldsBehavior::Allow },
+        _ => quote::quote! { #core::ExtraFieldsBehavior::Ignore },
     };
 
     // Handle optional string fields
@@ -898,7 +999,7 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
     };
 
     quote::quote! {
-        sqlmodel_core::ModelConfig {
+        #core::ModelConfig {
             table: #table,
             from_attributes: #from_attributes,
             validate_assignment: #validate_assignment,
@@ -919,6 +1020,7 @@ fn generate_model_config(model: &ModelDef) -> proc_macro2::TokenStream {
 fn generate_inheritance(
     model: &ModelDef,
     parent_ty_ts: Option<&proc_macro2::TokenStream>,
+    core: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     use crate::parse::InheritanceStrategy;
 
@@ -927,28 +1029,28 @@ fn generate_inheritance(
     // Determine the inheritance strategy token
     let strategy_ts = match config.inheritance {
         InheritanceStrategy::None => {
-            quote::quote! { sqlmodel_core::InheritanceStrategy::None }
+            quote::quote! { #core::InheritanceStrategy::None }
         }
         InheritanceStrategy::Single => {
-            quote::quote! { sqlmodel_core::InheritanceStrategy::Single }
+            quote::quote! { #core::InheritanceStrategy::Single }
         }
         InheritanceStrategy::Joined => {
-            quote::quote! { sqlmodel_core::InheritanceStrategy::Joined }
+            quote::quote! { #core::InheritanceStrategy::Joined }
         }
         InheritanceStrategy::Concrete => {
-            quote::quote! { sqlmodel_core::InheritanceStrategy::Concrete }
+            quote::quote! { #core::InheritanceStrategy::Concrete }
         }
     };
 
     // Store parent table name (not parent Rust type name) in metadata so schema/DDL can be correct.
     let parent_table_ts = if let Some(parent_ty) = parent_ty_ts {
-        quote::quote! { Some(<#parent_ty as sqlmodel_core::Model>::TABLE_NAME) }
+        quote::quote! { Some(<#parent_ty as #core::Model>::TABLE_NAME) }
     } else {
         quote::quote! { None }
     };
 
     let parent_fields_fn_ts = if let Some(parent_ty) = parent_ty_ts {
-        quote::quote! { Some(<#parent_ty as sqlmodel_core::Model>::fields) }
+        quote::quote! { Some(<#parent_ty as #core::Model>::fields) }
     } else {
         quote::quote! { None }
     };
@@ -962,7 +1064,7 @@ fn generate_inheritance(
         quote::quote! { Some(#column) }
     } else if config.discriminator_value.is_some() {
         if let Some(parent_ty) = parent_ty_ts {
-            quote::quote! { <#parent_ty as sqlmodel_core::Model>::INHERITANCE.discriminator_column }
+            quote::quote! { <#parent_ty as #core::Model>::INHERITANCE.discriminator_column }
         } else {
             quote::quote! { None }
         }
@@ -978,7 +1080,7 @@ fn generate_inheritance(
     };
 
     quote::quote! {
-        sqlmodel_core::InheritanceInfo {
+        #core::InheritanceInfo {
             strategy: #strategy_ts,
             parent: #parent_table_ts,
             parent_fields_fn: #parent_fields_fn_ts,
@@ -993,7 +1095,10 @@ fn generate_inheritance(
 /// Returns a tuple of (const token, method body token) for:
 /// - `const SHARD_KEY: Option<&'static str>`
 /// - `fn shard_key_value(&self) -> Option<Value>`
-fn generate_shard_key(model: &ModelDef) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+fn generate_shard_key(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
     let config = &model.config;
 
     if let Some(ref shard_key_name) = config.shard_key {
@@ -1009,14 +1114,14 @@ fn generate_shard_key(model: &ModelDef) -> (proc_macro2::TokenStream, proc_macro
                 // Option<T> field: return Some(value) if Some, None if None
                 quote::quote! {
                     match &self.#field_ident {
-                        Some(v) => Some(sqlmodel_core::Value::from(v.clone())),
+                        Some(v) => Some(#core::Value::from(v.clone())),
                         None => None,
                     }
                 }
             } else {
                 // Non-optional field: always has a value
                 quote::quote! {
-                    Some(sqlmodel_core::Value::from(self.#field_ident.clone()))
+                    Some(#core::Value::from(self.#field_ident.clone()))
                 }
             }
         } else {
@@ -1104,14 +1209,17 @@ fn relationship_container(ty: &syn::Type) -> Option<(String, syn::Type)> {
 /// Generate `Model::hydrate_relationship`: assign each relationship field from
 /// the prefixed rows an eager-loading JOIN produced. Without this the eager
 /// query fetched the related columns and threw them away.
-fn generate_hydrate_relationship(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_hydrate_relationship(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let relationship_fields = model.relationship_fields();
     if relationship_fields.is_empty() {
         return quote::quote! {
             let _ = rows;
-            Err(sqlmodel_core::Error::Custom(format!(
+            Err(#core::Error::Custom(format!(
                 "model `{}` has no relationship `{relationship}`",
-                <Self as sqlmodel_core::Model>::TABLE_NAME
+                <Self as #core::Model>::TABLE_NAME
             )))
         };
     }
@@ -1134,7 +1242,7 @@ fn generate_hydrate_relationship(model: &ModelDef) -> proc_macro2::TokenStream {
                 let remote_col = &lt.remote_column;
                 quote::quote! {
                     <#field_ty>::with_link_table(
-                        sqlmodel_core::LinkTableInfo::new(#table, #local_col, #remote_col)
+                        #core::LinkTableInfo::new(#table, #local_col, #remote_col)
                     )
                 }
             } else {
@@ -1144,7 +1252,7 @@ fn generate_hydrate_relationship(model: &ModelDef) -> proc_macro2::TokenStream {
             quote::quote! {
                 let mut objects = Vec::with_capacity(rows.len());
                 for row in rows {
-                    objects.push(<#related_ty as sqlmodel_core::Model>::from_row(row)?);
+                    objects.push(<#related_ty as #core::Model>::from_row(row)?);
                 }
                 let mut loaded = #fresh;
                 if let Some(pk) = self.primary_key_value().into_iter().next() {
@@ -1156,7 +1264,7 @@ fn generate_hydrate_relationship(model: &ModelDef) -> proc_macro2::TokenStream {
         } else {
             quote::quote! {
                 let object = match rows.first() {
-                    Some(row) => Some(<#related_ty as sqlmodel_core::Model>::from_row(row)?),
+                    Some(row) => Some(<#related_ty as #core::Model>::from_row(row)?),
                     None => None,
                 };
                 let loaded = match self.#field_name.fk().cloned() {
@@ -1178,16 +1286,19 @@ fn generate_hydrate_relationship(model: &ModelDef) -> proc_macro2::TokenStream {
     quote::quote! {
         match relationship {
             #(#arms)*
-            other => Err(sqlmodel_core::Error::Custom(format!(
+            other => Err(#core::Error::Custom(format!(
                 "model `{}` has no relationship `{other}`",
-                <Self as sqlmodel_core::Model>::TABLE_NAME
+                <Self as #core::Model>::TABLE_NAME
             ))),
         }
     }
 }
 
 /// Generate the RELATIONSHIPS constant from relationship fields.
-fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
+fn generate_relationships(
+    model: &ModelDef,
+    core: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let relationship_fields = model.relationship_fields();
 
     if relationship_fields.is_empty() {
@@ -1219,16 +1330,16 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
         // Determine RelationshipKind token
         let kind_ts = match rel.kind {
             RelationshipKindAttr::OneToOne => {
-                quote::quote! { sqlmodel_core::RelationshipKind::OneToOne }
+                quote::quote! { #core::RelationshipKind::OneToOne }
             }
             RelationshipKindAttr::ManyToOne => {
-                quote::quote! { sqlmodel_core::RelationshipKind::ManyToOne }
+                quote::quote! { #core::RelationshipKind::ManyToOne }
             }
             RelationshipKindAttr::OneToMany => {
-                quote::quote! { sqlmodel_core::RelationshipKind::OneToMany }
+                quote::quote! { #core::RelationshipKind::OneToMany }
             }
             RelationshipKindAttr::ManyToMany => {
-                quote::quote! { sqlmodel_core::RelationshipKind::ManyToMany }
+                quote::quote! { #core::RelationshipKind::ManyToMany }
             }
         };
 
@@ -1261,7 +1372,7 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
             let local_col = &lt.local_column;
             let remote_col = &lt.remote_column;
             quote::quote! {
-                .link_table(sqlmodel_core::LinkTableInfo::new(#table, #local_col, #remote_col))
+                .link_table(#core::LinkTableInfo::new(#table, #local_col, #remote_col))
             }
         } else {
             quote::quote! {}
@@ -1271,13 +1382,13 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
         let cascade_val = rel.cascade_delete;
         let passive_deletes_ts = match rel.passive_deletes {
             crate::parse::PassiveDeletesAttr::Active => {
-                quote::quote! { sqlmodel_core::PassiveDeletes::Active }
+                quote::quote! { #core::PassiveDeletes::Active }
             }
             crate::parse::PassiveDeletesAttr::Passive => {
-                quote::quote! { sqlmodel_core::PassiveDeletes::Passive }
+                quote::quote! { #core::PassiveDeletes::Passive }
             }
             crate::parse::PassiveDeletesAttr::All => {
-                quote::quote! { sqlmodel_core::PassiveDeletes::All }
+                quote::quote! { #core::PassiveDeletes::All }
             }
         };
 
@@ -1291,28 +1402,28 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
         let lazy_strategy_call = if let Some(ref strategy) = rel.lazy_strategy {
             let strategy_ts = match strategy {
                 crate::parse::LazyLoadStrategyAttr::Select => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Select }
+                    quote::quote! { #core::LazyLoadStrategy::Select }
                 }
                 crate::parse::LazyLoadStrategyAttr::Joined => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Joined }
+                    quote::quote! { #core::LazyLoadStrategy::Joined }
                 }
                 crate::parse::LazyLoadStrategyAttr::Subquery => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Subquery }
+                    quote::quote! { #core::LazyLoadStrategy::Subquery }
                 }
                 crate::parse::LazyLoadStrategyAttr::Selectin => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Selectin }
+                    quote::quote! { #core::LazyLoadStrategy::Selectin }
                 }
                 crate::parse::LazyLoadStrategyAttr::Dynamic => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::Dynamic }
+                    quote::quote! { #core::LazyLoadStrategy::Dynamic }
                 }
                 crate::parse::LazyLoadStrategyAttr::NoLoad => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::NoLoad }
+                    quote::quote! { #core::LazyLoadStrategy::NoLoad }
                 }
                 crate::parse::LazyLoadStrategyAttr::RaiseOnSql => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::RaiseOnSql }
+                    quote::quote! { #core::LazyLoadStrategy::RaiseOnSql }
                 }
                 crate::parse::LazyLoadStrategyAttr::WriteOnly => {
-                    quote::quote! { sqlmodel_core::LazyLoadStrategy::WriteOnly }
+                    quote::quote! { #core::LazyLoadStrategy::WriteOnly }
                 }
             };
             quote::quote! { .lazy_strategy(#strategy_ts) }
@@ -1336,12 +1447,12 @@ fn generate_relationships(model: &ModelDef) -> proc_macro2::TokenStream {
             // The related *table* comes from the related model's own metadata;
             // `model = "..."` names the type. Emitting that name here made every
             // eager JOIN target a table called `Team`.
-            sqlmodel_core::RelationshipInfo::new(
+            #core::RelationshipInfo::new(
                 stringify!(#field_name),
-                <#related_ty as sqlmodel_core::Model>::TABLE_NAME,
+                <#related_ty as #core::Model>::TABLE_NAME,
                 #kind_ts
             )
-            .related_fields(<#related_ty as sqlmodel_core::Model>::fields)
+            .related_fields(<#related_ty as #core::Model>::fields)
             #local_key_call
             #remote_key_call
             #back_populates_call
@@ -1454,6 +1565,21 @@ fn generate_sql_enum_impl(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
+    let mut crate_path: Option<syn::Path> = None;
+    for attr in &input.attrs {
+        if attr.path().is_ident("sqlmodel") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("crate") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    crate_path = Some(lit.parse()?);
+                }
+                Ok(())
+            })?;
+        }
+    }
+    let core = resolve_core_crate(crate_path.as_ref());
+
     let syn::Data::Enum(data) = &input.data else {
         return Err(syn::Error::new_spanned(
             input,
@@ -1528,7 +1654,7 @@ fn generate_sql_enum_impl(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
     );
 
     Ok(quote::quote! {
-        impl #impl_generics sqlmodel_core::SqlEnum for #name #ty_generics #where_clause {
+        impl #impl_generics #core::SqlEnum for #name #ty_generics #where_clause {
             const VARIANTS: &'static [&'static str] = &[#(#variant_str_refs),*];
             const TYPE_NAME: &'static str = #type_name;
 
@@ -1538,7 +1664,7 @@ fn generate_sql_enum_impl(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
                 }
             }
 
-            fn from_sql_str(s: &str) -> Result<Self, String> {
+            fn from_sql_str(s: &str) -> ::core::result::Result<Self, String> {
                 match s {
                     #(#from_sql_arms,)*
                     _ => Err(format!("{}, got '{}'", #error_msg, s)),
@@ -1546,39 +1672,39 @@ fn generate_sql_enum_impl(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
             }
         }
 
-        impl #impl_generics From<#name #ty_generics> for sqlmodel_core::Value #where_clause {
+        impl #impl_generics From<#name #ty_generics> for #core::Value #where_clause {
             fn from(v: #name #ty_generics) -> Self {
-                sqlmodel_core::Value::Text(
-                    sqlmodel_core::SqlEnum::to_sql_str(&v).to_string()
+                #core::Value::Text(
+                    #core::SqlEnum::to_sql_str(&v).to_string()
                 )
             }
         }
 
-        impl #impl_generics From<&#name #ty_generics> for sqlmodel_core::Value #where_clause {
+        impl #impl_generics From<&#name #ty_generics> for #core::Value #where_clause {
             fn from(v: &#name #ty_generics) -> Self {
-                sqlmodel_core::Value::Text(
-                    sqlmodel_core::SqlEnum::to_sql_str(v).to_string()
+                #core::Value::Text(
+                    #core::SqlEnum::to_sql_str(v).to_string()
                 )
             }
         }
 
-        impl #impl_generics TryFrom<sqlmodel_core::Value> for #name #ty_generics #where_clause {
-            type Error = sqlmodel_core::Error;
+        impl #impl_generics TryFrom<#core::Value> for #name #ty_generics #where_clause {
+            type Error = #core::Error;
 
-            fn try_from(value: sqlmodel_core::Value) -> Result<Self, Self::Error> {
+            fn try_from(value: #core::Value) -> ::core::result::Result<Self, Self::Error> {
                 match value {
-                    sqlmodel_core::Value::Text(ref s) => {
-                        sqlmodel_core::SqlEnum::from_sql_str(s.as_str()).map_err(|e| {
-                            sqlmodel_core::Error::Type(sqlmodel_core::error::TypeError {
-                                expected: <#name as sqlmodel_core::SqlEnum>::TYPE_NAME,
+                    #core::Value::Text(ref s) => {
+                        #core::SqlEnum::from_sql_str(s.as_str()).map_err(|e| {
+                            #core::Error::Type(#core::error::TypeError {
+                                expected: <#name as #core::SqlEnum>::TYPE_NAME,
                                 actual: e,
                                 column: None,
                                 rust_type: None,
                             })
                         })
                     }
-                    other => Err(sqlmodel_core::Error::Type(sqlmodel_core::error::TypeError {
-                        expected: <#name as sqlmodel_core::SqlEnum>::TYPE_NAME,
+                    other => Err(#core::Error::Type(#core::error::TypeError {
+                        expected: <#name as #core::SqlEnum>::TYPE_NAME,
                         actual: other.type_name().to_string(),
                         column: None,
                         rust_type: None,
@@ -1589,15 +1715,15 @@ fn generate_sql_enum_impl(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
 
         impl #impl_generics ::core::fmt::Display for #name #ty_generics #where_clause {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                f.write_str(sqlmodel_core::SqlEnum::to_sql_str(self))
+                f.write_str(#core::SqlEnum::to_sql_str(self))
             }
         }
 
         impl #impl_generics ::core::str::FromStr for #name #ty_generics #where_clause {
             type Err = String;
 
-            fn from_str(s: &str) -> Result<Self, Self::Err> {
-                sqlmodel_core::SqlEnum::from_sql_str(s)
+            fn from_str(s: &str) -> ::core::result::Result<Self, Self::Err> {
+                #core::SqlEnum::from_sql_str(s)
             }
         }
     })
@@ -1698,4 +1824,82 @@ fn is_cx_path(ty: &syn::Type) -> bool {
         return false;
     };
     p.path.segments.last().is_some_and(|seg| seg.ident == "Cx")
+}
+
+#[cfg(test)]
+mod crate_path_tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn explicit_crate_path_eliminates_hardcoded_sqlmodel_core_in_model_codegen() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[sqlmodel(table = "notes", crate = "custom_facade")]
+            struct Note {
+                #[sqlmodel(primary_key, auto_increment)]
+                id: Option<i64>,
+                title: String,
+                #[sqlmodel(hybrid, sql = "UPPER(title)")]
+                upper_title: String,
+            }
+        };
+        let model = parse_model(&input).expect("parse model with explicit crate");
+        let generated = generate_model_impl(&model).to_string();
+        assert!(
+            generated.contains("custom_facade :: __private :: core :: Model"),
+            "expected resolved core path in generated impl: {generated}"
+        );
+        assert!(
+            generated.contains("custom_facade :: __private :: query :: Expr"),
+            "expected resolved query path in hybrid method: {generated}"
+        );
+        assert!(
+            !generated.contains("sqlmodel_core"),
+            "generated code must not hardcode sqlmodel_core: {generated}"
+        );
+        assert!(
+            !generated.contains("sqlmodel_query"),
+            "generated code must not hardcode sqlmodel_query: {generated}"
+        );
+    }
+
+    #[test]
+    fn explicit_crate_path_eliminates_hardcoded_sqlmodel_core_in_sql_enum_and_validate() {
+        let enum_input: syn::DeriveInput = parse_quote! {
+            #[sqlmodel(crate = "custom_facade")]
+            enum Status {
+                Active,
+                #[sqlmodel(rename = "on_hold")]
+                OnHold,
+            }
+        };
+        let enum_ts = generate_sql_enum_impl(&enum_input)
+            .expect("generate sql enum")
+            .to_string();
+        assert!(enum_ts.contains("custom_facade :: __private :: core :: SqlEnum"));
+        assert!(
+            !enum_ts.contains("sqlmodel_core"),
+            "SqlEnum must not hardcode sqlmodel_core: {enum_ts}"
+        );
+
+        let val_input: syn::DeriveInput = parse_quote! {
+            #[validate(crate = "custom_facade")]
+            struct Account {
+                #[validate(email)]
+                email: String,
+                #[validate(credit_card)]
+                card: String,
+            }
+        };
+        let val_def = validate_derive::parse_validate(&val_input).expect("parse validate");
+        let val_ts = validate_derive::generate_validate_impl(&val_def).to_string();
+        assert!(val_ts.contains("custom_facade :: __private :: core :: ValidationError"));
+        assert!(
+            val_ts.contains("custom_facade :: __private :: core :: validate :: matches_pattern")
+        );
+        assert!(
+            !val_ts.contains("sqlmodel_core"),
+            "Validate must not hardcode sqlmodel_core: {val_ts}"
+        );
+    }
 }

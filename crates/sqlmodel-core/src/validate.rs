@@ -10,7 +10,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use regex::Regex;
-use serde::de::DeserializeOwned;
+use serde::de::{
+    self, DeserializeOwned, Deserializer, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
+    VariantAccess, Visitor,
+};
 
 use crate::Value;
 use crate::error::{ValidationError, ValidationErrorKind};
@@ -223,7 +226,20 @@ impl From<serde_json::Value> for ValidateInput {
 /// Controls the validation behavior.
 #[derive(Debug, Clone, Default)]
 pub struct ValidateOptions {
-    /// If true, use strict type coercion (no implicit conversions).
+    /// If true, use strict type matching with no implicit conversions.
+    ///
+    /// When `false` (the default, lax mode matching Pydantic), `model_validate`
+    /// and `sql_model_validate` coerce compatible JSON values during
+    /// deserialization:
+    /// - numeric strings (e.g. `"30"`, `"-5"`) and exact whole-number floats
+    ///   (e.g. `30.0`) or booleans into integer fields;
+    /// - numeric strings (e.g. `"3.14"`, `"42"`) and booleans into float fields;
+    /// - boolean strings (`"true"`, `"false"`, `"1"`, `"0"`, `"yes"`, `"no"`,
+    ///   `"on"`, `"off"`, `"t"`, `"f"`, `"y"`, `"n"`, case-insensitive) and
+    ///   integers `1`/`0` into `bool` fields.
+    ///
+    /// When `true` (strict mode), serde's exact JSON types are required and
+    /// none of these coercions are performed.
     pub strict: bool,
     /// If true, read from object attributes (ORM mode).
     /// Currently unused - reserved for future from_attributes support.
@@ -240,7 +256,7 @@ impl ValidateOptions {
         Self::default()
     }
 
-    /// Enable strict mode (no implicit type conversions).
+    /// Enable strict mode (disables lax string/number/bool coercions).
     pub fn strict(mut self) -> Self {
         self.strict = true;
         self
@@ -352,30 +368,466 @@ impl<T: DeserializeOwned> ModelValidate for T {
         }
 
         // Deserialize with appropriate strictness
-        if options.strict {
-            // In strict mode, we use serde's strict deserialization
-            // (default behavior - no implicit conversions)
-            serde_json::from_value(json_value).map_err(|e| {
-                let mut err = ValidationError::new();
-                err.add(
-                    "_model",
-                    ValidationErrorKind::Custom,
-                    format!("Validation failed: {e}"),
-                );
-                err
-            })
-        } else {
-            // Non-strict mode - same for now, but could add coercion logic
-            serde_json::from_value(json_value).map_err(|e| {
-                let mut err = ValidationError::new();
-                err.add(
-                    "_model",
-                    ValidationErrorKind::Custom,
-                    format!("Validation failed: {e}"),
-                );
-                err
-            })
+        deserialize_json_value(json_value, options.strict)
+    }
+}
+
+/// Deserialize a `serde_json::Value` into `T` using either strict serde matching
+/// or Pydantic-style lax coercion.
+fn deserialize_json_value<T: DeserializeOwned>(
+    json_value: serde_json::Value,
+    strict: bool,
+) -> ValidateResult<T> {
+    let result = if strict {
+        serde_json::from_value(json_value)
+    } else {
+        T::deserialize(LaxValueDeserializer(json_value))
+    };
+    result.map_err(|e| {
+        let mut err = ValidationError::new();
+        err.add(
+            "_model",
+            ValidationErrorKind::Custom,
+            format!("Validation failed: {e}"),
+        );
+        err
+    })
+}
+
+/// Deserializer wrapper around `serde_json::Value` that implements Pydantic-style
+/// lax coercion for booleans, integers, and floating-point fields while leaving
+/// strict type checking to `serde_json::from_value`.
+struct LaxValueDeserializer(serde_json::Value);
+
+fn parse_lax_bool_str(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "t" | "y" => Some(true),
+        "false" | "0" | "no" | "off" | "f" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_lax_int_from_json<T>(value: &serde_json::Value) -> Option<Result<T, String>>
+where
+    T: std::str::FromStr + TryFrom<i64> + TryFrom<u64> + From<bool>,
+{
+    match value {
+        serde_json::Value::String(s) => Some(
+            s.trim()
+                .parse::<T>()
+                .map_err(|_| format!("cannot coerce string {s:?} to integer")),
+        ),
+        serde_json::Value::Bool(b) => Some(Ok(T::from(*b))),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(
+                    T::try_from(i)
+                        .map_err(|_| format!("integer {i} is out of range for target type")),
+                )
+            } else if let Some(u) = n.as_u64() {
+                Some(
+                    T::try_from(u)
+                        .map_err(|_| format!("integer {u} is out of range for target type")),
+                )
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 {
+                    Some(
+                        format!("{f:.0}")
+                            .parse::<T>()
+                            .map_err(|_| format!("float {f} is out of range for target integer")),
+                    )
+                } else {
+                    Some(Err(format!(
+                        "cannot coerce non-integer float {f} to integer"
+                    )))
+                }
+            } else {
+                None
+            }
         }
+        _ => None,
+    }
+}
+
+fn parse_lax_float_from_json(value: &serde_json::Value) -> Option<Result<f64, String>> {
+    match value {
+        serde_json::Value::String(s) => Some(match s.trim().parse::<f64>() {
+            Ok(f) if f.is_finite() => Ok(f),
+            _ => Err(format!("cannot coerce string {s:?} to float")),
+        }),
+        serde_json::Value::Bool(b) => Some(Ok(if *b { 1.0 } else { 0.0 })),
+        serde_json::Value::Number(n) => n.as_f64().map(Ok),
+        _ => None,
+    }
+}
+
+impl<'de> Deserializer<'de> for LaxValueDeserializer {
+    type Error = serde_json::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_any(visitor)
+    }
+
+    fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match &self.0 {
+            serde_json::Value::Bool(b) => visitor.visit_bool(*b),
+            serde_json::Value::Number(n) => {
+                if n.as_i64() == Some(1) || n.as_u64() == Some(1) {
+                    visitor.visit_bool(true)
+                } else if n.as_i64() == Some(0) || n.as_u64() == Some(0) {
+                    visitor.visit_bool(false)
+                } else {
+                    Err(de::Error::custom(format!(
+                        "cannot coerce number {n} to bool"
+                    )))
+                }
+            }
+            serde_json::Value::String(s) => match parse_lax_bool_str(s) {
+                Some(b) => visitor.visit_bool(b),
+                None => Err(de::Error::custom(format!(
+                    "cannot coerce string {s:?} to bool"
+                ))),
+            },
+            _ => self.0.deserialize_bool(visitor),
+        }
+    }
+
+    fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<i8>(&self.0) {
+            Some(Ok(v)) => visitor.visit_i8(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_i8(visitor),
+        }
+    }
+
+    fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<i16>(&self.0) {
+            Some(Ok(v)) => visitor.visit_i16(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_i16(visitor),
+        }
+    }
+
+    fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<i32>(&self.0) {
+            Some(Ok(v)) => visitor.visit_i32(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_i32(visitor),
+        }
+    }
+
+    fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<i64>(&self.0) {
+            Some(Ok(v)) => visitor.visit_i64(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_i64(visitor),
+        }
+    }
+
+    fn deserialize_i128<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<i128>(&self.0) {
+            Some(Ok(v)) => visitor.visit_i128(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_i128(visitor),
+        }
+    }
+
+    fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<u8>(&self.0) {
+            Some(Ok(v)) => visitor.visit_u8(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_u8(visitor),
+        }
+    }
+
+    fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<u16>(&self.0) {
+            Some(Ok(v)) => visitor.visit_u16(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_u16(visitor),
+        }
+    }
+
+    fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<u32>(&self.0) {
+            Some(Ok(v)) => visitor.visit_u32(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_u32(visitor),
+        }
+    }
+
+    fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<u64>(&self.0) {
+            Some(Ok(v)) => visitor.visit_u64(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_u64(visitor),
+        }
+    }
+
+    fn deserialize_u128<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_int_from_json::<u128>(&self.0) {
+            Some(Ok(v)) => visitor.visit_u128(v),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_u128(visitor),
+        }
+    }
+
+    fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_float_from_json(&self.0) {
+            Some(Ok(f)) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let narrow = f as f32;
+                if narrow.is_finite() {
+                    visitor.visit_f32(narrow)
+                } else {
+                    Err(de::Error::custom(format!("float {f} overflows f32")))
+                }
+            }
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_f32(visitor),
+        }
+    }
+
+    fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match parse_lax_float_from_json(&self.0) {
+            Some(Ok(f)) => visitor.visit_f64(f),
+            Some(Err(msg)) => Err(de::Error::custom(msg)),
+            None => self.0.deserialize_f64(visitor),
+        }
+    }
+
+    fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_char(visitor)
+    }
+
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_str(visitor)
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_string(visitor)
+    }
+
+    fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_bytes(visitor)
+    }
+
+    fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_byte_buf(visitor)
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Null => visitor.visit_none(),
+            other => visitor.visit_some(LaxValueDeserializer(other)),
+        }
+    }
+
+    fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_unit(visitor)
+    }
+
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_unit_struct(name, visitor)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Array(arr) => visitor.visit_seq(LaxSeqAccess(arr.into_iter())),
+            other => other.deserialize_seq(visitor),
+        }
+    }
+
+    fn deserialize_tuple<V: Visitor<'de>>(
+        self,
+        len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Array(arr) => visitor.visit_seq(LaxSeqAccess(arr.into_iter())),
+            other => other.deserialize_tuple(len, visitor),
+        }
+    }
+
+    fn deserialize_tuple_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Array(arr) => visitor.visit_seq(LaxSeqAccess(arr.into_iter())),
+            other => other.deserialize_tuple_struct(name, len, visitor),
+        }
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Object(map) => visitor.visit_map(LaxMapAccess {
+                iter: map.into_iter(),
+                value: None,
+            }),
+            other => other.deserialize_map(visitor),
+        }
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Object(map) => visitor.visit_map(LaxMapAccess {
+                iter: map.into_iter(),
+                value: None,
+            }),
+            serde_json::Value::Array(arr) => visitor.visit_seq(LaxSeqAccess(arr.into_iter())),
+            other => other.deserialize_struct(name, fields, visitor),
+        }
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            serde_json::Value::Object(map) if map.len() == 1 => {
+                let (variant, value) = map.into_iter().next().expect("checked len == 1");
+                visitor.visit_enum(LaxEnumAccess { variant, value })
+            }
+            other => other.deserialize_enum(name, variants, visitor),
+        }
+    }
+
+    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_identifier(visitor)
+    }
+
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_ignored_any(visitor)
+    }
+}
+
+struct LaxSeqAccess(std::vec::IntoIter<serde_json::Value>);
+
+impl<'de> SeqAccess<'de> for LaxSeqAccess {
+    type Error = serde_json::Error;
+
+    fn next_element_seed<T: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Self::Error> {
+        match self.0.next() {
+            Some(value) => seed.deserialize(LaxValueDeserializer(value)).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.0.len())
+    }
+}
+
+struct LaxMapAccess {
+    iter: serde_json::map::IntoIter,
+    value: Option<serde_json::Value>,
+}
+
+impl<'de> MapAccess<'de> for LaxMapAccess {
+    type Error = serde_json::Error;
+
+    fn next_key_seed<K: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        match self.iter.next() {
+            Some((key, value)) => {
+                self.value = Some(value);
+                seed.deserialize(key.into_deserializer()).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, Self::Error> {
+        let value = self
+            .value
+            .take()
+            .ok_or_else(|| de::Error::custom("map value requested without key"))?;
+        seed.deserialize(LaxValueDeserializer(value))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.iter.len())
+    }
+}
+
+struct LaxEnumAccess {
+    variant: String,
+    value: serde_json::Value,
+}
+
+impl<'de> EnumAccess<'de> for LaxEnumAccess {
+    type Error = serde_json::Error;
+    type Variant = LaxVariantAccess;
+
+    fn variant_seed<V: de::DeserializeSeed<'de>>(
+        self,
+        seed: V,
+    ) -> Result<(V::Value, Self::Variant), Self::Error> {
+        let variant = seed.deserialize(self.variant.into_deserializer())?;
+        Ok((variant, LaxVariantAccess(self.value)))
+    }
+}
+
+struct LaxVariantAccess(serde_json::Value);
+
+impl<'de> VariantAccess<'de> for LaxVariantAccess {
+    type Error = serde_json::Error;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        serde_json::from_value(self.0)
+    }
+
+    fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(
+        self,
+        seed: T,
+    ) -> Result<T::Value, Self::Error> {
+        seed.deserialize(LaxValueDeserializer(self.0))
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(
+        self,
+        len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        LaxValueDeserializer(self.0).deserialize_tuple(len, visitor)
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        LaxValueDeserializer(self.0).deserialize_struct("", fields, visitor)
     }
 }
 
@@ -859,16 +1311,8 @@ pub trait SqlModelValidate: Model + DeserializeOwned + Sized {
             }
         }
 
-        // Deserialize
-        serde_json::from_value(json_value).map_err(|e| {
-            let mut err = ValidationError::new();
-            err.add(
-                "_model",
-                ValidationErrorKind::Custom,
-                format!("Validation failed: {e}"),
-            );
-            err
-        })
+        // Deserialize with appropriate strictness
+        deserialize_json_value(json_value, options.strict)
     }
 
     /// Create and validate a model from input, also tracking which fields were explicitly set.
@@ -920,15 +1364,7 @@ pub trait SqlModelValidate: Model + DeserializeOwned + Sized {
             }
         }
 
-        let model = serde_json::from_value(json_value).map_err(|e| {
-            let mut err = ValidationError::new();
-            err.add(
-                "_model",
-                ValidationErrorKind::Custom,
-                format!("Validation failed: {e}"),
-            );
-            err
-        })?;
+        let model = deserialize_json_value(json_value, options.strict)?;
 
         Ok(crate::TrackedModel::new(model, fields_set))
     }
@@ -1568,11 +2004,115 @@ mod tests {
 
     #[test]
     fn test_model_validate_strict_mode() {
-        let json = r#"{"name": "Alice", "age": 30}"#;
-        let options = ValidateOptions::new().strict();
-        let user: TestUser = TestUser::model_validate(json, options).unwrap();
+        // Exact types pass in both strict and lax mode.
+        let exact = r#"{"name": "Alice", "age": 30, "active": true}"#;
+        let user: TestUser = TestUser::model_validate(exact, ValidateOptions::new().strict())
+            .expect("exact types must pass strict mode");
         assert_eq!(user.name, "Alice");
         assert_eq!(user.age, 30);
+        assert!(user.active);
+
+        // Coercible input ("30" -> i32, "true" -> bool) MUST pass lax mode and
+        // MUST fail strict mode so the two paths cannot silently collapse.
+        let coercible = r#"{"name": "Alice", "age": "30", "active": "true"}"#;
+        let lax_user: TestUser = TestUser::model_validate(coercible, ValidateOptions::default())
+            .expect("lax mode must coerce numeric and boolean strings");
+        assert_eq!(lax_user.name, "Alice");
+        assert_eq!(lax_user.age, 30);
+        assert!(lax_user.active);
+
+        let strict_err = TestUser::model_validate(coercible, ValidateOptions::new().strict())
+            .expect_err("strict mode must reject string-encoded integer/bool fields");
+        assert!(!strict_err.is_empty());
+    }
+
+    #[test]
+    fn test_model_validate_lax_vs_strict_edge_cases() {
+        #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+        struct CoerceSample {
+            count: i32,
+            ratio: f64,
+            enabled: bool,
+            maybe_id: Option<u64>,
+            items: Vec<i16>,
+        }
+
+        // Lax mode coerces strings, whole floats for ints, 1/0 for bool, options, and vec elements.
+        let lax_input = serde_json::json!({
+            "count": 42.0,
+            "ratio": "3.25",
+            "enabled": 1,
+            "maybe_id": "99",
+            "items": ["1", "-2", 3.0]
+        });
+        let sample: CoerceSample =
+            CoerceSample::model_validate(lax_input.clone(), ValidateOptions::default())
+                .expect("lax coercion must succeed");
+        assert_eq!(sample.count, 42);
+        assert!((sample.ratio - 3.25).abs() < f64::EPSILON);
+        assert!(sample.enabled);
+        assert_eq!(sample.maybe_id, Some(99));
+        assert_eq!(sample.items, vec![1, -2, 3]);
+
+        // Strict mode rejects the exact same input.
+        assert!(CoerceSample::model_validate(lax_input, ValidateOptions::new().strict()).is_err());
+
+        // Lax mode still rejects non-integral floats for integer fields and invalid strings/bools.
+        let fractional_int = serde_json::json!({
+            "count": 42.5,
+            "ratio": 1.0,
+            "enabled": true,
+            "maybe_id": null,
+            "items": []
+        });
+        assert!(CoerceSample::model_validate(fractional_int, ValidateOptions::default()).is_err());
+
+        let bad_bool = serde_json::json!({
+            "count": 1,
+            "ratio": 1.0,
+            "enabled": "maybe",
+            "maybe_id": null,
+            "items": []
+        });
+        assert!(CoerceSample::model_validate(bad_bool, ValidateOptions::default()).is_err());
+
+        let bad_bool_int = serde_json::json!({
+            "count": 1,
+            "ratio": 1.0,
+            "enabled": 2,
+            "maybe_id": null,
+            "items": []
+        });
+        assert!(CoerceSample::model_validate(bad_bool_int, ValidateOptions::default()).is_err());
+
+        // Strict mode also rejects string-to-int even on sql_model_validate / tracked paths.
+        let alias_coercible =
+            r#"{"id": "25", "userName": "Bob", "emailAddress": "bob@example.com"}"#;
+        let lax_aliased: TestAliasedUser =
+            TestAliasedUser::sql_model_validate(alias_coercible, ValidateOptions::default())
+                .expect("sql_model_validate lax mode must coerce id string");
+        assert_eq!(lax_aliased.id, 25);
+        assert_eq!(lax_aliased.name, "Bob");
+        assert!(
+            TestAliasedUser::sql_model_validate(alias_coercible, ValidateOptions::new().strict())
+                .is_err(),
+            "sql_model_validate strict mode must reject string id"
+        );
+        let tracked_lax = TestAliasedUser::sql_model_validate_tracked(
+            alias_coercible,
+            ValidateOptions::default(),
+        )
+        .expect("sql_model_validate_tracked lax mode must coerce id string");
+        assert_eq!(tracked_lax.inner().id, 25);
+        assert_eq!(tracked_lax.inner().name, "Bob");
+        assert!(
+            TestAliasedUser::sql_model_validate_tracked(
+                alias_coercible,
+                ValidateOptions::new().strict(),
+            )
+            .is_err(),
+            "sql_model_validate_tracked strict mode must reject string id"
+        );
     }
 
     #[test]

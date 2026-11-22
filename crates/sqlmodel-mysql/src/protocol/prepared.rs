@@ -276,12 +276,16 @@ fn value_to_field_type(value: &Value) -> FieldType {
         Value::Decimal(_) => FieldType::NewDecimal,
         Value::Text(_) => FieldType::VarString,
         Value::Bytes(_) => FieldType::Blob,
-        Value::Json(_) => FieldType::Json,
+        // Both MySQL 8.x and MariaDB accept UTF-8 JSON text with MYSQL_TYPE_VAR_STRING
+        // (matching `encode_binary_param`, which writes length-encoded JSON text).
+        // MariaDB implements JSON as a LONGTEXT alias and rejects MYSQL_TYPE_JSON (245)
+        // in COM_STMT_EXECUTE with ER_WRONG_ARGUMENTS (`Incorrect arguments to mysqld_stmt_execute`).
+        Value::Json(_) => FieldType::VarString,
         Value::Date(_) => FieldType::Date,
         Value::Time(_) => FieldType::Time,
         Value::Timestamp(_) | Value::TimestampTz(_) => FieldType::DateTime,
         Value::Uuid(_) => FieldType::Blob,
-        Value::Array(_) => FieldType::Json,
+        Value::Array(_) => FieldType::VarString,
         Value::Default => FieldType::Null,
     }
 }
@@ -654,6 +658,34 @@ mod tests {
             FieldType::VarString
         );
         assert_eq!(value_to_field_type(&Value::Bytes(vec![])), FieldType::Blob);
+        assert_eq!(
+            value_to_field_type(&Value::Json(serde_json::json!({"k": "v"}))),
+            FieldType::VarString
+        );
+        assert_eq!(
+            value_to_field_type(&Value::Array(vec![Value::Int(1)])),
+            FieldType::VarString
+        );
+    }
+
+    #[test]
+    fn test_build_stmt_execute_encodes_json_as_var_string() {
+        let payload = serde_json::json!({"a": [1, 2], "b": true});
+        let params = vec![Value::Json(payload.clone())];
+        let packet = build_stmt_execute_packet(7, &params, 0);
+
+        // Header(4) + cmd(1) + stmt_id(4) + flags(1) + iter(4) + null_bitmap(1) + new_params_bound(1) = 16
+        assert_eq!(packet[16], FieldType::VarString as u8);
+        assert_ne!(
+            packet[16],
+            FieldType::Json as u8,
+            "MariaDB rejects MYSQL_TYPE_JSON (0xF5) in COM_STMT_EXECUTE"
+        );
+        assert_eq!(packet[17], 0x00);
+
+        let expected = payload.to_string();
+        assert_eq!(packet[18] as usize, expected.len());
+        assert_eq!(&packet[19..19 + expected.len()], expected.as_bytes());
     }
 
     #[test]

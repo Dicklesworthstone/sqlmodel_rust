@@ -29,7 +29,7 @@ use rand::rngs::SysRng;
 // RSA is only needed for the no-TLS full-auth path; the `rsa-auth` feature
 // (on by default) controls it so TLS-only deployments can drop the dependency.
 #[cfg(feature = "rsa-auth")]
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 #[cfg(feature = "rsa-auth")]
 use rsa::pkcs1::DecodeRsaPublicKey;
 #[cfg(feature = "rsa-auth")]
@@ -224,8 +224,8 @@ pub fn sha256_password_rsa(
         .map_err(|e| format!("Public key is not valid UTF-8 PEM: {e}"))?;
 
     // Try both common encodings.
-    let pub_key = RsaPublicKey::from_public_key_pem(pem)
-        .or_else(|_| RsaPublicKey::from_pkcs1_pem(pem))
+    let pub_key = PublicKey::from_public_key_pem(pem)
+        .or_else(|_| PublicKey::from_pkcs1_pem(pem))
         .map_err(|e| format!("Failed to parse RSA public key PEM: {e}"))?;
 
     let encrypted = if use_oaep {

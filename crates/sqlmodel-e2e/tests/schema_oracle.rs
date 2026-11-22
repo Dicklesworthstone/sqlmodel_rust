@@ -261,18 +261,23 @@ async fn run_corpus_relations<C: Connection>(cx: &Cx, conn: &C, driver: &DriverU
     }
 
     // ---- Law 2: commutation A -> B ------------------------------------
-    expect_outcome(
-        conn.execute(
-            cx,
-            &format!(
-                "CREATE TABLE {} (id INTEGER PRIMARY KEY, code VARCHAR(255) NOT NULL)",
-                q("e2e_oracle_comm")
-            ),
-            &[],
-        )
-        .await,
-        &format!("{d}: create comm V1"),
+    let v1 = expected_schema::<CommV1>(dialect);
+    let empty_v1 = DatabaseSchema::new(dialect);
+    let create_v1 = schema_diff(&empty_v1, &v1);
+    assert_eq!(
+        create_v1.operations.len(),
+        1,
+        "{d}: CommV1 must produce a single CreateTable, got {:#?}",
+        create_v1.operations
     );
+    apply_operations(
+        cx,
+        conn,
+        dialect,
+        &create_v1.operations,
+        &format!("{d}:comm:create_v1"),
+    )
+    .await;
     let current = introspect_ours(
         cx,
         conn,
@@ -281,19 +286,10 @@ async fn run_corpus_relations<C: Connection>(cx: &Cx, conn: &C, driver: &DriverU
         &format!("{d}:comm:s1"),
     )
     .await;
-    // The raw V1 table must itself be a fixpoint of the V1 model before the
+    // The V1 table must itself be a fixpoint of the V1 model before the
     // V2 evolution is applied, so the oscillated operations come from a
     // verified baseline.
-    let v1 = expected_schema::<CommV1>(dialect);
-    let s1_baseline = introspect_ours(
-        cx,
-        conn,
-        dialect,
-        &["e2e_oracle_comm"],
-        &format!("{d}:comm:v1"),
-    )
-    .await;
-    assert_fixpoint(&format!("{d}: fixpoint CommV1"), dialect, &s1_baseline, &v1);
+    assert_fixpoint(&format!("{d}: fixpoint CommV1"), dialect, &current, &v1);
     let v2 = expected_schema::<CommV2>(dialect);
     let ops = schema_diff(&current, &v2);
     assert!(
@@ -327,18 +323,14 @@ async fn run_corpus_relations<C: Connection>(cx: &Cx, conn: &C, driver: &DriverU
                 .await,
             &format!("{d}: involution reset"),
         );
-        expect_outcome(
-            conn.execute(
-                cx,
-                &format!(
-                    "CREATE TABLE {} (id INTEGER PRIMARY KEY, code VARCHAR(255) NOT NULL)",
-                    q("e2e_oracle_comm")
-                ),
-                &[],
-            )
-            .await,
-            &format!("{d}: involution create V1"),
-        );
+        apply_operations(
+            cx,
+            conn,
+            dialect,
+            &create_v1.operations,
+            &format!("{d}:inv:create_v1:{i}"),
+        )
+        .await;
         let s1 = introspect_ours(
             cx,
             conn,
@@ -453,6 +445,67 @@ async fn run_corpus_relations<C: Connection>(cx: &Cx, conn: &C, driver: &DriverU
             }
         }
     }
+
+    // ---- Negative control: non-equivalent physical types must still diff ----
+    // Proves `schema_diff` was not weakened to make CommV1 pass: an intentionally
+    // mismatched raw table must produce AlterColumnType operations.
+    expect_outcome(
+        conn.execute(cx, &drop_stale_sql(dialect, "e2e_oracle_comm"), &[])
+            .await,
+        &format!("{d}: negative-control reset"),
+    );
+    let mismatch_ddl = match dialect {
+        Dialect::Postgres => format!(
+            "CREATE TABLE {} (id INTEGER PRIMARY KEY, code VARCHAR(255) NOT NULL)",
+            q("e2e_oracle_comm")
+        ),
+        Dialect::Sqlite | Dialect::Mysql => format!(
+            "CREATE TABLE {} (id INTEGER PRIMARY KEY, code INTEGER NOT NULL)",
+            q("e2e_oracle_comm")
+        ),
+    };
+    expect_outcome(
+        conn.execute(cx, &mismatch_ddl, &[]).await,
+        &format!("{d}: negative-control create mismatched table"),
+    );
+    let mismatched = introspect_ours(
+        cx,
+        conn,
+        dialect,
+        &["e2e_oracle_comm"],
+        &format!("{d}:neg:introspect"),
+    )
+    .await;
+    let neg_diff = schema_diff(&mismatched, &v1);
+    let altered_cols: Vec<&str> = neg_diff
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            SchemaOperation::AlterColumnType { column, .. } => Some(column.as_str()),
+            _ => None,
+        })
+        .collect();
+    match dialect {
+        Dialect::Postgres => {
+            assert!(
+                altered_cols.contains(&"id") && altered_cols.contains(&"code"),
+                "{d}: negative control must detect INTEGER vs BIGINT and VARCHAR(255) vs TEXT; got {:#?}",
+                neg_diff.operations
+            );
+        }
+        Dialect::Sqlite | Dialect::Mysql => {
+            assert!(
+                altered_cols.contains(&"code"),
+                "{d}: negative control must detect INTEGER vs TEXT/VARCHAR on `code`; got {:#?}",
+                neg_diff.operations
+            );
+        }
+    }
+    expect_outcome(
+        conn.execute(cx, &drop_stale_sql(dialect, "e2e_oracle_comm"), &[])
+            .await,
+        &format!("{d}: negative-control cleanup"),
+    );
 }
 
 #[test]

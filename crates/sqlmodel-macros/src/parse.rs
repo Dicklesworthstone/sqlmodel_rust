@@ -77,6 +77,8 @@ pub struct ModelDef {
     pub generics: Generics,
     /// Model-level configuration.
     pub config: ModelConfigParsed,
+    /// Optional explicit crate path override from `#[sqlmodel(crate = "...")]`.
+    pub crate_path: Option<syn::Path>,
 }
 
 /// Parsed field definition from a struct field.
@@ -434,6 +436,7 @@ pub fn parse_model(input: &DeriveInput) -> Result<ModelDef> {
         table_name,
         table_alias,
         config,
+        crate_path,
     } = parse_struct_sqlmodel_attrs(&input.attrs, &name)?;
 
     // Get struct fields
@@ -468,6 +471,7 @@ pub fn parse_model(input: &DeriveInput) -> Result<ModelDef> {
         fields,
         generics,
         config,
+        crate_path,
     })
 }
 
@@ -476,6 +480,7 @@ struct StructAttrs {
     table_name: String,
     table_alias: Option<String>,
     config: ModelConfigParsed,
+    crate_path: Option<syn::Path>,
 }
 
 /// Parse struct-level `#[sqlmodel(...)]` attributes.
@@ -483,10 +488,12 @@ struct StructAttrs {
 /// Supported keys:
 /// - `table = "name"` (overrides derived table name)
 /// - `table_alias = "alias"` (optional table alias)
+/// - `crate = "path"` (explicit path to `sqlmodel` or `sqlmodel_core`)
 /// - Model config options (from_attributes, validate_assignment, extra, strict, etc.)
 fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Result<StructAttrs> {
     let mut table_name: Option<String> = None;
     let mut table_alias: Option<String> = None;
+    let mut crate_path: Option<syn::Path> = None;
     let mut config = ModelConfigParsed::default();
 
     for attr in attrs {
@@ -672,10 +679,28 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
                         "expected string literal for shard_key",
                     ))
                 }
+            } else if meta.path.is_ident("crate") {
+                let value: Lit = meta.value()?.parse()?;
+                if let Lit::Str(lit_str) = value {
+                    if crate_path.is_some() {
+                        return Err(Error::new_spanned(
+                            meta.path,
+                            "duplicate sqlmodel attribute: crate",
+                        ));
+                    }
+                    let parsed: syn::Path = lit_str.parse()?;
+                    crate_path = Some(parsed);
+                    Ok(())
+                } else {
+                    Err(Error::new_spanned(
+                        value,
+                        "expected string literal path for crate",
+                    ))
+                }
             } else {
                 Err(Error::new_spanned(
                     meta.path,
-                    "unknown sqlmodel struct attribute (supported: table, table_alias, from_attributes, \
+                    "unknown sqlmodel struct attribute (supported: table, table_alias, crate, from_attributes, \
                      validate_assignment, extra, strict, populate_by_name, use_enum_values, \
                      arbitrary_types_allowed, defer_build, revalidate_instances, json_schema_extra, title, \
                      inheritance, inherits, discriminator, discriminator_value, shard_key)",
@@ -704,6 +729,7 @@ fn parse_struct_sqlmodel_attrs(attrs: &[Attribute], struct_name: &Ident) -> Resu
         table_name,
         table_alias,
         config,
+        crate_path,
     })
 }
 

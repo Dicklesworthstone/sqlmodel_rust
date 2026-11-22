@@ -38,11 +38,11 @@ serde_json.workspace = true
 sha1 = "0.11"
 sha2 = "0.11"
 rand = "0.10"
-# rsa 0.10 (currently at rc) is the release line built against digest 0.11 and
-# rand_core 0.10, matching sha1/sha2 0.11 and rand 0.10 above. Move to plain
-# "0.10" once the stable release ships. Optional: only the `rsa-auth` feature
-# (no-TLS full authentication) needs it.
-rsa = { version = "0.10.0-rc.18", optional = true, default-features = false, features = ["std", "encoding"] }
+# rsa 0.10 is built against digest 0.11 and rand_core 0.10, matching sha1/sha2
+# 0.11 and rand 0.10 above. Optional: only the `rsa-auth` feature (no-TLS full
+# authentication) needs it. `pkcs1v15` is enabled solely for public-key password
+# encryption with older MySQL servers (auth.rs never performs decryption).
+rsa = { version = "0.10", optional = true, default-features = false, features = ["std", "encoding", "pkcs1v15"] }
 
 # Optional console support
 sqlmodel-console = { workspace = true, optional = true }
