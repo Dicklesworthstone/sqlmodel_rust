@@ -34,7 +34,7 @@ Database operations in SQLModel check `cx` at critical execution boundaries:
 - **Between wire packets**: During large result streaming, long read loops yield and check for cancellation.
 - **Before committing transactions**: A cancellation already observed before the commit is sent prevents that write. A commit sent before cancellation can have an unknown outcome.
 
-On repository `main`, PostgreSQL also registers cancellation and deadline
+Starting in SQLModel 0.6.0, PostgreSQL also registers cancellation and deadline
 wakers while wire I/O is pending. An interrupted exchange closes its socket
 before releasing the shared connection lock. Other clones then reject new
 queries, and a pool with checkout validation retires the connection. This
@@ -48,7 +48,7 @@ does a server error whose complete response has been consumed.
 
 One of the most dangerous bugs in traditional database libraries is transaction leakage: when an async future is dropped or cancelled, the server-side transaction may remain open, holding locks indefinitely.
 
-On repository `main`, `SharedPgTransaction` exclusively owns its PostgreSQL
+Starting in SQLModel 0.6.0, `SharedPgTransaction` exclusively owns its PostgreSQL
 connection until finalization. Other shared handles wait for that ownership
 to end. A waiting handle's cancellation or deadline removes that waiter
 without cancelling the transaction owner.
@@ -62,8 +62,7 @@ The server aborts an open transaction when it observes the disconnect.
 Successful explicit commit and rollback release a healthy idle connection for
 reuse before reporting completion. A server `ROLLBACK` acknowledgement in
 response to `COMMIT` is reported as `AlreadyRolledBack`, not as a successful
-commit. These ownership protections are unreleased and are not part of
-published SQLModel 0.5.1.
+commit.
 
 If a `COMMIT` was sent and its response was lost, closing the socket does not
 establish whether the commit succeeded. Treat that result as unknown rather
@@ -73,7 +72,7 @@ than assuming the transaction rolled back.
 
 ## Dropping an ORM Flush
 
-On repository `main`, a `Session` keeps ownership of its pending INSERT,
+Starting in SQLModel 0.6.0, a `Session` keeps ownership of its pending INSERT,
 UPDATE, and DELETE queues while `flush` awaits database operations. Dropping
 the flush future therefore preserves unfinished work. Acknowledged inserts
 and updates retain their recorded state, and acknowledged parent deletions
@@ -88,8 +87,7 @@ is not an exactly-once guarantee for cascade statements or their triggers.
 Retaining queued work does not establish the outcome of a statement whose
 response was interrupted. If cancellation invalidated the connection, the
 application still needs to resolve the transaction and replace the connection
-before deciding whether to retry. These queue protections are unreleased and
-are not part of published SQLModel 0.5.1.
+before deciding whether to retry.
 
 ---
 
@@ -106,10 +104,9 @@ async fn bounded_query(cx: &Cx, conn: &impl Connection) -> Outcome<Vec<Row>, Err
 ```
 
 The incoming `Cx` must carry a deadline; the SQL statement alone does not set
-one. On repository `main`, PostgreSQL returns `Outcome::Cancelled` when that
+one. Starting in SQLModel 0.6.0, PostgreSQL returns `Outcome::Cancelled` when that
 deadline expires, even while a socket read is pending. If a wire exchange has
-started, the connection is closed and must be replaced. These changes are not
-part of the published SQLModel 0.5.1 release.
+started, the connection is closed and must be replaced.
 
 Closing the client socket is not a PostgreSQL `CancelRequest` and does not
 prove that the server stopped a statement before applying its effects. A

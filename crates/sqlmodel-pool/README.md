@@ -31,11 +31,11 @@ propagated, while ordinary failed pings retire the connection and retry within
 the remaining budget.
 
 These protections bound the failure described in
-[issue #43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43). They
-do not by themselves repair socket registrations owned by a departed runtime
-or qualify an already-published SQLModel release. Runtime-handoff qualification
-must additionally prove reuse of the original PostgreSQL connection with the
-selected published Asupersync dependency.
+[issue #43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43), and
+SQLModel 0.6.0 aligns the full workspace on Asupersync 0.6.2 so PostgreSQL
+connections migrate cleanly and reuse their original backend across
+current-thread runtime exits while retaining bounded checkout validation and
+retirement safeguards.
 
 ## Links
 - Repository: https://github.com/Dicklesworthstone/sqlmodel_rust

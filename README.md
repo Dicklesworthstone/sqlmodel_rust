@@ -156,32 +156,32 @@ No tokio, no sqlx, no diesel, no sea-orm. We build what we need.
 
 ### From crates.io (recommended)
 
-Version 0.5.1 is available on crates.io for all 12 SQLModel crates.
+Version 0.6.0 is available on crates.io for all 12 SQLModel crates.
 
 ```toml
 # Cargo.toml
 [dependencies]
-sqlmodel = "0.5.1"
-# `#[derive(Model)]` expands to `sqlmodel_core::` paths, so a crate that derives
-# models also needs the core crate directly, at the same version (issue #37):
-sqlmodel-core = "0.5.1"
+sqlmodel = "0.6.0"
 
 # Choose a driver (pick one or more)
-sqlmodel-postgres = "0.5.1"
-# sqlmodel-mysql = "0.5.1"
-# sqlmodel-sqlite = "0.5.1"
-# sqlmodel-frankensqlite = "0.5.1"
+sqlmodel-postgres = "0.6.0"
+# sqlmodel-mysql = "0.6.0"
+# sqlmodel-sqlite = "0.6.0"
+# sqlmodel-frankensqlite = "0.6.0"
 
 # Optional rich console output
-sqlmodel-console = { version = "0.5.1", features = ["rich"] }
+sqlmodel-console = { version = "0.6.0", features = ["rich"] }
 
 # TLS-only MySQL deployments can drop the `rsa` dependency (the no-TLS
 # full-auth path is compiled out; the server must then allow TLS auth):
-# sqlmodel-mysql = { version = "0.5.1", default-features = false, features = ["tls"] }
+# sqlmodel-mysql = { version = "0.6.0", default-features = false, features = ["tls"] }
 ```
 
-All SQLModel crates are released in lockstep at the same version (0.5.1);
-mix and match drivers within that release family.
+All SQLModel crates are released in lockstep at the same version (0.6.0);
+mix and match drivers within that release family. `#[derive(Model)]`,
+`#[derive(Validate)]`, and `#[derive(SqlEnum)]` resolve their internal crate
+paths through the `sqlmodel` facade automatically (including renamed
+dependencies), so a separate direct `sqlmodel-core` dependency is not required.
 
 You do **not** need to add `asupersync` directly; the `Cx` and `Outcome` types are
 re-exported from `sqlmodel` and `sqlmodel-core`.
@@ -358,7 +358,7 @@ Add the console feature to your dependency:
 
 ```toml
 [dependencies]
-sqlmodel-console = { version = "0.5.1", features = ["rich"] }
+sqlmodel-console = { version = "0.6.0", features = ["rich"] }
 ```
 
 Create and use a console:
@@ -521,7 +521,7 @@ of that type does not compile.
 
 ```toml
 # `nightly-try` enables `?` on `Outcome` (nightly toolchain, see above)
-sqlmodel = { version = "0.5.1", features = ["chrono", "uuid", "decimal", "nightly-try"] }
+sqlmodel = { version = "0.6.0", features = ["chrono", "uuid", "decimal", "nightly-try"] }
 ```
 
 ---
@@ -598,14 +598,12 @@ Expr::case()
 
 - **Rust 1.95+** for the facade and the Postgres/MySQL/SQLite drivers; **nightly** for `sqlmodel-frankensqlite` (fsqlite enables `core_intrinsics` on x86_64) and for building this repo itself (`.cargo/config.toml` passes `-Z threads`)
 - **No stable release yet**: API may change
-- **asupersync dependency**: Resolved from crates.io as `^0.5.0`, matching the runtime used by `fsqlite` 0.4.x, so a single runtime version unifies across the stack
+- **asupersync dependency**: Resolved from crates.io as `^0.6.2`, matching the runtime used by `fsqlite` 0.5.x, so a single runtime version unifies across the stack
 - **PostgreSQL runtime handoff ([#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43))**:
-  published SQLModel 0.5.1 can hang while validating a connection after its
-  holder's current-thread runtime exits on Asupersync 0.5.0. The issue's
-  explicit `worker_threads(2)` controls pass. The repository now bounds
-  checkout validation, but fixed-runtime integration and release qualification
-  remain open. See the [production qualification runner](crates/sqlmodel-e2e/runtime-handoff/README.md)
-  for the staged Asupersync 0.6.1 candidate and the published controls.
+  resolved in SQLModel 0.6.0 by aligning the workspace and FrankenSQLite on
+  Asupersync 0.6.2 alongside bounded pool checkout validation and retirement.
+  Published 0.5.x releases on Asupersync 0.5.0 remain affected and should
+  upgrade to 0.6.0.
 
 ---
 
@@ -614,11 +612,11 @@ Expr::case()
 ### "Failed to resolve dependency `asupersync`"
 
 ```bash
-# SQLModel 0.5.x requires asupersync ^0.5.0, the same runtime line fsqlite 0.4.x
+# SQLModel 0.6.x requires asupersync ^0.6.2, the same runtime line fsqlite 0.5.x
 # uses, so one asupersync should resolve for the whole graph. If resolution
 # fails, another dependency may require an older, incompatible runtime line:
 cargo tree -i asupersync     # find who requires the conflicting version
-# then upgrade that crate (or use `cargo update -p asupersync` once it allows 0.5.0)
+# then upgrade that crate (or use `cargo update -p asupersync` once it allows 0.6.2)
 cargo build
 ```
 

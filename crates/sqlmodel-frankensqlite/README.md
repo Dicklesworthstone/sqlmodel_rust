@@ -9,7 +9,7 @@ Pure-Rust SQLite driver for SQLModel Rust, backed by [FrankenSQLite](https://git
 
 ## Requirements
 - **Nightly Rust.** `fsqlite-pager` enables `core_intrinsics` on x86_64, so this crate is nightly-only while the rest of the workspace compiles on stable 1.95+. The repository pins `nightly-2026-08-31` in `rust-toolchain.toml`.
-- **fsqlite 0.4.0**, with `fsqlite-core`, `fsqlite-types`, and `fsqlite-error` on the same release line. FrankenSQLite and SQLModel share Asupersync 0.5 context types.
+- **fsqlite 0.5.1**, with `fsqlite-core`, `fsqlite-types`, and `fsqlite-error` on the same release line. FrankenSQLite and SQLModel share Asupersync 0.6 context types.
 
 ## Opening a connection
 | Constructor | Use |
@@ -57,8 +57,8 @@ Most users should depend on `sqlmodel` plus this crate and import from `sqlmodel
 
 ```toml
 [dependencies]
-sqlmodel = "0.4"
-sqlmodel-frankensqlite = "0.4"
+sqlmodel = "0.6.0"
+sqlmodel-frankensqlite = "0.6.0"
 ```
 
 Use this crate directly if you are extending internals or building tooling around the core APIs.

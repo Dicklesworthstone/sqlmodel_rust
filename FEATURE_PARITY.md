@@ -2,7 +2,7 @@
 
 This document tracks feature parity between Python SQLModel and Rust SQLModel.
 
-**Last Updated:** 2026-11-01 (verified for v0.5.1 lockstep release; all 12 crates verified, full workspace test gate passing on the C SQLite and FrankenSQLite drivers, plus the nightly-try README doctests and the c-sqlite-tests and console suites. The MySQL/PostgreSQL integration and TLS tests need a server and were compiled, not run, for 0.5.1; that driver code is unchanged since 0.5.0)
+**Last Updated:** 2026-11-21 (verified for v0.6.0 lockstep release; all 12 crates verified across C SQLite, FrankenSQLite 0.5.1, PostgreSQL 16, MySQL 8.4, and MariaDB 11, including live PostgreSQL and MySQL/MariaDB TLS suites, PostgreSQL current-thread runtime handoff reuse on Asupersync 0.6.2, isolated external facade-consumer derive builds, strict vs lax model validation, and nightly-try README doctests)
 
 ---
 

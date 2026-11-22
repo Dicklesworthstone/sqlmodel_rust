@@ -6,8 +6,7 @@ This project follows approximate [Semantic Versioning](https://semver.org/). Ver
 
 Repository: <https://github.com/Dicklesworthstone/sqlmodel_rust>
 
-Scope window: first commit through 0.5.1 (2026-11-01), with catch-up qualification
-notes from 2026-10-04.
+Scope window: first commit through 0.6.0 (2026-11-21).
 
 Sources: git history and tags on `main`, GitHub Releases, the crates.io
 version list for `sqlmodel`, and the `.beads` issue records referenced inline.
@@ -18,6 +17,7 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 | Version | Date | Git tag | GitHub Release | crates.io | Notes |
 |---------|------|---------|----------------|-----------|-------|
+| 0.6.0 | 2026-11-21 | [sqlmodel-v0.6.0](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-v0.6.0) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/sqlmodel-v0.6.0) | [yes](https://crates.io/crates/sqlmodel/0.6.0) | Asupersync 0.6.2, FrankenSQLite 0.5.1, facade derives (#37), MariaDB/Postgres fixes (#38–#43), lax validation, opt-level 3 |
 | 0.5.1 | 2026-11-01 | [sqlmodel-v0.5.1](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-v0.5.1) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/sqlmodel-v0.5.1) | [yes](https://crates.io/crates/sqlmodel/0.5.1) | Strict-durable open fix, FrankenSQLite 0.4.12 floor, lock past four advisories |
 | 0.5.0 | 2026-09-12 | [sqlmodel-v0.5.0](https://github.com/Dicklesworthstone/sqlmodel_rust/tree/sqlmodel-v0.5.0) | no | [yes](https://crates.io/crates/sqlmodel/0.5.0) | All 12 crates published with Asupersync 0.5 and FrankenSQLite 0.4 |
 | 0.4.3 | 2026-09-08 | [v0.4.3](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://github.com/Dicklesworthstone/sqlmodel_rust/releases/tag/v0.4.3) | [yes](https://crates.io/crates/sqlmodel/0.4.3) | Lockstep release of all 12 crates; 11-chapter ORM guide, Session::with_retry, multi-statement migrations, MVCC retry hardening |
@@ -34,128 +34,149 @@ Dates are the local commit/tag dates; crates.io shows the same publishes in UTC
 
 ---
 
-## [Unreleased]
+## [0.6.0] -- 2026-11-21
+
+A lockstep minor release of all 12 crates aligning the entire workspace onto
+Asupersync 0.6.2, FrankenSQLite 0.5.1, `libsqlite3-sys 0.40.0`, `rsa 0.10.0`,
+and `rich_rust 0.2.4`; resolving all open PostgreSQL, MariaDB, facade-derive,
+and TLS/audit issues (`#37`–`#43`); implementing strict vs. lax `model_validate`
+coercion; hardening PostgreSQL transaction/wire/session/pool cancellation; and
+switching `[profile.release]` to `opt-level = 3`.
+
+### Breaking / Major Dependency Alignment
+
+- Upgraded `asupersync` from `0.5.0` to `^0.6.2` across the workspace and
+  upgraded `sqlmodel-frankensqlite` from `fsqlite 0.4.12` to `fsqlite 0.5.1`
+  (`fsqlite`, `fsqlite-core`, `fsqlite-types`, `fsqlite-error`), keeping a
+  single unified `asupersync` version in the resolved dependency graph
+  (`fe850b3`, `c19aaff`).
+- Upgraded `libsqlite3-sys` to `0.40.0` (bundled C SQLite 3.54.1), `rsa` to
+  stable `0.10.0` (clearing historical `RUSTSEC-2023-0071`), `rich_rust` to
+  `0.2.4`, `rustls` to `0.23.46`, `rustls-webpki` to `0.103.17`, and
+  `webpki-roots` to `1.0.12` (`fe850b3`, `abafb07`, `965cdbb`;
+  [#42](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/42)).
 
 ### Fixed
 
-- Session retries now require acknowledged rollback before another attempt.
-  Failed, cancelled, panicked, or dropped cleanup preserves transaction and
-  tracking ownership. Dropping work also marks the Session as requiring
-  rollback; subsequent Session writes return `RollbackRequired` until explicit
-  rollback succeeds. The guard includes bulk and relationship writes without
-  consuming their pending operations. Cancellation and panic from the original
-  work remain authoritative when cleanup also fails.
+- **Facade-only derive ergonomics ([#37](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/37), `c19aaff`)**:
+  `#[derive(Model)]`, `#[derive(Validate)]`, and `#[derive(SqlEnum)]` now
+  resolve `sqlmodel-core` and `sqlmodel-query` dynamically through
+  `proc-macro-crate` and `sqlmodel::__private`, supporting facade-only
+  consumers, renamed `sqlmodel` / `sqlmodel-core` dependencies, and explicit
+  `#[sqlmodel(crate = "...")]` / `#[validate(crate = "...")]` overrides.
+  `#[derive(SqlEnum)]` now qualifies `::core::result::Result` so importing
+  `sqlmodel::prelude::*` (which brings the 1-arg `Result<T>` alias into scope)
+  no longer shadows `Result<T, E>`. Verified by the new isolated
+  `facade_consumer` external-workspace test suite (5 scenarios including
+  compile-fail control).
+- **MariaDB foreign-key diff fixpoint ([#38](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/38), `c19aaff`)**:
+  normalized MariaDB/MySQL default foreign-key referential actions (`RESTRICT`
+  vs. `NO ACTION`) in `sqlmodel-schema` so schema diffing reaches a fixpoint on
+  MariaDB 11 as well as MySQL 8.4, PostgreSQL 16, and SQLite.
+- **All-features Clippy & SQLite test gates ([#39](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/39), `c19aaff`)**:
+  verified zero warnings under `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  verified `migration_runner_sqlite` under `c-sqlite-tests`, and serialized
+  `joined_inheritance_sqlite` around scoped `tracing::subscriber::with_default`
+  to eliminate a parallel callsite interest-cache race.
+- **PostgreSQL schema-oracle fixture normalization ([#40](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/40), `c19aaff`)**:
+  updated `schema_oracle` normalization for PostgreSQL type equivalences with
+  negative controls confirming real type mismatches (`INTEGER` vs `BIGINT`,
+  `VARCHAR(255)` vs `TEXT`) still produce schema diffs.
+- **MariaDB prepared-statement parameter encoding ([#41](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/41), `c19aaff`)**:
+  `sqlmodel-mysql` now encodes inferred-type string parameters with
+  `MYSQL_TYPE_VAR_STRING`, resolving MariaDB 11 prepared-statement rejection on
+  first execution, and adapts `sha256_password_rsa` to `rsa 0.10.0`.
+- **Strict vs. lax `model_validate` (`c19aaff`)**:
+  `model_validate` now distinguishes `ValidationMode::Strict` (rejects
+  mismatched JSON scalar types) from lax mode (safely coerces compatible
+  representations such as stringified integers/booleans/floats).
+- **PostgreSQL current-thread runtime handoff ([#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43), `fe850b3`, `ee08466`, `bc7fd90`)**:
+  aligning the full workspace on Asupersync 0.6.2 resolves the stale
+  current-thread reactor socket registration bug; live PostgreSQL 16 pool
+  handoff tests now directly reuse the original backend PID after both normal
+  holder exit and intentional holder panic (~0.5 ms), alongside bounded
+  checkout validation and retirement safeguards.
+- **FrankenSQLite 0.5.1 alignment (`c19aaff`)**:
+  updated `sqlmodel-frankensqlite` for `fsqlite 0.5.1` error/constraint
+  variants and dropped seven stale `KNOWN_DIVERGENCES` entries from
+  `sqlite_differential` that are now fixed upstream (`INSERT ... RETURNING`
+  and plain/tail `rowid` tracking), leaving 3 documented divergences across
+  46 lockstep operations.
+- Session retries now require acknowledged rollback before another attempt
+  (`33ce8ac`). Failed, cancelled, panicked, or dropped cleanup preserves
+  transaction and tracking ownership. Dropping work also marks the Session as
+  requiring rollback; subsequent Session writes return `RollbackRequired` until
+  explicit rollback succeeds. The guard includes bulk and relationship writes
+  without consuming their pending operations. Cancellation and panic from the
+  original work remain authoritative when cleanup also fails.
 - Acknowledged Session commits now prevent retrying the same work after an
-  `AfterCommit` notification error or a later failure inside the work closure.
-  Earlier durable objects remain tracked when a later transaction is rolled
-  back. Retry entry also checks the caller's deadline before `BEGIN` or work,
-  including immediate retry policies. Regressions cover real PostgreSQL
-  duplicate-write prevention, explicit recovery, hard-dropped futures,
-  cancellation at rollback, and exact virtual-time deadline expiry.
-- ORM Session finalization now preserves PostgreSQL's command acknowledgement.
-  If a statement has aborted the transaction, a `COMMIT` acknowledged as
-  `ROLLBACK` returns `AlreadyRolledBack`, reconciles tracked objects, and fires
-  `AfterRollback` instead of reporting success or firing `AfterCommit`.
-  Notification failures cannot replace that database outcome. Additive
-  connection hooks carry these semantics through connection wrappers, while
-  the typed PostgreSQL transaction retains its exclusive cleanup ownership.
-  Native regressions check durability from an independent backend and verify
-  healthy commit, rollback, and subsequent reuse on the original backend.
+  `AfterCommit` notification error or a later failure inside the work closure
+  (`33ce8ac`). Earlier durable objects remain tracked when a later transaction
+  is rolled back. Retry entry also checks the caller's deadline before `BEGIN`
+  or work, including immediate retry policies.
+- ORM Session finalization now preserves PostgreSQL's command acknowledgement
+  (`36404cf`). If a statement has aborted the transaction, a `COMMIT`
+  acknowledged as `ROLLBACK` returns `AlreadyRolledBack`, reconciles tracked
+  objects, and fires `AfterRollback` instead of reporting success or firing
+  `AfterCommit`.
 - Synchronous pool retirement now uses `acquire_timeout` as a finite grace,
-  with one deadline for an entire idle batch. Returning a lease to a closed
-  pool, retiring an expired lease, and dropping a lease after its pool is gone
-  cannot wait indefinitely on a yielding close hook. Retirement ownership
-  survives close-hook panic, and incomplete graceful cleanup is recorded
-  before the final slot is released, so later drains cannot report success.
-  Native PostgreSQL coverage holds an escaped transaction open while returning
-  its lease; cleanup releases pool capacity without waiting for that owner.
-- ORM flush queues now remain owned by the `Session` across suspension. Dropping
-  a pending flush preserves unfinished INSERT, UPDATE, and DELETE work while
-  retaining acknowledged row progress. Completed parent deletions are detached
-  immediately, and cascade cleanup is not undone by restoring an older queue
-  snapshot. Regression tests cover interruption before and after partial
-  progress, including a completed child cascade with its parent still pending.
+  with one deadline for an entire idle batch (`b31e36d`, `ca959f8`). Returning
+  a lease to a closed pool, retiring an expired lease, and dropping a lease
+  after its pool is gone cannot wait indefinitely on a yielding close hook.
+  Retirement ownership survives close-hook panic, and incomplete graceful
+  cleanup is recorded before the final slot is released.
+- ORM flush queues now remain owned by the `Session` across suspension
+  (`7731f71`). Dropping a pending flush preserves unfinished INSERT, UPDATE,
+  and DELETE work while retaining acknowledged row progress.
 - Pool checkout now runs driver reuse safeguards even when its optional ping
-  is disabled. PostgreSQL rejects and physically retires open or failed raw
-  transactions left by an abandoned ORM `Session`, so the next borrower
-  cannot observe or commit the previous borrower's uncommitted work.
-  Cancellation, retirement, and replacement remain within the original
-  acquisition deadline. Explicitly committed and rolled-back sessions still
-  reuse their original backend, and ordinary `ping` retains its transaction
-  behavior. Connection wrappers forward the new `validate_for_pool` hook.
+  is disabled (`5ac0170`). PostgreSQL rejects and physically retires open or
+  failed raw transactions left by an abandoned ORM `Session`.
 - PostgreSQL transactions now retain exclusive connection ownership through
-  finalization. Dropped transactions and abandoned commit/rollback futures
-  close their socket before releasing ownership, including holder panic and
-  surviving shared handles. Closing a physically retired, poisoned connection
-  is idempotent, so the first pool checkout can replace it and drain cleanly.
-  Waiting handles honor their own cancellation/deadline without interrupting
-  the transaction owner. `BEGIN` applies the requested isolation level, and
-  a server `ROLLBACK` acknowledgement cannot be reported as a successful commit.
+  finalization (`068a6a0`). Dropped transactions and abandoned commit/rollback
+  futures close their socket before releasing ownership.
 - PostgreSQL now owns each wire exchange until its matching `ReadyForQuery`
-  is consumed. Dropping or cancelling an unfinished query closes the socket
-  before releasing the shared connection lock, so a later query or checkout
-  ping cannot consume the abandoned response. Pending wire I/O observes both
-  explicit cancellation and the caller's absolute deadline. Fully drained
-  SQL errors and cancellation before the first write preserve healthy reuse.
-- Pool shutdown now registers the caller's future deadline across idle
-  retirement and waiting for borrowed leases. A production request context
-  can time out a drain even when no driver or borrower wakes it. Expiry
-  discards the drain's owned resources before returning `Cancelled(Deadline)`;
-  outstanding borrowers keep their ownership, admission stays closed, and a
-  later drain can finish. Native regressions cover both supported runtimes.
+  is consumed (`bef4100`). Dropping or cancelling an unfinished query closes
+  the socket before releasing the shared connection lock, and pending wire I/O
+  observes both explicit cancellation and the caller's absolute deadline.
+- Pool shutdown (`close_and_drain`) now registers the caller's future deadline
+  across idle retirement and waiting for borrowed leases (`a66af32`).
 - Pool acquisition now enforces one deadline across capacity waits, connection
-  creation, checkout validation, and rejected-connection retirement. A stalled
-  ping no longer bypasses `acquire_timeout` or a shorter caller budget
-  ([#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43)). Timeout,
-  cancellation, and hard drop discard an unvalidated connection before
-  releasing its slot, and queued requests unregister on every exit.
-- Checkout validation preserves cancellation and panic outcomes and rechecks
-  pool closure and the acquisition deadline before publishing a lease. A ping
-  finishing after closure or expiry cannot hand out a connection.
-- Acquisition also checks its remaining deadline before each retirement hook
-  and after a driver returns `Pending`. A failed ping that consumes the last
-  of the budget cannot start another close operation. The connection contract
-  documents hard-drop cleanup when graceful retirement is interrupted.
+  creation, checkout validation, and rejected-connection retirement (`ee08466`,
+  `c996710`, `0f88bc4`).
 
-These are unreleased protections. They do not change the known limitation
-of the published SQLModel 0.5.1 release or establish successful PostgreSQL
-handoff against a fixed runtime dependency.
+### Performance
 
-### Qualification
+- Switched `[profile.release]` from `opt-level = "z"` to `opt-level = 3`
+  (`fe850b3`). Back-to-back same-host A/B criterion benchmarks (30 samples,
+  pre-upgrade `opt-level = "z"` vs. 0.6.0 `opt-level = 3`) showed **13/13 timed
+  guarded CPU benchmarks faster (-18.1% to -47.7%, 1.40x geometric mean
+  speedup, 0 regressions)** and the allocation benchmark unchanged (`1,667 B`),
+  with all 14 guarded benchmarks 2.7x–8.5x below `benches/thresholds.toml`:
+  - `row_conversion/hand_from_row`: `209.76 ns -> 109.61 ns` (-47.7%, 1.91x)
+  - `row_conversion/derive_to_row`: `197.79 ns -> 118.11 ns` (-40.3%, 1.67x)
+  - `sql_emission/select_filtered/{Mysql,Sqlite,Postgres}`: `-36.1%` to `-38.1%` (1.56x–1.62x)
+  - `row_conversion/derive_from_row`: `485.33 ns -> 351.64 ns` (-27.5%, 1.38x)
+  - `sql_emission/create_table`: `3.664 µs -> 2.835 µs` (-22.6%, 1.29x)
+  - `sql_emission_batches/insert_many_{10,100,500}`: `-18.1%` to `-18.9%` (1.22x–1.23x)
 
-- PostgreSQL handoff tests now log checkout completion before verifying reuse
-  and apply a finite production budget to the verification queries. An
-  already-readable ping cannot turn a later stalled query into an unbounded
-  test step or be counted as successful runtime handoff.
-- Fixed the standalone qualification runner's staged workspace inheritance:
-  the outer fixture excludes the copied workspace, so Cargo resolves the
-  copied crates' package fields and dependencies from their own manifest.
-  Actual metadata resolution verifies one production registry runtime. The
-  PostgreSQL holder also awaits a delayed server response before runtime exit.
-- Native pool regressions cover permanently pending validation on both
-  current-thread and explicit two-worker runtimes, stalled expired-connection
-  retirement, and successful validation without a leftover timeout timer.
-  PostgreSQL tests separately check bounded handoff failure and retirement,
-  successful reuse, normal runtime exit, holder panic, expired sessions, and
-  server-terminated sessions. A checkout cancellation sweep verifies that
-  interrupted validation retires ownership without retrying or leaking slots.
-- Added production-context PostgreSQL runtime-handoff witnesses for normal
-  holder exit and intentional holder panic, retaining the explicit
-  `worker_threads(2)` controls. The witness asserts the original backend PID,
-  pool accounting, and successful drain; a reconnect cannot hide the defect.
-  Separate TCP witnesses force pending readiness across runtime destruction.
-- The standalone runner checks resolved dependency features, enforces a
-  separate process deadline for each case after compilation, and retains
-  manifests, sources, dependency metadata, logs, and results. Missing
-  PostgreSQL, a timeout, or a missing completion marker fails qualification.
-- CI compares the published 0.4.3 / Asupersync 0.4.10 baseline, the published
-  0.5.1 / Asupersync 0.5.0 failing control, and a copied repository candidate
-  with published Asupersync 0.6.1. The candidate changes only its copied runtime
-  requirement. The root dependency remains 0.5.0: the published FrankenSQLite
-  family still requires that runtime line, and the all-driver single-runtime
-  release gate remains in force. See the
-  [qualification instructions](crates/sqlmodel-e2e/runtime-handoff/README.md)
-  for evidence requirements and the remaining integration boundary.
+### Validation
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passes, 0 warnings ([#39](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/39)) |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | passes across all 13 crates |
+| `cargo audit --deny warnings` | 0 vulnerabilities, 0 warnings across 382 crates; `RUSTSEC-2023-0071` removed ([#42](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/42)) |
+| `cargo deny check bans advisories licenses sources` | advisories, bans, licenses, sources ok |
+| Core / macros / query / schema / session / pool unit tests | 1,247 passed, 0 failed across 13 test suites |
+| `sqlmodel-frankensqlite` unit & MVCC tests | 88 passed, 0 failed, 1 ignored |
+| `sqlmodel` facade unit, `c-sqlite-tests`, trybuild UI & doctests | all passing (incl. `migration_runner_sqlite`, `joined_inheritance_sqlite`, `ui`, and README/guide doctests) |
+| `facade_consumer` isolated external consumer workspaces | 5/5 passed (`facade_only`, `renamed_facade`, `direct_core`, `renamed_core`, `compile_fail_control`) ([#37](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/37)) |
+| `sqlite_differential` (C SQLite 3.54.1 vs FrankenSQLite 0.5.1) | passed (46 lockstep operations, 3 known divergences) |
+| Live 6-driver `sqlmodel-e2e` suite (C SQLite mem/file, FrankenSQLite 0.5.1, PostgreSQL 16, MySQL 8.4, MariaDB 11) | 10/10 scenarios passed (`smoke`, `expressions`, `operations`, `types` [#41], `attributes` [#38], `migrations`, `schema_fixpoint` [#38], `schema_oracle` [#40], `session`, `pool` [#43]) |
+| Live PostgreSQL 16 runtime handoff (`pool`, Asupersync 0.6.2) | 10/10 passed; current-thread normal-exit & panic handoffs directly reused original backend PID (~510 µs) ([#43](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/43)) |
+| Live TLS suites (`postgres_tls` on PostgreSQL 16, `mysql_tls` on MySQL 8.4 + MariaDB 11) | `postgres_tls` 6/6 passed; `mysql_tls` 9/9 passed incl. `caching_sha2_no_tls_rsa` on `rsa 0.10.0` ([#42](https://github.com/Dicklesworthstone/sqlmodel_rust/issues/42)) |
+| `doc_truth` documentation & version sync guard | 7/7 passed on the 0.6.0 release commit |
 
 ## [0.5.1] -- 2026-11-01
 

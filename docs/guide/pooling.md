@@ -102,7 +102,7 @@ runtime thread.
 
 Every reused connection also passes the driver's `validate_for_pool` hook.
 Disabling `test_on_checkout` skips the network health probe while retaining
-local reuse safeguards. On repository `main`, PostgreSQL physically retires
+local reuse safeguards. Starting in SQLModel 0.6.0, PostgreSQL physically retires
 an open or failed transaction left by raw SQL or an abandoned ORM `Session`,
 including holder panic. The next borrower receives a fresh connection and
 cannot observe or commit the abandoned work. A surviving shared handle cannot
@@ -128,7 +128,7 @@ async fn shutdown_pool(cx: &Cx, pool: Pool<impl Connection>) -> Outcome<(), Erro
 
 ### Bounded Synchronous Retirement
 
-On repository `main`, `close()`, `clear_idle()`, and lease destruction use
+Starting in SQLModel 0.6.0, `close()`, `clear_idle()`, and lease destruction use
 `acquire_timeout` as the maximum grace for synchronous retirement. An entire
 idle batch shares one deadline; the grace does not restart for each connection.
 A lease retains this setting even if its pool has already been dropped. A
@@ -203,35 +203,20 @@ replacement session, missing service, or absent completion marker fails
 qualification; the runner retains the dependency graph, lockfile, source
 provenance, and individual logs.
 
-### Published Dependency Boundary (verified 2026-11-02 UTC)
+### Resolution in SQLModel 0.6.0 (verified 2026-11-21)
 
-The upstream runtime fix is now available in the registry:
-[Asupersync 0.6.0](https://crates.io/crates/asupersync/0.6.0) was published at
-13:41 UTC and [0.6.1](https://crates.io/crates/asupersync/0.6.1) at 20:03 UTC on
-November 1. The 0.6.1 package records source revision
-`4d0ef0e79a6efa36023f32fcd81615122c809d3d`; its source includes the weak
-current-thread root waker and migration to the polling socket reactor. Neither
-release satisfies SQLModel's existing `asupersync = "0.5.0"` requirement, and
-there is still no published compatible 0.5 patch carrying the fix.
+SQLModel 0.6.0 resolves this boundary end-to-end by aligning the entire
+workspace and the FrankenSQLite engine family (`fsqlite 0.5.1`) onto
+[Asupersync 0.6.2](https://crates.io/crates/asupersync/0.6.2), preserving a
+single unified `asupersync` version across the full dependency graph.
 
-A complete SQLModel 0.6 port must also align the FrankenSQLite dependency
-family. Even [fsqlite-core 0.4.13](https://crates.io/crates/fsqlite-core/0.4.13/dependencies)
-and [fsqlite-types 0.4.13](https://crates.io/crates/fsqlite-types/0.4.13/dependencies)
-still select Asupersync `^0.5.0`. Updating only SQLModel's workspace dependency
-to 0.6.1 produces both runtime versions in the full graph, violating the
-existing downstream single-Asupersync gate in `publish-set.yml` and
-`release.yml` (tracked by `bd-jeof.3`). The production dependency and these
-gates therefore remain unchanged; the port needs an aligned published engine
-family and a repeat of the native success matrix, not a local dependency patch.
+Against live PostgreSQL 16, all 10 `sqlmodel-e2e` pool scenarios pass with
+`asupersync 0.6.2`, including direct reuse of the original backend PID on
+current-thread runtime handoffs after both normal holder exit and intentional
+holder panic (completing in ~0.5 ms), alongside the two-worker controls and
+bounded checkout/retirement safeguards.
 
-The same runner accepts `--stage-asupersync-version 0.6.1` to evaluate the
-PostgreSQL subset against the published runtime in a copied workspace. It
-rejects multiple runtimes, a non-registry runtime without an explicitly
-requested source override, and the `test-internals` feature. A successful
-staged run is evidence for that PostgreSQL integration, while the all-driver
-port and qualification of a published SQLModel release remain separate gates.
-
-### Native Qualification Results (2026-11-02 UTC)
+### Historical 0.5.x Qualification Baseline (2026-11-02 UTC)
 
 The repository checkout protection was exercised against PostgreSQL 16.15 on
 native x86_64 Linux, using the published Asupersync 0.5.0 dependency:
