@@ -12,15 +12,26 @@
 
 [graph]
 all-features = true
+# Evaluate the workspace's real targets so unstable emscripten-only cfg edges
+# (e.g. wasm-bindgen-futures >= 0.4.79's cfg(all(target_os = "emscripten",
+# wasm_bindgen_unstable_tokio)) tokio edge) do not produce false positives.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "wasm32-unknown-unknown",
+]
 
 [advisories]
 version = 2
 yanked = "deny"
 # Keep in sync with .cargo/audit.toml (that file carries the full rationale).
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack targets private-key decryption; sqlmodel-mysql only encrypts with the server's public key (auth.rs). Review 2026-12-01. Beads bd-j7wt.1 / bd-j7wt.2." },
-    { id = "RUSTSEC-2025-0141", reason = "bincode 1 via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to decode untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2026-11-01." },
-    { id = "RUSTSEC-2024-0320", reason = "yaml-rust via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to parse untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2026-11-01." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1 via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to decode untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2027-03-01." },
+    { id = "RUSTSEC-2024-0320", reason = "yaml-rust via syntect <- rich_rust <- sqlmodel-console (feature rich). Not used to parse untrusted input here. Cross-repo fix in rich_rust tracked by bd-j7wt.4. Review 2027-03-01." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4 marked unmaintained (no vulnerability); opt-in `chrono` feature on sqlmodel-core and transitive via fsqlite-func 0.5.1. Review 2027-03-01." },
 ]
 
 [bans]
@@ -50,7 +61,6 @@ skip = [
     { crate = "rand@0.8", reason = "rand 0.8 line is a transitive dependency of asupersync/fsqlite internals; sqlmodel drivers use rand 0.10" },
     { crate = "sha2@0.10", reason = "sha2 0.10 is used by transitive crates on the digest 0.10 line; sqlmodel auth uses sha2 0.11" },
     { crate = "getrandom@0.2", reason = "rand 0.8 line" },
-    { crate = "base64@0.22", reason = "transitive; sqlmodel-postgres uses base64 0.23" },
 ]
 
 [licenses]

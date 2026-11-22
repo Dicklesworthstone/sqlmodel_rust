@@ -7,26 +7,20 @@
 
 [advisories]
 ignore = [
-    # rsa 0.10.0-rc.x — RUSTSEC-2023-0071 "Marvin Attack" (timing side channel,
-    # medium 5.9, no fixed upstream version).
-    # Why it does not apply: Marvin recovers the PRIVATE key by timing PKCS#1 v1.5
-    # DECRYPTION on the party that holds the private key. sqlmodel-mysql uses the
-    # rsa crate only to ENCRYPT the scrambled password with the MySQL server's
-    # PUBLIC key during caching_sha2_password / sha256_password full authentication
-    # on a non-TLS connection (crates/sqlmodel-mysql/src/auth.rs,
-    # `sha256_password_rsa`). The client never holds a private key and never
-    # decrypts or signs; a test in auth.rs asserts no private-key API is referenced.
-    # TLS connections (SslMode::Required or stronger) never take this path at all.
-    # Follow-up: bd-j7wt.1 (this analysis), bd-j7wt.2 (feature-gate the RSA path).
-    # Review: 2026-12-01, or when rsa 0.10 stable ships (then re-run cargo audit).
-    "RUSTSEC-2023-0071",
-
     # bincode 1.3 (RUSTSEC-2025-0141) and yaml-rust 0.4 (RUSTSEC-2024-0320) are
     # unmaintained. They reach this workspace only through syntect (default
     # features) <- rich_rust <- sqlmodel-console with the `rich` feature, and are
     # used for syntect's own bundled syntax/theme dumps, never to decode input
     # SQLModel receives. The fix is in rich_rust (trim syntect features); tracked
-    # by bd-j7wt.4. Review: 2026-11-01.
+    # by bd-j7wt.4. Review: 2027-03-01.
     "RUSTSEC-2025-0141",
     "RUSTSEC-2024-0320",
+
+    # chrono 0.4.x (RUSTSEC-2026-0543) was marked unmaintained on 2026-09-14 with
+    # no security vulnerability. It is an opt-in feature (`chrono`) on
+    # sqlmodel-core (for user models using chrono::NaiveDate/DateTime) and a
+    # transitive dependency of fsqlite-func 0.5.1. Dropping it from sqlmodel-core
+    # is a public API decision and requires fsqlite upstream migration to jiff/time.
+    # Review: 2027-03-01.
+    "RUSTSEC-2026-0543",
 ]
