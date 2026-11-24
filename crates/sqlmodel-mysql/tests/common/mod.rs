@@ -88,22 +88,54 @@ pub fn parse_mysql_url(url: &str) -> Option<MySqlConfig> {
 }
 
 fn parse_host_port(input: &str) -> Option<(&str, u16)> {
+    if input.is_empty() {
+        return None;
+    }
     if let Some(rest) = input.strip_prefix('[') {
         let end = rest.find(']')?;
         let host = &rest[..end];
+        if host.is_empty() || host.chars().any(char::is_whitespace) {
+            return None;
+        }
         let after = &rest[end + 1..];
-        let port = after
-            .strip_prefix(':')
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(3306);
+        let port = if after.is_empty() {
+            3306
+        } else {
+            let port_str = after.strip_prefix(':')?;
+            if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let parsed = port_str.parse::<u16>().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            parsed
+        };
         return Some((host, port));
     }
 
-    match input.rsplit_once(':') {
-        Some((host, port_str)) if port_str.chars().all(|c| c.is_ascii_digit()) => {
-            Some((host, port_str.parse::<u16>().ok()?))
+    if input.contains('[') || input.contains(']') {
+        return None;
+    }
+
+    if let Some((host, port_str)) = input.split_once(':') {
+        if host.is_empty()
+            || host.chars().any(char::is_whitespace)
+            || port_str.is_empty()
+            || !port_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
         }
-        _ => Some((input, 3306)),
+        let port = port_str.parse::<u16>().ok()?;
+        if port == 0 {
+            return None;
+        }
+        Some((host, port))
+    } else {
+        if input.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some((input, 3306))
     }
 }
 

@@ -159,3 +159,66 @@ fn postgres_fixture_path_errors_when_missing() {
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn postgres_url_ipv6_and_malformed_host_port_validation() {
+    let ipv6_default = common::resolve_postgres_config_from_env(
+        Ok("postgres://sqlmodel:pw@[::1]/sqlmodel_test".to_owned()),
+        common::POSTGRES_URL_ENV,
+    )
+    .expect("valid IPv6 URL with default port should parse");
+    assert_eq!(ipv6_default.host, "::1");
+    assert_eq!(ipv6_default.port, 5432);
+
+    let ipv6_explicit = common::resolve_postgres_config_from_env(
+        Ok("postgresql://sqlmodel:pw@[::1]:5433/sqlmodel_test".to_owned()),
+        common::POSTGRES_URL_ENV,
+    )
+    .expect("valid IPv6 URL with explicit port should parse");
+    assert_eq!(ipv6_explicit.host, "::1");
+    assert_eq!(ipv6_explicit.port, 5433);
+
+    let default_port = common::resolve_postgres_config_from_env(
+        Ok("postgres://sqlmodel:pw@localhost/sqlmodel_test".to_owned()),
+        common::POSTGRES_URL_ENV,
+    )
+    .expect("valid hostname URL without port should use default 5432");
+    assert_eq!(default_port.host, "localhost");
+    assert_eq!(default_port.port, 5432);
+
+    for bad_url in [
+        "postgres://u:p@[::1]:abc/db",
+        "postgres://u:p@[::1]:/db",
+        "postgres://u:p@[::1]:99999/db",
+        "postgres://u:p@[::1]:0/db",
+        "postgres://u:p@[::1]:+5432/db",
+        "postgres://u:p@[::1]junk/db",
+        "postgres://u:p@[]/db",
+        "postgres://u:p@[]:5432/db",
+        "postgres://u:p@[::1/db",
+        "postgres://u:p@/db",
+        "postgres://u:p@:5432/db",
+        "postgres://u:p@localhost:notaport/db",
+        "postgres://u:p@localhost:/db",
+        "postgres://u:p@localhost:99999/db",
+        "postgres://u:p@localhost:0/db",
+        "postgres://u:p@localhost:+5432/db",
+        "postgres://u:p@localhost:5432:extra/db",
+        "postgres://u:p@::1/db",
+        "postgres://u:p@bad host:5432/db",
+    ] {
+        assert!(
+            common::parse_postgres_url(bad_url).is_none(),
+            "malformed URL must be rejected: {bad_url}"
+        );
+        let err = common::resolve_postgres_config_from_env(
+            Ok(bad_url.to_owned()),
+            common::POSTGRES_URL_ENV,
+        )
+        .expect_err("malformed URL must return Err");
+        assert!(
+            err.as_str().contains(common::POSTGRES_URL_ENV),
+            "error for {bad_url} must name env var: {err}"
+        );
+    }
+}

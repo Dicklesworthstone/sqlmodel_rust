@@ -217,19 +217,15 @@ fn mysql_auth_caching_sha2_no_tls_rsa() {
     let cx = Cx::for_testing();
 
     rt.block_on(async {
-        // With SslMode::Disable, caching_sha2_password exercises the RSA public key request + OAEP encryption path
-        let outcome = SharedMySqlConnection::connect(&cx, cfg.ssl_mode(SslMode::Disable)).await;
-        match outcome {
-            Outcome::Ok(conn) => {
-                let rows = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
-                assert_eq!(rows.len(), 1);
-            }
-            Outcome::Err(e) => {
-                // If server prohibits insecure transport, note it; otherwise should succeed via RSA
-                eprintln!("caching_sha2 no-tls outcome: {e}");
-            }
-            other => panic!("unexpected outcome: {other:?}"),
-        }
+        // With require_secure_transport=OFF (enforced by require_secure_transport_disabled above)
+        // and SslMode::Disable, caching_sha2_password must succeed via RSA public-key OAEP auth.
+        let conn = unwrap_outcome(
+            SharedMySqlConnection::connect(&cx, cfg.ssl_mode(SslMode::Disable)).await,
+        );
+        let rows = unwrap_outcome(conn.query(&cx, "SELECT 1", &[]).await);
+        assert_eq!(rows.len(), 1);
+        let val: i64 = rows[0].get_as(0).expect("row[0] as i64");
+        assert_eq!(val, 1);
     });
 }
 

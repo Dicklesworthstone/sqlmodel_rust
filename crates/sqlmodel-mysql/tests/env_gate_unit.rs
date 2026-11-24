@@ -175,3 +175,70 @@ fn mysql_fixture_path_errors_when_missing() {
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn mysql_url_ipv6_and_malformed_host_port_validation() {
+    let ipv6_default = common::resolve_mysql_config_from_env(
+        Ok("mysql://root:pw@[::1]/sqlmodel_test".to_owned()),
+        common::MYSQL_URL_ENV,
+        true,
+    )
+    .expect("valid IPv6 URL with default port should parse");
+    assert_eq!(ipv6_default.host, "::1");
+    assert_eq!(ipv6_default.port, 3306);
+
+    let ipv6_explicit = common::resolve_mysql_config_from_env(
+        Ok("mysql://root:pw@[::1]:3307/sqlmodel_test".to_owned()),
+        common::MYSQL_URL_ENV,
+        true,
+    )
+    .expect("valid IPv6 URL with explicit port should parse");
+    assert_eq!(ipv6_explicit.host, "::1");
+    assert_eq!(ipv6_explicit.port, 3307);
+
+    let default_port = common::resolve_mysql_config_from_env(
+        Ok("mysql://root:pw@localhost/sqlmodel_test".to_owned()),
+        common::MYSQL_URL_ENV,
+        true,
+    )
+    .expect("valid hostname URL without port should use default 3306");
+    assert_eq!(default_port.host, "localhost");
+    assert_eq!(default_port.port, 3306);
+
+    for bad_url in [
+        "mysql://root:pw@[::1]:abc/db",
+        "mysql://root:pw@[::1]:/db",
+        "mysql://root:pw@[::1]:99999/db",
+        "mysql://root:pw@[::1]:0/db",
+        "mysql://root:pw@[::1]:+3306/db",
+        "mysql://root:pw@[::1]junk/db",
+        "mysql://root:pw@[]/db",
+        "mysql://root:pw@[]:3306/db",
+        "mysql://root:pw@[::1/db",
+        "mysql://root:pw@/db",
+        "mysql://root:pw@:3306/db",
+        "mysql://root:pw@localhost:notaport/db",
+        "mysql://root:pw@localhost:/db",
+        "mysql://root:pw@localhost:99999/db",
+        "mysql://root:pw@localhost:0/db",
+        "mysql://root:pw@localhost:+3306/db",
+        "mysql://root:pw@localhost:3306:extra/db",
+        "mysql://root:pw@::1/db",
+        "mysql://root:pw@bad host:3306/db",
+    ] {
+        assert!(
+            common::parse_mysql_url(bad_url).is_none(),
+            "malformed URL must be rejected: {bad_url}"
+        );
+        let err = common::resolve_mysql_config_from_env(
+            Ok(bad_url.to_owned()),
+            common::MYSQL_URL_ENV,
+            true,
+        )
+        .expect_err("malformed URL must return Err");
+        assert!(
+            err.as_str().contains(common::MYSQL_URL_ENV),
+            "error for {bad_url} must name env var: {err}"
+        );
+    }
+}
