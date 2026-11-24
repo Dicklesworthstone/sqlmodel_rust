@@ -7,6 +7,7 @@
 //! fail immediately with an explicit diagnostic naming the required variable.
 
 use std::env::VarError;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -284,10 +285,29 @@ pub fn require_mysql_ca_path() -> PathBuf {
         .expect("MySQL TLS test prerequisite missing")
 }
 
+#[allow(dead_code)] // Used by sibling test binaries (`mysql_tls`, `env_gate_unit`).
+pub fn resolve_manifest_dir(runtime_env: Option<OsString>, compile_time: &str) -> PathBuf {
+    if let Some(raw) = runtime_env {
+        let path = PathBuf::from(raw);
+        if !path.as_os_str().is_empty() && !path.to_str().is_some_and(|s| s.trim().is_empty()) {
+            return path;
+        }
+    }
+    PathBuf::from(compile_time)
+}
+
+#[allow(dead_code)] // Used by sibling test binaries (`mysql_tls`, `env_gate_unit`).
+pub fn manifest_dir() -> PathBuf {
+    resolve_manifest_dir(
+        std::env::var_os("CARGO_MANIFEST_DIR"),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+}
+
 #[allow(dead_code)] // Used by `mysql_tls`.
 pub fn require_fixture_path(filename: &str) -> PathBuf {
-    resolve_fixture_path(Path::new(env!("CARGO_MANIFEST_DIR")), filename)
-        .expect("MySQL TLS test prerequisite missing")
+    let dir = manifest_dir();
+    resolve_fixture_path(&dir, filename).expect("MySQL TLS test prerequisite missing")
 }
 
 #[allow(dead_code)] // Used by `mysql_tls`.

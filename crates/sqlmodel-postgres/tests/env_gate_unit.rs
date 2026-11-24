@@ -89,9 +89,8 @@ fn postgres_ca_path_missing_env_and_fallbacks_errors_naming_env() {
 
 #[test]
 fn postgres_ca_path_explicit_nonexistent_does_not_silently_fallback() {
-    let fixture =
-        common::resolve_fixture_path(Path::new(env!("CARGO_MANIFEST_DIR")), "untrusted_ca.crt")
-            .expect("checked-in fixture exists");
+    let fixture = common::resolve_fixture_path(&common::manifest_dir(), "untrusted_ca.crt")
+        .expect("checked-in fixture exists");
     let err = common::resolve_ca_path_from_env(
         Ok("/nonexistent/explicit-pg-ca.crt".to_owned()),
         common::POSTGRES_CA_ENV,
@@ -110,9 +109,8 @@ fn postgres_ca_path_explicit_nonexistent_does_not_silently_fallback() {
 
 #[test]
 fn postgres_ca_path_explicit_and_fallback_succeed_when_file_exists() {
-    let fixture =
-        common::resolve_fixture_path(Path::new(env!("CARGO_MANIFEST_DIR")), "untrusted_ca.crt")
-            .expect("checked-in fixture exists");
+    let fixture = common::resolve_fixture_path(&common::manifest_dir(), "untrusted_ca.crt")
+        .expect("checked-in fixture exists");
 
     let explicit = common::resolve_ca_path_from_env(
         Ok(fixture.display().to_string()),
@@ -149,11 +147,8 @@ fn postgres_require_ssl_mode_enforces_precondition() {
 
 #[test]
 fn postgres_fixture_path_errors_when_missing() {
-    let err = common::resolve_fixture_path(
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-        "does_not_exist_ca.crt",
-    )
-    .expect_err("missing fixture must error");
+    let err = common::resolve_fixture_path(&common::manifest_dir(), "does_not_exist_ca.crt")
+        .expect_err("missing fixture must error");
     assert!(
         err.as_str().contains("does_not_exist_ca.crt"),
         "unexpected error: {err}"
@@ -221,4 +216,20 @@ fn postgres_url_ipv6_and_malformed_host_port_validation() {
             "error for {bad_url} must name env var: {err}"
         );
     }
+}
+
+#[test]
+fn postgres_manifest_dir_prefers_runtime_override_and_falls_back() {
+    let runtime = common::resolve_manifest_dir(
+        Some(std::ffi::OsString::from("/custom/runtime/crate")),
+        "/compile/time/crate",
+    );
+    assert_eq!(runtime, Path::new("/custom/runtime/crate"));
+
+    let fallback_none = common::resolve_manifest_dir(None, "/compile/time/crate");
+    assert_eq!(fallback_none, Path::new("/compile/time/crate"));
+
+    let fallback_blank =
+        common::resolve_manifest_dir(Some(std::ffi::OsString::from("   ")), "/compile/time/crate");
+    assert_eq!(fallback_blank, Path::new("/compile/time/crate"));
 }
