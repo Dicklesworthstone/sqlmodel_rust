@@ -12,7 +12,10 @@
 //!    table exists;
 //! 4. every bead ID cited in the planning documents exists in
 //!    `.beads/issues.jsonl` (historical footprints on lines that explicitly
-//!    say the bead "no longer exists" are exempt);
+//!    say the bead "no longer exists" are exempt; a missing tracker file fails
+//!    unless `SQLMODEL_ALLOW_MISSING_BEADS_TRACKER=1` is set intentionally for
+//!    stripped remote-worker closures, in which case the gate must count the
+//!    check as not run);
 //! 5. the README install snippet versions equal the workspace version;
 //! 6. FEATURE_PARITY's last-verified date is not older than the newest
 //!    dated CHANGELOG release entry (a release re-verifies parity);
@@ -25,8 +28,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Repository root, derived from this crate's manifest directory.
+///
+/// Prefers the runtime `CARGO_MANIFEST_DIR` provided by `cargo test` so a shared
+/// `CARGO_TARGET_DIR` across checkouts always inspects the tree under test,
+/// falling back to the compile-time path when the test binary is run directly.
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    manifest_dir
         .join("..")
         .join("..")
         .canonicalize()
@@ -124,6 +133,54 @@ fn agents_key_files_reference_existing_paths() {
     }
 }
 
+const ALLOW_MISSING_BEADS_TRACKER_ENV: &str = "SQLMODEL_ALLOW_MISSING_BEADS_TRACKER";
+
+#[derive(Debug, PartialEq, Eq)]
+enum BeadsTrackerLoad {
+    Loaded(String),
+    OptedOutMissing { path: PathBuf },
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn load_beads_tracker(root: &Path, allow_missing: bool) -> Result<BeadsTrackerLoad, String> {
+    load_beads_tracker_at(&root.join(".beads/issues.jsonl"), allow_missing)
+}
+
+fn load_beads_tracker_at(
+    tracker_path: &Path,
+    allow_missing: bool,
+) -> Result<BeadsTrackerLoad, String> {
+    match fs::read_to_string(tracker_path) {
+        Ok(contents) => Ok(BeadsTrackerLoad::Loaded(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if allow_missing {
+                Ok(BeadsTrackerLoad::OptedOutMissing {
+                    path: tracker_path.to_path_buf(),
+                })
+            } else {
+                Err(format!(
+                    "missing beads issue tracker at {} ({error}): `.beads/issues.jsonl` is checked \
+                     into the repository, so its absence indicates an incomplete tree or stripped \
+                     remote-worker closure; run on a full checkout, or set \
+                     {ALLOW_MISSING_BEADS_TRACKER_ENV}=1 intentionally (and record \
+                     `cited_bead_ids_exist_in_the_tracker` as NOT RUN)",
+                    tracker_path.display()
+                ))
+            }
+        }
+        Err(error) => Err(format!(
+            "cannot read beads issue tracker at {}: {error}",
+            tracker_path.display()
+        )),
+    }
+}
+
 #[test]
 fn cited_bead_ids_exist_in_the_tracker() {
     let documents = [
@@ -134,14 +191,24 @@ fn cited_bead_ids_exist_in_the_tracker() {
         "FEATURE_PARITY.md",
         "EXISTING_SQLMODEL_STRUCTURE.md",
     ];
-    let tracker_path = repo_root().join(".beads/issues.jsonl");
-    if !tracker_path.exists() {
-        eprintln!(
-            "skipping cited_bead_ids_exist_in_the_tracker: .beads/issues.jsonl not present (remote worker or stripped closure)"
-        );
-        return;
-    }
-    let tracker = read(".beads/issues.jsonl");
+    let allow_missing = env_flag_enabled(
+        std::env::var(ALLOW_MISSING_BEADS_TRACKER_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let tracker = match load_beads_tracker(&repo_root(), allow_missing) {
+        Ok(BeadsTrackerLoad::Loaded(contents)) => contents,
+        Ok(BeadsTrackerLoad::OptedOutMissing { path }) => {
+            eprintln!(
+                "NOT RUN: cited_bead_ids_exist_in_the_tracker opted out via \
+                 {ALLOW_MISSING_BEADS_TRACKER_ENV}=1 because {} is absent \
+                 (gates setting this opt-out must record this check as not run)",
+                path.display()
+            );
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    };
     let mut unknown: Vec<(String, String)> = Vec::new();
     for document in documents {
         let content = read(document);
@@ -393,5 +460,62 @@ fn guide_docs_are_synchronized() {
                 crate_path.display()
             );
         }
+    }
+}
+
+#[test]
+fn missing_beads_tracker_fails_without_explicit_opt_out() {
+    let dir_without_beads = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let err = load_beads_tracker(&dir_without_beads, false)
+        .expect_err("missing .beads/issues.jsonl must fail by default");
+    assert!(
+        err.contains(".beads/issues.jsonl"),
+        "diagnostic must name missing tracker path: {err}"
+    );
+    assert!(
+        err.contains(ALLOW_MISSING_BEADS_TRACKER_ENV),
+        "diagnostic must name explicit opt-out variable: {err}"
+    );
+}
+
+#[test]
+fn missing_beads_tracker_opt_out_is_explicit_and_does_not_mask_io_errors() {
+    let dir_without_beads = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let opted_out = load_beads_tracker(&dir_without_beads, true)
+        .expect("explicit opt-out allows missing .beads/issues.jsonl");
+    assert_eq!(
+        opted_out,
+        BeadsTrackerLoad::OptedOutMissing {
+            path: dir_without_beads.join(".beads/issues.jsonl"),
+        }
+    );
+
+    // Existing readable file loads normally regardless of opt-out.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let loaded = load_beads_tracker_at(&manifest, false).expect("existing file loads");
+    assert!(matches!(loaded, BeadsTrackerLoad::Loaded(s) if s.contains("sqlmodel-e2e")));
+
+    // Non-NotFound errors (such as pointing at a directory) still fail even with opt-out.
+    let dir_err = load_beads_tracker_at(&dir_without_beads, true)
+        .expect_err("non-NotFound IO errors must not be masked by opt-out");
+    assert!(
+        dir_err.contains("cannot read beads issue tracker"),
+        "unexpected error: {dir_err}"
+    );
+
+    for disabled in [None, Some(""), Some("0"), Some("false"), Some("no")] {
+        assert!(
+            !env_flag_enabled(disabled),
+            "should be disabled: {disabled:?}"
+        );
+    }
+    for enabled in [
+        Some("1"),
+        Some(" 1 "),
+        Some("true"),
+        Some("TRUE"),
+        Some("yes"),
+    ] {
+        assert!(env_flag_enabled(enabled), "should be enabled: {enabled:?}");
     }
 }

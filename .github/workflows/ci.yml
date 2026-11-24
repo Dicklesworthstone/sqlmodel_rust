@@ -250,9 +250,10 @@ jobs:
         run: cargo test --workspace --doc --features sqlmodel/nightly-try
 
   integration:
-    # Postgres and MySQL end-to-end suites. Until this job existed the
-    # integration tests were env-gated and silently skipped on every run
-    # (bead bd-slot.1). The final step fails the job if a suite skipped.
+    # Postgres and MySQL end-to-end suites. Driver integration tests are marked
+    # #[ignore] by default and invoked with --ignored here (bead bd-fxso);
+    # missing env vars panic rather than reporting ok, and SQLMODEL_TEST_REQUIRE_SERVICES=1
+    # enforces the same rule on sqlmodel-e2e service witnesses.
     name: Integration (Postgres 16 · MySQL 8.4 · MariaDB 11)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -289,6 +290,7 @@ jobs:
       SQLMODEL_TEST_POSTGRES_URL: postgres://sqlmodel:sqlmodel@127.0.0.1:5432/sqlmodel_test
       SQLMODEL_TEST_MYSQL_URL: mysql://root:sqlmodel@127.0.0.1:3306/sqlmodel_test
       SQLMODEL_TEST_MARIADB_URL: mysql://root:sqlmodel@127.0.0.1:3307/sqlmodel_test
+      SQLMODEL_TEST_REQUIRE_SERVICES: "1"
       RUST_LOG: sqlmodel=debug
     steps:
       - uses: actions/checkout@v7
@@ -303,12 +305,19 @@ jobs:
 
       - name: Run driver integration suites against live services
         run: |
-          set -o pipefail
-          cargo test -p sqlmodel-postgres -p sqlmodel-mysql --tests -- --nocapture 2>&1 | tee integration.log
+          set -euo pipefail
+          cargo test -p sqlmodel-postgres --test postgres_integration -- --ignored --nocapture 2>&1 | tee integration-drivers.log
+          cargo test -p sqlmodel-mysql --test mysql_integration -- --ignored --nocapture 2>&1 | tee -a integration-drivers.log
+          cp integration-drivers.log integration.log
+          if grep -Eq "test result: .*0 passed;|[1-9][0-9]* ignored;" integration-drivers.log; then
+            echo "Driver integration suite had 0 passed or unexpected ignored tests:"
+            cat integration-drivers.log
+            exit 1
+          fi
 
       - name: Run end-to-end crate against every available driver
         run: |
-          set -o pipefail
+          set -euo pipefail
           if cargo metadata --format-version 1 --no-deps | jq -e '.packages[] | select(.name=="sqlmodel-e2e")' >/dev/null; then
             cargo test -p sqlmodel-e2e -- --nocapture 2>&1 | tee -a integration.log
           else
@@ -317,8 +326,10 @@ jobs:
 
       - name: Fail if any suite skipped instead of running
         run: |
-          if grep -q "skipping .* integration tests" integration.log; then
-            echo "A suite skipped although services are available:"; grep "skipping" integration.log; exit 1
+          if grep -Eq "skipping .* (integration|finalization) tests|sqlmodel-e2e: .* not exercised|NOT RUN:" integration.log; then
+            echo "A suite skipped although services are available:"
+            grep -E "skipping|not exercised|NOT RUN:" integration.log
+            exit 1
           fi
 
   tls-matrix:
@@ -419,8 +430,22 @@ jobs:
           SQLMODEL_TEST_MYSQL_CA: /tmp/tls-certs/mysql-ca.pem
           SQLMODEL_TEST_MYSQL_REQUIRE_SECURE_TRANSPORT: "1"
           SQLMODEL_TEST_MARIADB_URL: mysql://root:sqlmodel@127.0.0.1:3307/sqlmodel_test
+          SQLMODEL_TEST_REQUIRE_SERVICES: "1"
         run: |
-          cargo test -p sqlmodel-postgres -p sqlmodel-mysql --features sqlmodel-postgres/tls,sqlmodel-mysql/tls --test postgres_tls --test mysql_tls -- --nocapture
+          set -euo pipefail
+          # The two opposite-policy tests run in their own steps below after reconfiguring the servers.
+          cargo test -p sqlmodel-postgres -p sqlmodel-mysql \
+            --features sqlmodel-postgres/tls,sqlmodel-mysql/tls \
+            --test postgres_tls --test mysql_tls -- \
+            --ignored \
+            --skip postgres_tls_disable_when_ssl_required \
+            --skip mysql_auth_caching_sha2_no_tls_rsa \
+            --nocapture 2>&1 | tee tls-matrix.log
+          if grep -Eq "test result: .*0 passed;|[1-9][0-9]* ignored;" tls-matrix.log; then
+            echo "Expected TLS matrix tests did not execute:"
+            cat tls-matrix.log
+            exit 1
+          fi
 
       - name: Verify Postgres SslMode::Disable rejection with hostssl
         run: |
@@ -432,7 +457,10 @@ jobs:
           SQLMODEL_TEST_POSTGRES_URL="postgres://sqlmodel:sqlmodel@127.0.0.1:5432/sqlmodel_test" \
           SQLMODEL_TEST_POSTGRES_CA="/tmp/tls-certs/ca.crt" \
           SQLMODEL_TEST_POSTGRES_REQUIRE_SSL="1" \
-          cargo test -p sqlmodel-postgres --features tls --test postgres_tls postgres_tls_disable_when_ssl_required -- --nocapture
+          SQLMODEL_TEST_REQUIRE_SERVICES="1" \
+          cargo test -p sqlmodel-postgres --features tls --test postgres_tls \
+            postgres_tls_disable_when_ssl_required -- --exact --ignored --nocapture 2>&1 | tee tls-pg-disable.log
+          grep -q "test result: .*1 passed; 0 failed; 0 ignored;" tls-pg-disable.log
 
       - name: Test caching_sha2_password without TLS (rsa-auth key exchange)
         run: |
@@ -441,7 +469,10 @@ jobs:
           docker exec $MYSQL_CONTAINER mysql -uroot -psqlmodel -e "SET GLOBAL require_secure_transport = OFF;"
           SQLMODEL_TEST_MYSQL_URL="mysql://root:sqlmodel@127.0.0.1:3306/sqlmodel_test" \
           SQLMODEL_TEST_MYSQL_REQUIRE_SECURE_TRANSPORT="0" \
-          cargo test -p sqlmodel-mysql --features tls,rsa-auth --test mysql_tls mysql_auth_caching_sha2_no_tls_rsa -- --nocapture
+          SQLMODEL_TEST_REQUIRE_SERVICES="1" \
+          cargo test -p sqlmodel-mysql --features tls,rsa-auth --test mysql_tls \
+            mysql_auth_caching_sha2_no_tls_rsa -- --exact --ignored --nocapture 2>&1 | tee tls-mysql-rsa.log
+          grep -q "test result: .*1 passed; 0 failed; 0 ignored;" tls-mysql-rsa.log
 
   asan:
     name: AddressSanitizer (SQLite FFI)

@@ -7,75 +7,10 @@ use asupersync::{Budget, CancelKind, Cx, Outcome};
 use sqlmodel_core::error::{ConnectionErrorKind, QueryErrorKind, TransactionErrorKind};
 use sqlmodel_core::{Connection, Error, IsolationLevel, TransactionOps, Value};
 
-use sqlmodel_postgres::{PgConfig, SharedPgConnection, SslMode};
+use sqlmodel_postgres::SharedPgConnection;
 use sqlmodel_schema::introspect::{Dialect, Introspector};
 
-const POSTGRES_URL_ENV: &str = "SQLMODEL_TEST_POSTGRES_URL";
-
-fn postgres_test_config() -> Option<PgConfig> {
-    let raw = std::env::var(POSTGRES_URL_ENV).ok()?;
-    let cfg = parse_postgres_url(&raw)?;
-    if cfg.database.is_empty() {
-        eprintln!(
-            "skipping Postgres integration tests: {POSTGRES_URL_ENV} must include a database name (postgres://user:pass@host:5432/db)"
-        );
-        return None;
-    }
-    Some(
-        cfg.connect_timeout(Duration::from_secs(10))
-            .ssl_mode(SslMode::Disable),
-    )
-}
-
-fn parse_postgres_url(url: &str) -> Option<PgConfig> {
-    let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-
-    let rest = url
-        .strip_prefix("postgres://")
-        .or_else(|| url.strip_prefix("postgresql://"))?;
-
-    let (auth, host_and_path) = rest.split_once('@')?;
-    let (user, password) = match auth.split_once(':') {
-        Some((u, p)) => (u, Some(p)),
-        None => (auth, None),
-    };
-
-    let (host_port, db) = host_and_path.split_once('/')?;
-    let db = db
-        .split_once('?')
-        .map_or(db, |(left, _)| left)
-        .trim_matches('/');
-
-    let (host, port) = parse_host_port(host_port)?;
-    let mut cfg = PgConfig::new(host, user, db).port(port);
-    if let Some(pw) = password.filter(|p| !p.is_empty()) {
-        cfg = cfg.password(pw);
-    }
-    Some(cfg)
-}
-
-fn parse_host_port(input: &str) -> Option<(&str, u16)> {
-    if let Some(rest) = input.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = &rest[..end];
-        let after = &rest[end + 1..];
-        let port = after
-            .strip_prefix(':')
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(5432);
-        return Some((host, port));
-    }
-
-    match input.rsplit_once(':') {
-        Some((host, port_str)) if port_str.chars().all(|c| c.is_ascii_digit()) => {
-            Some((host, port_str.parse::<u16>().ok()?))
-        }
-        _ => Some((input, 5432)),
-    }
-}
+mod common;
 
 fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
     match outcome {
@@ -115,11 +50,9 @@ fn test_table_name(prefix: &str) -> String {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_connect_select_1() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -136,11 +69,9 @@ fn postgres_connect_select_1() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_dropped_query_future_invalidates_unfinished_exchange() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -190,11 +121,9 @@ fn postgres_dropped_query_future_invalidates_unfinished_exchange() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_pending_wire_read_observes_cancellation_and_request_deadline() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -270,11 +199,9 @@ fn postgres_pending_wire_read_observes_cancellation_and_request_deadline() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_completed_or_unstarted_exchange_remains_reusable() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -308,11 +235,9 @@ fn postgres_completed_or_unstarted_exchange_remains_reusable() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_fully_drained_server_errors_preserve_connection_reuse() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -362,11 +287,9 @@ fn postgres_fully_drained_server_errors_preserve_connection_reuse() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_insert_and_select_roundtrip() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -406,11 +329,9 @@ fn postgres_insert_and_select_roundtrip() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_transaction_rollback_discards_changes() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -454,11 +375,9 @@ fn postgres_transaction_rollback_discards_changes() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_transaction_isolation_is_applied_by_begin() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -481,11 +400,9 @@ fn postgres_transaction_isolation_is_applied_by_begin() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_transaction_excludes_connection_clones_until_finalized() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -607,11 +524,9 @@ fn postgres_transaction_excludes_connection_clones_until_finalized() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_transaction_commit_and_rollback_preserve_backend() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -716,11 +631,9 @@ fn postgres_transaction_commit_and_rollback_preserve_backend() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_transaction_cancelled_or_unpolled_finish_closes_connection() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .expect("production runtime");
@@ -774,11 +687,9 @@ fn postgres_transaction_cancelled_or_unpolled_finish_closes_connection() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_unique_violation_maps_to_constraint() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -818,11 +729,9 @@ fn postgres_unique_violation_maps_to_constraint() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_syntax_error_maps_to_syntax() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -840,11 +749,9 @@ fn postgres_syntax_error_maps_to_syntax() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_introspection_reports_check_constraints_and_table_comment() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -935,11 +842,9 @@ fn postgres_introspection_reports_check_constraints_and_table_comment() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_introspection_preserves_composite_index_column_order() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -991,11 +896,9 @@ fn postgres_introspection_preserves_composite_index_column_order() {
 /// per distinct (SQL, param types), no duplicate prepares on cache hits,
 /// and LRU eviction closing statements when exceeding capacity.
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_parameterized_queries_are_prepared_once_and_cached() {
-    let Some(cfg) = postgres_test_config() else {
-        eprintln!("skipping Postgres integration tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_integration_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()

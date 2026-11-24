@@ -6,77 +6,10 @@ use asupersync::{Cx, Outcome};
 use sqlmodel_core::error::QueryErrorKind;
 use sqlmodel_core::{Connection, Error, TransactionOps, Value};
 
-use sqlmodel_mysql::{MySqlConfig, SharedMySqlConnection};
+use sqlmodel_mysql::SharedMySqlConnection;
 use sqlmodel_schema::introspect::{Dialect, Introspector};
 
-const MYSQL_URL_ENV: &str = "SQLMODEL_TEST_MYSQL_URL";
-
-fn mysql_test_config() -> Option<MySqlConfig> {
-    let raw = std::env::var(MYSQL_URL_ENV).ok()?;
-    let cfg = parse_mysql_url(&raw)?;
-    if cfg.database.is_none() {
-        eprintln!(
-            "skipping MySQL integration tests: {MYSQL_URL_ENV} must include a database name (mysql://user:pass@host:3306/db)"
-        );
-        return None;
-    }
-    Some(cfg.connect_timeout(Duration::from_secs(10)))
-}
-
-fn parse_mysql_url(url: &str) -> Option<MySqlConfig> {
-    let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-
-    let rest = url.strip_prefix("mysql://")?;
-    let (auth, host_and_path) = rest.split_once('@')?;
-    let (user, password) = match auth.split_once(':') {
-        Some((u, p)) => (u, Some(p)),
-        None => (auth, None),
-    };
-
-    let (host_port, db) = match host_and_path.split_once('/') {
-        Some((hp, path)) => (hp, Some(path)),
-        None => (host_and_path, None),
-    };
-
-    let db = db
-        .map(|s| s.split_once('?').map_or(s, |(left, _)| left))
-        .filter(|s| !s.is_empty());
-
-    let (host, port) = parse_host_port(host_port)?;
-
-    let mut cfg = MySqlConfig::new().host(host).port(port).user(user);
-    if let Some(pw) = password.filter(|p| !p.is_empty()) {
-        cfg = cfg.password(pw);
-    }
-    if let Some(db) = db {
-        cfg = cfg.database(db);
-    }
-
-    Some(cfg)
-}
-
-fn parse_host_port(input: &str) -> Option<(&str, u16)> {
-    if let Some(rest) = input.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = &rest[..end];
-        let after = &rest[end + 1..];
-        let port = after
-            .strip_prefix(':')
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(3306);
-        return Some((host, port));
-    }
-
-    match input.rsplit_once(':') {
-        Some((host, port_str)) if port_str.chars().all(|c| c.is_ascii_digit()) => {
-            Some((host, port_str.parse::<u16>().ok()?))
-        }
-        _ => Some((input, 3306)),
-    }
-}
+mod common;
 
 fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
     match outcome {
@@ -116,11 +49,9 @@ fn test_table_name(prefix: &str) -> String {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_connect_select_1() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -137,11 +68,9 @@ fn mysql_connect_select_1() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_insert_and_select_roundtrip() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -181,11 +110,9 @@ fn mysql_insert_and_select_roundtrip() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_transaction_rollback_discards_changes() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -229,11 +156,9 @@ fn mysql_transaction_rollback_discards_changes() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_unique_violation_maps_to_constraint() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -274,11 +199,9 @@ fn mysql_unique_violation_maps_to_constraint() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_syntax_error_maps_to_syntax() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -296,11 +219,9 @@ fn mysql_syntax_error_maps_to_syntax() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_introspection_reports_check_constraints_and_table_comment() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -379,11 +300,9 @@ fn mysql_introspection_reports_check_constraints_and_table_comment() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_introspection_preserves_composite_index_column_order() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -436,11 +355,9 @@ fn mysql_introspection_preserves_composite_index_column_order() {
 /// the e2e schema fixpoint scenario on MySQL: "Protocol error: Invalid column
 /// count" on the query following the foreign-key lookup).
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_introspection_reports_foreign_keys_and_indexes_without_desync() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -541,11 +458,9 @@ fn mysql_introspection_reports_foreign_keys_and_indexes_without_desync() {
 /// dropped the rows, and left the terminator in the stream, so the next
 /// statement failed with "Protocol error: Invalid column count".
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_row_with_empty_first_value_does_not_desync_the_connection() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -577,11 +492,9 @@ fn mysql_row_with_empty_first_value_does_not_desync_the_connection() {
 /// for an OK packet), NULLs live in a bitmap offset by two bits, and each
 /// type has its own wire encoding. This drives all of that against MySQL 8.4.
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_prepared_statements_decode_rows_nulls_and_types_without_desync() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -753,11 +666,9 @@ fn mysql_prepared_statements_decode_rows_nulls_and_types_without_desync() {
 /// show one prepare per distinct statement, one execute per call, and a
 /// close for every statement evicted from the bounded cache.
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_parameterized_queries_are_prepared_once_and_executed_per_call() {
-    let Some(cfg) = mysql_test_config() else {
-        eprintln!("skipping MySQL integration tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()

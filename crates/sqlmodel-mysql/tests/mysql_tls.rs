@@ -1,101 +1,12 @@
 #![cfg(feature = "tls")]
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+mod common;
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 
 use sqlmodel_core::{Connection, Error};
-use sqlmodel_mysql::{MySqlConfig, SharedMySqlConnection, SslMode};
-
-const MYSQL_URL_ENV: &str = "SQLMODEL_TEST_MYSQL_URL";
-const MYSQL_CA_ENV: &str = "SQLMODEL_TEST_MYSQL_CA";
-const MYSQL_REQUIRE_SECURE_TRANSPORT_ENV: &str = "SQLMODEL_TEST_MYSQL_REQUIRE_SECURE_TRANSPORT";
-const MARIADB_URL_ENV: &str = "SQLMODEL_TEST_MARIADB_URL";
-
-fn mysql_base_config() -> Option<MySqlConfig> {
-    let raw = std::env::var(MYSQL_URL_ENV).ok()?;
-    let cfg = parse_mysql_url(&raw)?;
-    if cfg.database.is_none() {
-        eprintln!("skipping MySQL TLS tests: {MYSQL_URL_ENV} must include a database name");
-        return None;
-    }
-    Some(cfg.connect_timeout(Duration::from_secs(10)))
-}
-
-fn mysql_ca_path() -> Option<PathBuf> {
-    if let Ok(ca) = std::env::var(MYSQL_CA_ENV) {
-        let p = PathBuf::from(ca);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let fallback = PathBuf::from("/tmp/mysql-ca.pem");
-    if fallback.exists() {
-        return Some(fallback);
-    }
-    let local = PathBuf::from("mysql-ca.pem");
-    if local.exists() {
-        return Some(local);
-    }
-    None
-}
-
-fn parse_mysql_url(url: &str) -> Option<MySqlConfig> {
-    let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-
-    let rest = url.strip_prefix("mysql://")?;
-    let (auth, host_and_path) = rest.split_once('@')?;
-    let (user, password) = match auth.split_once(':') {
-        Some((u, p)) => (u, Some(p)),
-        None => (auth, None),
-    };
-
-    let (host_port, db) = match host_and_path.split_once('/') {
-        Some((hp, path)) => (hp, Some(path)),
-        None => (host_and_path, None),
-    };
-
-    let db = db
-        .map(|s| s.split_once('?').map_or(s, |(left, _)| left))
-        .filter(|s| !s.is_empty());
-
-    let (host, port) = parse_host_port(host_port)?;
-
-    let mut cfg = MySqlConfig::new().host(host).port(port).user(user);
-    if let Some(pw) = password.filter(|p| !p.is_empty()) {
-        cfg = cfg.password(pw);
-    }
-    if let Some(db) = db {
-        cfg = cfg.database(db);
-    }
-
-    Some(cfg)
-}
-
-fn parse_host_port(input: &str) -> Option<(&str, u16)> {
-    if let Some(rest) = input.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = &rest[..end];
-        let after = &rest[end + 1..];
-        let port = after
-            .strip_prefix(':')
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(3306);
-        return Some((host, port));
-    }
-
-    match input.rsplit_once(':') {
-        Some((host, port_str)) if port_str.chars().all(|c| c.is_ascii_digit()) => {
-            Some((host, port_str.parse::<u16>().ok()?))
-        }
-        _ => Some((input, 3306)),
-    }
-}
+use sqlmodel_mysql::{SharedMySqlConnection, SslMode};
 
 fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
     match outcome {
@@ -113,11 +24,9 @@ fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_tls_preferred_connect() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL TLS tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -136,11 +45,9 @@ fn mysql_tls_preferred_connect() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_tls_required_connect() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL TLS tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -159,15 +66,10 @@ fn mysql_tls_required_connect() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL and SQLMODEL_TEST_MYSQL_CA (run with -- --ignored)"]
 fn mysql_tls_verify_ca_success() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL TLS tests: set {MYSQL_URL_ENV}");
-        return;
-    };
-    let Some(ca_path) = mysql_ca_path() else {
-        eprintln!("skipping VerifyCa test: CA certificate not found (set {MYSQL_CA_ENV})");
-        return;
-    };
+    let cfg = common::require_mysql_config();
+    let ca_path = common::require_mysql_ca_path();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -185,21 +87,10 @@ fn mysql_tls_verify_ca_success() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_tls_verify_ca_rejects_untrusted_ca() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL TLS tests: set {MYSQL_URL_ENV}");
-        return;
-    };
-
-    let untrusted_ca_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("untrusted_ca.crt");
-
-    if !untrusted_ca_path.exists() {
-        eprintln!("skipping untrusted_ca test: fixture file missing");
-        return;
-    }
+    let cfg = common::require_mysql_config();
+    let untrusted_ca_path = common::require_fixture_path("untrusted_ca.crt");
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -227,15 +118,10 @@ fn mysql_tls_verify_ca_rejects_untrusted_ca() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL and SQLMODEL_TEST_MYSQL_CA (run with -- --ignored)"]
 fn mysql_tls_verify_identity_hostname_validation() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL TLS tests: set {MYSQL_URL_ENV}");
-        return;
-    };
-    let Some(ca_path) = mysql_ca_path() else {
-        eprintln!("skipping VerifyIdentity test: CA certificate not found (set {MYSQL_CA_ENV})");
-        return;
-    };
+    let cfg = common::require_mysql_config();
+    let ca_path = common::require_mysql_ca_path();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -267,20 +153,10 @@ fn mysql_tls_verify_identity_hostname_validation() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL and SQLMODEL_TEST_MYSQL_REQUIRE_SECURE_TRANSPORT=1 (run with -- --ignored)"]
 fn mysql_tls_disable_when_secure_transport_required() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL TLS tests: set {MYSQL_URL_ENV}");
-        return;
-    };
-
-    let require_secure =
-        std::env::var(MYSQL_REQUIRE_SECURE_TRANSPORT_ENV).is_ok_and(|v| v == "1" || v == "true");
-    if !require_secure {
-        eprintln!(
-            "skipping disable_when_secure_transport_required: {MYSQL_REQUIRE_SECURE_TRANSPORT_ENV} not set"
-        );
-        return;
-    }
+    let cfg = common::require_mysql_config();
+    common::require_secure_transport_enabled();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -309,11 +185,9 @@ fn mysql_tls_disable_when_secure_transport_required() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL (run with -- --ignored)"]
 fn mysql_auth_caching_sha2_with_tls() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL auth tests: set {MYSQL_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mysql_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -332,18 +206,10 @@ fn mysql_auth_caching_sha2_with_tls() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MYSQL_URL with SQLMODEL_TEST_MYSQL_REQUIRE_SECURE_TRANSPORT unset/0 (run with -- --ignored)"]
 fn mysql_auth_caching_sha2_no_tls_rsa() {
-    let Some(cfg) = mysql_base_config() else {
-        eprintln!("skipping MySQL auth tests: set {MYSQL_URL_ENV}");
-        return;
-    };
-
-    let require_secure =
-        std::env::var(MYSQL_REQUIRE_SECURE_TRANSPORT_ENV).is_ok_and(|v| v == "1" || v == "true");
-    if require_secure {
-        eprintln!("skipping no-tls RSA auth test: require_secure_transport is active");
-        return;
-    }
+    let cfg = common::require_mysql_config();
+    common::require_secure_transport_disabled();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -368,15 +234,9 @@ fn mysql_auth_caching_sha2_no_tls_rsa() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_MARIADB_URL (run with -- --ignored)"]
 fn mysql_auth_native_password_mariadb() {
-    let Ok(raw) = std::env::var(MARIADB_URL_ENV) else {
-        eprintln!("skipping MariaDB native_password test: set {MARIADB_URL_ENV}");
-        return;
-    };
-    let Some(cfg) = parse_mysql_url(&raw) else {
-        eprintln!("skipping MariaDB test: invalid URL in {MARIADB_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_mariadb_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()

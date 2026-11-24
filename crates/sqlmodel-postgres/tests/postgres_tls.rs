@@ -1,95 +1,12 @@
 #![cfg(feature = "tls")]
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+mod common;
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 
 use sqlmodel_core::{Connection, Error};
-use sqlmodel_postgres::{PgConfig, SharedPgConnection, SslMode};
-
-const POSTGRES_URL_ENV: &str = "SQLMODEL_TEST_POSTGRES_URL";
-const POSTGRES_CA_ENV: &str = "SQLMODEL_TEST_POSTGRES_CA";
-const POSTGRES_REQUIRE_SSL_ENV: &str = "SQLMODEL_TEST_POSTGRES_REQUIRE_SSL";
-
-fn postgres_base_config() -> Option<PgConfig> {
-    let raw = std::env::var(POSTGRES_URL_ENV).ok()?;
-    let cfg = parse_postgres_url(&raw)?;
-    if cfg.database.is_empty() {
-        eprintln!("skipping Postgres TLS tests: {POSTGRES_URL_ENV} must include a database name");
-        return None;
-    }
-    Some(cfg.connect_timeout(Duration::from_secs(10)))
-}
-
-fn postgres_ca_path() -> Option<PathBuf> {
-    if let Ok(ca) = std::env::var(POSTGRES_CA_ENV) {
-        let p = PathBuf::from(ca);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let fallback = PathBuf::from("/tmp/pg-test-certs/ca.crt");
-    if fallback.exists() {
-        return Some(fallback);
-    }
-    let local = PathBuf::from("pg-ca.crt");
-    if local.exists() {
-        return Some(local);
-    }
-    None
-}
-
-fn parse_postgres_url(url: &str) -> Option<PgConfig> {
-    let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-
-    let rest = url
-        .strip_prefix("postgres://")
-        .or_else(|| url.strip_prefix("postgresql://"))?;
-
-    let (auth, host_and_path) = rest.split_once('@')?;
-    let (user, password) = match auth.split_once(':') {
-        Some((u, p)) => (u, Some(p)),
-        None => (auth, None),
-    };
-
-    let (host_port, db) = host_and_path.split_once('/')?;
-    let db = db
-        .split_once('?')
-        .map_or(db, |(left, _)| left)
-        .trim_matches('/');
-
-    let (host, port) = parse_host_port(host_port)?;
-    let mut cfg = PgConfig::new(host, user, db).port(port);
-    if let Some(pw) = password.filter(|p| !p.is_empty()) {
-        cfg = cfg.password(pw);
-    }
-    Some(cfg)
-}
-
-fn parse_host_port(input: &str) -> Option<(&str, u16)> {
-    if let Some(rest) = input.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = &rest[..end];
-        let after = &rest[end + 1..];
-        let port = after
-            .strip_prefix(':')
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(5432);
-        return Some((host, port));
-    }
-
-    match input.rsplit_once(':') {
-        Some((host, port_str)) if port_str.chars().all(|c| c.is_ascii_digit()) => {
-            Some((host, port_str.parse::<u16>().ok()?))
-        }
-        _ => Some((input, 5432)),
-    }
-}
+use sqlmodel_postgres::{SharedPgConnection, SslMode};
 
 fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
     match outcome {
@@ -107,11 +24,9 @@ fn unwrap_outcome<T>(outcome: Outcome<T, Error>) -> T {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_tls_prefer_connect() {
-    let Some(cfg) = postgres_base_config() else {
-        eprintln!("skipping Postgres TLS tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_tls_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -129,11 +44,9 @@ fn postgres_tls_prefer_connect() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_tls_require_connect() {
-    let Some(cfg) = postgres_base_config() else {
-        eprintln!("skipping Postgres TLS tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
+    let cfg = common::require_postgres_tls_config();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -151,15 +64,10 @@ fn postgres_tls_require_connect() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL and SQLMODEL_TEST_POSTGRES_CA (run with -- --ignored)"]
 fn postgres_tls_verify_ca_success() {
-    let Some(cfg) = postgres_base_config() else {
-        eprintln!("skipping Postgres TLS tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
-    let Some(ca_path) = postgres_ca_path() else {
-        eprintln!("skipping VerifyCa test: CA certificate not found (set {POSTGRES_CA_ENV})");
-        return;
-    };
+    let cfg = common::require_postgres_tls_config();
+    let ca_path = common::require_postgres_ca_path();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -177,21 +85,10 @@ fn postgres_tls_verify_ca_success() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL (run with -- --ignored)"]
 fn postgres_tls_verify_ca_rejects_untrusted_ca() {
-    let Some(cfg) = postgres_base_config() else {
-        eprintln!("skipping Postgres TLS tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
-
-    let untrusted_ca_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("untrusted_ca.crt");
-
-    if !untrusted_ca_path.exists() {
-        eprintln!("skipping untrusted_ca test: fixture file missing");
-        return;
-    }
+    let cfg = common::require_postgres_tls_config();
+    let untrusted_ca_path = common::require_fixture_path("untrusted_ca.crt");
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -221,15 +118,10 @@ fn postgres_tls_verify_ca_rejects_untrusted_ca() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL and SQLMODEL_TEST_POSTGRES_CA (run with -- --ignored)"]
 fn postgres_tls_verify_full_connect() {
-    let Some(cfg) = postgres_base_config() else {
-        eprintln!("skipping Postgres TLS tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
-    let Some(ca_path) = postgres_ca_path() else {
-        eprintln!("skipping VerifyFull test: CA certificate not found (set {POSTGRES_CA_ENV})");
-        return;
-    };
+    let cfg = common::require_postgres_tls_config();
+    let ca_path = common::require_postgres_ca_path();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -259,18 +151,10 @@ fn postgres_tls_verify_full_connect() {
 }
 
 #[test]
+#[ignore = "requires SQLMODEL_TEST_POSTGRES_URL and SQLMODEL_TEST_POSTGRES_REQUIRE_SSL=1 (run with -- --ignored)"]
 fn postgres_tls_disable_when_ssl_required() {
-    let Some(cfg) = postgres_base_config() else {
-        eprintln!("skipping Postgres TLS tests: set {POSTGRES_URL_ENV}");
-        return;
-    };
-
-    let require_ssl =
-        std::env::var(POSTGRES_REQUIRE_SSL_ENV).is_ok_and(|v| v == "1" || v == "true");
-    if !require_ssl {
-        eprintln!("skipping disable_when_ssl_required test: {POSTGRES_REQUIRE_SSL_ENV} not set");
-        return;
-    }
+    let cfg = common::require_postgres_tls_config();
+    common::require_postgres_ssl_enabled();
 
     let rt = RuntimeBuilder::current_thread()
         .build()
